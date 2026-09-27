@@ -279,7 +279,8 @@ describe('integrateWorktrees — the rules of the one automatic writer into a re
   // Rule 10.
   it('counts what a source worktree left uncommitted, and says so in the log', async () => {
     const a = await worked('a'); await fs.writeFile(path.join(a, 'forgot.txt'), 'x')
-    expect(await integrateWorktrees(repo, [a], { reap: false }, ctx())).toEqual({ kind: 'merged', uncommitted: 1 })
+    // `dirty` names the folder, so a caller about to delete folders can keep this one.
+    expect(await integrateWorktrees(repo, [a], { reap: false }, ctx())).toEqual({ kind: 'merged', uncommitted: 1, dirty: [a] })
     expect(logs.join('\n')).toMatch(/1 uncommitted change\(s\) — not merged/)
   })
 })
@@ -363,6 +364,21 @@ describe('worktreeDeps', () => {
       merged: ['D:/wt/a'],
       uncommitted: 0,
       unchecked: ['D:/wt/a']
+    })
+  })
+
+  it('mergeWorktrees passes on the worktrees that hold uncommitted changes', async () => {
+    const d = worktreeDeps({
+      integrate: async () => ({ kind: 'merged', uncommitted: 3, dirty: ['D:/wt/a'] }),
+      reap: async () => true,
+      log: () => {},
+      exists: () => true
+    })
+    expect(await d.mergeWorktrees('D:/p', ['D:/wt/a', 'D:/wt/b'])).toEqual({
+      ok: true,
+      merged: ['D:/wt/a', 'D:/wt/b'],
+      uncommitted: 3,
+      dirty: ['D:/wt/a']
     })
   })
 

@@ -240,6 +240,9 @@ export interface OrchServerDeps {
         uncommitted: number
         /** Worktrees whose uncommitted changes could not be checked (git status failed) — unknown, not 0. */
         unchecked?: string[]
+        /** Worktrees that hold uncommitted changes. They are only in that folder, so `run-delete
+         *  --remove-worktrees` keeps these folders rather than deleting the changes with them. */
+        dirty?: string[]
       }
     | { ok: false; reason: string }
   >
@@ -2013,13 +2016,23 @@ export async function handleCommand(
       // 없다. id 만 보면 그 목록이 비어서 병합도 폴더 삭제도 조용히 건너뛰어지고, 회차마다 하나씩
       // 쌓인 폴더가 그대로 남는다(그렇게 보고됐다).
       const worktrees = [...doomed].flatMap((r) => runWorktrees(s, r))
+      // **병합이 센 사실을 버리지 않는다.** 병합은 커밋만 옮기므로 커밋되지 않은 변경은 원본 폴더에만
+      // 남는다. 그 폴더를 --force 로 지우면 그 변경도 조용히 사라진다. 그래서 변경이 남은 폴더와
+      // 상태를 확인하지 못한 폴더는 지우지 않고(worktreesKept) 그 수와 경로를 응답에 싣는다.
+      // 이 명령에는 그것을 넘어서 지우라는 force 플래그가 없다 — 지우려면 사람이 그 폴더를 보고
+      // 워크트리 패널에서 지운다.
+      let mergeFacts: { uncommitted: number; unchecked: string[]; dirty: string[] } | null = null
       if (args.merge === true && worktrees.length > 0) {
         if (!deps.mergeWorktrees) return bad('merging is not available in this build')
         const cwd = job?.cwd ?? (run && jobOf(s, run)?.cwd)
         if (cwd === undefined) return bad(`no project folder for ${String(id)}`)
         const merged = await deps.mergeWorktrees(cwd, worktrees)
         if (!merged.ok) return conflict(merged.reason)
+        mergeFacts = { uncommitted: merged.uncommitted ?? 0, unchecked: merged.unchecked ?? [], dirty: merged.dirty ?? [] }
       }
+      const keep = new Set([...(mergeFacts?.dirty ?? []), ...(mergeFacts?.unchecked ?? [])])
+      const worktreesKept = worktrees.filter((p) => keep.has(p))
+      const toRemove = worktrees.filter((p) => !keep.has(p))
       // 백업은 지우기 전에. reset 과 같은 관례이고 같은 이유다 — 되돌릴 수 없는 삭제에 .bak 하나는
       // 값이 싸다. 실패해도 삭제를 막지 않는다(deps.backup 이 스스로 접는다).
       if (deps.backup) await deps.backup()
@@ -2031,9 +2044,14 @@ export async function handleCommand(
       // 않고, 사용자에게는 "체크했는데 폴더가 남았다"로 보인다 — 실제로 그렇게 보고됐고, 그때 로그에
       // 아무 흔적이 없어서 어느 조건이 걸렸는지 알 수 없었다. reapWorktree 는 자기 결과를 남기지만
       // 그것은 불린 뒤의 이야기다. 여기서 한 줄을 남기면 그 물음이 로그로 답해진다.
-      if (args.removeWorktrees === true && worktrees.length > 0 && deps.removeWorktrees)
-        worktreesFailed = (await deps.removeWorktrees(worktrees)).failed
-      else if (args.removeWorktrees === true)
+      if (args.removeWorktrees === true && worktreesKept.length > 0)
+        deps.log?.(
+          `run-delete ${id}: kept ${worktreesKept.length} worktree(s) with uncommitted or unchecked changes: ` +
+            worktreesKept.join(', ')
+        )
+      if (args.removeWorktrees === true && toRemove.length > 0 && deps.removeWorktrees)
+        worktreesFailed = (await deps.removeWorktrees(toRemove)).failed
+      else if (args.removeWorktrees === true && worktreesKept.length === 0)
         deps.log?.(
           `run-delete ${id}: asked to remove worktrees but did not — ` +
             `worktrees=${worktrees.length} wired=${deps.removeWorktrees !== undefined}`
@@ -2046,7 +2064,11 @@ export async function handleCommand(
       return okBody({
         deleted: id,
         tasks: before,
-        ...(worktreesFailed.length > 0 ? { worktreesFailed } : {})
+        ...(worktreesFailed.length > 0 ? { worktreesFailed } : {}),
+        // run-merge 와 같은 이름이다. 병합했을 때만 싣는다 — 병합하지 않았으면 센 적이 없다
+        ...(mergeFacts ? { uncommitted: mergeFacts.uncommitted } : {}),
+        ...(mergeFacts && mergeFacts.unchecked.length > 0 ? { uncommittedUnchecked: mergeFacts.unchecked } : {}),
+        ...(args.removeWorktrees === true && worktreesKept.length > 0 ? { worktreesKept } : {})
       })
     }
     // 사람이 '실행' 을 눌렀거나, Run 줄의 ▶ 로 사라진 코디네이터를 다시 띄운다. 부르는 것은 UI 와

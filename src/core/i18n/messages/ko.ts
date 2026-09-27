@@ -1360,6 +1360,7 @@ export const ko = {
   'jobs.run.deleteRetained': 'worker-retain 으로 붙잡아 둔 세션이 있어 지울 수 없습니다 — 먼저 놓아 주세요',
   'jobs.run.deleteBusy': '이 작업에 도는 워커가 있어 지울 수 없습니다 — 먼저 멈춰 주세요',
   'jobs.run.deleteFailed': '작업을 지우지 못했습니다',
+  'jobs.run.deleteKeptWorktrees': '워크트리 폴더 {count}개를 남겼습니다. 커밋되지 않은 변경이 있거나 상태를 확인하지 못했습니다. 내용을 확인한 뒤 워크트리 패널에서 지우세요.',
   'jobs.run.sharedFolder': '폴더 공유',
   'jobs.run.sharedFolderHint': '다른 작업의 워커와 같은 폴더에서 돌고 있습니다 — 서로의 편집이 섞일 수 있고, 앱은 그것을 막지도 알아채지도 못합니다',
   'jobs.run.scheduled': '예약',

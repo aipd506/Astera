@@ -1071,6 +1071,7 @@ export const ja: Catalog = {
   'jobs.run.deleteRetained': 'worker-retain で保持中のセッションがあるため削除できません — まず解放してください',
   'jobs.run.deleteBusy': 'この作業でワーカーが動いているため削除できません — 先に停止してください',
   'jobs.run.deleteFailed': '作業を削除できませんでした',
+  'jobs.run.deleteKeptWorktrees': 'ワークツリーのフォルダーを {count} 個残しました。コミットされていない変更があるか、状態を確認できませんでした。中身を確認してから、ワークツリーパネルで削除してください。',
   'jobs.run.sharedFolder': 'フォルダ共有',
   'jobs.run.sharedFolderHint': '別の作業のワーカーと同じフォルダで動いています — 互いの編集が混ざることがあり、アプリはそれを防ぐことも気づくこともできません',
   'jobs.run.scheduled': '予約',

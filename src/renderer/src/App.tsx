@@ -4033,6 +4033,13 @@ export default function App(): React.JSX.Element {
                             : t('jobs.run.deleteBusy')
                         )
                       else if (reply.status >= 400) toast.error(t('jobs.run.deleteFailed'))
+                      else {
+                        // 병합 뒤에도 커밋되지 않은 변경이 남았거나 상태를 확인하지 못한 폴더는 명령이
+                        // 지우지 않고 남겼다. 사라지지 않고 남는 알림으로 그 사실을 알린다
+                        const kept = (reply.body as { worktreesKept?: unknown } | null)?.worktreesKept
+                        if (Array.isArray(kept) && kept.length > 0)
+                          toast.error(t('jobs.run.deleteKeptWorktrees', { count: kept.length }))
+                      }
                     } catch {
                       toast.error(t('jobs.run.deleteFailed'))
                     }

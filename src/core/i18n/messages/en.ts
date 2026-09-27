@@ -1154,6 +1154,7 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.run.deleteRetained': 'A session is held by worker-retain, so this cannot be deleted — release it first',
   'jobs.run.deleteBusy': 'A worker is running in this job, so it cannot be deleted — stop it first',
   'jobs.run.deleteFailed': 'Could not delete the job',
+  'jobs.run.deleteKeptWorktrees': 'Kept {count} worktree folder(s): they hold uncommitted changes, or their status could not be checked. Look at them, then delete them from the worktree panel.',
   'jobs.run.sharedFolder': 'shared folder',
   'jobs.run.sharedFolderHint': 'Running in the same folder as another job worker — their edits can mix, and the app neither prevents it nor notices it',
   'jobs.run.scheduled': 'Scheduled',

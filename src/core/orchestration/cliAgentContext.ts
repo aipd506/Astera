@@ -159,7 +159,10 @@ const SESSION = {
     flags: [
       req('id', '<jobId|runId>', 'the Job or the run to delete'),
       { name: 'merge', about: 'merge the worktrees before deleting' },
-      { name: 'remove-worktrees', about: 'delete the worktree folders too' }
+      {
+        name: 'remove-worktrees',
+        about: 'delete the worktree folders too (with --merge, a folder with uncommitted or unchecked changes is kept and listed in worktreesKept)'
+      }
     ]
   },
   'task-create': {

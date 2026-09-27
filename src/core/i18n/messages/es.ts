@@ -1084,6 +1084,7 @@ export const es: Catalog = {
   'jobs.run.deleteRetained': 'Hay una sesión retenida por worker-retain, así que no se puede eliminar — libérala primero',
   'jobs.run.deleteBusy': 'Hay un worker corriendo en este trabajo, así que no se puede eliminar — deténlo primero',
   'jobs.run.deleteFailed': 'No se pudo eliminar el trabajo',
+  'jobs.run.deleteKeptWorktrees': 'Se conservaron {count} carpeta(s) de worktree: tienen cambios sin confirmar o no se pudo comprobar su estado. Revísalas y elimínalas desde el panel de worktrees.',
   'jobs.run.sharedFolder': 'carpeta compartida',
   'jobs.run.sharedFolderHint': 'Corre en la misma carpeta que el worker de otro trabajo — sus ediciones pueden mezclarse, y la app ni lo impide ni lo detecta',
   'jobs.run.scheduled': 'Programado',

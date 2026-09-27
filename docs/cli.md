@@ -221,6 +221,16 @@ that fires on a schedule closes its open workers and merges before a folder remo
 after that refusal, nothing about the Job or its runs is deleted, but the workers are already closed and
 the merge has already happened.
 
+**`run-delete --merge --remove-worktrees` never deletes changes that were not committed.** A merge moves
+commits only, so a change left uncommitted in a worker's worktree exists in that folder and nowhere
+else. Such a folder is kept, and so is one whose status git could not report. The rest are removed and
+the Job or run is deleted as usual. There is no flag that removes them anyway: look at a kept folder,
+then delete it from the worktree panel. The reply gains three fields, each present only when it applies:
+
+- `uncommitted`: how many uncommitted changes the merged worktrees hold, as `run-merge` reports it.
+- `uncommittedUnchecked`: the worktrees whose status could not be checked.
+- `worktreesKept`: the worktree folders that were not removed for either reason.
+
 **`astera host status` says whether this Host can do this.** `spawn` in `data.features` means it can
 start and stop workers, and `worktrees` in `data.features` means it can make, merge and remove them
 itself. `dispatch` means it also places the workers of a Job with no coordinator and runs their checks
