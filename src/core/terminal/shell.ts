@@ -23,3 +23,18 @@ export function resolveShell(
   }
   return { file: envShell || '/bin/sh', args: [] }
 }
+
+/**
+ * resolveShell over an async exists: on win32 every candidate is looked for at once — each lookup walks
+ * PATH, and one PATH entry on an offline drive must not be paid for three times in a row — and then the
+ * same order decides. Off win32 nothing is looked for, exactly as resolveShell does.
+ */
+export async function resolveShellAsync(
+  platform: NodeJS.Platform,
+  exists: (file: string) => Promise<boolean>,
+  envShell?: string
+): Promise<ShellSpawn> {
+  if (platform !== 'win32') return resolveShell(platform, () => false, envShell)
+  const found = await Promise.all(WIN_CANDIDATES.map((f) => exists(f)))
+  return resolveShell(platform, (f) => found[WIN_CANDIDATES.indexOf(f)] === true, envShell)
+}

@@ -2,18 +2,24 @@
 // Kept apart from RunManager even though both are now keyed by an id and hold several per project: a terminal
 // spawns the user's shell and lives until closed, a run spawns one assembled command and reports its exit.
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { PtyFactory, PtyLike } from '../core/sessions/pty'
 import type { TerminalBuffer, TerminalInfo } from '../core/types'
-import { resolveShell } from '../core/terminal/shell'
+import { PathKeyedCache, defaultProbe, findOnPath } from '../core/sessions/pathProbe'
+import { resolveShellAsync } from '../core/terminal/shell'
 
 const OUTPUT_LIMIT = 200_000 // Cap on the recent-output buffer kept for re-entry — same value as RunManager
 
-/** Looks for the executable in each PATH directory — the default exists implementation for resolveShell. */
-function onPath(file: string): boolean {
-  const dirs = (process.env.PATH ?? '').split(path.delimiter)
-  return dirs.some((dir) => dir !== '' && existsSync(path.join(dir, file)))
+/** What onPath found, per PATH string and file, for this process (about five minutes, or until PATH changes). */
+const onPathCache = new PathKeyedCache<boolean>()
+
+/** Looks for the executable in each PATH directory — the default exists implementation for
+ *  resolveShellAsync. Async and time-limited (core/sessions/pathProbe.ts): the directories are probed
+ *  together, off the main thread, and one on an offline drive counts as not holding it after 1.5 s,
+ *  once per PATH string rather than on every terminal opened. */
+function onPath(file: string): Promise<boolean> {
+  const pathValue = process.env.PATH ?? ''
+  return onPathCache.get(pathValue, file, () => findOnPath(pathValue, file, defaultProbe, path.delimiter, path.join))
 }
 
 interface LiveTerminal {
@@ -31,14 +37,14 @@ export class TerminalManager {
   constructor(
     private ptyFactory: PtyFactory,
     private platform: NodeJS.Platform = process.platform,
-    private exists: (file: string) => boolean = onPath,
+    private exists: (file: string) => Promise<boolean> = onPath,
     private envShell: string | undefined = process.env.SHELL
   ) {}
 
   /** Spawns a shell with the project path as cwd. env is the app environment as-is — this is a plain shell, not a
    *  session bound to an account, so account isolation variables like CLAUDE_CONFIG_DIR are not injected. */
-  open(projectPath: string, cols?: number, rows?: number): TerminalInfo {
-    const shell = resolveShell(this.platform, this.exists, this.envShell)
+  async open(projectPath: string, cols?: number, rows?: number): Promise<TerminalInfo> {
+    const shell = await resolveShellAsync(this.platform, this.exists, this.envShell)
     const id = randomUUID()
     const pty = this.ptyFactory(shell.file, shell.args, {
       cwd: projectPath,

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolveShell } from './shell'
+import { resolveShell, resolveShellAsync } from './shell'
 
 const has = (...present: string[]) => (file: string) => present.includes(file)
 
@@ -56,5 +56,22 @@ describe('resolveShell — non-win32', () => {
       return true
     })
     expect(called).toBe(false)
+  })
+})
+
+describe('resolveShellAsync', () => {
+  const hasAsync = (...present: string[]) => async (file: string) => present.includes(file)
+
+  it('answers what resolveShell answers, candidate order kept', async () => {
+    for (const present of [['pwsh.exe', 'cmd.exe'], ['powershell.exe', 'cmd.exe'], ['cmd.exe'], []]) {
+      expect(await resolveShellAsync('win32', hasAsync(...present))).toEqual(resolveShell('win32', has(...present)))
+    }
+  })
+
+  it('probes nothing off win32', async () => {
+    let probed = 0
+    const shell = await resolveShellAsync('linux', async () => (probed++, true), '/bin/zsh')
+    expect(shell).toEqual({ file: '/bin/zsh', args: [] })
+    expect(probed).toBe(0)
   })
 })
