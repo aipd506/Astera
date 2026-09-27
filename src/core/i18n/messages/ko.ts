@@ -644,6 +644,7 @@ export const ko = {
   'explorer.git.deleted': '삭제됨',
   'explorer.git.conflict': '충돌',
   'explorer.git.folderCount': '변경 {count}건',
+  'explorer.git.unavailable': 'git 상태를 확인하지 못했습니다 — 표시는 마지막 결과입니다',
   'explorer.rail.toggle': '파일 탐색기',
   // WorkbenchTabs.tsx — the dirty marker on a file tab
   'explorer.tab.unsaved': '저장 안 됨',

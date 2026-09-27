@@ -555,6 +555,7 @@ export const en: Record<keyof typeof ko, string> = {
   'explorer.git.deleted': 'Deleted',
   'explorer.git.conflict': 'Conflict',
   'explorer.git.folderCount': '{count} changed',
+  'explorer.git.unavailable': 'Git status unavailable — showing the last result',
   'explorer.rail.toggle': 'File explorer',
   'explorer.tab.unsaved': 'Unsaved',
   'explorer.find.placeholder': 'Find in file',

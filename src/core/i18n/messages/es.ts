@@ -487,6 +487,7 @@ export const es: Catalog = {
   'explorer.git.deleted': 'Eliminado',
   'explorer.git.conflict': 'Conflicto',
   'explorer.git.folderCount': '{count} cambios',
+  'explorer.git.unavailable': 'Estado de git no disponible: se muestra el último resultado',
   'explorer.rail.toggle': 'Explorador de archivos',
   // WorkbenchTabs.tsx — the dirty marker on a file tab
   'explorer.tab.unsaved': 'Sin guardar',

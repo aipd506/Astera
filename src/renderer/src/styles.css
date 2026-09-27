@@ -2109,6 +2109,11 @@ input[type="checkbox"]:not(.md-task input):focus-visible {
   font-variant-numeric: tabular-nums;
 }
 .fx-note { padding: 2px 8px; font-size: 12px; color: var(--text-faint); white-space: nowrap; }
+/* git status could not be checked — the kept badges are the last answer, so they are dimmed */
+.fx-git-stale { flex: none; overflow: hidden; text-overflow: ellipsis; }
+.fx-tree.git-stale .fx-git-mark,
+.fx-tree.git-stale .fx-git-count,
+.fx-tree.git-stale .fx-name[class*="git-"] { opacity: 0.55; }
 /* the header root row — scoped to the explorer so the shared .panel-header h2 is untouched */
 .file-explorer .panel-header h2 { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .file-explorer .panel-header h2 .fi { width: 12px; height: 12px; }

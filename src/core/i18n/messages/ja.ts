@@ -483,6 +483,7 @@ export const ja: Catalog = {
   'explorer.git.deleted': '削除済み',
   'explorer.git.conflict': '競合',
   'explorer.git.folderCount': '変更 {count} 件',
+  'explorer.git.unavailable': 'git の状態を確認できません — 前回の結果を表示しています',
   'explorer.rail.toggle': 'ファイルエクスプローラー',
   // WorkbenchTabs.tsx — the dirty marker on a file tab
   'explorer.tab.unsaved': '未保存',

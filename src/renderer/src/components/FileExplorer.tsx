@@ -770,8 +770,14 @@ export function FileExplorer({
           </button>
         </div>
       </header>
+      {/* git did not answer the last status query: the badges below are the previous answer, dimmed */}
+      {gitStatus.stale && (
+        <div className="fx-note fx-git-stale" role="status">
+          {t('explorer.git.unavailable')}
+        </div>
+      )}
       <div
-        className="fx-tree"
+        className={`fx-tree${gitStatus.stale ? ' git-stale' : ''}`}
         ref={treeRef}
         tabIndex={0}
         onContextMenu={(ev) => {

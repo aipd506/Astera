@@ -4,10 +4,22 @@ import { folderCounts, type GitState } from '../../../core/git/status'
 export interface GitStatusMap {
   fileState: Record<string, GitState>
   folderCount: Record<string, number>
+  /** The last query could not be answered (git failed or timed out): fileState is the previous answer,
+   *  kept to avoid flicker, and may be out of date. The explorer dims the badges and says so. */
+  stale: boolean
   refresh: () => void
 }
 
 const DEBOUNCE_MS = 250
+
+/** One git.status answer applied to the badges. null is "could not check" — never an empty map, which
+ *  is a clean tree: the previous badges stay, marked stale. */
+export function nextGitStatus(
+  prev: Record<string, GitState>,
+  result: Record<string, GitState> | null
+): { fileState: Record<string, GitState>; stale: boolean } {
+  return result === null ? { fileState: prev, stale: true } : { fileState: result, stale: false }
+}
 
 /**
  * git status for the explorer tree.
@@ -18,10 +30,12 @@ const DEBOUNCE_MS = 250
  *   3. window focus — whatever happened outside the app (an external git client, a terminal, a pull)
  *   4. refresh() — the explorer's refresh button
  *
- * On a failed or timed-out query the map is not cleared, the previous value is kept — this avoids flicker.
+ * On a failed or timed-out query the map is not cleared, the previous value is kept — this avoids flicker —
+ * and `stale` turns on until a query is answered again (nextGitStatus).
  */
 export function useGitStatus(root: string | null): GitStatusMap {
   const [fileState, setFileState] = useState<Record<string, GitState>>({})
+  const [stale, setStale] = useState(false)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const running = useRef(false)
   const pending = useRef(false)
@@ -39,11 +53,15 @@ export function useGitStatus(root: string | null): GitStatusMap {
     try {
       const map = await window.api.git.status(r)
       // null means the git query failed or timed out — the previous map is left alone (not cleared, to
-      // avoid flicker). The result is also discarded if the root changed during the query — an old root's
-      // status must not end up on the new tree.
-      if (map !== null && rootRef.current === r) setFileState(map)
+      // avoid flicker) and marked stale. The result is also discarded if the root changed during the
+      // query — an old root's status must not end up on the new tree.
+      if (rootRef.current === r) {
+        setFileState((prev) => nextGitStatus(prev, map).fileState)
+        setStale(map === null)
+      }
     } catch {
-      /* Fail quietly — keep the previous map */
+      // The call itself failed — the same "could not check" as null: keep the previous map, mark it stale
+      if (rootRef.current === r) setStale(true)
     } finally {
       running.current = false
       if (pending.current) {
@@ -59,6 +77,7 @@ export function useGitStatus(root: string | null): GitStatusMap {
   }
 
   useEffect(() => {
+    setStale(false)
     if (!root) {
       setFileState({})
       return
@@ -86,5 +105,5 @@ export function useGitStatus(root: string | null): GitStatusMap {
     [fileState, root]
   )
 
-  return { fileState, folderCount, refresh: () => void run() }
+  return { fileState, folderCount, stale, refresh: () => void run() }
 }
