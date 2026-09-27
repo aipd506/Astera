@@ -59,21 +59,44 @@ jobs:
 
       # The agent app workspace against a real display (docs/agent-workspace-isolation.md). The unit
       # tests above drive every desk with fakes; these two start Xvfb or a background app for real.
-      # They are gated on ASTERA_DESKTOP_E2E=1, so `npm test` collects and skips them, and a run here
-      # that reports them skipped means the gate did not open, which is a failure to read, not a pass.
+      # They are gated on ASTERA_DESKTOP_E2E=1, so `npm test` collects and skips them. A run that skips
+      # them here still exits 0, so each step reads vitest's JSON report afterward and fails unless every
+      # test in the file passed (two on Linux, one on macOS): a gate that did not open is a red step.
       # After the build (preflight ruling F6), so a failing or flaky e2e never skips the build step.
+      # Ten minutes each: a hung Xvfb, xdotool or ps would otherwise hold the job for GitHub's 6 h.
+      #
+      # The runtime libraries Electron loads are on the image already, since it ships Google Chrome;
+      # they are named anyway, with the 24.04 (t64) package names, so a leaner image fails here and not
+      # inside Electron.
       - name: Linux desktop tools for the agent workspace e2e
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y xvfb xdotool imagemagick
+        timeout-minutes: 10
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y --no-install-recommends
+          xvfb xdotool imagemagick
+          libnss3 libgbm1 libasound2t64 libgtk-3-0t64 libxss1 libxtst6
 
       - name: Agent workspace e2e (Linux, Xvfb)
         if: runner.os == 'Linux'
+        timeout-minutes: 10
+        shell: bash
         env:
           ASTERA_DESKTOP_E2E: '1'
-        run: npx vitest run src/host/workspace/desktop.linux.e2e.test.ts
+          E2E_FILE: src/host/workspace/desktop.linux.e2e.test.ts
+          E2E_EXPECT: '2'
+        run: |
+          npx vitest run "$E2E_FILE" --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/e2e.json"
+          node -e 'const r = require(process.argv[1]); const want = Number(process.argv[2]); if (r.numTotalTests !== want || r.numPassedTests !== want) { console.error(`expected ${want} of ${want} e2e tests to pass, got ${r.numPassedTests} passed of ${r.numTotalTests} (${r.numPendingTests} skipped)`); process.exit(1) }' "$RUNNER_TEMP/e2e.json" "$E2E_EXPECT"
 
       - name: Agent workspace e2e (macOS, background)
         if: runner.os == 'macOS'
+        timeout-minutes: 10
+        shell: bash
         env:
           ASTERA_DESKTOP_E2E: '1'
-        run: npx vitest run src/host/workspace/desktop.mac.e2e.test.ts
+          E2E_FILE: src/host/workspace/desktop.mac.e2e.test.ts
+          E2E_EXPECT: '1'
+        run: |
+          npx vitest run "$E2E_FILE" --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/e2e.json"
+          node -e 'const r = require(process.argv[1]); const want = Number(process.argv[2]); if (r.numTotalTests !== want || r.numPassedTests !== want) { console.error(`expected ${want} of ${want} e2e tests to pass, got ${r.numPassedTests} passed of ${r.numTotalTests} (${r.numPendingTests} skipped)`); process.exit(1) }' "$RUNNER_TEMP/e2e.json" "$E2E_EXPECT"
