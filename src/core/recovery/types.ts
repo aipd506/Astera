@@ -40,12 +40,15 @@ export interface LostAttempt {
 }
 
 export interface GitFacts {
-  /** The folder is there and is a git repository. */
-  exists: boolean
+  /** The folder is there and is a git repository. null when the folder did not answer in time (an
+   *  offline share): not known either way, and never to be read as "gone". */
+  exists: boolean | null
   head: string | null
   /** Anything uncommitted, tracked or not. null when git could not be asked; recovery must treat that as a reason to stop. */
   dirty: boolean | null
-  inProgress: 'merge' | 'rebase' | 'cherry-pick' | 'revert' | null
+  /** The multi-step operation git has unfinished there, null for none. `unknown` when its marker files
+   *  could not be checked in time: recovery must treat that as a reason to stop, never as none. */
+  inProgress: 'merge' | 'rebase' | 'cherry-pick' | 'revert' | 'unknown' | null
   /** Whether any file is conflicted. null when git could not be asked; recovery must treat that as a reason to stop. */
   conflicts: boolean | null
   branch: string | null

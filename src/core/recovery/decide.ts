@@ -34,14 +34,16 @@ export function decideRecovery(a: {
 }): RecoveryDecision {
   const { attempt, git, smartResume } = a
 
-  if (!git.exists)
+  // `=== false`, not `!`: null is a folder that did not answer, which is not known to be gone. It
+  // falls to the unreadable row below with everything else nobody could check.
+  if (git.exists === false)
     return decide(
       'review',
       'unsafe',
       'the worktree is gone, so nothing can be verified or continued there',
       'jobs.recovery.reason.worktreeGone'
     )
-  if (git.inProgress)
+  if (git.inProgress !== null && git.inProgress !== 'unknown')
     return decide(
       'review',
       'unsafe',
@@ -51,7 +53,7 @@ export function decideRecovery(a: {
     )
   if (git.conflicts)
     return decide('review', 'unsafe', 'the worktree holds conflicted files', 'jobs.recovery.reason.conflicts')
-  if (git.dirty === null || git.conflicts === null)
+  if (git.exists === null || git.inProgress === 'unknown' || git.dirty === null || git.conflicts === null)
     return decide(
       'review',
       'review',
