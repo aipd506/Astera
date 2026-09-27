@@ -104,6 +104,7 @@ describe('codex expansion through the rollout index', () => {
     await index.projectsPage()
     await index.page({ projectPath: ALPHA })
     await index.stop()
+    await cache.flush() // the index asks for a debounced write; a quit-time flush is this call
 
     // "Restart": a fresh cache object read from the file, a fresh index
     heads.clear()
@@ -229,5 +230,70 @@ describe('codex first-time scan progress', () => {
       throw new Error('renderer gone')
     }
     expect((await index.projectsPage()).projects.map((p) => p.projectPath)).toEqual([ALPHA])
+  })
+})
+
+describe('codex index — writes and listing failures', () => {
+  /** A memory store that counts what the index asks of it. */
+  const countingStore = async () => {
+    const { MemoryCwdStore } = await import('./projects')
+    const calls = { flush: 0, prune: 0 }
+    class Counting extends MemoryCwdStore {
+      override async flush(): Promise<void> {
+        calls.flush++
+      }
+      override prune(root: string, live: Iterable<string>): number {
+        calls.prune++
+        return super.prune(root, live)
+      }
+    }
+    return { store: new Counting(), calls }
+  }
+
+  it('목록 한 번, 펼치기 한 번에 인덱스 저장을 한 번씩만 청한다', async () => {
+    const cx = codexAccount('cx')
+    for (let i = 0; i < 4; i++) await writeRollout(cx, i, i < 2 ? ALPHA : BETA)
+    const { store, calls } = await countingStore()
+    index = new HistoryIndex(() => [cx], undefined, store)
+    await index.projectsPage()
+    expect(calls.flush).toBe(1)
+    await index.page({ projectPath: ALPHA })
+    expect(calls.flush).toBe(2)
+  })
+
+  it('폴더를 읽다 일시적으로 실패한 목록은 인덱스를 prune 하지 않는다', async () => {
+    const cx = codexAccount('cx')
+    const files: string[] = []
+    for (let i = 0; i < 3; i++) files.push(await writeRollout(cx, i, ALPHA))
+    const { store, calls } = await countingStore()
+    index = new HistoryIndex(() => [cx], undefined, store)
+    await index.projectsPage()
+    expect(calls.prune).toBe(1) // a complete listing prunes
+
+    const dayDir = path.dirname(files[0])
+    const realReaddir = fs.readdir.bind(fs)
+    const spy = vi.spyOn(fs, 'readdir').mockImplementation((async (p: unknown, ...rest: unknown[]) => {
+      if (path.resolve(String(p)) === path.resolve(dayDir)) throw Object.assign(new Error('busy'), { code: 'EBUSY' })
+      return (realReaddir as (...a: unknown[]) => Promise<unknown>)(p, ...rest)
+    }) as typeof fs.readdir)
+    await index.refresh()
+    await index.projectsPage()
+    spy.mockRestore()
+    expect(calls.prune).toBe(1) // the failed listing did not prune
+    const st = await fs.stat(files[0])
+    expect(store.get(files[0], st.mtimeMs, st.size)).toBe(ALPHA)
+
+    // The next good listing is complete again, and prunes
+    await index.refresh()
+    await index.projectsPage()
+    expect(calls.prune).toBe(2)
+  })
+
+  it('뿌리 폴더가 아직 없으면(ENOENT) 빈 목록도 완전한 목록이다', async () => {
+    const cx = codexAccount('cx-none')
+    const { store, calls } = await countingStore()
+    index = new HistoryIndex(() => [cx], undefined, store)
+    await index.projectsPage()
+    expect(calls.prune).toBe(1)
   })
 })

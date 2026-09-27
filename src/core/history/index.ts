@@ -123,13 +123,15 @@ export class HistoryIndex {
   // The narrow interface handed to a strategy — ownership of the cache and file traversal stays here
   private readonly io: HistoryIo = {
     parseDir: (account, dir) => this.parseDir(account, dir),
-    jsonlByMtimeDesc: (dir) => jsonlFilesByMtimeDesc(dir),
-    subdirs: (dir) => subdirs(dir),
+    jsonlByMtimeDesc: (dir, status) => jsonlFilesByMtimeDesc(dir, status),
+    subdirs: (dir, status) => subdirs(dir, status),
     resolveProjectCwd: (dir, files) => resolveProjectCwd(dir, files),
     // The persisted memo, when there is one (see projects.ts's cwdMemo and sessionCwdCache.ts)
     cwdMemo: (files, parse, scope) =>
       cwdMemo(files, parse, this.store, { scope, progress: (misses) => this.scan.begin(misses) }),
     rowMemo: (files, build) => rowMemo(files, build, this.store),
+    // Not awaited: the store debounces and serializes its own writes (sessionCwdCache.ts flush)
+    flushIndex: () => void this.store.flush().catch(() => undefined),
     samePath: (a, b) => comparablePath(a) === comparablePath(b),
     pathKey: (p) => comparablePath(p),
     cacheDirForProject: (accountId, projectPath, dir) => {

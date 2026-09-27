@@ -20,7 +20,9 @@ export interface IndexedRow {
 export interface HistoryIo {
   /** Owns the mtime signature cache (dirCache), entryById registration, and parsing in parallel at concurrency 24 */
   parseDir(account: Account, dir: string): Promise<HistoryEntry[]>
-  jsonlByMtimeDesc(dir: string): Promise<{ name: string; mtimeMs: number; size: number }[]>
+  /** `status`, when given, is marked incomplete if the directory or a file in it could not be read
+   *  for any reason other than not existing (projects.ts ListStatus). */
+  jsonlByMtimeDesc(dir: string, status?: { complete: boolean }): Promise<{ name: string; mtimeMs: number; size: number }[]>
   /** Resolves the cwd of many session files at once, reusing a persisted memo where (mtimeMs, size)
    *  still match; `parse` is called only on a miss. For a provider whose folder name does not carry
    *  the project (codex: the folder is a date), the project list can only be built by opening every
@@ -33,10 +35,13 @@ export interface HistoryIo {
   /** The expansion row of each file through the same persisted index: `build` runs only for a file
    *  whose (mtimeMs, size) has no row yet. Input order is preserved; a null build stays null. */
   rowMemo(files: MemoFile[], build: (f: MemoFile) => Promise<IndexedRow | null>): Promise<(IndexedRow | null)[]>
+  /** Asks for the index to be saved — once per pass, after cwdMemo and rowMemo. Not awaited: the store
+   *  debounces, serializes and writes atomically on its own. */
+  flushIndex(): void
   /** Absolute paths of the subdirectories. The codex strategy assembles the three-level date walk
    *  (y/m/d) out of this itself — the knowledge that "the date is three levels" belongs to the side
    *  that knows the layout */
-  subdirs(dir: string): Promise<string[]>
+  subdirs(dir: string, status?: { complete: boolean }): Promise<string[]>
   /** Resolves a directory's real cwd (the cwd of the newest non-helper session). Both strategies use it */
   resolveProjectCwd(dir: string, filesNewestFirst: string[]): Promise<string | null>
   /** Normalization for path comparison — the same rule as `norm` in index.ts */

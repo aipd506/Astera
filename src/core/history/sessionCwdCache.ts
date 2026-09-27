@@ -51,9 +51,16 @@ export interface RolloutRow {
   awaitingReply: boolean
 }
 
-// Bound on the file. Only a history larger than this is pruned, and the pruning keeps the newest
-// mtimes — the ones a project list actually reads.
+// Bound on the **file**, not on memory. A history larger than this writes only its newest mtimes — the
+// ones a project list actually reads. The entries past the bound stay in memory, so within one run an
+// old rollout is read once and never again (trimming the map itself made every pass re-read and
+// re-trim the same oldest files). After a restart those are read once more, with the scan progress
+// showing. Memory is bounded by the live rollouts anyway: prune drops the entries of files that are gone.
 const MAX_ENTRIES = 10_000
+
+/** How long a flush waits for more changes before writing. A running codex session changes its
+ *  rollout on every append, and each change used to rewrite the whole file. */
+const FLUSH_DELAY_MS = 500
 
 function isValidCwdPart(v: unknown[]): boolean {
   return (
@@ -83,6 +90,11 @@ function readEntry(v: unknown): Entry | null {
 export class SessionCwdCache {
   private map = new Map<string, Entry>()
   private dirty = false
+  /** The writes, one after another — a write never starts before the previous one has finished. */
+  private chain: Promise<void> = Promise.resolve()
+  /** The debounced write the next flush() calls join, until its timer fires. */
+  private scheduled: Promise<void> | null = null
+  private seq = 0
 
   constructor(
     private filePath: string,
@@ -91,7 +103,7 @@ export class SessionCwdCache {
      *  `.bak` a corrupt file gets. For the Host (host/projectRoots.ts), which lists the same projects
      *  with Astera closed: the file is the app's, and a second writer could interleave with the app's
      *  own flush. A miss is still parsed and remembered in memory, for the life of this object. */
-    private opts: { readOnly?: boolean } = {}
+    private opts: { readOnly?: boolean; flushDelayMs?: number } = {}
   ) {}
 
   private keyOf(p: string): string {
@@ -181,20 +193,55 @@ export class SessionCwdCache {
     return dropped
   }
 
-  /** Writes once per pass, and only when something was actually added. A write failure is swallowed —
-   *  the next start just pays the parse again. */
-  async flush(): Promise<void> {
-    if (!this.dirty || this.opts.readOnly) return
+  /**
+   * Asks for the file to be written, and resolves once a write covering everything set so far is done.
+   * Never rejects: a cache write failure must not break the project list.
+   *
+   * - **Debounced** (FLUSH_DELAY_MS): calls within the window share one write, so a running session's
+   *   appends and the listing's and the expansion's requests become one rewrite.
+   * - **Serialized**: a write starts only after the previous one ended, and each writes the map as it
+   *   is then, so the latest state wins and two writes never interleave in the file.
+   * - **Atomic**: the JSON goes to a temp file beside it, which is then renamed over the old one. A
+   *   reader (the Host's read-only load, another process) sees the old file or the new one, never a
+   *   torn one — a torn file is invalid JSON, and load() answers that by dropping the whole cache.
+   * - A failed write leaves the cache dirty, so the next flush tries again.
+   *
+   * The callers (the codex strategy, once per pass) do not await it. A caller that must see the file
+   * written — a test, a quit — awaits it.
+   */
+  flush(): Promise<void> {
+    if (this.opts.readOnly) return Promise.resolve()
+    if (this.scheduled) return this.scheduled
+    if (!this.dirty) return this.chain
+    this.scheduled = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.scheduled = null
+        this.chain = this.chain.then(() => this.write())
+        void this.chain.then(resolve)
+      }, this.opts.flushDelayMs ?? FLUSH_DELAY_MS)
+      // A pending cache write must not keep a process (the Host, a test worker) alive
+      ;(timer as { unref?: () => void }).unref?.()
+    })
+    return this.scheduled
+  }
+
+  /** One write of the map as it is now. Never rejects. */
+  private async write(): Promise<void> {
+    if (!this.dirty) return
     this.dirty = false
-    if (this.map.size > MAX_ENTRIES) {
-      const kept = [...this.map.entries()].sort((a, b) => b[1][0] - a[1][0]).slice(0, MAX_ENTRIES)
-      this.map = new Map(kept)
-    }
+    const entries =
+      this.map.size > MAX_ENTRIES
+        ? [...this.map.entries()].sort((a, b) => b[1][0] - a[1][0]).slice(0, MAX_ENTRIES)
+        : this.map.entries()
+    const text = JSON.stringify(Object.fromEntries(entries))
+    const tmp = `${this.filePath}.${process.pid}.${++this.seq}.tmp`
     try {
       await fs.mkdir(path.dirname(this.filePath), { recursive: true })
-      await fs.writeFile(this.filePath, JSON.stringify(Object.fromEntries(this.map)), 'utf8')
+      await fs.writeFile(tmp, text, 'utf8')
+      await fs.rename(tmp, this.filePath)
     } catch {
-      /* a cache write failure must not break the project list */
+      this.dirty = true // the next flush tries again
+      await fs.rm(tmp, { force: true }).catch(() => undefined)
     }
   }
 }

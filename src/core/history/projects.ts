@@ -38,6 +38,15 @@ export interface CwdStore {
 
 export type JsonlFile = { name: string; mtimeMs: number; size: number }
 
+/** Filled in by a listing that wants to know whether it saw everything. A missing directory (ENOENT)
+ *  is a complete answer — there is nothing there; any other failure (EBUSY, EPERM, EMFILE…) is not,
+ *  and a listing that is not complete must not be used to prune the index. */
+export type ListStatus = { complete: boolean }
+
+function noteFailure(err: unknown, status?: ListStatus): void {
+  if (status && (err as NodeJS.ErrnoException)?.code !== 'ENOENT') status.complete = false
+}
+
 /** Parallel map with a concurrency ceiling (input order preserved). Overlaps I/O-bound parsing to
  *  make the first expand fast. */
 export async function mapWithConcurrency<T, R>(
@@ -58,23 +67,25 @@ export async function mapWithConcurrency<T, R>(
 }
 
 /** Absolute paths of the subdirectories. Absent = no history (normal), so a read failure is `[]`. */
-export async function subdirs(dir: string): Promise<string[]> {
+export async function subdirs(dir: string, status?: ListStatus): Promise<string[]> {
   try {
     return (await fs.readdir(dir, { withFileTypes: true }))
       .filter((e) => e.isDirectory())
       .map((e) => path.join(dir, e.name))
-  } catch {
+  } catch (err) {
+    noteFailure(err, status)
     return []
   }
 }
 
 /** The directory's .jsonl files in descending mtime order. Files whose stat fails are excluded.
  *  size rides along because the stat is already being paid for and cwdMemo keys on it. */
-export async function jsonlFilesByMtimeDesc(dir: string): Promise<JsonlFile[]> {
+export async function jsonlFilesByMtimeDesc(dir: string, status?: ListStatus): Promise<JsonlFile[]> {
   let names: string[]
   try {
     names = (await fs.readdir(dir)).filter((f) => f.endsWith('.jsonl'))
-  } catch {
+  } catch (err) {
+    noteFailure(err, status)
     return []
   }
   const stats = await Promise.all(
@@ -82,7 +93,8 @@ export async function jsonlFilesByMtimeDesc(dir: string): Promise<JsonlFile[]> {
       try {
         const st = await fs.stat(path.join(dir, name))
         return { name, mtimeMs: st.mtimeMs, size: st.size }
-      } catch {
+      } catch (err) {
+        noteFailure(err, status) // gone since the readdir is fine; unreadable is not
         return null
       }
     })
@@ -149,7 +161,6 @@ export async function cwdMemo(
     scan?.end()
   }
   if (opts.scope !== undefined) store?.prune(opts.scope, files.map((f) => f.path))
-  await store?.flush()
   return out
 }
 
@@ -173,7 +184,6 @@ export async function rowMemo(
     if (row) store?.setRow(f.path, f.mtimeMs, f.size, row.cwd, row)
     return row
   })
-  await store?.flush()
   return out
 }
 
@@ -270,12 +280,12 @@ export class ProjectPathListing {
     parseDir: async () => {
       throw new Error('a project listing does not parse sessions')
     },
-    jsonlByMtimeDesc: async (dir) => {
-      const files = await jsonlFilesByMtimeDesc(dir)
+    jsonlByMtimeDesc: async (dir, status) => {
+      const files = await jsonlFilesByMtimeDesc(dir, status)
       this.lastFiles.set(comparablePath(dir), files)
       return files
     },
-    subdirs,
+    subdirs: (dir, status) => subdirs(dir, status),
     resolveProjectCwd: async (dir, names) => {
       const key = comparablePath(dir)
       const files = this.lastFiles.get(key)
@@ -290,6 +300,7 @@ export class ProjectPathListing {
     },
     cwdMemo: (files, parse, scope) => cwdMemo(files, parse, this.store, { scope }),
     rowMemo: (files, build) => rowMemo(files, build, this.store),
+    flushIndex: () => void this.store.flush().catch(() => undefined),
     samePath: (a, b) => comparablePath(a) === comparablePath(b),
     pathKey: (p) => comparablePath(p),
     cacheDirForProject: () => {}

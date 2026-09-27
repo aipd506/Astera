@@ -13,15 +13,19 @@ import type { HistoryIo, HistoryStrategy, MemoFile } from './types'
 /** Scan root for codex session files — this file is the only place that knows about `sessions` */
 const root = (configDir: string): string => path.join(configDir, 'sessions')
 
-/** Every rollout of the account with its (mtimeMs, size) — the listing the index is keyed on. */
-async function rolloutFiles(account: Account, io: HistoryIo): Promise<MemoFile[]> {
+/** Every rollout of the account with its (mtimeMs, size) — the listing the index is keyed on.
+ *  `complete` is false when some folder or file could not be read (EBUSY, EPERM…): such a listing is
+ *  still good for showing, but not for saying which files are gone. */
+async function rolloutFiles(account: Account, io: HistoryIo): Promise<{ files: MemoFile[]; complete: boolean }> {
+  const status = { complete: true }
   const files: MemoFile[] = []
-  for (const dir of await codexHistoryStrategy.allDirs(account, io)) {
-    for (const f of await io.jsonlByMtimeDesc(dir)) {
-      files.push({ path: path.join(dir, f.name), mtimeMs: f.mtimeMs, size: f.size })
-    }
-  }
-  return files
+  for (const y of await io.subdirs(root(account.configDir), status))
+    for (const m of await io.subdirs(y, status))
+      for (const dir of await io.subdirs(m, status))
+        for (const f of await io.jsonlByMtimeDesc(dir, status)) {
+          files.push({ path: path.join(dir, f.name), mtimeMs: f.mtimeMs, size: f.size })
+        }
+  return { files, complete: status.complete }
 }
 
 /** The cwd the index keeps for one rollout. An exec rollout reports none, which is the same thing the
@@ -34,10 +38,12 @@ async function headCwd(filePath: string): Promise<string | null> {
 }
 
 /** Every rollout with the cwd the index knows for it — parsing only the heads it does not know, and
- *  pruning the entries of files that are gone (the listing is complete for this root). */
+ *  pruning the entries of files that are gone, but only after a listing that read everything: a
+ *  transient failure answers an empty folder, and pruning on that would throw the root's entries away
+ *  and rescan them all on the next pass. */
 async function rolloutCwds(account: Account, io: HistoryIo): Promise<{ files: MemoFile[]; cwds: (string | null)[] }> {
-  const files = await rolloutFiles(account, io)
-  const cwds = await io.cwdMemo(files, headCwd, root(account.configDir))
+  const { files, complete } = await rolloutFiles(account, io)
+  const cwds = await io.cwdMemo(files, headCwd, complete ? root(account.configDir) : undefined)
   return { files, cwds }
 }
 
@@ -67,6 +73,7 @@ export const codexHistoryStrategy: HistoryStrategy = {
    *  The exclusion rule stays "no cwd = not a project", the same one buildEntry applies. */
   projectSummaries: async (account, io): Promise<ProjectSummary[]> => {
     const { files, cwds } = await rolloutCwds(account, io)
+    io.flushIndex()
     const byPath = new Map<string, ProjectSummary>()
     files.forEach((f, i) => {
       const cwd = cwds[i]
@@ -102,6 +109,7 @@ export const codexHistoryStrategy: HistoryStrategy = {
       const e = await codexHistoryStrategy.buildEntry(account, f.path, f.mtimeMs, io)
       return e && { cwd: e.projectPath, sessionId: e.sessionId, title: e.title, awaitingReply: e.awaitingReply }
     })
+    io.flushIndex() // once for the pass: the cwds and the rows together
     const out: HistoryEntry[] = []
     rows.forEach((row, i) => {
       if (!row || io.pathKey(row.cwd) !== key) return

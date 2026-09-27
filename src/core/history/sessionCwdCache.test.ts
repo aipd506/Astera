@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -283,5 +283,100 @@ describe('SessionCwdCache — rollout index', () => {
     c.set(sibling, 1, 1, CWD_A)
     expect(c.prune(root, [])).toBe(0)
     expect(c.get(sibling, 1, 1)).toBe(CWD_A)
+  })
+})
+
+// Review follow-up: the file is rewritten whole while a codex session runs, the Host reads it from
+// another process, and several listings can flush at once. A torn or interleaved write is invalid JSON,
+// which load() answers by dropping the whole cache — a full rescan.
+describe('SessionCwdCache — writing the file', () => {
+  const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('창 안에 몰린 flush 는 한 번만 쓰고, 그 한 번에 JSON.stringify 도 한 번이다', async () => {
+    const c = new SessionCwdCache(filePath(), process.platform, { flushDelayMs: 40 })
+    await c.load()
+    const write = vi.spyOn(fs, 'writeFile')
+    const stringify = vi.spyOn(JSON, 'stringify')
+    c.set(sessionPath('a', '1.jsonl'), 1, 1, CWD_A)
+    const first = c.flush()
+    c.set(sessionPath('a', '2.jsonl'), 1, 1, CWD_B)
+    const second = c.flush()
+    await Promise.all([first, second])
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(stringify).toHaveBeenCalledTimes(1)
+    const again = new SessionCwdCache(filePath())
+    await again.load()
+    expect(again.get(sessionPath('a', '2.jsonl'), 1, 1)).toBe(CWD_B)
+  })
+
+  it('임시 파일에 쓰고 이름을 바꾼다 — 대상 파일에 직접 쓰지 않고, 임시 파일도 남기지 않는다', async () => {
+    const c = new SessionCwdCache(filePath(), process.platform, { flushDelayMs: 0 })
+    await c.load()
+    const write = vi.spyOn(fs, 'writeFile')
+    const rename = vi.spyOn(fs, 'rename')
+    c.set(sessionPath('a', '1.jsonl'), 1, 1, CWD_A)
+    await c.flush()
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(String(write.mock.calls[0][0])).not.toBe(filePath())
+    expect(rename).toHaveBeenCalledWith(write.mock.calls[0][0], filePath())
+    expect(await fs.readdir(tmp)).toEqual(['session-cwd.json'])
+  })
+
+  it('쓰기는 한 번에 하나뿐이고, 나중 것이 이긴다', async () => {
+    const c = new SessionCwdCache(filePath(), process.platform, { flushDelayMs: 0 })
+    await c.load()
+    const real = fs.writeFile.bind(fs)
+    let active = 0
+    let maxActive = 0
+    vi.spyOn(fs, 'writeFile').mockImplementation(async (...args: Parameters<typeof fs.writeFile>) => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      await sleep(60)
+      try {
+        return await real(...args)
+      } finally {
+        active--
+      }
+    })
+    c.set(sessionPath('a', '1.jsonl'), 1, 1, CWD_A)
+    const first = c.flush()
+    await sleep(20) // the first write is in flight
+    c.set(sessionPath('a', '1.jsonl'), 2, 2, CWD_B)
+    const second = c.flush()
+    await Promise.all([first, second])
+    expect(maxActive).toBe(1)
+    const again = new SessionCwdCache(filePath())
+    await again.load()
+    expect(again.get(sessionPath('a', '1.jsonl'), 2, 2)).toBe(CWD_B)
+  })
+
+  it('쓰기가 실패하면 다음 flush 가 다시 쓴다', async () => {
+    const c = new SessionCwdCache(filePath(), process.platform, { flushDelayMs: 0 })
+    await c.load()
+    vi.spyOn(fs, 'rename').mockRejectedValueOnce(Object.assign(new Error('busy'), { code: 'EPERM' }))
+    c.set(sessionPath('a', '1.jsonl'), 1, 1, CWD_A)
+    await c.flush()
+    await expect(fs.access(filePath())).rejects.toMatchObject({ code: 'ENOENT' })
+    await c.flush()
+    const again = new SessionCwdCache(filePath())
+    await again.load()
+    expect(again.get(sessionPath('a', '1.jsonl'), 1, 1)).toBe(CWD_A)
+    expect(await fs.readdir(tmp)).toEqual(['session-cwd.json'])
+  })
+
+  it('상한을 넘은 오래된 항목은 파일에서만 빠지고 메모리에는 남는다 — 같은 실행 안에서 다시 읽지 않는다', async () => {
+    const c = new SessionCwdCache(filePath(), process.platform, { flushDelayMs: 0 })
+    await c.load()
+    for (let i = 0; i < 10_050; i++) c.set(sessionPath('a', `f${i}.jsonl`), i, 1, `D:\\proj\\p${i}`)
+    await c.flush()
+    expect(c.get(sessionPath('a', 'f0.jsonl'), 0, 1)).toBe('D:\\proj\\p0')
+    const reloaded = new SessionCwdCache(filePath())
+    await reloaded.load()
+    expect(reloaded.get(sessionPath('a', 'f0.jsonl'), 0, 1)).toBeUndefined()
+    expect(reloaded.get(sessionPath('a', 'f10049.jsonl'), 10_049, 1)).toBe('D:\\proj\\p10049')
   })
 })
