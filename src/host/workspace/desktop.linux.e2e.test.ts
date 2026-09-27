@@ -32,6 +32,12 @@ const TITLE = 'Astera workspace fixture'
 const NUL = String.fromCharCode(0)
 /** Typed with native keys: Latin, then Hangul, which needs xdotool's default per character delay. */
 const TYPED = 'hi 한글 입력'
+/** What drag() depends on, as the page sees it: visibility, focus, window and viewport sizes, the
+ *  window's screen position, the pixel ratio, the scroll, and the rects of the drag's two elements. */
+const PAGE_STATE =
+  'JSON.stringify({ vis: document.visibilityState, focus: document.hasFocus(), inner: [innerWidth, innerHeight], outer: [outerWidth, outerHeight], ' +
+  'screen: [screenX, screenY], dpr: devicePixelRatio, scroll: [scrollX, scrollY], vv: visualViewport && [visualViewport.width, visualViewport.height, visualViewport.offsetLeft, visualViewport.offsetTop, visualViewport.scale], ' +
+  "src: document.getElementById('src').getBoundingClientRect(), dst: document.getElementById('dst').getBoundingClientRect() })"
 
 /** The session the Host was "started from": a person's X display and Wayland compositor, neither of
  *  which exists, so an app that reached either would fail to open rather than appear on a real screen. */
@@ -243,6 +249,10 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
       await vi.waitFor(async () => expect(await recordedPids(h.recordFile)).toHaveLength(2))
       expect((await recordedPids(h.recordFile))[1]).toBe(xvfb.pid)
       const port = (JSON.parse(firstBody.log[0]) as { port: number }).port
+      // The page's own view of its window and viewport, and the rects drag() will read, printed below.
+      const pageState = (): Promise<string> =>
+        read2(port, PAGE_STATE).then((v) => String(v), (err: unknown) => `unreadable: ${String(err)}`)
+      const before = await pageState()
 
       // 2. Drive it: click, an in-page drag, a file drop, native keys, the window list, both captures.
       const second = await h.m.run(
@@ -264,7 +274,10 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
       // Printed on every run: what the page saw of the pointer, and whether drag() fell back to the
       // display's own pointer (CI run 36310700864 failed the CDP drag and printed nothing of either).
       const mouseLog = await read2(port, 'JSON.stringify(window.mouseLog)').catch((err: unknown) => `unreadable: ${String(err)}`)
-      console.log(`drag diagnostics: error=${JSON.stringify(body.error ?? null)} desk=${JSON.stringify(h.log.filter((l) => /pointer|drag/.test(l)))} page=${String(mouseLog)}`)
+      console.log(
+        `drag diagnostics: error=${JSON.stringify(body.error ?? null)} desk=${JSON.stringify(h.log.filter((l) => /pointer|drag|keyboard map/.test(l)))} ` +
+          `before=${before} after=${await pageState()} page=${String(mouseLog)}`
+      )
       expect(body.error).toBeUndefined()
       const [windowsLine, windowShotLine, screenshotLine] = body.log
       expect(JSON.parse(windowsLine)).toEqual(expect.arrayContaining([expect.objectContaining({ title: TITLE, className: '' })]))
