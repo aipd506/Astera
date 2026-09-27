@@ -395,6 +395,7 @@ export const en: Record<keyof typeof ko, string> = {
   'update.tb.available': 'New version {version} found',
   'update.tb.downloading': 'Downloading {percent}%',
   'update.tb.error': 'Update error',
+  'update.checkTimedOut': 'The update check did not answer within {seconds} s. Check your network and try again.',
   'update.tb.autoUpdaterMissing': 'Could not find autoUpdater export',
   'update.info.downloading': 'Downloading {percent}%…',
   'update.info.restartInstallVersion': 'Restart to install v{version}',

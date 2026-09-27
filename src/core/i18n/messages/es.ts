@@ -305,6 +305,7 @@ export const es: Catalog = {
   'update.tb.available': 'Nueva versión {version} encontrada',
   'update.tb.downloading': 'Descargando {percent}%',
   'update.tb.error': 'Error de actualización',
+  'update.checkTimedOut': 'La comprobación de actualizaciones no respondió en {seconds} s. Revisa la red e inténtalo de nuevo.',
   // index.ts — diagnostic message for when the electron-updater module does not export properly (title-bar tooltip)
   'update.tb.autoUpdaterMissing': 'No se encontró el export autoUpdater',
   'update.info.downloading': 'Descargando {percent}%…',

@@ -301,6 +301,7 @@ export const ja: Catalog = {
   'update.tb.available': '新しいバージョン {version} を検出',
   'update.tb.downloading': 'ダウンロード中 {percent}%',
   'update.tb.error': 'アップデートエラー',
+  'update.checkTimedOut': 'アップデートの確認が {seconds} 秒以内に応答しませんでした。ネットワークを確認してもう一度お試しください。',
   // index.ts — diagnostic message for when the electron-updater module does not export properly
   'update.tb.autoUpdaterMissing': 'autoUpdater の export が見つかりません',
   'update.info.downloading': 'ダウンロード中 {percent}%…',

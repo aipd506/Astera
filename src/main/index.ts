@@ -62,7 +62,14 @@ import {
   type StagingEvent,
   type StagingState
 } from './manualInstall'
-import type { SessionInfo, RollStateEvent, UpdateCampaignInfo, InstallOutcome } from '../core/types'
+import type {
+  SessionInfo,
+  RollStateEvent,
+  UpdateCampaignInfo,
+  InstallOutcome,
+  UpdateStatus
+} from '../core/types'
+import { afterCheckTimeout, checkWithTimeout, UPDATE_CHECK_TIMEOUT_MS } from '../core/update/checkTimeout'
 import { providerOf } from '../core/providers/meta'
 import { USAGE_GATE_MAX_AGE_MS } from '../core/usage/rateLimitFetcher'
 
@@ -1243,12 +1250,16 @@ app.whenReady().then(async () => {
         /* a logging failure must not block the update */
       }
     }
+    // The last state pushed, so a check that runs out of time knows what the screen is showing
+    // (afterCheckTimeout).
+    let lastUpdateState: UpdateStatus['state'] | null = null
     const push = (s: {
-      state: string
+      state: UpdateStatus['state']
       version?: string
       percent?: number
       message?: string
     }): void => {
+      lastUpdateState = s.state
       flog(JSON.stringify(s))
       try {
         if (!win.isDestroyed()) win.webContents.send('update:status', s)
@@ -1352,9 +1363,29 @@ app.whenReady().then(async () => {
           flog(`next auto check: ${Math.round(delay / 60_000)}min (consecutive failures ${consecutiveFailures})`)
           checkTimer = setTimeout(() => void runAutomaticCheck(), delay)
         }
+        // checkForUpdates has no deadline of its own; a feed that never answers would leave
+        // "checking" on screen for good (core/update/checkTimeout.ts). On the deadline the screen is
+        // put back and the wait is logged; the check itself cannot be cancelled and may still land.
+        const checkOnce = async (userInitiated: boolean): Promise<'done' | 'timedOut'> => {
+          const r = await checkWithTimeout(
+            () => autoUpdater.checkForUpdates(),
+            UPDATE_CHECK_TIMEOUT_MS,
+            () => flog(`WARN update check timed out after ${UPDATE_CHECK_TIMEOUT_MS / 1000}s (${userInitiated ? 'manual' : 'automatic'})`)
+          )
+          if (r !== 'timedOut') return 'done'
+          const next = afterCheckTimeout(lastUpdateState, userInitiated)
+          if (next?.state === 'error')
+            push({
+              state: 'error',
+              message: t(core!.lang, next.messageKey, { seconds: UPDATE_CHECK_TIMEOUT_MS / 1000 })
+            })
+          else if (next) push({ state: 'init', version: app.getVersion() })
+          if (userInitiated) settleCheck()
+          return 'timedOut'
+        }
         const runAutomaticCheck = async (): Promise<void> => {
           try {
-            await autoUpdater.checkForUpdates()
+            if ((await checkOnce(false)) === 'timedOut') throw new Error('timed out')
             consecutiveFailures = 0
           } catch (e) {
             consecutiveFailures += 1
@@ -1366,8 +1397,7 @@ app.whenReady().then(async () => {
         ipcMain.handle('update:check', async () => {
           userInitiatedCheck = true
           try {
-            await autoUpdater.checkForUpdates()
-            consecutiveFailures = 0
+            if ((await checkOnce(true)) === 'done') consecutiveFailures = 0
           } catch {
             /* the state is delivered through the error event */
           }

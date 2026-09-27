@@ -452,6 +452,7 @@ export const ko = {
   'update.tb.available': '새 버전 {version} 발견',
   'update.tb.downloading': '다운로드 중 {percent}%',
   'update.tb.error': '업데이트 오류',
+  'update.checkTimedOut': '업데이트 확인이 {seconds}초 안에 응답하지 않았습니다. 네트워크를 확인하고 다시 시도하세요.',
   // index.ts — diagnostic message for when the electron-updater module does not export properly (title-bar tooltip)
   'update.tb.autoUpdaterMissing': 'autoUpdater export를 찾지 못함',
   'update.info.downloading': '다운로드 중 {percent}%…',
