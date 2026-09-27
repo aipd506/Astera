@@ -13,7 +13,8 @@ export function startedTask(input: {
   objective: string
   at: string
   startHead: string | null
-  baselineDirtyFiles: string[]
+  /** Absent when git could not be asked — see SessionWorkUnit.git.baselineDirtyFiles */
+  baselineDirtyFiles?: string[]
 }): SessionWorkUnit {
   return {
     id: input.id,
@@ -24,7 +25,7 @@ export function startedTask(input: {
     startedAt: input.at,
     git: {
       startHead: input.startHead,
-      baselineDirtyFiles: input.baselineDirtyFiles,
+      ...(input.baselineDirtyFiles !== undefined ? { baselineDirtyFiles: input.baselineDirtyFiles } : {}),
       observedChangedFiles: []
     },
     encounteredExternalGitChangeIds: []

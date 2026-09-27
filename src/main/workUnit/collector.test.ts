@@ -375,6 +375,81 @@ describe('WorkUnitCollector — 선언으로 여닫는다', () => {
     expect(closed).toHaveLength(1)
   })
 
+  // 중단되는 순간의 읽기가 null 이면 그 Unit 의 관찰은 "모름"으로 얼어붙는다. 나중에 사람이 완료를
+  // 누를 때 그것을 "바뀐 파일 없음"으로 읽고 지우면, 쓰기 증거가 있는 일이 기록 없이 사라진다.
+  it('중단 순간 git 이 답하지 못한(null) Unit 은 나중에 완료해도 쓰기 증거가 있으면 기록된다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    const first = await collector.startTask('s1', '첫 작업')
+    if (!first.ok) throw new Error('unexpected')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null // 중단 직전의 읽기가 시간 초과
+    await collector.startTask('s1', '두 번째 작업') // 첫 작업을 중단으로 민다
+    const interrupted = store.get(projectPath)!.units.find((u) => u.id === first.id)!
+    expect(interrupted.status).toBe('interrupted')
+    expect(interrupted.git.observationUnknown).toBe(true)
+
+    fake.git.files = [] // 지금은 답한다 — 그래도 중단된 Unit 의 창은 이미 닫혔다
+    const result = await collector.completeTaskById(projectPath, first.id)
+    expect(result).toEqual({ ok: true, recorded: true })
+    expect(store.get(projectPath)!.units.find((u) => u.id === first.id)!.status).toBe('completed')
+    expect(closed).toHaveLength(1)
+  })
+
+  it('세션이 끝나는 순간 git 이 답하지 못한(null) Unit 도 완료하면 기록된다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    const t = await collector.startTask('s1', '세션이 끝나기 전 작업')
+    if (!t.ok) throw new Error('unexpected')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null
+    fake.sessions = []
+    await collector.onSessionExit('s1')
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBe(true)
+
+    const result = await collector.completeTaskById(projectPath, t.id)
+    expect(result).toEqual({ ok: true, recorded: true })
+    expect(closed).toHaveLength(1)
+  })
+
+  it('한 번 답하지 못했어도 다음 읽기가 답하면 모름 표지는 걷힌다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    await collector.startTask('s1', '작업')
+    fake.git.files = null
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBe(true)
+    fake.git.files = []
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBeUndefined()
+  })
+
+  // 기준선을 읽지 못했으면 기준선 자리를 비워 둔다(undefined) — [] 는 "열릴 때 깨끗했다"는 답이다.
+  it('시작할 때 git 이 답하지 못하면 baselineDirtyFiles 는 없다(undefined) — []가 아니다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    fake.git.files = null
+    await collector.startTask('s1', '작업')
+    const u = store.get(projectPath)!.units[0]
+    expect('baselineDirtyFiles' in u.git).toBe(false)
+  })
+
   it('completeTaskById 는 중단된 것도 닫는다', async () => {
     const fake = makeFake()
     fake.sessions = [session()]

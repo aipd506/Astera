@@ -50,10 +50,16 @@ export interface SessionWorkUnit {
   git: {
     startHead: string | null
     endHead?: string | null
-    /** Files **already dirty** when the unit opened. observe counts only files outside this list. */
+    /** Files **already dirty** when the unit opened. observe counts only files outside this list.
+     *  Absent when git could not be asked at that moment (and for units stored before the field). */
     baselineDirtyFiles?: string[]
     /** Changes **observed** in this window. Not a claim that this unit made them. */
     observedChangedFiles: string[]
+    /** The latest look at the working tree for this unit got no answer from git (error, timeout,
+     *  output limit). Set and cleared by each read while the unit is open, so once it is interrupted
+     *  this says whether its window closed on "unknown". An empty `observedChangedFiles` then means
+     *  "could not check", not "nothing changed", and completing keeps a unit with write evidence. */
+    observationUnknown?: true
   }
 
   /** External git changes met during the work (EG §27). "Met", not "made". */

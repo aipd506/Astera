@@ -421,10 +421,11 @@ export class WorkUnitCollector {
       interruptedId = open.id
     }
     const head = (await this.refOf(s.projectPath)).head
-    // 기준선을 git 이 답하지 못했으면(null) 빈 기준선으로 연다. 이것은 "깨끗했다"고 믿는 것이
-    // 아니라 **덜 가리는 쪽**을 고른 것이다: 기준선은 관찰에서 빼는 목록이라, 모를 때 비워 두면
-    // 열리기 전부터 더럽던 파일이 이 Unit 의 관찰에 더 들어갈 수는 있어도 실제 변경이 가려지지는
-    // 않는다. 질문만 한 Unit 이 그 때문에 기록되는 일은 finish 의 sawWrite 조건이 막는다.
+    // 기준선을 git 이 답하지 못했으면(null) 기준선 자리를 비워 둔다(undefined) — []는 "열릴 때
+    // 깨끗했다"는 답이라 쓰지 않는다. observe 는 없는 기준선을 아무 것도 빼지 않는 것으로 읽으므로
+    // **덜 가리는 쪽**이다: 열리기 전부터 더럽던 파일이 이 Unit 의 관찰에 더 들어갈 수는 있어도
+    // 실제 변경이 가려지지는 않는다. 질문만 한 Unit 이 그 때문에 기록되는 일은 finish 의 sawWrite
+    // 조건이 막는다.
     const baseline = await this.changedFiles(s.projectPath)
     if (baseline === null) this.log(`baseline unknown ${s.projectPath}: git did not answer, opening with none`)
     state.units.push(
@@ -435,7 +436,7 @@ export class WorkUnitCollector {
         objective,
         at,
         startHead: head,
-        baselineDirtyFiles: baseline ?? []
+        ...(baseline !== null ? { baselineDirtyFiles: baseline } : {})
       })
     )
     const id = state.units[state.units.length - 1].id
@@ -470,11 +471,9 @@ export class WorkUnitCollector {
     const state = this.stateOf(s.projectPath)
     const open = state.units.find((u) => u.sessionId === sessionId && u.status === 'active')
     if (!open) return { ok: false as const, reason: 'NO_ACTIVE_TASK' }
-    const live = await this.changedFiles(s.projectPath)
-    this.observe(state, s.projectPath, live)
-    this.finish(state, open, completedTask(open, { ...input, at: this.nowIso() }), s.projectPath, {
-      gitUnknown: live === null
-    })
+    // The live read sets or clears `observationUnknown` on this open unit (observe), which finish reads.
+    this.observe(state, s.projectPath, await this.changedFiles(s.projectPath))
+    this.finish(state, open, completedTask(open, { ...input, at: this.nowIso() }), s.projectPath)
     await this.persist(s.projectPath, state)
     this.deps.onTasksChanged?.(s.projectPath)
     return { ok: true as const, id: open.id }
@@ -503,16 +502,15 @@ export class WorkUnitCollector {
       if (!state || !u) return { ok: false as const, reason: `unknown task: ${unitId}` }
       if (u.status !== 'active' && u.status !== 'interrupted')
         return { ok: false as const, reason: `task is ${u.status}` }
-      // Only an open (active) unit takes this live read into its window — see observe — so only
-      // then does "git did not answer" say anything about what this unit changed.
-      const live = this.running ? await this.changedFiles(projectPath) : undefined
-      if (live !== undefined) this.observe(state, projectPath, live)
+      // Only an open (active) unit takes this live read into its window — see observe, which also
+      // sets or clears its `observationUnknown`. An interrupted unit keeps the flag its window closed
+      // on; finish reads it either way.
+      if (this.running) this.observe(state, projectPath, await this.changedFiles(projectPath))
       const recorded = this.finish(
         state,
         u,
         completedTask(u, { source: 'user', at: this.nowIso() }),
-        projectPath,
-        { gitUnknown: live === null && isOpen(u.status) }
+        projectPath
       )
       await this.persist(projectPath, state)
       this.deps.onTasksChanged?.(projectPath)
@@ -1582,14 +1580,13 @@ export class WorkUnitCollector {
     state: WorkUnitState,
     unit: SessionWorkUnit,
     next: SessionWorkUnit,
-    projectPath: string,
-    /** The live read taken just before this close could not be answered by git. Then an empty
-     *  observed list is "could not check", not "nothing changed", and a unit with write evidence is
-     *  kept rather than dropped. */
-    opts: { gitUnknown?: boolean } = {}
+    projectPath: string
   ): boolean {
     const i = state.units.indexOf(unit)
-    const nothingChanged = next.git.observedChangedFiles.length === 0 && opts.gitUnknown !== true
+    // observationUnknown: the last look at this unit's window got no answer from git — then an empty
+    // observed list is "could not check", not "nothing changed", and a unit with write evidence is
+    // kept rather than dropped.
+    const nothingChanged = next.git.observedChangedFiles.length === 0 && next.git.observationUnknown !== true
     if (next.status === 'completed' && (!next.sawWrite || nothingChanged)) {
       if (i >= 0) state.units.splice(i, 1)
       return false
@@ -1622,10 +1619,21 @@ export class WorkUnitCollector {
    *  interrupts a unit without this same live look first can freeze it holding zero observed files
    *  despite real, already-made edits sitting right there in the working tree. */
   private observe(state: WorkUnitState, projectPath: string, files: string[] | null): boolean {
-    // null: git did not answer. Nothing is added — and nothing is concluded either; callers that
-    // judge "nothing changed" (finish) are told separately.
-    if (files === null || files.length === 0) return false
     let changed = false
+    // Each read decides `observationUnknown` for every open unit: null (git did not answer) sets it,
+    // any answer clears it. Nothing is added on null — and nothing is concluded either: finish reads
+    // the flag, so an interrupt that happens on a null read leaves the unit marked "could not check".
+    for (const u of state.units) {
+      if (u.projectPath !== projectPath || !isOpen(u.status)) continue
+      if (files === null && u.git.observationUnknown !== true) {
+        u.git.observationUnknown = true
+        changed = true
+      } else if (files !== null && u.git.observationUnknown === true) {
+        delete u.git.observationUnknown
+        changed = true
+      }
+    }
+    if (files === null || files.length === 0) return changed
     for (const u of state.units) {
       if (u.projectPath !== projectPath || !isOpen(u.status)) continue
       // 열릴 때 이미 더러웠던 파일은 이 Unit 의 관찰이 아니다. 기준선에 있던 파일이 이 구간에
