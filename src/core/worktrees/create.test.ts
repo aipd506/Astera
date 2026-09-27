@@ -126,3 +126,38 @@ describe('createWorktree', () => {
     expect(info.baseRef).toBe('main') // origin이 없는 픽스처 → 로컬 main
   })
 })
+
+// 이름이 비었는지는 비동기로, 시간 제한을 두고 묻는다(presence.ts). 동기 existsSync 는 끊긴 네트워크
+// 공유 위의 워크트리 루트에서 20~60초 동안 스레드를 세웠다. 닿지 않는 루트는 기다리지 않고 분명한
+// 오류로 곧바로 실패한다.
+describe('createWorktree, 루트에 닿지 않을 때', () => {
+  it('후보 폴더 확인이 시간 초과면 만들지 않고 WORKTREE_ROOT_UNREACHABLE 로 실패한다', async () => {
+    await expect(
+      createWorktree({ repoPath: repo, name: 'dead', registry: reg, presence: async () => 'unreachable' })
+    ).rejects.toThrow(/WORKTREE_ROOT_UNREACHABLE/)
+    expect(await localBranchExists(repo, 'Test-User/dead')).toBe(false)
+    expect(reg.list()).toEqual([])
+  })
+
+  it('부모 폴더를 만드는 호출이 시간 초과면 후보를 묻지도 않고 곧바로 실패한다', async () => {
+    const asked: string[] = []
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'deadroot', registry: reg,
+        makeDir: async () => 'timeout',
+        presence: async (p) => { asked.push(p); return 'missing' }
+      })
+    ).rejects.toThrow(/WORKTREE_ROOT_UNREACHABLE/)
+    expect(asked).toEqual([])
+    expect(reg.list()).toEqual([])
+  })
+
+  it('이름이 쓰였는지는 비동기 확인의 답으로 정한다', async () => {
+    const first = path.join(root, path.basename(repo), 'taken')
+    const { info } = await createWorktree({
+      repoPath: repo, name: 'taken', registry: reg,
+      presence: async (p) => (path.resolve(p) === path.resolve(first) ? 'present' : 'missing')
+    })
+    expect(info.name).toBe('taken-2')
+  })
+})

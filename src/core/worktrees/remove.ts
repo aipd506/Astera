@@ -1,4 +1,4 @@
-import { promises as fs, existsSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { WorktreeRemoveResult } from '../types'
@@ -10,6 +10,7 @@ import { git, gitVersionAtLeast, isCleanWorktree, listGitWorktrees, GIT_WRITE_TI
  *  are never cut short at the read default. */
 const write = (cwd: string): { cwd: string; timeoutMs: number } => ({ cwd, timeoutMs: GIT_WRITE_TIMEOUT_MS })
 import type { WorktreeStore } from './registry'
+import { defaultPresenceCheck, type PresenceCheck } from './presence'
 
 /** Dangerous paths: the repo itself, a parent that contains the repo, home, a parent that contains home, the filesystem root */
 export function isDangerousRemovalPath(
@@ -53,7 +54,7 @@ async function countOrphanEntries(
     const entries = await fs.readdir(worktreePath)
     return opts?.countGitDir ? entries.length : entries.filter((e) => e !== '.git').length
   } catch (err) {
-    // ENOENT (a TOCTOU race after existsSync) and EACCES/EPERM (permission denied) both converge on "unverifiable"
+    // ENOENT (a TOCTOU race after the presence check) and EACCES/EPERM (permission denied) both converge on "unverifiable"
     throw new Error(
       `ORPHAN_UNVERIFIABLE: ${worktreePath} (${err instanceof Error ? err.message : String(err)})`
     )
@@ -105,14 +106,28 @@ async function isBranchMerged(repo: string, branch: string): Promise<boolean> {
   return false
 }
 
+/** Whether the worktree's folder is there, asked asynchronously and with a time limit (presence.ts).
+ *  A sync existsSync on a folder on a dead network share froze the calling thread (the Electron main
+ *  thread, or the Host's) for 20 to 60 s. **Only `missing` counts as gone**: a timeout, a refused
+ *  check or any other error is "not known", and nothing is deleted on it (the registry entry least of
+ *  all), so the caller is told the folder could not be reached. */
+async function folderState(p: string, check: PresenceCheck): Promise<'present' | 'missing'> {
+  const r = await check(p).catch(() => 'unreachable' as const)
+  if (r === 'present' || r === 'missing') return r
+  throw new Error(`WORKTREE_UNREACHABLE: folder not reachable, nothing was removed (${p})`)
+}
+
 export async function removeWorktree(args: {
   id: string
   force?: boolean
   registry: WorktreeStore
   isPathInUse: (worktreePath: string) => string | null
+  /** Test seam; defaults to the process-wide presence check (presence.ts). */
+  presence?: PresenceCheck
 }): Promise<WorktreeRemoveResult> {
   const info = args.registry.get(args.id)
   if (!info) throw new Error(`NOT_MANAGED: not a worktree created by this app (${args.id})`)
+  const presence = args.presence ?? defaultPresenceCheck
 
   const inUse = args.isPathInUse(info.path)
   if (inUse) throw new Error(`IN_USE: ${inUse}`)
@@ -124,7 +139,7 @@ export async function removeWorktree(args: {
   try {
     rows = await listGitWorktrees(info.repoPath)
   } catch {
-    if (!existsSync(info.path)) {
+    if ((await folderState(info.path, presence)) === 'missing') {
       await pruneEmptyRepoDir(info.path, args.registry.getRoot())
       await args.registry.removeEntry(args.id)
       return { removed: true, branchDeleted: false }
@@ -139,7 +154,7 @@ export async function removeWorktree(args: {
   if (!row) {
     // git has forgotten it
     await git(['worktree', 'prune'], write(info.repoPath))
-    if (existsSync(info.path)) {
+    if ((await folderState(info.path, presence)) === 'present') {
       if (!(await isProvenOrphanDir(info.path, info.repoPath))) {
         // Without proof there is no telling our worktree from an unrelated directory — but an empty one
         // has nothing to lose, and demanding proof there left the row undeletable forever
@@ -156,8 +171,9 @@ export async function removeWorktree(args: {
       }
     }
   } else {
-    // If the directory is already gone, git status itself is impossible and there is nothing to inspect — skip the cleanliness check
-    if (!args.force && existsSync(info.path)) {
+    // If the directory is already gone, git status itself is impossible and there is nothing to inspect — skip the cleanliness check.
+    // With force nothing is inspected, so nothing is asked either: git itself answers for the folder.
+    if (!args.force && (await folderState(info.path, presence)) === 'present') {
       const { clean, changedCount } = await isCleanWorktree(info.path)
       if (!clean) throw new Error(`DIRTY: ${changedCount}`)
     }
