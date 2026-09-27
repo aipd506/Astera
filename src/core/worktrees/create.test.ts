@@ -2,12 +2,12 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { promises as fs, existsSync } from 'node:fs'
 import path from 'node:path'
-import { createWorktree, rollbackAdd, probedRollbackFs, type RollbackFs } from './create'
+import { createWorktree, rollbackAdd, probedRollbackFs, resolveRepo, type RollbackFs } from './create'
 import type { WorktreeCreateProgress } from '../types'
 import { WorktreeRegistry } from './registry'
 import { git, localBranchExists } from './git'
 import { makeRepo, addOrigin, tempDir } from './testRepo'
-import { createProbePool, createProber, rootOf, ProbeBudget, PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
+import { createProbePool, createProber, rootOf, ProbeBudget, PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS, processProbeBudget } from '../sessions/pathProbe'
 
 let repo: string
 let root: string
@@ -574,5 +574,29 @@ describe('rollback fs — slow removal is not a probe', () => {
     const rfs = probedRollbackFs(pool, { rmTree: () => new Promise<void>(() => {}), fsWorkTimeoutMs: 200 })
     expect(await rfs.removeOwned(dir)).toBe(false)
     expect(budget.isStuck(rootOf(dir))).toBe(false)
+  })
+})
+
+// Stage 4 T1 review: what the repository question says, and that a person's creation gets its call.
+describe('resolveRepo', () => {
+  it('git that cannot be started in a folder that is there is NO_GIT, not REPO_UNREACHABLE', async () => {
+    const run = (async () => ({ ok: false, stdout: '', stderr: 'spawn git ENOENT', errorCode: 'ENOENT' })) as unknown as typeof git
+    const err = await resolveRepo(repo, async () => 'present', run).catch((e: unknown) => e)
+    expect(String(err)).toMatch(/NO_GIT:/)
+    expect(String(err)).not.toMatch(/REPO_UNREACHABLE/)
+  })
+
+  it('the repo folder is asked past the stuck-call cap: dead drives elsewhere do not refuse it', async () => {
+    const budget = processProbeBudget()
+    try {
+      for (const r of ['Q:/', 'R:/', 'S:/'].map(rootOf)) {
+        const t = await budget.enter(r)
+        if (typeof t === 'string') throw new Error(t)
+        t.timedOut()
+      }
+      expect(await resolveRepo(repo)).toBe(path.resolve(gitIn(repo, ['rev-parse', '--show-toplevel'])))
+    } finally {
+      budget.reset()
+    }
   })
 })

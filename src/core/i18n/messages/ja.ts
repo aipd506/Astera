@@ -136,6 +136,7 @@ export const ja: Catalog = {
   'worktree.error.hasSubmodules': 'worktree にサブモジュールがあるため、何も削除していません。git はサブモジュールのある worktree を強制的にしか削除しません。強制的に削除してください。',
   'worktree.error.rootUnreachable': 'worktree のフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   'worktree.error.repoUnreachable': 'プロジェクトのフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
+  'worktree.error.noGit': 'git を実行できなかったため、worktree を作成していません（git がインストールされ PATH に含まれているか確認してください）。',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
     '実行中のセッション「{title}」がこの worktree を使用中です。先にセッションを閉じてください。',

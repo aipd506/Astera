@@ -206,7 +206,8 @@ import { deleteProjectHistory } from './historyDeletion'
 import { removeWorktree } from '../core/worktrees/remove'
 import { listWithStatus } from '../core/worktrees/list'
 import { PresenceCache, PRESENCE_SWEEP_MS } from '../core/worktrees/presence'
-import { probeLog, gateRoot, isRootUnreachable } from '../core/sessions/pathProbe'
+import { probeLog } from '../core/sessions/pathProbe'
+import { gateFolders, unreachableInLang, withUnreachableInLang } from './fileOpGate'
 import { readConfiguredModel } from './models/configuredModel'
 import { createPresenceRepush } from './worktreePresenceRepush'
 import {
@@ -5023,24 +5024,11 @@ export function registerIpc(
   const withFileOp = async <T>(opId: unknown, run: (c: FileOpCounter | null) => Promise<T>): Promise<T> => {
     const counter = fileOpCounter(opId)
     try {
-      return await run(counter)
-    } catch (err) {
-      throw unreachableInLang(err)
+      // fsTree's and the Local History store's ROOT_UNREACHABLE (a folder that did not answer, refused
+      // before any call) in the person's language (fileOpGate.ts).
+      return await withUnreachableInLang(core.lang, () => run(counter))
     } finally {
       counter?.end()
-    }
-  }
-  /** fsTree's and the Local History store's ROOT_UNREACHABLE (core/sessions/pathProbe.ts gateRoot: a
-   *  folder that did not answer, refused before any call) in the person's language; anything else as is. */
-  const unreachableInLang = (err: unknown): unknown =>
-    isRootUnreachable(err) ? new Error(t(core.lang, 'files.error.unreachable')) : err
-  /** Asks each folder once through the probe budget before a handler touches it with unbudgeted calls
-   *  (stage 4 T1). Throws files.error.unreachable for one that does not answer. */
-  const gateFolders = async (...folders: string[]): Promise<void> => {
-    try {
-      for (const f of folders) await gateRoot(f)
-    } catch (err) {
-      throw unreachableInLang(err)
     }
   }
   ipcMain.handle('files.create', async (_e, parentDirPath: string, name: string, isDir: boolean) => {
@@ -5108,7 +5096,7 @@ export function registerIpc(
     // path.basename does not normalise, so a `from` of the form '...\sub\..' can return '..' — that
     // would leak `to` out into destDir's parent, so it is checked before the existence check
     await assertAllowedPath(to)
-    await gateFolders(from, destDir)
+    await gateFolders(core.lang, [from, destDir])
     try {
       await fs.access(to)
       throw new Error(t(core.lang, 'files.error.alreadyExistsInDest', { name: path.basename(from) }))
@@ -5166,7 +5154,7 @@ export function registerIpc(
     // copying into itself.
     const copyReason = canCopy(from, destDir)
     if (copyReason) throw new Error(t(core.lang, copyReason.key, copyReason.params))
-    await gateFolders(from, destDir)
+    await gateFolders(core.lang, [from, destDir])
     const existing = await fs.readdir(destDir)
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
@@ -5194,7 +5182,7 @@ export function registerIpc(
     await assertAllowedPath(destDir)
     const copyReason = canCopy(from, destDir)
     if (copyReason) throw new Error(t(core.lang, copyReason.key, copyReason.params))
-    await gateFolders(from, destDir)
+    await gateFolders(core.lang, [from, destDir])
     const existing = await fs.readdir(destDir)
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
@@ -5287,7 +5275,7 @@ export function registerIpc(
       // what keeps both consistent.
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.startsWith('LOCAL_HISTORY_NOT_FOUND')) throw new Error(t(core.lang, 'localHistory.notFound'))
-      throw unreachableInLang(err)
+      throw unreachableInLang(err, core.lang)
     }
   })
 

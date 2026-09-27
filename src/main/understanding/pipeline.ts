@@ -362,6 +362,8 @@ function defaultFileProbe(abs: string): Promise<ProbeResult> {
       fs.stat(p).then((st) => {
         if (!st.isFile()) throw new Error('not a file')
       }),
+    // Its own kind: a folder is present to an access probe and absent here, so the two never share
+    kind: 'stat-is-file',
     skipQueue: true
   })
   return fileProber(abs)

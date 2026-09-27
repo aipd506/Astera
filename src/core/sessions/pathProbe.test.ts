@@ -606,3 +606,78 @@ describe('gateRoot', () => {
     expect(access).not.toHaveBeenCalled()
   })
 })
+
+// Stage 4 T1 review (Important): once PROBE_STUCK_MAX calls are stuck, the budget refused every root
+// that had not answered in the last 5 minutes — a local D: included, so with three dead VPN drives a
+// delete in D:/proj failed as "not reachable" and could never recover, since it never got a call. A
+// refusal by the cap is not a stuck root: a person's operation (gateRoot) gets its one call past the cap.
+describe('gateRoot past the stuck-call cap', () => {
+  const stickRoots = async (budget: { enter(r: string): Promise<unknown> }, roots: string[]): Promise<void> => {
+    for (const r of roots) {
+      const t = (await budget.enter(r)) as { timedOut(): void } | string
+      if (typeof t === 'string') throw new Error(t)
+      t.timedOut()
+    }
+  }
+
+  it('a fresh local root gets its call with the cap reached, while a background probe is still refused', async () => {
+    const { gateRoot, createProber, createProbePool, ProbeBudget, PROBE_STUCK_MAX } = await import('./pathProbe')
+    const budget = new ProbeBudget()
+    await stickRoots(budget, ['Z:/', 'Y:/', 'X:/'].map(rootOf).slice(0, PROBE_STUCK_MAX))
+    expect(budget.stuckCount()).toBe(PROBE_STUCK_MAX)
+    const pool = createProbePool(2, 60_000, budget)
+    const access = vi.fn(async () => {})
+    const background = createProber({ access, skipQueue: true, pool, log: () => {} })
+    expect(await background('D:/proj')).toBe('timeout')
+    expect(access).not.toHaveBeenCalled()
+    const person = createProber({ access, skipQueue: true, pool, log: () => {}, pastCap: true })
+    await expect(gateRoot('D:/proj', person)).resolves.toBe('present')
+    expect(access).toHaveBeenCalledTimes(1)
+  })
+
+  it('the default gate is the one that goes past the cap', async () => {
+    const { gateRoot, processProbeBudget } = await import('./pathProbe')
+    const budget = processProbeBudget()
+    try {
+      await stickRoots(budget, ['Q:/', 'R:/', 'S:/'].map(rootOf))
+      await expect(gateRoot(process.cwd())).resolves.toBe('present')
+    } finally {
+      budget.reset()
+    }
+  })
+
+  it('a root that is itself stuck is still refused at once, past the cap or not', async () => {
+    const { gateRoot, createProber, createProbePool, ProbeBudget } = await import('./pathProbe')
+    const budget = new ProbeBudget()
+    await stickRoots(budget, [rootOf('D:/proj')])
+    const access = vi.fn(async () => {})
+    const person = createProber({ access, skipQueue: true, pool: createProbePool(2, 60_000, budget), log: () => {}, pastCap: true })
+    await expect(gateRoot('D:/proj', person)).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(access).not.toHaveBeenCalled()
+  })
+})
+
+// Stage 4 T1 review (minor 1): two probes of different kinds on the same path (an access, and a stat
+// that answers present only for a file) must not take each other's answer while one is in flight.
+describe('the session-folder lane shares an answer only between probes of the same kind', () => {
+  it('a directory is present to an access probe and absent to an is-a-file probe asked at the same time', async () => {
+    const { createProber, createProbePool, ProbeBudget } = await import('./pathProbe')
+    const pool = createProbePool(2, 60_000, new ProbeBudget())
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const access = createProber({ access: async () => { await gate }, skipQueue: true, pool, log: () => {} })
+    const isFile = createProber({
+      access: async () => {
+        throw new Error('not a file')
+      },
+      skipQueue: true,
+      pool,
+      log: () => {}
+    })
+    const a = access('C:/proj/src')
+    const b = isFile('C:/proj/src')
+    release()
+    expect(await a).toBe('present')
+    expect(await b).toBe('absent')
+  })
+})

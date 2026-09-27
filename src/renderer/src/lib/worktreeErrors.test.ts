@@ -121,6 +121,11 @@ describe('worktreeErrorMessage, unreachable folders', () => {
       worktreeErrorMessage("Error invoking remote method 'worktrees.create': Error: REPO_UNREACHABLE: folder not reachable: Z:/proj")
     ).toEqual({ key: 'worktree.error.repoUnreachable' })
   })
+  it('NO_GIT 는 git 을 찾지 못했다는 키로 간다', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.create': Error: NO_GIT: git could not be run (is it installed and on PATH?): D:/proj")
+    ).toEqual({ key: 'worktree.error.noGit' })
+  })
 })
 
 // 취소와, 취소(또는 실패) 뒤 되돌리기가 끝나지 못한 경우

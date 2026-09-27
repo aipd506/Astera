@@ -33,6 +33,10 @@
 //   4 threads stays free for roots known to be alive. (A root that answered a moment ago and then dies
 //   can still add one stuck call past 3, once: its timeout forgets that it answered, so it is risky
 //   from then on. That is the price of keeping C: answered.)
+//   **The one exception is a probe a person is waiting on** (`pastCap`: gateRoot, a worktree's repo
+//   folder): a root with no stuck or in-flight call of its own gets that one call past the cap, so
+//   dead drives elsewhere never make a live local root "not reachable" for good. It may cost one more
+//   thread when that root is dead too, once per root, and a root stuck itself is refused as always.
 // - **Within that, the PATH pool keeps its own caps.** At most PROBE_CONCURRENCY (2) PATH probe calls
 //   exist at once, stuck ones included; once 2 PATH calls are stuck, every PATH probe answers `timeout`
 //   without a call until one settles; and at most one PATH call per root. A healthy path may then be
@@ -102,6 +106,10 @@ interface ProbeJob {
   access: (p: string) => Promise<void>
   timeoutMs: number
   skipQueue: boolean
+  /** What the probe asks (ProberDeps.kind). Only probes of one kind share an answer. */
+  kind: string
+  /** A person is waiting on this probe: it may go past the stuck-call cap (ProbeBudget.enter). */
+  pastCap: boolean
   /** Told why a probe answered timeout; the prober logs each path once. */
   note(p: string, why: string): void
   /** Told when a stuck call is let go at the ceiling — once per call. */
@@ -167,8 +175,15 @@ export class ProbeBudget {
   }
 
   /** A ticket for one call on `root`, or why none is given. Waits while another lane's call on the
-   *  root is in flight. Never rejects. */
-  async enter(root: string): Promise<ProbeTicket | string> {
+   *  root is in flight. Never rejects.
+   *
+   *  `pastCap`: a person is waiting on this one call (gateRoot, a worktree creation). A root that is
+   *  stuck itself is still refused at once, and the call on a root in flight is still waited for —
+   *  one call per root — but a root merely not known to be alive gets its call past PROBE_STUCK_MAX.
+   *  Otherwise three dead VPN drives made a local D: "not reachable" for every operation, with no way
+   *  back: a refusal made no call, so D: never answered, so it was never fresh again. The cap still
+   *  holds every probe that does not ask for this — the PATH lookups, the sweeps, the background lanes. */
+  async enter(root: string, opts: { pastCap?: boolean } = {}): Promise<ProbeTicket | string> {
     for (;;) {
       if (this.stuck.has(root)) return `${root} has a call that gave no answer yet`
       const current = this.inflight.get(root)
@@ -181,6 +196,7 @@ export class ProbeBudget {
       if (!fresh) {
         // A root not known to be alive may become one more stuck call. Those, the stuck ones and the
         // ones in flight on such roots, never pass PROBE_STUCK_MAX together.
+        if (opts.pastCap) return this.admit(root, true)
         if (this.stuckTotal >= this.maxStuck)
           return `${this.stuckTotal} probe calls are stuck, only a root that answered recently is probed until one ends`
         if (this.stuckTotal + this.risky.size >= this.maxStuck) {
@@ -252,7 +268,7 @@ export class ProbePool {
   private busy = new Set<string>()
   private queue: Waiter[] = []
   /** root → the session-folder call in flight on it, and the answer it will give. */
-  private cwdCalls = new Map<string, { p: string; answer: Promise<ProbeResult> }>()
+  private cwdCalls = new Map<string, { p: string; kind: string; answer: Promise<ProbeResult> }>()
 
   constructor(
     private max: number = PROBE_CONCURRENCY,
@@ -287,16 +303,24 @@ export class ProbePool {
     const current = this.cwdCalls.get(root)
     if (current) {
       void current.answer.then((r) => {
-        if (current.p === job.p) resolve(r)
-        else if (r === 'timeout') {
-          job.note(job.p, `${root} gave no answer to ${current.p}`)
-          resolve('timeout')
-        } else this.startCwd(job, root, resolve)
+        if (r === 'timeout') {
+          // The root gave no answer: it is stuck now, and this one is refused too.
+          if (this.budget.isStuck(root)) {
+            job.note(job.p, `${root} gave no answer to ${current.p}`)
+            resolve('timeout')
+          }
+          // Refused by the cap, not by the root: no call was made, so nothing was learned about it.
+          // Asked again under this probe's own rules (one that may go past the cap then gets its call).
+          else this.startCwd(job, root, resolve)
+        }
+        // The same question — same path, same kind — shares the answer; any other asks its own.
+        else if (current.p === job.p && current.kind === job.kind) resolve(r)
+        else this.startCwd(job, root, resolve)
       })
       return
     }
     let answered!: (r: ProbeResult) => void
-    const entry = { p: job.p, answer: new Promise<ProbeResult>((res) => (answered = res)) }
+    const entry = { p: job.p, kind: job.kind, answer: new Promise<ProbeResult>((res) => (answered = res)) }
     this.cwdCalls.set(root, entry)
     this.start(
       job,
@@ -348,7 +372,7 @@ export class ProbePool {
       }
       this.pump()
     }
-    this.budget.enter(root).then(
+    this.budget.enter(root, { pastCap: job.pastCap }).then(
       (t) => (typeof t === 'string' ? refuse(t) : this.call(job, root, resolve, counted, t)),
       (err: unknown) => refuse(`the probe budget failed: ${String(err)}`)
     )
@@ -446,12 +470,21 @@ export interface ProberDeps {
   log?: (m: string) => void
   /** Issue the call at once, outside the PATH cap and the per-root rule — the session folder's check. */
   skipQueue?: boolean
+  /** What the probe asks, so two probes that ask different things of one path (an access, a stat that
+   *  answers present only for a file) never take each other's answer. Defaults to `access` with the
+   *  default `access`, and to a kind of this prober's own with an injected one. */
+  kind?: string
+  /** A person is waiting on this probe: its call may go past the stuck-call cap (ProbeBudget.enter).
+   *  Only for a probe asked once per operation (gateRoot), never for a sweep or a lookup. */
+  pastCap?: boolean
 }
 
 export type Prober = Probe & {
   /** How many paths the logged-once memory holds (bounded by LOGGED_PATHS_MAX). */
   loggedCount(): number
 }
+
+let proberKinds = 0
 
 /**
  * A probe: `present`, `absent`, or `timeout` when the call did not come back within the limit or was
@@ -464,6 +497,8 @@ export function createProber(d: ProberDeps = {}): Prober {
   const pool = d.pool ?? sharedPool
   const log = d.log ?? probeLog
   const skipQueue = d.skipQueue === true
+  const pastCap = d.pastCap === true
+  const kind = d.kind ?? (d.access ? `prober-${++proberKinds}` : 'access')
   const logged = new Set<string>()
   const safeLog = (m: string): void => {
     try {
@@ -478,7 +513,8 @@ export function createProber(d: ProberDeps = {}): Prober {
     if (logged.size > LOGGED_PATHS_MAX) logged.delete(logged.values().next().value as string)
     safeLog(`path probe: ${why}, treated as absent: ${p}`)
   }
-  const probe = (p: string): Promise<ProbeResult> => pool.submit({ p, access, timeoutMs, skipQueue, note, log: safeLog })
+  const probe = (p: string): Promise<ProbeResult> =>
+    pool.submit({ p, access, timeoutMs, skipQueue, kind, pastCap, note, log: safeLog })
   return Object.assign(probe, { loggedCount: () => logged.size })
 }
 
@@ -488,6 +524,13 @@ let defaultCwdProber: Prober | null = null
 export function defaultProbe(p: string): Promise<ProbeResult> {
   defaultPathProber ??= createProber()
   return defaultPathProber(p)
+}
+let defaultGateProber: Prober | null = null
+/** The probe gateRoot asks by default: the session folder's lane, **past the stuck-call cap** — a
+ *  person is waiting on the operation (see ProbeBudget.enter). A root stuck itself is still refused. */
+export function defaultGateProbe(p: string): Promise<ProbeResult> {
+  defaultGateProber ??= createProber({ skipQueue: true, pastCap: true })
+  return defaultGateProber(p)
 }
 /** The process-wide probe for a session folder: the same, but it never waits for a slot. */
 export function defaultCwdProbe(p: string): Promise<ProbeResult> {
@@ -516,14 +559,16 @@ export const ROOT_UNREACHABLE = 'ROOT_UNREACHABLE'
  * as SMB takes to give up, so four of them are enough to stop every async fs call in the process.
  *
  * So the operation asks here first, once per root it is about to touch: the session folder's lane
- * (`defaultCwdProbe`), inside the process-wide budget. A root the budget already holds as stuck is
+ * (`defaultGateProbe`), inside the process-wide budget. A root the budget already holds as stuck is
  * refused at once without a call; a probe that gets no answer within PROBE_TIMEOUT_MS is refused too.
+ * A person is waiting on the operation, so its one call goes **past the stuck-call cap**: dead drives
+ * elsewhere never make a live local root "not reachable" (ProbeBudget.enter's `pastCap`).
  * Either way this throws `ROOT_UNREACHABLE: folder not reachable: <p>` and the operation issues
  * nothing more. `present` and `absent` are handed back: a missing folder is the operation's own
  * business (it fails with its own ENOENT, as before). Not every per-file call goes through here —
  * one gate per operation per root is enough, since a root that just answered is alive.
  */
-export async function gateRoot(p: string, probe: Probe = defaultCwdProbe): Promise<'present' | 'absent'> {
+export async function gateRoot(p: string, probe: Probe = defaultGateProbe): Promise<'present' | 'absent'> {
   const r = await probe(p)
   if (r === 'timeout') throw new Error(`${ROOT_UNREACHABLE}: folder not reachable: ${p}`)
   return r

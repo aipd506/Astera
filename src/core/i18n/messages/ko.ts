@@ -153,6 +153,7 @@ export const ko = {
   'worktree.error.hasSubmodules': '워크트리에 서브모듈이 있어 아무것도 지우지 않았습니다. git 은 서브모듈이 있는 워크트리를 강제로만 지웁니다. 강제로 지우세요.',
   'worktree.error.rootUnreachable': '워크트리 폴더에 닿지 못했거나 확인하지 못해 워크트리를 만들지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
   'worktree.error.repoUnreachable': '프로젝트 폴더에 닿지 못했거나 확인하지 못해 워크트리를 만들지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
+  'worktree.error.noGit': 'git 을 실행하지 못해 워크트리를 만들지 않았습니다(git 이 설치되어 있고 PATH 에 있는지 확인하세요).',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session': "실행 중 세션 '{title}'이(가) 이 worktree를 사용 중입니다. 세션을 먼저 닫으세요.",
   'worktree.inUse.run': "실행 중 프로세스 '{name}'이(가) 이 worktree를 사용 중입니다. 실행을 먼저 중지하세요.",

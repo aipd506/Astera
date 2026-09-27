@@ -138,6 +138,7 @@ export const es: Catalog = {
   'worktree.error.hasSubmodules': 'El worktree tiene submódulos, que git solo elimina forzando, así que no se eliminó nada. Elimínalo forzando.',
   'worktree.error.rootUnreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
   'worktree.error.repoUnreachable': 'No se pudo acceder a la carpeta del proyecto ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
+  'worktree.error.noGit': 'No se pudo ejecutar git (¿está instalado y en el PATH?), así que no se creó ningún worktree.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
     'La sesión «{title}» está en ejecución y usa este worktree. Cierre primero esa sesión.',

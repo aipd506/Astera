@@ -14,7 +14,7 @@ import {
 import { copyWorktreeInclude } from './include'
 import type { WorktreeStore } from './registry'
 import type { Message } from '../i18n'
-import { createProber, defaultCwdProbe, type Probe, type ProbePool } from '../sessions/pathProbe'
+import { createProber, defaultGateProbe, type Probe, type ProbePool } from '../sessions/pathProbe'
 import { runFsWork, FS_WORK_TIMEOUT_MS } from './fsWork'
 import { detachLinks } from './detachLinks'
 import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
@@ -30,7 +30,8 @@ export type MakeDirResult = 'created' | 'present' | 'absent' | 'timeout'
  *  budget, so a dead root answers `timeout` at once. The mkdir itself is mutating work and runs outside
  *  the budget with its own deadline (fsWork.ts). `created` only when this call made it. */
 async function defaultMakeDir(p: string): Promise<MakeDirResult> {
-  const reach = await createProber({ access: (d) => fs.lstat(d).then(() => undefined), skipQueue: true })(p)
+  // Past the stuck-call cap, like the repo folder's question: one call, for a creation someone waits on.
+  const reach = await createProber({ access: (d) => fs.lstat(d).then(() => undefined), skipQueue: true, pastCap: true })(p)
   if (reach === 'timeout') return 'timeout'
   let made = false
   const r = await runFsWork(() =>
@@ -186,15 +187,21 @@ const REPO_ROOT_TIMEOUT_MS = 30_000
  * folder synchronously on the calling thread (the Host's only thread, or the Electron main thread) for
  * the 20 to 60 s the SMB redirector takes, before any deadline can fire.
  *
- * `NOT_GIT_REPO` only when it is known: git said no, or the folder is not there. A folder that did not
- * answer, or a git that did not (timeout, could not start), is `REPO_UNREACHABLE` — "could not check",
- * never "not a repository".
+ * `NOT_GIT_REPO` only when it is known: git said no, or the folder is not there. `NO_GIT` when the
+ * folder is there and git could not be started (not installed, not on PATH). A folder that did not
+ * answer, or a git that did not (timeout, any other failure), is `REPO_UNREACHABLE` — "could not
+ * check", never "not a repository".
+ *
+ * A person (or a Run) is waiting on this one question, so the folder is asked **past the stuck-call
+ * cap** (defaultGateProbe): dead drives elsewhere never refuse a live local repository.
  */
-async function resolveRepo(repoPath: string, probe: Probe): Promise<string> {
-  const r = await probeRepoRoot(repoPath, git, REPO_ROOT_TIMEOUT_MS, undefined, probe)
+export async function resolveRepo(repoPath: string, probe: Probe = defaultGateProbe, run: typeof git = git): Promise<string> {
+  const r = await probeRepoRoot(repoPath, run, REPO_ROOT_TIMEOUT_MS, undefined, probe)
   if (r.kind === 'repo') return r.root
   if (r.kind === 'none' || r.reason === 'no-folder') throw new Error(`NOT_GIT_REPO: ${repoPath}`)
   if (r.reason === 'timeout') throw new Error(`REPO_UNREACHABLE: folder not reachable: ${repoPath}`)
+  // The folder is there and git could not be started: git is not installed or not on PATH.
+  if (r.reason === 'no-git') throw new Error(`NO_GIT: git could not be run (is it installed and on PATH?): ${repoPath}`)
   throw new Error(`REPO_UNREACHABLE: could not ask git about ${repoPath} (${r.reason})`)
 }
 
@@ -238,7 +245,7 @@ export async function createWorktree(args: {
   }
   throwIfCancelled(signal)
   report({ stage: 'fetch' })
-  const repo = await resolveRepo(args.repoPath, args.repoProbe ?? defaultCwdProbe)
+  const repo = await resolveRepo(args.repoPath, args.repoProbe ?? defaultGateProbe)
 
   const warnings: Message[] = []
   const baseSlug = args.name && args.name.trim() !== '' ? slugify(args.name) : autoName()

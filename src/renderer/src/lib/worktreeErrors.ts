@@ -22,6 +22,8 @@ const MESSAGES: Array<[string, MessageKey]> = [
   // The project folder did not answer before git was spawned in it (create.ts resolveRepo): could not
   // check, not "not a repository". Nothing was created.
   ['REPO_UNREACHABLE', 'worktree.error.repoUnreachable'],
+  // The folder is there and git could not be started (create.ts resolveRepo): not installed, not on PATH
+  ['NO_GIT', 'worktree.error.noGit'],
   // The links inside the folder could not all be taken out before git removes it (a junction would carry
   // the removal outside the folder). Nothing was removed.
   ['LINKS_UNVERIFIED', 'worktree.error.linksUnverified'],
