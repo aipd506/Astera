@@ -36,9 +36,15 @@ export async function listWithStatus(
       rowsByRepo.set(repo, null) // repo unreachable — prune 을 부를 수 없다(아래)
     }
   }
-  // 항목들을 함께 묻는다 — 동시에 몇 개가 실제로 도는지는 pathProbe 의 풀이 정한다
+  // 항목들을 함께 묻는다 — 동시에 몇 개가 실제로 도는지는 presence.ts 와 pathProbe 의 풀이 정한다.
+  // 묻지 못한 것(refused)은 모르는 것이므로 unreachable 로 둔다 — 지우지 않는다
   const presence = new Map<string, Presence>()
-  await Promise.all(items.map(async (w) => presence.set(w.id, await check(w.path))))
+  await Promise.all(
+    items.map(async (w) => {
+      const r = await check(w.path)
+      presence.set(w.id, r === 'refused' ? 'unreachable' : r)
+    })
+  )
   const dead = items.filter((w) => presence.get(w.id) === 'missing')
   // prune 은 저장소마다 한 번이다 — 같은 저장소의 항목 여럿이 사라졌을 때 그 수만큼 git 을 부르지
   // 않는다(한 번이 그 저장소의 잔해를 모두 걷는다).
