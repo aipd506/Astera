@@ -6,6 +6,10 @@ export interface GitResult {
   ok: boolean
   stdout: string
   stderr: string
+  /** Set only on a failure that git itself reported: it ran and exited with this non-zero code. Absent
+   *  when git answered ok, and absent when it did not answer at all (killed at its deadline, output
+   *  over the limit, or never started), so a caller can tell "git said no" from "git said nothing". */
+  exitCode?: number
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -62,11 +66,16 @@ export function git(
         resolve({ err, stdout: '', stderr: err instanceof Error ? err.message : String(err) })
       }
     })
-  const shape = (r: { err: unknown; stdout: string; stderr: string }): GitResult => ({
-    ok: !r.err,
-    stdout: opts?.trim === false ? r.stdout : r.stdout.trim(),
-    stderr: r.stderr.trim()
-  })
+  const shape = (r: { err: unknown; stdout: string; stderr: string }): GitResult => {
+    const out: GitResult = {
+      ok: !r.err,
+      stdout: opts?.trim === false ? r.stdout : r.stdout.trim(),
+      stderr: r.stderr.trim()
+    }
+    const e = r.err as { code?: unknown; killed?: unknown } | null
+    if (e && typeof e.code === 'number' && e.killed !== true) out.exitCode = e.code
+    return out
+  }
   return once().then(async (first) => {
     if (!isTransientSpawnFailure(first.err)) return shape(first)
     await new Promise((r) => setTimeout(r, RETRY_DELAY_MS))

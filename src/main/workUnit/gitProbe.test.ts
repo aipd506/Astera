@@ -208,10 +208,24 @@ describe('readChangedFiles', () => {
     expect(await readChangedFiles(repo)).toEqual([])
   })
 
+  // 저장소가 아닌 폴더는 "모름"이 아니라 확실한 답이다: 바뀐 것을 잴 git 이 없으니 바뀐 것도 없다.
+  // 탐색기(ipc.ts 의 git.status)가 그렇게 다룬다. null 로 주면 수집기가 git 없는 프로젝트의 모든
+  // 완료를 "모름"으로 붙잡아 파일 없는 기록과 설명 에이전트를 만든다.
+  it('git 저장소가 아닌 폴더는 null 이 아니라 빈 목록이다 (확실히 바뀐 것 없음)', async () => {
+    const notRepo = await tempDir('astera-gitprobe-changed-notrepo-')
+    expect(await readChangedFiles(notRepo)).toEqual([])
+  })
+
   // git 이 답하지 못했을 때 []를 주면 깨끗한 작업 트리와 구별되지 않는다 — 수집기가 그것을 "바뀐 것
   // 없음"으로 읽고 Unit 을 지운다.
-  it('git 이 실패하면 빈 목록이 아니라 null(모름)이다', async () => {
-    const notRepo = await tempDir('astera-gitprobe-changed-notrepo-')
-    expect(await readChangedFiles(notRepo)).toBeNull()
+  it('저장소인데 status 가 실패하면 빈 목록이 아니라 null(모름)이다', async () => {
+    const repo = await makeRepo()
+    await fs.writeFile(path.join(repo, '.git', 'index'), 'not an index', 'utf8')
+    expect(await readChangedFiles(repo)).toBeNull()
+  })
+
+  it('폴더가 없어 git 을 띄우지도 못하면 null(모름)이다', async () => {
+    const parent = await tempDir('astera-gitprobe-changed-gone-')
+    expect(await readChangedFiles(path.join(parent, 'gone'))).toBeNull()
   })
 })

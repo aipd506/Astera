@@ -58,17 +58,25 @@ export async function isAncestorOf(
  * (이 함수는 한동안 collector.ts 에 있었다 — 그때는 이 파일을 고칠 수 없다는 제약이 있어서였다.
  * 지금은 그 제약이 없어 제자리로 옮긴다: git 에 말을 거는 일이 두 파일에 나뉘어 있을 이유가 없다.)
  *
- * **실패하면 null(모름)이다 — 빈 목록이 아니다.** 저장소가 아니거나, 5초 안에 답하지 못했거나, 출력
- * 한도에 걸린 것을 []로 주면 깨끗한 작업 트리와 구별되지 않고, 수집기는 그것을 "바뀐 것 없음"으로
- * 읽어 쓰기 증거가 있는 Unit 을 지운다. 여전히 던지지는 않는다(감시 고리 안에서 불린다).
+ * **git 이 실패하면 null(모름)이다 — 빈 목록이 아니다.** 5초 안에 답하지 못했거나, 출력 한도에
+ * 걸렸거나, 저장소인데 status 가 실패한 것을 []로 주면 깨끗한 작업 트리와 구별되지 않고, 수집기는
+ * 그것을 "바뀐 것 없음"으로 읽어 쓰기 증거가 있는 Unit 을 지운다. 여전히 던지지는 않는다(감시 고리
+ * 안에서 불린다).
+ *
+ * **저장소가 아닌 폴더는 [] 다 — 모름이 아니다.** git 이 없는 프로젝트에서는 git 으로 잴 변경도 없다.
+ * 탐색기(ipc.ts 의 git.status)가 같은 구분을 한다. 이것을 null 로 주면 수집기가 그런 프로젝트의 모든
+ * 완료를 "모름"으로 붙잡아, 파일 없는 기록을 남기고 설명 에이전트를 띄운다(명세 §12 가 막은 일).
+ * 판정은 status 가 실패한 뒤에만 한 번 더 묻는다: `rev-parse --git-dir` 을 git 이 **스스로 거절했으면**
+ * (종료 코드가 있으면) 저장소가 아니다. 시간 초과나 실행 실패는 답이 아니므로 그대로 null 이다.
+ * 거절 문구는 보지 않는다 — git 은 로캘에 따라 번역된 문구를 낸다.
  */
 export async function readChangedFiles(repoPath: string): Promise<string[] | null> {
-  const r = await git(
-    ['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all'],
-    { cwd: repoPath, timeoutMs: WATCH_ROUND_TIMEOUT_MS, trim: false }
-  )
-  if (!r.ok) return null // 저장소가 아니거나 git 이 실패했다 — 모른다. 변경이 없다는 뜻이 아니다
-  return parsePorcelainZ(r.stdout).map((e) => e.relPath)
+  const opts = { cwd: repoPath, timeoutMs: WATCH_ROUND_TIMEOUT_MS, trim: false }
+  const r = await git(['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all'], opts)
+  if (r.ok) return parsePorcelainZ(r.stdout).map((e) => e.relPath)
+  const probe = await git(['rev-parse', '--git-dir'], opts)
+  if (!probe.ok && probe.exitCode !== undefined) return [] // git 이 답했다: 저장소가 아니다 — 확실히 바뀐 것 없음
+  return null // 저장소인데 status 가 실패했거나, git 이 답하지 못했다 — 모른다
 }
 
 /**

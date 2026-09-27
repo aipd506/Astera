@@ -26,6 +26,7 @@ import type { GitRef } from '../../core/git/types'
 import type { HostMergeRecord } from '../../core/git/hostMerges'
 import type { SessionWorkUnit } from '../../core/workUnit/types'
 import { foldsCaseHere } from '../../core/testPaths'
+import { readGitRef, isAncestorOf, readChangedFiles, readRange } from './gitProbe'
 
 let dir: string
 let storeFile: string
@@ -355,6 +356,29 @@ describe('WorkUnitCollector — 선언으로 여닫는다', () => {
     fake.git.files = null
     await collector.completeTask('s1', { source: 'agent' })
     expect(store.get(projectPath)!.units).toHaveLength(0)
+  })
+
+  // Spec §12: a completed record with no changed files is not recorded. A project that is not a git
+  // repository has nothing that could have changed as far as git can say, so a completion there is
+  // dropped and starts no write-up agent. The real probes run against the temp project folder, which
+  // is not a repository: this is the regression the fake git above could not show.
+  it('in a project that is not a git repository, a completed task with write evidence is dropped and starts no write-up', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const real: CollectorGit = { readRef: readGitRef, isAncestor: isAncestorOf, changedFiles: readChangedFiles, readRange }
+    const { collector, store, closed } = await makeCollector(fake, storeFile, undefined, { git: real })
+    await collector.start()
+
+    const started = await collector.startTask('s1', '고쳐줘')
+    if (!started.ok) throw new Error('unexpected')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBeUndefined()
+    const r = await collector.completeTaskById(projectPath, started.id)
+    expect(r).toEqual({ ok: true, recorded: false })
+    expect(store.get(projectPath)!.units).toHaveLength(0)
+    expect(closed).toHaveLength(0)
   })
 
   it('completeTaskById 도 git 이 답하지 못하면(null) 쓰기 증거가 있는 Unit 을 기록한다', async () => {

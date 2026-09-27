@@ -57,8 +57,22 @@ describe('git adapter, spawn failures', () => {
   it('a failure git itself reports is not retried', async () => {
     mocked.mockImplementationOnce((...a) => { callback(a)(Object.assign(new Error('exit 128'), { code: 128 }), '', 'fatal: not a git repository'); return {} })
     const r = await git(['status'])
-    expect(r).toEqual({ ok: false, stdout: '', stderr: 'fatal: not a git repository' })
+    expect(r).toEqual({ ok: false, stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 })
     expect(mocked.mock.calls.length).toBe(1)
+  })
+
+  // exitCode says git ran and answered. A call killed at its deadline, or one that never started,
+  // did not answer, and a caller must be able to tell that apart from git's own refusal.
+  it('a call killed at its deadline, or one that never started, carries no exitCode', async () => {
+    mocked.mockImplementationOnce((...a) => {
+      callback(a)(Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM', code: null }), '', '')
+      return {}
+    })
+    expect((await git(['status'])).exitCode).toBeUndefined()
+    mocked.mockImplementationOnce(() => {
+      throw Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })
+    })
+    expect((await git(['status'])).exitCode).toBeUndefined()
   })
 })
 
