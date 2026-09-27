@@ -2,6 +2,7 @@ import { promises as fs, createReadStream, createWriteStream } from 'node:fs'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { git } from './git'
+import { isPathWithin } from '../files/tree'
 import { cancelledError, isCancelledError, throwIfCancelled } from './cancel'
 import type { Message } from '../i18n'
 
@@ -12,6 +13,8 @@ const MAX_COPY_TOTAL_BYTES = 200 * 1024 * 1024
 /** Files at or above this size are copied as a stream, so an abort can stop them part-way and the
  *  byte count moves while they copy. Smaller ones go through copyFile in one call. */
 const STREAM_COPY_MIN_BYTES = 4 * 1024 * 1024
+/** How many entries one include walk looks at before it gives up on the entry (see measureTree). */
+export const MAX_WALK_ENTRIES = 200_000
 
 /** Only literal paths are allowed. globs, negations, absolute paths, .. and .git are warned about and skipped. */
 export function parseWorktreeInclude(content: string): { entries: string[]; warnings: Message[] } {
@@ -47,35 +50,47 @@ export function parseWorktreeInclude(content: string): { entries: string[]; warn
   return { entries, warnings }
 }
 
-/** What one include entry would copy: its files (with sizes), its folders, and how many linked folders
- *  were left out. `rel` paths are relative to the measured root, with the platform separator. */
+/** A link found in a walk: where it sits, what it says (readlink, as written), and whether it leads to a
+ *  folder. It is recreated as a link, never followed. */
+export interface TreeLink {
+  rel: string
+  raw: string
+  isDir: boolean
+}
+
+/** What one include entry would copy: its files (with sizes), its folders and its links. `rel` paths are
+ *  relative to the measured root, with the platform separator. */
 export interface TreePlan {
   files: Array<{ rel: string; size: number }>
   dirs: string[]
+  links: TreeLink[]
   bytes: number
-  /** The walk stopped because `bytes` passed the limit. The plan is then incomplete on purpose. */
+  /** The walk stopped early — past the byte limit, or past the entry limit (`overEntries`). The plan is
+   *  then incomplete on purpose. */
   over: boolean
-  /** Linked folders (symlinks, junctions) found and not descended into. */
-  linkedDirs: number
+  overEntries: boolean
 }
 
 /** Walks a folder for copying, **bounded**:
  *
- *  - It never descends into a linked folder (symlink or junction). pnpm's node_modules is a tree of
- *    such links, and following them — with a realpath and a stat on every entry — made the size walk
- *    effectively unbounded. A linked folder is counted in `linkedDirs` and left out of the copy too, so
- *    what is measured and what is copied stay the same set (no cycle can form, so no realpath is needed).
- *  - A link to a **file** is followed (one stat, no walk): its target is what gets copied.
- *  - It stops the moment the byte count passes `limit` (`over`), instead of measuring everything.
+ *  - It never follows a link (symlink or junction), to a folder or to a file. pnpm's node_modules is a
+ *    tree of such links, and following them — a realpath and a stat on every entry — made the walk
+ *    effectively unbounded. A link is recorded as it is written (readlink) and counted as 0 bytes; the
+ *    copy recreates it as a link (copyWorktreeInclude). One stat tells a folder link from a file link.
+ *  - It stops the moment the byte count passes `limit`, or the number of entries seen passes
+ *    `maxEntries` (MAX_WALK_ENTRIES by default) — hundreds of thousands of empty files are no cheaper to
+ *    walk than a big one.
  *  - It checks `signal` on every entry and throws WORKTREE_CANCELLED once it is aborted.
  *
- *  A broken link counts as nothing (it cannot be copied). A folder that cannot be read throws. */
+ *  A broken link is left out (there is nothing to copy it as). A folder that cannot be read throws. */
 export async function measureTree(
   root: string,
-  opts: { limit?: number; signal?: AbortSignal } = {}
+  opts: { limit?: number; maxEntries?: number; signal?: AbortSignal } = {}
 ): Promise<TreePlan> {
   const limit = opts.limit ?? Infinity
-  const plan: TreePlan = { files: [], dirs: [], bytes: 0, over: false, linkedDirs: 0 }
+  const maxEntries = opts.maxEntries ?? MAX_WALK_ENTRIES
+  const plan: TreePlan = { files: [], dirs: [], links: [], bytes: 0, over: false, overEntries: false }
+  let seen = 0
   const stack: string[] = ['']
   while (stack.length > 0) {
     throwIfCancelled(opts.signal)
@@ -83,43 +98,40 @@ export async function measureTree(
     const entries = await fs.readdir(path.join(root, relDir), { withFileTypes: true })
     for (const e of entries) {
       throwIfCancelled(opts.signal)
+      if (++seen > maxEntries) {
+        plan.over = true
+        plan.overEntries = true
+        return plan
+      }
       const rel = relDir === '' ? e.name : path.join(relDir, e.name)
       const abs = path.join(root, rel)
-      let size: number
       if (e.isDirectory()) {
         plan.dirs.push(rel)
         stack.push(rel)
-        continue
       } else if (e.isFile()) {
-        size = (await fs.lstat(abs)).size
+        const size = (await fs.lstat(abs)).size
+        plan.files.push({ rel, size })
+        plan.bytes += size
+        if (plan.bytes > limit) {
+          plan.over = true
+          return plan
+        }
       } else if (e.isSymbolicLink()) {
-        let target
         try {
-          target = await fs.stat(abs)
+          const raw = await fs.readlink(abs)
+          const isDir = (await fs.stat(abs)).isDirectory()
+          plan.links.push({ rel, raw, isDir })
         } catch {
-          continue // broken link — not copied, counts as nothing
+          // broken link — nothing to recreate it as
         }
-        if (target.isDirectory()) {
-          plan.linkedDirs++
-          continue
-        }
-        if (!target.isFile()) continue
-        size = target.size
-      } else {
-        continue // sockets, fifos and the like are not copied
       }
-      plan.files.push({ rel, size })
-      plan.bytes += size
-      if (plan.bytes > limit) {
-        plan.over = true
-        return plan
-      }
+      // sockets, fifos and the like are not copied
     }
   }
   return plan
 }
 
-/** The byte size measureTree finds — linked folders not followed; stops early past `limit`. */
+/** The byte size measureTree finds — links not followed; stops early past `limit`. */
 export async function dirSize(
   p: string,
   opts: { limit?: number; signal?: AbortSignal } = {}
@@ -134,6 +146,40 @@ export interface IncludeCopyProgress {
   bytesTotal?: number
   filesCopied?: number
   filesTotal?: number
+}
+
+/** Makes one link — fs.symlink by default; a test seam. */
+export type MakeLink = (target: string, linkPath: string, type: 'file' | 'dir' | 'junction') => Promise<void>
+
+/** Where a copied link should point, and as what.
+ *
+ *  A link whose target lies inside the entry being copied is pointed at the same place **in the copy** —
+ *  a relative link keeps its text (it resolves the same way from the copy), an absolute one is rewritten.
+ *  A link pointing outside the entry keeps pointing at the same place, written absolute so that moving
+ *  it into the worktree does not change what a relative text resolves to. On Windows a folder link is
+ *  made as a junction, which needs no privilege but must be absolute. The entry's real path is checked
+ *  as well as the given one: a junction's text is always a real, absolute path. */
+export function linkTargetFor(a: {
+  srcRoot: string
+  srcRootReal: string
+  destRoot: string
+  linkAbs: string
+  raw: string
+  isDir: boolean
+  platform?: NodeJS.Platform
+}): { target: string; type: 'file' | 'dir' | 'junction' } {
+  const platform = a.platform ?? process.platform
+  const resolved = path.resolve(path.dirname(a.linkAbs), a.raw)
+  const type = a.isDir ? (platform === 'win32' ? 'junction' : 'dir') : 'file'
+  let rel: string | null = null
+  if (a.linkAbs !== a.srcRoot) {
+    if (isPathWithin(a.srcRoot, resolved, platform)) rel = path.relative(a.srcRoot, resolved)
+    else if (isPathWithin(a.srcRootReal, resolved, platform)) rel = path.relative(a.srcRootReal, resolved)
+  }
+  if (rel === null) return { target: resolved, type }
+  const mapped = path.join(a.destRoot, rel)
+  if (type === 'junction' || path.isAbsolute(a.raw)) return { target: mapped, type }
+  return { target: a.raw, type }
 }
 
 async function copyOneFile(
@@ -158,21 +204,39 @@ async function copyOneFile(
   }
 }
 
-type PlannedEntry = { entry: string; src: string; dest: string; dir: boolean; plan: TreePlan }
+type PlannedEntry = {
+  entry: string
+  src: string
+  dest: string
+  kind: 'dir' | 'file' | 'link'
+  plan: TreePlan
+}
+
+/** A link that could not be recreated. The whole entry is then taken out again and skipped: a
+ *  node_modules with its package links missing looks installed and is not. */
+class LinkFailed extends Error {}
 
 /** Copies only the repo's .worktreeinclude entries that exist and are gitignored into the worktree. Returns the warning list.
  *
- *  Every entry is measured first (bounded — see measureTree), then everything is copied file by file, so
- *  `onProgress` can report bytes and files against known totals. A linked folder is never copied (a
- *  warning names the entry). `signal` stops the work between files, and inside a large one, with
- *  WORKTREE_CANCELLED; what was already copied is left to the caller's rollback, which removes the whole
- *  worktree. A copy failure of one entry is still only a warning. */
+ *  Every entry is measured first (bounded — see measureTree), then copied: folders, then links, then the
+ *  files one by one, so `onProgress` can report bytes and files against known totals. Links are
+ *  recreated as links (linkTargetFor), 0 bytes each; a file link that needs a privilege the user lacks
+ *  (EPERM, Windows without Developer Mode) is copied as the file instead. Any other failure to make a
+ *  link skips the whole entry, with what was already made of it removed. `signal` stops the work between
+ *  files, and inside a large one, with WORKTREE_CANCELLED; what was already copied is left to the
+ *  caller's rollback, which removes the whole worktree. Any other copy failure of one entry is still only
+ *  a warning. */
 export async function copyWorktreeInclude(
   repoPath: string,
   worktreePath: string,
-  opts: { signal?: AbortSignal; onProgress?: (p: IncludeCopyProgress) => void } = {}
+  opts: {
+    signal?: AbortSignal
+    onProgress?: (p: IncludeCopyProgress) => void
+    makeLink?: MakeLink
+  } = {}
 ): Promise<Message[]> {
   const { signal, onProgress } = opts
+  const makeLink: MakeLink = opts.makeLink ?? ((t, p, type) => fs.symlink(t, p, type))
   const file = path.join(repoPath, INCLUDE_FILE)
   let content: string
   try {
@@ -190,19 +254,13 @@ export async function copyWorktreeInclude(
   for (const entry of entries) {
     throwIfCancelled(signal)
     const src = path.join(repoPath, entry)
-    let stat
-    let linkedDir = false
+    let own
+    let target
     try {
-      // The entry itself: a link to a file is followed, a link to a folder is not (see measureTree)
-      const own = await fs.lstat(src)
-      stat = own.isSymbolicLink() ? await fs.stat(src) : own
-      linkedDir = own.isSymbolicLink() && stat.isDirectory()
+      own = await fs.lstat(src)
+      target = own.isSymbolicLink() ? await fs.stat(src) : own // a broken link is "missing"
     } catch {
       warnings.push({ key: 'worktree.include.missing', params: { entry } })
-      continue
-    }
-    if (linkedDir) {
-      warnings.push({ key: 'worktree.include.linkedDirSkipped', params: { entry, count: 1 } })
       continue
     }
     // copying a tracked file would overwrite what checkout produced, so only gitignored entries
@@ -212,11 +270,22 @@ export async function copyWorktreeInclude(
       warnings.push({ key: 'worktree.include.notIgnored', params: { entry } })
       continue
     }
+    const dest = path.join(worktreePath, entry)
+    const empty = (): TreePlan => ({ files: [], dirs: [], links: [], bytes: 0, over: false, overEntries: false })
     let plan: TreePlan
+    let kind: PlannedEntry['kind']
     try {
-      plan = stat.isDirectory()
-        ? await measureTree(src, { limit: budget, signal })
-        : { files: [{ rel: '', size: stat.size }], dirs: [], bytes: stat.size, over: stat.size > budget, linkedDirs: 0 }
+      if (own.isSymbolicLink()) {
+        // the entry itself is a link: recreated as one, never followed
+        kind = 'link'
+        plan = { ...empty(), links: [{ rel: '', raw: await fs.readlink(src), isDir: target.isDirectory() }] }
+      } else if (own.isDirectory()) {
+        kind = 'dir'
+        plan = await measureTree(src, { limit: budget, signal })
+      } else {
+        kind = 'file'
+        plan = { ...empty(), files: [{ rel: '', size: own.size }], bytes: own.size, over: own.size > budget }
+      }
     } catch (err) {
       if (isCancelledError(err)) throw err
       // a failure while measuring size (permission denied, deletion during the scan and other races) must not block creation itself
@@ -226,14 +295,16 @@ export async function copyWorktreeInclude(
       })
       continue
     }
+    if (plan.overEntries) {
+      warnings.push({ key: 'worktree.include.overFileCount', params: { entry, max: MAX_WALK_ENTRIES } })
+      continue
+    }
     if (plan.over) {
       warnings.push({ key: 'worktree.include.overLimit', params: { entry } })
       continue
     }
-    if (plan.linkedDirs > 0)
-      warnings.push({ key: 'worktree.include.linkedDirSkipped', params: { entry, count: plan.linkedDirs } })
     budget -= plan.bytes
-    planned.push({ entry, src, dest: path.join(worktreePath, entry), dir: stat.isDirectory(), plan })
+    planned.push({ entry, src, dest, kind, plan })
   }
 
   const progress: Required<IncludeCopyProgress> = {
@@ -246,17 +317,46 @@ export async function copyWorktreeInclude(
   report()
   for (const p of planned) {
     throwIfCancelled(signal)
+    const at = { bytes: progress.bytesCopied, files: progress.filesCopied }
     try {
-      if (p.dir) {
+      if (p.kind === 'dir') {
         await fs.mkdir(p.dest, { recursive: true })
         for (const d of p.plan.dirs) await fs.mkdir(path.join(p.dest, d), { recursive: true })
       } else {
         await fs.mkdir(path.dirname(p.dest), { recursive: true })
       }
+      if (p.plan.links.length > 0) {
+        // An entry that is itself a link has nothing "inside" it — its target keeps pointing where it did
+        const srcRootReal = p.kind === 'link' ? p.src : await fs.realpath(p.src).catch(() => p.src)
+        for (const l of p.plan.links) {
+          throwIfCancelled(signal)
+          const linkAbs = l.rel === '' ? p.src : path.join(p.src, l.rel)
+          const linkDest = l.rel === '' ? p.dest : path.join(p.dest, l.rel)
+          const { target, type } = linkTargetFor({
+            srcRoot: p.src, srcRootReal, destRoot: p.dest, linkAbs, raw: l.raw, isDir: l.isDir
+          })
+          try {
+            await makeLink(target, linkDest, type)
+          } catch (err) {
+            // A file link the user lacks the privilege for (EPERM: Windows without Developer Mode) is
+            // copied as the file instead. That one file is outside the byte budget and the progress
+            // totals, which count links as 0 — it is one file, not a walk.
+            if (type === 'file' && (err as NodeJS.ErrnoException).code === 'EPERM') {
+              try {
+                await fs.copyFile(linkAbs, linkDest)
+                continue
+              } catch (copyErr) {
+                throw new LinkFailed(copyErr instanceof Error ? copyErr.message : String(copyErr))
+              }
+            }
+            throw new LinkFailed(err instanceof Error ? err.message : String(err))
+          }
+        }
+      }
       for (const f of p.plan.files) {
         throwIfCancelled(signal)
-        const from = p.dir ? path.join(p.src, f.rel) : p.src
-        const to = p.dir ? path.join(p.dest, f.rel) : p.dest
+        const from = p.kind === 'dir' ? path.join(p.src, f.rel) : p.src
+        const to = p.kind === 'dir' ? path.join(p.dest, f.rel) : p.dest
         let seen = 0
         await copyOneFile(from, to, f.size, signal, (n) => {
           // a file that grew since it was measured must not push the count past the total
@@ -271,6 +371,17 @@ export async function copyWorktreeInclude(
       }
     } catch (err) {
       if (isCancelledError(err)) throw err
+      if (err instanceof LinkFailed) {
+        // take out what was made of this entry, and its share of the totals — no half-copied entry
+        await fs.rm(p.dest, { recursive: true, force: true }).catch(() => {})
+        progress.bytesTotal -= p.plan.bytes
+        progress.filesTotal -= p.plan.files.length
+        progress.bytesCopied = at.bytes
+        progress.filesCopied = at.files
+        report()
+        warnings.push({ key: 'worktree.include.linkFailed', params: { entry: p.entry, detail: err.message } })
+        continue
+      }
       warnings.push({
         key: 'worktree.include.copyFailed',
         params: { entry: p.entry, detail: err instanceof Error ? err.message : String(err) }

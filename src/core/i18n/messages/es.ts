@@ -97,7 +97,8 @@ export const es: Catalog = {
   'worktree.include.notIgnored': 'Omitido, no está en gitignore: {entry}',
   'worktree.include.sizeFailed': 'No se pudo calcular el tamaño: {entry} ({detail})',
   'worktree.include.overLimit': 'Omitido, supera el límite de copia (200 MB): {entry}',
-  'worktree.include.linkedDirSkipped': 'Carpetas enlazadas no copiadas ({count}): {entry}',
+  'worktree.include.linkFailed': 'Omitido, no se pudo recrear un enlace: {entry} ({detail})',
+  'worktree.include.overFileCount': 'Omitido, más de {max} elementos: {entry}',
   'worktree.include.copyFailed': 'Error al copiar: {entry} ({detail})',
   'worktree.create.fetchFailed':
     'No se pudo actualizar desde el remoto; se creó a partir de {baseRef} local',
