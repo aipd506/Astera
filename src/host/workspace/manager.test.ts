@@ -8,6 +8,18 @@ import type { DeskShot, DeskWindow } from '../../core/workspace/protocol'
 import type { DesktopHelper } from './desktopHelper'
 import { DISPOSE_CAP_MS, createWorkspaceManager, disposeWithin, type WorkspaceEvent, type WorkspaceManager, type WorkspaceManagerDeps } from './manager'
 
+// Records the child processes the script runner spawns (scriptWorker.ts), delegating to the real spawn.
+const spawned = vi.hoisted(() => ({ children: [] as import('node:child_process').ChildProcess[] }))
+vi.mock('node:child_process', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:child_process')>()
+  const spawn = ((...a: Parameters<typeof real.spawn>) => {
+    const c = (real.spawn as (...b: unknown[]) => import('node:child_process').ChildProcess)(...a)
+    spawned.children.push(c)
+    return c
+  }) as typeof real.spawn
+  return { ...real, spawn, default: { ...real, spawn } }
+})
+
 class FakeDesk implements DesktopHelper {
   static made: FakeDesk[] = []
   pid: number
@@ -552,10 +564,27 @@ describe('Stop, Close, the session, the helper, idleness', () => {
     }
   })
 
+  // Each script runs in a child process of its own: the session ending and the Host leaving both end it.
+  for (const way of ['sessionEnded', 'dispose'] as const)
+    it(`${way} ends a running script and its child process`, { timeout: 40_000 }, async () => {
+      const { m } = await rig({ scriptTimeoutMs: 30_000 })
+      const before = spawned.children.length
+      const run = m.run('s1', "{ const end = Date.now() + 20000; while (Date.now() < end) {} } log('never')")
+      await vi.waitFor(() => expect(spawned.children.length).toBe(before + 1), { timeout: 10_000 })
+      const child = spawned.children[before]
+      await new Promise((r) => setTimeout(r, 300))
+      if (way === 'sessionEnded') m.sessionEnded('s1')
+      else await m.dispose()
+      expect(body(await run)).toEqual({ log: [], error: { message: 'stopped', at: 'stopped' } })
+      await vi.waitFor(() => expect(child.exitCode !== null || child.signalCode !== null).toBe(true), { timeout: 10_000 })
+    })
+
   it('a launch still on its way when the script times out opens nothing (review critical 1)', async () => {
     let resolved!: () => void
+    // Longer than a child process takes to start (scriptWorker.ts), so the script reaches its launch;
+    // the launch then waits for the test, so the deadline always comes first.
     const { m, deps, settle } = await rig({
-      scriptTimeoutMs: 50,
+      scriptTimeoutMs: 3_000,
       resolveLaunch: ({ cwd }) =>
         new Promise((r) => {
           resolved = () => r({ command: 'app.exe', cwd, env: {} })

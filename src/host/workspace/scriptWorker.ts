@@ -1,22 +1,31 @@
-// The Host's `app js` runner: each script runs in a worker thread of its own, with the vm inside it,
-// so a busy loop, before or after an `await`, blocks only that worker. The Host's thread, which holds
-// every session's terminal, keeps running, owns the deadline and Stop, and ends the worker with
-// `terminate()`, which cuts off a loop that never yields (the limit this replaces is gone from
-// docs/agent-workspace-isolation.md, amendment 2026-09-27).
+// The Host's `app js` runner: each script runs in a child process of its own, and inside it in a worker
+// thread, with the vm inside that. A busy loop, before or after an `await`, blocks only that worker, and
+// memory the script takes is the child's, so running out of it ends the child, never the Host
+// (docs/agent-workspace-isolation.md, P13 and P14). The Host's thread, which holds every session's
+// terminal, keeps running, owns the deadline and Stop, and ends the child's process tree for both.
+//
+// Memory is bounded twice. The worker's `resourceLimits` bound its V8 heap (SCRIPT_HEAP_LIMIT_MB), and
+// the child's main thread reads its rss every SCRIPT_MEMORY_WATCH_MS and ends the child above
+// SCRIPT_MEMORY_CAP_MB, which covers ArrayBuffer and TypedArray memory the heap limit does not see.
+// Either ends the run at `at: 'memory'`; V8 ending the child outright is read from its stderr and is
+// `at: 'memory'` too; a child that dies any other way is `at: 'crashed'`.
 //
 // The helpers stay on this thread, gated exactly as before (core/workspace/script.ts's gateHelpers),
 // so `ctx.at`, the mirror's "helper running now" and the frames a helper asks for behave as they did.
-// Inside the worker every helper name is an async proxy: it posts `{ id, name, args }` and this thread
-// answers `{ id, ok, value }` or `{ id, ok: false, error: { message, at? } }`. `log` posts a line and
-// waits for nothing. `help` is answered in the worker from the texts in workerData, so it stays
-// synchronous (WORKSPACE_SYNCHRONOUS_HELPERS names no other helper, and one that did could not be
-// proxied, so the runner refuses it).
+// Inside the worker every helper name is an async proxy: it posts `{ id, name, args }`, the child's
+// main thread relays it over the IPC channel unchanged, and this thread answers `{ id, ok, value }` or
+// `{ id, ok: false, error: { message, at? } }` the same way back. `log` posts a line and waits for
+// nothing. `help` is answered in the worker from the texts in workerData, so it stays synchronous
+// (WORKSPACE_SYNCHRONOUS_HELPERS names no other helper, and one that did could not be proxied, so the
+// runner refuses it).
 //
 // The agent browser's runner (core/agentBrowser/scriptRunner.ts) is untouched: it runs in the app.
 // core/workspace/script.ts's runWorkspaceScript, the in-process runner this replaced for the Host, is
-// the contract this one keeps. The worker is not a security boundary either: it is a clean global scope for a
-// script written by the user's own agent, as the vm was.
-import { Worker } from 'node:worker_threads'
+// the contract this one keeps. Neither the worker nor the child is a security boundary: they are a
+// clean global scope and a separate heap for a script written by the user's own agent, as the vm was.
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import os from 'node:os'
+import { treeKillCommand } from '../../core/run/kill'
 import { Interrupted, SCRIPT_TIMEOUT_MS, type RunError, type RunResult } from '../../core/agentBrowser/script'
 import type { RunContext } from '../../core/agentBrowser/scriptRunner'
 import { helpTexts } from '../../core/workspace/helpers'
@@ -155,12 +164,114 @@ const start = () => {
 start()
 `
 
-type FromWorker =
+/** The child's rss cap. rss counts what the V8 heap does not, such as ArrayBuffer and TypedArray memory,
+ *  which a worker's `resourceLimits` cannot bound: above this the child reports and ends itself. */
+export const SCRIPT_MEMORY_CAP_MB = 512
+/** The worker's old generation heap limit inside the child (`resourceLimits.maxOldGenerationSizeMb`). */
+export const SCRIPT_HEAP_LIMIT_MB = 256
+/** How often the child reads its own rss. */
+export const SCRIPT_MEMORY_WATCH_MS = 250
+
+/** The child's main thread, sent over the IPC channel as its first message and run with `new Function`,
+ *  so the build needs no second entry and the command line stays one short line. It starts the worker
+ *  from WORKER_SOURCE with the heap limit, relays every message both ways unchanged, and watches rss.
+ *  `init` is `{ workerSource, workerData, heapMb, capMb, watchMs }`. Plain ES2020, no template literals. */
+export const CHILD_SOURCE = String.raw`
+'use strict'
+const { Worker } = require('node:worker_threads')
+
+let leaving = false
+const leave = (code) => {
+  if (leaving) return
+  leaving = true
+  process.exit(code)
+}
+const messageOf = (err) => {
+  try {
+    return err && typeof err.message === 'string' ? err.message : String(err)
+  } catch {
+    return 'an error that cannot be read'
+  }
+}
+// A send can fail only when the Host has gone, and then nothing is left to tell.
+const send = (m, done) => {
+  try {
+    process.send(m, done)
+  } catch {
+    if (done) done()
+  }
+}
+// The Host closed the channel or died: this process has no one to answer to, so it ends.
+process.on('disconnect', () => leave(0))
+
+let worker
+try {
+  worker = new Worker(init.workerSource, { eval: true, workerData: init.workerData, resourceLimits: { maxOldGenerationSizeMb: init.heapMb } })
+} catch (err) {
+  send({ type: 'failed', message: messageOf(err) })
+}
+if (worker) {
+  worker.on('message', (m) => {
+    try {
+      process.send(m)
+    } catch (err) {
+      // The worker's structured clone took it, so the channel's serializer, the same one, takes it too;
+      // a call that still cannot cross is answered here rather than left waiting for the deadline.
+      if (m && m.type === 'call')
+        worker.postMessage({ id: m.id, ok: false, error: { message: m.name + ': its arguments could not be handed to the Host (' + messageOf(err) + ')' } })
+    }
+  })
+  process.on('message', (m) => worker.postMessage(m))
+  worker.on('error', (err) => {
+    if (err && err.code === 'ERR_WORKER_OUT_OF_MEMORY') send({ type: 'memory', heap: true })
+    else send({ type: 'failed', message: messageOf(err) })
+  })
+  worker.on('exit', (code) => send({ type: 'exited', code }))
+  const cap = init.capMb * 1024 * 1024
+  const watch = setInterval(() => {
+    if (process.memoryUsage().rss <= cap) return
+    clearInterval(watch)
+    send({ type: 'memory' }, () => leave(75))
+    // A Host too busy to take the report does not keep this process growing.
+    setTimeout(() => leave(75), 200)
+  }, init.watchMs)
+}
+`
+
+/** The whole `-e` program: it waits for CHILD_SOURCE and its `init` on the IPC channel and runs it. */
+const CHILD_BOOT = "process.once('message', (m) => new Function('require', 'init', m.source)(require, m.init))"
+
+/** What the child's environment may hold beyond ELECTRON_RUN_AS_NODE: only what Node itself reads on
+ *  start. No ASTERA_, CLAUDE_ or CODEX_ variable, no NODE_OPTIONS, no PATH. */
+const CHILD_ENV_KEYS = ['SystemRoot', 'windir', 'TEMP', 'TMP', 'TMPDIR']
+
+/** The child's environment, built from nothing. ELECTRON_RUN_AS_NODE makes the Host's own binary, when
+ *  it is Electron, run as Node, and a plain node.exe ignores it. Names are matched without case, as a
+ *  Windows environment block is. */
+export function scriptChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: '1' }
+  for (const [k, v] of Object.entries(env)) {
+    const name = CHILD_ENV_KEYS.find((n) => n.toLowerCase() === k.toLowerCase())
+    if (name !== undefined && v !== undefined && out[name] === undefined) out[name] = v
+  }
+  return out
+}
+
+/** How much of the child's stderr is kept: enough for V8's fatal out-of-memory banner. */
+const STDERR_KEEP = 16 * 1024
+/** V8's words when it ends a process for want of memory ("... Allocation failed - JavaScript heap out
+ *  of memory"). */
+const FATAL_OOM = /heap out of memory|allocation failed/i
+
+type FromChild =
   | { type: 'log'; line: string }
   | { type: 'begin' }
   | { type: 'started' }
   | { type: 'call'; id: number; name: string; args: unknown[] }
   | { type: 'done'; error?: { message: string; at?: string } }
+  | { type: 'memory'; heap?: boolean }
+  | { type: 'failed'; message: string }
+  | { type: 'exited'; code: number }
 
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
@@ -179,9 +290,43 @@ function errorOf(err: unknown, name: string): { message: string; at?: string } {
   return { message: `${name}: the helper failed with an error that cannot be read` }
 }
 
-/** Runs one script in a worker of its own. The contract is core/workspace/script.ts's
- *  runWorkspaceScript's, plus the guide `help()` answers from: the same result, `at`, log order and
- *  Stop and deadline mapping. `stop` and the deadline both end the worker, whatever it is doing. */
+const alive = (c: ChildProcess): boolean => c.exitCode === null && c.signalCode === null
+
+/** Ends the child and anything it started. The script cannot reach `require`, but the vm is no boundary,
+ *  so a process it started is ended with it: taskkill /T on win32, the child's own process group (it is
+ *  spawned detached) elsewhere. The plain kill follows either way, so a failed tree kill still ends it. */
+function endChild(c: ChildProcess): void {
+  if (!alive(c) || c.pid === undefined) return
+  const hard = (): void => {
+    try {
+      if (alive(c)) c.kill('SIGKILL')
+    } catch {
+      /* already gone */
+    }
+  }
+  const tree = treeKillCommand(process.platform, c.pid)
+  if (tree) {
+    try {
+      execFile(tree.file, tree.args, { windowsHide: true, timeout: 10_000 }, hard)
+    } catch {
+      hard()
+    }
+    return
+  }
+  try {
+    process.kill(-c.pid, 'SIGKILL')
+  } catch {
+    /* no group: the plain kill below */
+  }
+  hard()
+}
+
+/** Runs one script in a worker inside a child process of its own. The contract is
+ *  core/workspace/script.ts's runWorkspaceScript's, plus the guide `help()` answers from: the same
+ *  result, `at`, log order and Stop and deadline mapping. `stop` and the deadline both end the child,
+ *  whatever it is doing. Memory the script takes ends the child too, at `at: 'memory'`, and a child
+ *  that dies without saying why ends the run at `at: 'crashed'`. The caps are parameters for the tests;
+ *  the Host uses the defaults. */
 export async function runScriptInWorker(a: {
   script: string
   helpers: (ctx: RunContext) => Record<string, unknown>
@@ -189,10 +334,14 @@ export async function runScriptInWorker(a: {
   onHelper(name: string | null): void
   guide: string
   timeoutMs?: number
+  memoryCapMb?: number
+  heapLimitMb?: number
 }): Promise<RunResult> {
-  // A Stop already given: the answer is known, so no worker is started for it.
+  // A Stop already given: the answer is known, so no child is started for it.
   if (a.stop.aborted) return { log: [], error: { message: 'stopped', at: 'stopped' } }
   const timeoutMs = a.timeoutMs ?? SCRIPT_TIMEOUT_MS
+  const capMb = a.memoryCapMb ?? SCRIPT_MEMORY_CAP_MB
+  const heapMb = a.heapLimitMb ?? SCRIPT_HEAP_LIMIT_MB
   const ctx: RunContext = { at: 'script' }
   const inner = new AbortController()
   const gated = gateHelpers(a.helpers(ctx), ctx, inner.signal, a.onHelper)
@@ -200,19 +349,33 @@ export async function runScriptInWorker(a: {
   for (const n of names)
     if (WORKSPACE_SYNCHRONOUS_HELPERS.has(n)) throw new Error(`the script worker cannot proxy the synchronous helper ${n}`)
   const lines: string[] = []
+  const couldNotStart = (err: unknown): RunResult => ({ log: [], error: { message: `the script could not start: ${messageOf(err)}`, at: 'script' } })
 
-  let worker: Worker
+  let child: ChildProcess
   try {
-    worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { script: a.script, names, help: helpTexts(a.guide) } })
+    // The Host's own runtime (node.exe, or Electron run as Node), with none of its arguments, an
+    // environment built from nothing, and no console: detached is DETACHED_PROCESS on win32, and its
+    // own process group elsewhere. The channel's `advanced` serialization is the structured clone the
+    // worker's messages already passed, so what the worker could post, the channel can carry.
+    child = spawn(process.execPath, ['-e', CHILD_BOOT], {
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+      serialization: 'advanced',
+      env: scriptChildEnv(process.env),
+      cwd: os.tmpdir(),
+      windowsHide: true,
+      detached: true
+    })
   } catch (err) {
     inner.abort()
-    return { log: [], error: { message: `the script could not start: ${messageOf(err)}`, at: 'script' } }
+    return couldNotStart(err)
   }
 
   return new Promise<RunResult>((resolve) => {
     let over = false
     let begun = false
     let started = false
+    let heard = false
+    let stderr = ''
 
     const finish = (error?: RunError): void => {
       if (over) return
@@ -221,13 +384,13 @@ export async function runScriptInWorker(a: {
       a.stop.removeEventListener('abort', onStop)
       // Every way out aborts the gate, so a helper the manager is still running stops asking for more.
       inner.abort()
-      worker.terminate().catch(() => undefined)
+      endChild(child)
       resolve(error ? { log: [...lines], error } : { log: [...lines] })
     }
 
     const reply = (msg: { id: number; ok: true; value: unknown } | { id: number; ok: false; error: { message: string; at?: string } }): void => {
-      if (over) return
-      worker.postMessage(msg)
+      if (over || !child.connected) return
+      child.send(msg)
     }
 
     const serve = (m: { id: number; name: string; args: unknown[] }): void => {
@@ -239,8 +402,9 @@ export async function runScriptInWorker(a: {
       } catch (err) {
         p = Promise.reject(err)
       }
-      // Both branches handled, and neither can throw: a helper that settles after the worker is gone
-      // (a pending launch the deadline cut off) is dropped, never an unhandled rejection (R3).
+      // Both branches handled, and neither can throw: a helper that settles after the child is gone
+      // (a pending launch the deadline cut off, or a child that died) is dropped, never an unhandled
+      // rejection (R3).
       p.then(
         (value) => {
           try {
@@ -249,7 +413,7 @@ export async function runScriptInWorker(a: {
             try {
               reply({ id: m.id, ok: false, error: { message: `${m.name}: its result could not be handed to the script (${messageOf(err)})`, at: m.name } })
             } catch {
-              /* the worker is gone */
+              /* the child is gone */
             }
           }
         },
@@ -257,7 +421,7 @@ export async function runScriptInWorker(a: {
           try {
             reply({ id: m.id, ok: false, error: errorOf(err, m.name) })
           } catch {
-            /* the worker is gone */
+            /* the child is gone */
           }
         }
       )
@@ -274,17 +438,56 @@ export async function runScriptInWorker(a: {
       finish({ message: `script did not finish within ${timeoutMs} ms${never}`, at: 'timeout' })
     }, timeoutMs)
 
-    worker.on('message', (m: FromWorker) => {
+    const outOfMemory = (message: string): void => {
+      ctx.at = 'memory'
+      finish({ message, at: 'memory' })
+    }
+
+    child.on('message', (m: FromChild) => {
+      heard = true
       if (over) return
       if (m.type === 'log') lines.push(m.line)
       else if (m.type === 'begin') begun = true
       else if (m.type === 'started') started = true
       else if (m.type === 'call') serve(m)
       else if (m.type === 'done') finish(m.error ? { message: m.error.message, at: m.error.at ?? ctx.at } : undefined)
+      else if (m.type === 'memory')
+        outOfMemory(m.heap ? `the script ran out of memory (its heap is limited to ${heapMb} MB)` : `the script used more than ${capMb} MB of memory and was ended`)
+      else if (m.type === 'failed') finish({ message: `the script worker failed: ${m.message}`, at: ctx.at })
+      else if (m.type === 'exited') finish({ message: `the script worker exited early (code ${m.code})`, at: ctx.at })
+    })
+    child.stderr?.on('data', (d: Buffer) => {
+      if (stderr.length < STDERR_KEEP) stderr += d.toString('utf8').slice(0, STDERR_KEEP - stderr.length)
     })
     // Always listened to, also after the end: an 'error' event with no listener would throw in the Host.
-    worker.on('error', (err) => finish({ message: `the script worker failed: ${messageOf(err)}`, at: ctx.at }))
-    worker.on('exit', (code) => finish({ message: `the script worker exited early (code ${code})`, at: ctx.at }))
+    // Before the child has said anything it is a start that failed (the binary is missing); after, a
+    // send to a child that is going, whose 'exit' says the rest.
+    child.on('error', (err) => {
+      if (!heard) finish(couldNotStart(err).error)
+    })
+    child.on('exit', (code, signal) => {
+      if (over) return
+      // A child that dies without a report is judged once its stderr is read and any last message is in:
+      // V8 ending it for want of memory says so there.
+      const judge = (): void => {
+        if (over) return
+        if (FATAL_OOM.test(stderr)) return outOfMemory('the script ran out of memory and its process ended')
+        finish({ message: `the script's process ended unexpectedly (${signal ? `signal ${signal}` : `code ${code}`})`, at: 'crashed' })
+      }
+      const err = child.stderr
+      if (!err || err.readableEnded) return void setImmediate(judge)
+      const cap = setTimeout(judge, 500)
+      err.once('end', () => {
+        clearTimeout(cap)
+        setImmediate(judge)
+      })
+    })
+
+    try {
+      child.send({ source: CHILD_SOURCE, init: { workerSource: WORKER_SOURCE, workerData: { script: a.script, names, help: helpTexts(a.guide) }, heapMb, capMb, watchMs: SCRIPT_MEMORY_WATCH_MS } })
+    } catch (err) {
+      finish(couldNotStart(err).error)
+    }
 
     if (a.stop.aborted) onStop()
     else a.stop.addEventListener('abort', onStop, { once: true })

@@ -7,23 +7,38 @@
 // thread's ticks from that call. Ticks while the loop runs prove this thread was not blocked; the
 // outcome (cut off, never `log('never')`) proves the loop was ended rather than finished. The only
 // time bound left is many seconds below the loop's own end.
-import { describe, it, expect, vi } from 'vitest'
+import { afterAll, describe, it, expect, vi } from 'vitest'
 import { Interrupted } from '../../core/agentBrowser/script'
 import { workspaceHelpers, type HelperDeps } from '../../core/workspace/helpers'
-import { runScriptInWorker } from './scriptWorker'
+import { runScriptInWorker, scriptChildEnv } from './scriptWorker'
 
-// Counts the workers made, delegating to the real class, so a test can say none was started.
-const made = vi.hoisted(() => ({ workers: 0 }))
-vi.mock('node:worker_threads', async (importOriginal) => {
-  const real = await importOriginal<typeof import('node:worker_threads')>()
-  class CountingWorker extends real.Worker {
-    constructor(...a: ConstructorParameters<typeof real.Worker>) {
-      super(...a)
-      made.workers += 1
-    }
-  }
-  return { ...real, Worker: CountingWorker, default: { ...real, Worker: CountingWorker } }
+// Records every child process the runner spawns, delegating to the real spawn, so a test can say none
+// was started, reach one to kill it from outside, and check at the end that none is left running.
+const made = vi.hoisted(() => ({ children: [] as import('node:child_process').ChildProcess[] }))
+vi.mock('node:child_process', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:child_process')>()
+  const spawn = ((...a: Parameters<typeof real.spawn>) => {
+    const c = (real.spawn as (...b: unknown[]) => import('node:child_process').ChildProcess)(...a)
+    made.children.push(c)
+    return c
+  }) as typeof real.spawn
+  return { ...real, spawn, default: { ...real, spawn } }
 })
+
+const gone = (c: import('node:child_process').ChildProcess): boolean => {
+  if (c.exitCode !== null || c.signalCode !== null) return true
+  try {
+    process.kill(c.pid!, 0)
+    return false
+  } catch {
+    return true
+  }
+}
+
+// Every path ends its child: whatever a test did, nothing it spawned is still running after it.
+afterAll(async () => {
+  await vi.waitFor(() => expect(made.children.filter((c) => !gone(c)).map((c) => c.pid)).toEqual([]), { timeout: 15_000, interval: 100 })
+}, 20_000)
 
 const LOOP_MS = 20_000
 const LOOP_TEST_MS = 40_000
@@ -32,13 +47,16 @@ const busy = `mark(); { const end = Date.now() + ${LOOP_MS}; while (Date.now() <
 const GUIDE = '# guide\n\nIntro.\n\n## windows()\nLists them.\n\n## launch(spec)\nStarts it.\n\n## windows(again)\nNot this one.\n'
 
 type Helpers = Record<string, unknown>
-const run = (script: string, helpers: Helpers = {}, over: { stop?: AbortSignal; timeoutMs?: number; onHelper?: (n: string | null) => void } = {}) =>
+type Over = { stop?: AbortSignal; timeoutMs?: number; onHelper?: (n: string | null) => void; memoryCapMb?: number; heapLimitMb?: number }
+const run = (script: string, helpers: Helpers = {}, over: Over = {}) =>
   runScriptInWorker({
     script,
     guide: GUIDE,
     stop: over.stop ?? new AbortController().signal,
     onHelper: over.onHelper ?? (() => {}),
     timeoutMs: over.timeoutMs,
+    memoryCapMb: over.memoryCapMb,
+    heapLimitMb: over.heapLimitMb,
     helpers: () => helpers
   })
 
@@ -83,17 +101,17 @@ describe('a busy loop is cut off', () => {
     expect(done.msInLoop).toBeLessThan(LOOP_MS - 10_000)
   })
 
-  it('a Stop already given returns at once, without starting a worker', async () => {
+  it('a Stop already given returns at once, without starting a child', async () => {
     const stop = new AbortController()
     stop.abort()
     const called = vi.fn()
-    const before = made.workers
+    const before = made.children.length
     const r = await run('await nop()', { nop: async () => called() }, { stop: stop.signal })
     expect(r).toEqual({ log: [], error: { message: 'stopped', at: 'stopped' } })
     expect(called).not.toHaveBeenCalled()
-    expect(made.workers).toBe(before)
+    expect(made.children.length).toBe(before)
     await run("log('x')")
-    expect(made.workers).toBe(before + 1)
+    expect(made.children.length).toBe(before + 1)
   })
 })
 
@@ -233,5 +251,96 @@ describe('help', () => {
     const names = ['windows', 'launch', 'nope', 'constructor', '__proto__', 'Intro.']
     const r = await run(`log(help()); ${names.map((n) => `log(help(${JSON.stringify(n)}))`).join('; ')}; log(help(42))`)
     expect(r).toEqual({ log: [own(), ...names.map((n) => own(n)), own(42)] })
+  })
+})
+
+// The script runs in a child process of its own, so memory it takes is the child's. The caps here are
+// lowered for the test (the defaults are 512 MB of rss and 256 MB of heap), and every script is bounded
+// well below a gigabyte, so a runner that kept the script in this process fails these tests without
+// endangering the run.
+describe('memory and crashes end only the child', () => {
+  /** This process's largest rss growth while `work` runs, sampled every 20 ms. */
+  async function peakGrowth<T>(work: () => Promise<T>): Promise<{ value: T; growthMb: number }> {
+    const base = process.memoryUsage.rss()
+    let peak = base
+    const iv = setInterval(() => (peak = Math.max(peak, process.memoryUsage.rss())), 20)
+    try {
+      const value = await work()
+      return { value, growthMb: (Math.max(peak, process.memoryUsage.rss()) - base) / (1024 * 1024) }
+    } finally {
+      clearInterval(iv)
+    }
+  }
+
+  it('filling large ArrayBuffers ends at "memory", and this process never holds them', { timeout: 40_000 }, async () => {
+    const script =
+      'const keep = []; for (let i = 0; i < 40; i++) { const b = new ArrayBuffer(16 * 1024 * 1024); new Uint8Array(b).fill(1); keep.push(b); ' +
+      "const t = Date.now() + 25; while (Date.now() < t) {} } log('survived')"
+    const r = await peakGrowth(() => run(script, {}, { memoryCapMb: 160, timeoutMs: 20_000 }))
+    expect(r.value).toEqual({ log: [], error: { at: 'memory', message: 'the script used more than 160 MB of memory and was ended' } })
+    expect(r.growthMb).toBeLessThan(150)
+    expect(await run("log('alive')")).toEqual({ log: ['alive'] })
+  })
+
+  it('a heap that keeps growing hits the worker heap limit and ends at "memory"', { timeout: 40_000 }, async () => {
+    const script = "const keep = []; for (let i = 0; i < 3e6; i++) keep.push({ i, s: 'x' + i, a: [i, i, i] }); log('survived')"
+    const r = await run(script, {}, { heapLimitMb: 32, timeoutMs: 20_000 })
+    expect(r).toEqual({ log: [], error: { at: 'memory', message: 'the script ran out of memory (its heap is limited to 32 MB)' } })
+  })
+
+  it('an allocation that makes V8 end the whole child is read as "memory" too', { timeout: 40_000 }, async () => {
+    const r = await run("const a = new Array(3e7).fill(0.5); log('survived')", {}, { heapLimitMb: 32, timeoutMs: 20_000 })
+    expect(r.log).toEqual([])
+    expect(r.error?.at).toBe('memory')
+    expect(r.error?.message).toMatch(/^the script ran out of memory/)
+  })
+
+  it('a child killed from outside mid-call ends at "crashed", and its pending helper settles without an unhandled rejection', async () => {
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    try {
+      let fail: ((e: Error) => void) | undefined
+      const before = made.children.length
+      const p = run("await slow(); log('never')", { slow: () => new Promise((_, reject) => (fail = reject)) })
+      await vi.waitFor(() => expect(fail).toBeTypeOf('function'))
+      made.children[before].kill('SIGKILL')
+      const r = await p
+      expect(r).toEqual({ log: [], error: { at: 'crashed', message: expect.stringMatching(/^the script's process ended unexpectedly/) } })
+      fail!(new Error('late'))
+      await new Promise((res) => setTimeout(res, 50))
+      expect(unhandled).not.toHaveBeenCalled()
+      expect(await run("log('alive')")).toEqual({ log: ['alive'] })
+    } finally {
+      process.off('unhandledRejection', unhandled)
+    }
+  })
+})
+
+describe('the child environment', () => {
+  it('is built from a short list, so no session, agent or node setting reaches it', () => {
+    const env = scriptChildEnv({
+      SystemRoot: 'C:/Windows',
+      TEMP: 't',
+      ASTERA_SESSION_ID: 'x',
+      ASTERA_HOST_LOG: 'l',
+      CLAUDE_CODE_SESSION_ID: 'c',
+      CODEX_HOME: 'h',
+      NODE_OPTIONS: '--require evil',
+      PATH: 'p',
+      ELECTRON_RUN_AS_NODE: '0'
+    })
+    expect(env).toEqual({ ELECTRON_RUN_AS_NODE: '1', SystemRoot: 'C:/Windows', TEMP: 't' })
+  })
+
+  it('is what the script process sees', async () => {
+    const keys = ['ASTERA_LEAK_TEST', 'CLAUDE_LEAK_TEST', 'CODEX_LEAK_TEST']
+    for (const k of keys) process.env[k] = '1'
+    try {
+      // The vm is not a boundary (scriptWorker.ts): a helper's constructor reaches the worker's process.
+      const r = await run("const p = log.constructor('return process')(); log(Object.keys(p.env).filter((k) => /^(ASTERA|CLAUDE|CODEX)_/i.test(k)).join(','))")
+      expect(r).toEqual({ log: [''] })
+    } finally {
+      for (const k of keys) delete process.env[k]
+    }
   })
 })
