@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Account, BranchRef, ScheduleConfig, SessionKind, Provider } from '../../../core/types'
+import type {
+  Account,
+  BranchRef,
+  ScheduleConfig,
+  SessionKind,
+  Provider,
+  WorktreeCreateProgress
+} from '../../../core/types'
 import type { UnattendedPermission } from '../../../core/chat/types'
 import { providerOf } from '../../../core/providers/meta'
 import { rollChainCandidates } from '../../../core/resume'
@@ -10,11 +17,13 @@ import { branchPickerState, orderBranchesForPicker } from '../../../core/worktre
 import { isWaitingReason, startBlockedBy, type StartBlocked } from '../../../core/sessions/startBlocked'
 import type { MessageKey } from '../../../core/i18n'
 import { toast } from '../lib/toast'
+import { trackWorktreeCreate } from '../lib/worktreeCreate'
 import { useI18n } from '../i18n/I18nProvider'
 import { AccountSelect } from './AccountSelect'
 import { BranchGlyph } from './BranchGlyph'
 import { Select, type SelectOption } from './Select'
 import { ScheduleFields } from './ScheduleFields'
+import { StartingOverlay } from './WorktreeCreateStatus'
 import { X } from 'lucide-react'
 
 const SOFT_LIMIT = 12
@@ -53,6 +62,8 @@ export function NewSessionDialog({
     useWorktree: boolean
     worktreeName?: string
     worktreeBaseRef?: string
+    /** Set when a worktree is being made: the id its progress and Cancel go by (worktrees.create's opId). */
+    worktreeOpId?: string
     repoRoot: string | null
     schedule?: ScheduleConfig
   }) => void | Promise<void>
@@ -115,6 +126,12 @@ export function NewSessionDialog({
   // seconds: fetch, worktree add, copying the includes). This flag also stops a second click from
   // creating two worktrees.
   const [starting, setStarting] = useState(false)
+  // What the worktree creation behind that wait is doing (stage, copy counts), whether it is done (the
+  // session is starting), and whether Cancel was pressed. The tracker is the one creation being watched.
+  const [wtProgress, setWtProgress] = useState<WorktreeCreateProgress | null>(null)
+  const [wtCreated, setWtCreated] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const wtTrack = useRef<ReturnType<typeof trackWorktreeCreate> | null>(null)
   const touched = useRef(false)
   // On success App closes this modal (setShowNew(false)), so finally can run after unmount
   const mounted = useRef(true)
@@ -323,6 +340,24 @@ export function NewSessionDialog({
   const start = async (): Promise<void> => {
     if (!cwd || starting) return
     setStarting(true)
+    setWtProgress(null)
+    setWtCreated(false)
+    setCancelling(false)
+    const track = withWorktree
+      ? trackWorktreeCreate(
+          {
+            on: (channel, cb) => window.api.on(channel, cb),
+            cancelCreate: (opId) => window.api.worktrees.cancelCreate(opId)
+          },
+          crypto.randomUUID(),
+          (p) => {
+            if (!mounted.current) return
+            if (p === null) setWtCreated(true)
+            else setWtProgress(p)
+          }
+        )
+      : null
+    wtTrack.current = track
     try {
       // onSpawn (App.spawn) handles failures internally with a toast and does not reject — both
       // success and failure come back here, and on success App has already closed the modal so the
@@ -342,12 +377,28 @@ export function NewSessionDialog({
         useWorktree: withWorktree,
         worktreeName: wtName.trim() || undefined,
         worktreeBaseRef: wtBaseRef || undefined,
+        ...(track ? { worktreeOpId: track.opId } : {}),
         repoRoot,
         schedule: schedOn ? (schedule ?? undefined) : undefined
       })
     } finally {
-      if (mounted.current) setStarting(false)
+      track?.stop()
+      wtTrack.current = null
+      if (mounted.current) {
+        setStarting(false)
+        setCancelling(false)
+        setWtProgress(null)
+        setWtCreated(false)
+      }
     }
+  }
+
+  // Cancel on the busy overlay: main aborts the creation and rolls back what it made; the create call
+  // then rejects with WORKTREE_CANCELLED, App says so, and this dialog stays open to try again.
+  const cancelWorktree = (): void => {
+    if (!wtTrack.current || cancelling) return
+    setCancelling(true)
+    wtTrack.current.cancel()
   }
 
   const blocked = startBlockedBy({
@@ -369,14 +420,18 @@ export function NewSessionDialog({
 
   return (
     // While starting, an outside click does not close this — the worktree creation and spawn already
-    // under way are not cancelled, so if only the modal disappears the user mistakes it for a cancel
+    // under way are not cancelled, so if only the modal disappears the user mistakes it for a cancel.
+    // Cancelling a worktree creation is the overlay's own Cancel button.
     <div className="modal-backdrop" onClick={() => !starting && onCancel()}>
       <div className="modal new-session" onClick={(e) => e.stopPropagation()}>
         {starting && (
-          <div className="loading-overlay">
-            <span className="loading-spinner" aria-hidden="true" />
-            {t(withWorktree ? 'session.new.startingWorktree' : 'session.new.starting')}
-          </div>
+          <StartingOverlay
+            withWorktree={withWorktree}
+            progress={wtProgress}
+            created={wtCreated}
+            cancelling={cancelling}
+            onCancel={cancelWorktree}
+          />
         )}
         <h2>{t('session.new.title')}</h2>
         {runningCount >= SOFT_LIMIT && (

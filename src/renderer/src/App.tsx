@@ -90,7 +90,7 @@ import { quitConfirmBody, updateConfirmBody } from './lib/quitConfirm'
 import { toggleSidebarView, type SidebarView } from '../../core/ui/sidebar'
 import { terminalsWithCreated } from './lib/terminalTabs'
 import * as hiddenProjects from './lib/hiddenProjects'
-import { worktreeErrorMessage } from './lib/worktreeErrors'
+import { worktreeErrorMessage, isCancelled as isWorktreeCancelled } from './lib/worktreeErrors'
 import { notifyCreated as notifyWorktreeCreated } from './lib/worktreeBus'
 import { useI18n } from './i18n/I18nProvider'
 import {
@@ -1502,6 +1502,8 @@ export default function App(): React.JSX.Element {
     useWorktree?: boolean
     worktreeName?: string
     worktreeBaseRef?: string
+    /** The new-session dialog's id for this creation — its progress and Cancel go by it */
+    worktreeOpId?: string
     repoRoot?: string | null
     schedule?: ScheduleConfig
     /** The old session id, for when an existing tab's session id has to be swapped, as on a restart */
@@ -1517,7 +1519,8 @@ export default function App(): React.JSX.Element {
         const created = await window.api.worktrees.create({
           repoPath: opts.repoRoot,
           name: opts.worktreeName,
-          baseRef: opts.worktreeBaseRef
+          baseRef: opts.worktreeBaseRef,
+          ...(opts.worktreeOpId ? { opId: opts.worktreeOpId } : {})
         })
         createdWorktreeName = created.info.name
         created.warnings.forEach((w) => toast.info(t(w.key, w.params)))
@@ -1589,7 +1592,13 @@ export default function App(): React.JSX.Element {
           }
         }
       }
-      const msg = worktreeErrorMessage(err instanceof Error ? err.message : String(err))
+      const raw = err instanceof Error ? err.message : String(err)
+      // Cancelled and fully rolled back: what the person asked for, said as a notice rather than a failure
+      if (isWorktreeCancelled(raw)) {
+        toast.info(t('worktree.error.cancelled'))
+        return
+      }
+      const msg = worktreeErrorMessage(raw)
       const message = t(msg.key, msg.params)
       // On a failure after the worktree was created, the user is also told that it remains, unrolled-back
       toast.error(

@@ -122,6 +122,8 @@ export const es: Catalog = {
   'worktree.error.orphanUnverifiable':
     'git no rastrea esta carpeta, así que no se puede saber si hay cambios sin confirmar.',
   'worktree.error.gitAddFailed': 'No se pudo crear el worktree de git.',
+  'worktree.error.cancelled': 'Se canceló la creación del worktree. Se deshizo todo lo creado.',
+  'worktree.error.rollbackIncomplete': 'No se pudo deshacer la creación del worktree. Elimina a mano la carpeta {path} y la rama {branch}.',
   'worktree.error.gitRemoveFailed': 'No se pudo eliminar el worktree de git.',
   'worktree.error.unreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se eliminó nada. Vuelve a intentarlo cuando sea accesible.',
   'worktree.error.rootUnreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
@@ -630,6 +632,11 @@ export const es: Catalog = {
   'session.new.blocked.checkingFolder': 'Comprobando la carpeta del proyecto',
   'session.new.starting': 'Iniciando la sesión…',
   'session.new.startingWorktree': 'Creando el worktree…',
+  'session.new.stage.fetch': 'Obteniendo la rama base…',
+  'session.new.stage.checkout': 'Extrayendo los archivos…',
+  'session.new.stage.copyIncludes': 'Copiando los archivos incluidos…',
+  'session.new.stage.copyCount': '{copied} / {total} · {files} / {filesTotal} archivos',
+  'session.new.cancelling': 'Cancelando…',
   // NewSessionDialog.tsx scheduler UI
   'session.new.schedLabel': 'Programador — ejecutar un comando periódicamente',
   'session.new.schedMode.interval': 'Cada N minutos',

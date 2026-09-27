@@ -138,6 +138,8 @@ export const ko = {
   'worktree.error.orphanUnproven': '소유권을 확인할 수 없어 삭제하지 않았습니다. 수동으로 확인 후 삭제하세요.',
   'worktree.error.orphanUnverifiable': 'git이 이 폴더를 추적하지 않아 미커밋 변경 여부를 확인할 수 없습니다.',
   'worktree.error.gitAddFailed': 'git worktree 생성에 실패했습니다.',
+  'worktree.error.cancelled': 'worktree 만들기를 취소했습니다. 만들던 것은 모두 되돌렸습니다.',
+  'worktree.error.rollbackIncomplete': 'worktree 만들기를 되돌리지 못했습니다. 남은 폴더 {path} 와 브랜치 {branch} 를 직접 지워 주세요.',
   'worktree.error.gitRemoveFailed': 'git worktree 제거에 실패했습니다.',
   'worktree.error.unreachable': '워크트리 폴더에 닿지 못했거나 확인하지 못해 아무것도 지우지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
   'worktree.error.rootUnreachable': '워크트리 폴더에 닿지 못했거나 확인하지 못해 워크트리를 만들지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
@@ -835,6 +837,11 @@ export const ko = {
   // the include copy, taking several seconds, so what is in progress is announced separately.
   'session.new.starting': '세션을 시작하는 중…',
   'session.new.startingWorktree': 'worktree를 만드는 중…',
+  'session.new.stage.fetch': '기준 브랜치를 가져오는 중…',
+  'session.new.stage.checkout': '파일을 체크아웃하는 중…',
+  'session.new.stage.copyIncludes': '포함 파일을 복사하는 중…',
+  'session.new.stage.copyCount': '{copied} / {total} · 파일 {files} / {filesTotal}',
+  'session.new.cancelling': '취소하는 중…',
   // NewSessionDialog.tsx scheduler UI — a merge from main brought in hardcoded text, later moved into this catalog
   'session.new.schedLabel': '스케쥴러 — 주기적으로 명령 자동 실행',
   'session.new.schedMode.interval': 'N분마다',

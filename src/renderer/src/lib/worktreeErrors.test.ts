@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { worktreeErrorMessage, dirtyCount, isOrphanUnverifiable } from './worktreeErrors'
+import { worktreeErrorMessage, dirtyCount, isOrphanUnverifiable, isCancelled } from './worktreeErrors'
 
 describe('worktreeErrorMessage', () => {
   it('IPC 프리픽스가 붙어도 코드를 찾는다', () => {
@@ -115,5 +115,24 @@ describe('worktreeErrorMessage, unreachable folders', () => {
     expect(
       worktreeErrorMessage("Error invoking remote method 'worktrees.create': Error: WORKTREE_ROOT_UNREACHABLE: folder not reachable: Z:\wt")
     ).toEqual({ key: 'worktree.error.rootUnreachable' })
+  })
+})
+
+// 취소와, 취소(또는 실패) 뒤 되돌리기가 끝나지 못한 경우
+describe('worktreeErrorMessage, cancel and rollback', () => {
+  it('WORKTREE_CANCELLED 는 취소 키로 가고, isCancelled 가 알아본다', () => {
+    const raw = "Error invoking remote method 'worktrees.create': Error: WORKTREE_CANCELLED: worktree creation was cancelled"
+    expect(worktreeErrorMessage(raw)).toEqual({ key: 'worktree.error.cancelled' })
+    expect(isCancelled(raw)).toBe(true)
+    expect(isCancelled('GIT_ADD_FAILED: x')).toBe(false)
+  })
+  it('ROLLBACK_INCOMPLETE 는 남은 경로와 브랜치를 싣는다 — 취소 문구가 섞여 있어도', () => {
+    const note = JSON.stringify({ path: 'C:\wt\repo\a b', branch: 'me/a', remains: ['folder'] })
+    const raw = `Error invoking remote method 'worktrees.create': Error: ROLLBACK_INCOMPLETE: ${note} — remove it by hand; the rollback after "WORKTREE_CANCELLED: worktree creation was cancelled" did not finish`
+    expect(worktreeErrorMessage(raw)).toEqual({
+      key: 'worktree.error.rollbackIncomplete',
+      params: { path: 'C:\wt\repo\a b', branch: 'me/a' }
+    })
+    expect(isCancelled(raw)).toBe(false)
   })
 })

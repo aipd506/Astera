@@ -121,6 +121,8 @@ export const ja: Catalog = {
   'worktree.error.orphanUnverifiable':
     'git がこのフォルダを追跡していないため、未コミットの変更の有無を確認できません。',
   'worktree.error.gitAddFailed': 'git worktree の作成に失敗しました。',
+  'worktree.error.cancelled': 'worktree の作成をキャンセルしました。作成途中のものはすべて元に戻しました。',
+  'worktree.error.rollbackIncomplete': 'worktree の作成を元に戻せませんでした。フォルダー {path} とブランチ {branch} を手動で削除してください。',
   'worktree.error.gitRemoveFailed': 'git worktree の削除に失敗しました。',
   'worktree.error.unreachable': 'worktree のフォルダーに到達できないか確認できなかったため、何も削除していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   'worktree.error.rootUnreachable': 'worktree のフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
@@ -624,6 +626,11 @@ export const ja: Catalog = {
   'session.new.blocked.checkingFolder': 'プロジェクトフォルダを確認しています',
   'session.new.starting': 'セッションを開始しています…',
   'session.new.startingWorktree': 'worktree を作成しています…',
+  'session.new.stage.fetch': 'ベースブランチを取得しています…',
+  'session.new.stage.checkout': 'ファイルをチェックアウトしています…',
+  'session.new.stage.copyIncludes': 'インクルードファイルをコピーしています…',
+  'session.new.stage.copyCount': '{copied} / {total} · ファイル {files} / {filesTotal}',
+  'session.new.cancelling': 'キャンセルしています…',
   // NewSessionDialog.tsx scheduler UI
   'session.new.schedLabel': 'スケジューラー — 定期的にコマンドを自動実行',
   'session.new.schedMode.interval': 'N分ごと',
