@@ -510,11 +510,17 @@ export class OrchestrationStore {
     return this.queue
   }
 
-  /** The queue means no concurrency inside here — this is the atomic tmp+rename write itself. */
+  /** The queue means no concurrency inside here — this is the atomic tmp+rename write itself.
+   *
+   *  **Compact, one line.** The file is rewritten whole on every commit and grows with every Run it
+   *  keeps (30 days, and unfinished Runs for good), and indentation made each rewrite a good third
+   *  larger for no reader: every reader is a plain `JSON.parse` (load, `readStateFile`, `host status`),
+   *  which reads the indented files earlier versions wrote just the same. A person who hand-edits the
+   *  file formats it in the editor first; the loader does not care which shape comes back. */
   private async writeNow(next: OrchState): Promise<void> {
     await fs.mkdir(path.dirname(this.filePath), { recursive: true })
     const tmp = `${this.filePath}.${randomUUID()}.tmp`
-    await fs.writeFile(tmp, JSON.stringify(next, null, 2), 'utf8')
+    await fs.writeFile(tmp, JSON.stringify(next), 'utf8')
     await fs.rename(tmp, this.filePath)
   }
 }

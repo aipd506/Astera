@@ -483,6 +483,34 @@ describe('OrchestrationStore', () => {
     expect(store.get().gates).toHaveLength(0)
   })
 
+  // **파일은 한 줄의 압축 JSON 으로 쓰인다.** 들여쓰기는 커질수록 쓰기·읽기·전송 모두에 값을 더
+  // 치르게 하고(164 KB 에서 자라는 파일), 읽는 쪽은 JSON.parse 뿐이라 모양을 가리지 않는다. 이 앞의
+  // 판들이 남긴 들여쓴 파일도 그대로 읽혀야 한다 — 이 파일은 프로세스보다 오래 산다.
+  it('압축 JSON 한 줄로 쓰고 다시 읽으며, 예전의 들여쓴 파일도 읽는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const a = new OrchestrationStore(file)
+    await a.load()
+    const s = withOpenDispatch()
+    s.dispatches[0].endedAt = NOW
+    s.dispatches[0].outcome = 'succeeded'
+    s.tasks[0].status = 'completed'
+    await a.save(s)
+    const raw = await fs.readFile(file, 'utf8')
+    expect(raw).toBe(JSON.stringify(s))
+    expect(raw).not.toContain('\n')
+    const b = new OrchestrationStore(file)
+    await b.load()
+    expect(b.get()).toEqual(a.get())
+
+    // 예전 판이 쓴 모양
+    await fs.writeFile(file, JSON.stringify(s, null, 2), 'utf8')
+    const c = new OrchestrationStore(file)
+    const r = await c.load()
+    expect(r.recovered).toBe(false)
+    expect(c.get().tasks[0].status).toBe('completed')
+    expect(c.get().runs).toHaveLength(1)
+  })
+
   describe('save 직렬화', () => {
     const runState = (id: string): OrchState =>
   stateFromLegacy({
