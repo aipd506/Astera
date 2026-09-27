@@ -174,10 +174,15 @@ describe('src/host/index.ts wiring (source guard)', () => {
     }
     return ''
   }
-  it('builds the manager, hands it to the orch, and announces the feature on win32', () => {
+  it('builds the manager, hands it to the orch, and announces the feature on every platform the workspace runs on', () => {
     expect(src).toMatch(/createWorkspaceManager\(/) // the manager is never built
     expect(orchCallArgument()).toMatch(/^\s*workspaces(: workspaces)?,?\s*$/m) // createHostOrch is not given it
-    expect(src).toMatch(/workspace:\s*process\.platform === 'win32'/) // the feature is announced everywhere, or nowhere
+    expect(src).toMatch(/workspace:\s*workspaceSupported\(process\.platform\)/) // announced on one platform only, or everywhere
+    expect(src).not.toMatch(/workspace:\s*process\.platform === 'win32'/) // the Windows only gate came back
+  })
+  it("starts each platform's desk through one starter, and checks the Linux tools on every app js", () => {
+    expect(src).toMatch(/startDesk:\s*workspaceDeskStarter\(\{\s*platform:\s*process\.platform/) // the PowerShell helper on every OS
+    expect(src).toMatch(/linuxTools:\s*\(\)\s*=>\s*probeLinuxTools\(realProbeDeps\(process\.env\)\)/) // the L1 refusal never fires
   })
   it('pushes only to apps that yield workspace, and captures only for them', () => {
     expect(src).toMatch(/y\.has\(HOST_YIELD_WORKSPACE\)/)

@@ -27,6 +27,6 @@ export function hostFeatures(a: { spawns: boolean; slack?: boolean; workspace?: 
   // `check --wait`, spawner or not, and it is exactly the Host an app drives in front of that is asked.
   // `journal` (Host journal P6) rides no spawner either: every Host commits.
   // `workspace` rides no spawner: the Host answers `app js` from any session, and index.ts asks for it
-  // on win32 only (agent workspace design, W1).
+  // on every platform the workspace runs on (workspaceSupported: win32, linux, darwin).
   return [...spawning, HOST_FEATURE_COORDINATOR_IDLE, HOST_FEATURE_JOURNAL, ...(a.workspace === true ? [HOST_FEATURE_WORKSPACE] : [])]
 }

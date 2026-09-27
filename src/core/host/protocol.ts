@@ -131,7 +131,7 @@ export const HOST_FEATURE_JOURNAL = 'journal'
 
 /** The Host runs agent app workspaces (agent workspace design): it answers `app-js` and the app only
  *  orch-calls `workspace-list`, `workspace-stop` and `workspace-close`, and pushes `workspace` to the
- *  apps that yield `workspace`. Announced by a win32 Host only (W1: Windows only in this scope). An app
+ *  apps that yield `workspace`. Announced by a win32, linux or darwin Host (workspaceSupported). An app
  *  sends none of the three calls to a Host without it. Additive, so HOST_PROTOCOL stays 3. */
 export const HOST_FEATURE_WORKSPACE = 'workspace'
 

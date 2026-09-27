@@ -47,7 +47,9 @@ import { hostCliPaths, hostWorkerBaseEnv } from '../core/host/spawn'
 import { readAgentAppEnabled } from '../core/settings/agentAppEnabled'
 import { DISPOSE_CAP_MS, createWorkspaceManager, disposeWithin } from './workspace/manager'
 import { createLaunchResolver } from './workspace/launch'
-import { spawnPowerShell, startDesktopHelper, writeDeskScript } from './workspace/desktopHelper'
+import { workspaceDeskStarter } from './workspace/platformDesk'
+import { probeLinuxTools, realProbeDeps } from './workspace/linuxTools'
+import { workspaceSupported } from '../core/workspace/platform'
 import { connectCdp } from './workspace/cdp'
 import { freePort, killTree, processStartTimes } from './workspace/native'
 
@@ -415,10 +417,8 @@ async function main(): Promise<void> {
       baseEnv: () => hostWorkerBaseEnv(process.env),
       projectRoot: projectRoots.resolve
     }),
-    startDesk: async (name) => {
-      const script = await writeDeskScript(path.join(profileDir, 'host'))
-      return startDesktopHelper({ name, spawn: () => spawnPowerShell(script), log: (m) => log.write(m) })
-    },
+    startDesk: workspaceDeskStarter({ platform: process.platform, profileDir, hostEnv: process.env, log: (m) => log.write(m) }),
+    linuxTools: () => probeLinuxTools(realProbeDeps(process.env)),
     connectCdp: (port, waitMs) => connectCdp(port, waitMs),
     freePort,
     killTree: (pid) => killTree(pid),
@@ -574,7 +574,7 @@ async function main(): Promise<void> {
       // Announced only when there is a spawner, so an app can tell a Host that starts sessions itself,
       // that it also owns worktrees.json (R5: the one decision is `spawner !== null`), that it drives
       // Jobs (R7) and that it rolls its sessions (R17) — the same one fact.
-      features: hostFeatures({ spawns: spawner !== null, slack: slackSdk !== null, workspace: process.platform === 'win32' }),
+      features: hostFeatures({ spawns: spawner !== null, slack: slackSdk !== null, workspace: workspaceSupported(process.platform) }),
       // An app's hello and its socket's close (N1). The server isolates the call too (`tellAppsChanged`).
       ...(wiring?.serverHooks ?? {}),
       // Both hear it: the driver's app-left rule and the rolling's app-gone watch. Each isolates itself.

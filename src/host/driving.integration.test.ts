@@ -781,7 +781,7 @@ describe('the Host drives with no app (§9.3)', { timeout: 40_000 }, () => {
 
   it('announces dispatch and rolling exactly when it announces spawn, and index.ts builds the driving and the rolling through their compositions (R7, N11, S6 R17)', () => {
     const src = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'index.ts'), 'utf8')
-    expect(src).toMatch(/features:\s*hostFeatures\(\{\s*spawns:\s*spawner !== null,\s*slack:\s*slackSdk !== null,\s*workspace:\s*process\.platform === 'win32'\s*\}\)/)
+    expect(src).toMatch(/features:\s*hostFeatures\(\{\s*spawns:\s*spawner !== null,\s*slack:\s*slackSdk !== null,\s*workspace:\s*workspaceSupported\(process\.platform\)\s*\}\)/)
     // Slack in the Host Task 3 (P1): the SDK is loaded before the server fixes its features, and
     // slack-owner rides its outcome. Mutation: announce `slack: true`, or load after startHostServer.
     expect(src.indexOf('await loadSlackSdk(')).toBeGreaterThan(-1)
