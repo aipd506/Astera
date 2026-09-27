@@ -38,9 +38,9 @@ script or close the desktop from there. It works the same when the Astera app is
 - **Cleanup.** Call `close()` when you are done. The desktop is also cleaned up when your session ends
   and after 10 minutes without a script.
 - Every helper is `async` except `log` and `help`; `await` them.
-- **Never loop without an `await`.** Your script runs inside Astera's own background process, beside
-  every session's terminal. A busy loop such as `while (!ready) {}` freezes Astera for every session:
-  after an `await`, neither the 60 second limit nor Stop can end it. Wait with `waitFor()` instead.
+- **A script that never finishes is cut off at 60 s.** A busy loop such as `while (!ready) {}` is ended
+  there, or when the person presses Stop, and reports `at: "timeout"` or `at: "stopped"`. Wait with
+  `waitFor()` instead, which returns as soon as the selector matches.
 
 ## The pattern
 

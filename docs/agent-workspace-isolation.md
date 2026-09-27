@@ -15,10 +15,10 @@ port. The script drives the page over CDP (`snapshot`, `click`, `fill`, `press`,
 `keys`). The person's screen, foreground window and pointer are never touched; the clipboard is shared.
 
 - **Where it lives.** `src/core/workspace/` (the JSON line protocol, the idle and leftover rules, the
-  script runner, and the helpers over the `Cdp` and `Desk` ports, none of it Windows specific) and
-  `src/host/workspace/` (the PowerShell desktop helper with its embedded C#, the CDP client, and
-  `WorkspaceManager`). The app shows a mirror tab per session (`AppMirrorPane`), in the agent's violet,
-  with the running helper, a Stop and a Close.
+  script gate, and the helpers over the `Cdp` and `Desk` ports, none of it Windows specific) and
+  `src/host/workspace/` (the PowerShell desktop helper with its embedded C#, the CDP client, the worker
+  each script runs in, and `WorkspaceManager`). The app shows a mirror tab per session
+  (`AppMirrorPane`), in the agent's violet, with the running helper, a Stop and a Close.
 - **What the agent is told.** `resources/skills/app-guide.md`, printed by `astera app help`, and the
   `astera-app` skill, installed while **Agent app workspace** is on in Settings.
 - **Lifecycle.** One desktop per session, cleaned up on `close()`, on Close in the tab, when the
@@ -78,6 +78,10 @@ changed one of them:
 - **P12. Frames.** JPEG, at most 960 px wide, about one a second while a script runs and an app yields
   `workspace`, plus one capture after each helper that changes the screen, coalesced while one is in
   flight; only the latest frame is kept.
+- **P13. Each script in a worker of its own (amended 2026-09-27).** The Host runs every `app js` script
+  in a worker thread, with the helpers left on its own thread behind the same gate, and ends the worker at
+  the 60 second deadline or on Stop. A busy loop, before or after an `await`, is cut off and no longer
+  freezes the Host or any session's terminal (`src/host/workspace/scriptWorker.ts`).
 
 Two more limits, found only once a real desktop and a real helper were driven (Task 3, Task 10):
 
@@ -96,12 +100,8 @@ Known limits, beside the spec's:
 - **A closed mirror tab reappears when the Host reconnects while that workspace is still open.** The
   Close in the app ends the tab, not the workspace; a workspace the Host still holds is shown again once
   the app reconnects.
-- **A script runs inside the Host process, which also holds every session's terminal.** A loop that
-  never awaits blocks the Host until the 60 second script deadline cuts it off. A loop that comes after
-  an `await` (for example `await launch(...); while (!ready) {}`) is never cut off: neither the deadline
-  nor Stop can reach it, so the Host and every session's terminal stay frozen until the Host is
-  restarted. Unbounded allocation can take the Host down the same way. The guide tells the agent never
-  to loop without an `await`. Running scripts in a worker the Host can terminate is a possible follow up.
+- **A script that allocates without end can still take the Host down.** Its worker shares the Host's
+  process and memory, so running it out of memory ends the process, not only the worker.
 - An Electron app that is not started with a debugging port gets the native helpers only.
   `snapshot().url` is empty for an address that is not http or https (a `file:` or custom scheme page).
 
