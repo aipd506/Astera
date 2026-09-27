@@ -5,9 +5,9 @@ import {
   PROBE_CACHE_TTL_MS,
   PROBE_CONCURRENCY,
   PROBE_DEGRADED_TTL_MS,
+  PROBE_STUCK_CEILING_MS,
   PROBE_TIMEOUT_MS,
   PathKeyedCache,
-  createLimiter,
   createProbePool,
   createProber,
   findOnPath,
@@ -29,20 +29,46 @@ const flush = async () => {
   for (let i = 0; i < 10; i++) await Promise.resolve()
 }
 
-/** An access that hangs for every path on Z: (an offline drive) and answers at once elsewhere. */
-function offlineZ(present: (p: string) => boolean = () => true) {
-  const hung: { p: string; d: ReturnType<typeof deferred<void>> }[] = []
+/**
+ * A model of the libuv threadpool as the probes see it: every call is one thread until it settles.
+ * Paths on a dead root (by rootOf) hang until the test settles them; the rest answer at once. It
+ * records the peak of calls in flight, overall and per root, for the probes it was built for.
+ */
+function threadpool(deadRoots: string[], present: (p: string) => boolean = () => true) {
   const started: string[] = []
+  const hung: { p: string; d: ReturnType<typeof deferred<void>> }[] = []
+  const inFlight = new Map<string, number>()
+  let total = 0
+  let peakTotal = 0
+  let peakPerRoot = 0
   const access = (p: string): Promise<void> => {
     started.push(p)
-    if (p.toUpperCase().startsWith('Z:')) {
+    const root = rootOf(p)
+    total++
+    inFlight.set(root, (inFlight.get(root) ?? 0) + 1)
+    peakTotal = Math.max(peakTotal, total)
+    peakPerRoot = Math.max(peakPerRoot, inFlight.get(root)!)
+    const done = () => {
+      total--
+      inFlight.set(root, inFlight.get(root)! - 1)
+    }
+    let call: Promise<void>
+    if (deadRoots.includes(root)) {
       const d = deferred<void>()
       hung.push({ p, d })
-      return d.promise
+      call = d.promise
+    } else {
+      call = present(p) ? Promise.resolve() : Promise.reject(new Error('ENOENT'))
     }
-    return present(p) ? Promise.resolve() : Promise.reject(new Error('ENOENT'))
+    return call.finally(done)
   }
-  return { access, hung, started }
+  return {
+    access,
+    started,
+    hung,
+    peak: () => ({ total: peakTotal, perRoot: peakPerRoot }),
+    inFlight: () => total
+  }
 }
 
 afterEach(() => {
@@ -50,21 +76,27 @@ afterEach(() => {
 })
 
 describe('the probe constants', () => {
-  it('are the approved values: 1.5 s per probe, 4 at once, about 5 minutes of cache, 10 s for a result with a timeout in it', () => {
+  it('are the approved values: 1.5 s per probe, 2 PATH calls in flight, 5 minutes of cache, 10 s with a timeout in it, a 2-minute stuck ceiling', () => {
     expect(PROBE_TIMEOUT_MS).toBe(1_500)
-    expect(PROBE_CONCURRENCY).toBe(4)
+    expect(PROBE_CONCURRENCY).toBe(2)
     expect(PROBE_CACHE_TTL_MS).toBe(5 * 60_000)
     expect(PROBE_DEGRADED_TTL_MS).toBe(10_000)
+    expect(PROBE_STUCK_CEILING_MS).toBe(2 * 60_000)
   })
 })
 
 describe('rootOf', () => {
   it('is the drive or the UNC share on Windows paths, and the first two segments on POSIX ones', () => {
     expect(rootOf('Z:\\tools\\bin\\bash.exe')).toBe('z:\\')
-    expect(rootOf('z:/tools')).toBe('z:\\')
-    expect(rootOf('\\\\nas\\share\\proj\\x')).toBe('\\\\nas\\share\\')
     expect(rootOf('/mnt/nas/proj/x')).toBe('/mnt/nas')
     expect(rootOf('/usr/bin')).toBe('/usr/bin')
+  })
+
+  it('gives every spelling of one drive or share the same key', () => {
+    for (const p of ['Z:', 'z:', 'Z:\\', 'z:/', 'Z:tools', 'Z:\\Tools\\x', '\\\\?\\Z:\\tools']) expect(rootOf(p)).toBe('z:\\')
+    for (const p of ['\\\\nas\\share', '\\\\NAS\\Share\\', '//nas/share/proj', '\\\\nas\\SHARE\\a\\b', '\\\\?\\UNC\\nas\\share\\x'])
+      expect(rootOf(p)).toBe('\\\\nas\\share\\')
+    expect(rootOf('\\\\nas\\other')).not.toBe(rootOf('\\\\nas\\share'))
   })
 })
 
@@ -75,7 +107,7 @@ describe('createProber', () => {
     expect(await probe('C:\\gone')).toBe('absent')
   })
 
-  it('a probe that never answers is cut at 1.5 s and counts as timed out, not before', async () => {
+  it('a probe that never answers is cut 1.5 s after its call starts, not before', async () => {
     vi.useFakeTimers()
     const probe = createProber({ access: () => new Promise<void>(() => {}), log: () => {}, pool: createProbePool() })
     let result: string | undefined
@@ -99,15 +131,19 @@ describe('createProber', () => {
   })
 
   it('keeps no more than LOGGED_PATHS_MAX paths in its logged-once memory', async () => {
-    vi.useFakeTimers()
     const log = vi.fn()
-    const probe = createProber({ access: () => new Promise<void>(() => {}), log, pool: createProbePool(10_000) })
-    // Distinct roots, so none is short-circuited by another's hung call.
-    const ps = Array.from({ length: LOGGED_PATHS_MAX + 1 }, (_, i) => probe(`\\\\srv${i}\\share\\x`))
+    const probe = createProber({ access: async () => {}, log, pool: createProbePool() })
+    // Every probe after the first two is refused without a call (two calls are stuck), and each is logged.
+    const pool = threadpool(['\\\\srv0\\share\\', '\\\\srv1\\share\\'])
+    const stuck = createProber({ access: pool.access, log, pool: createProbePool() })
+    vi.useFakeTimers()
+    const first = [stuck('\\\\srv0\\share\\x'), stuck('\\\\srv1\\share\\x')]
     await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
-    await Promise.all(ps)
-    expect(log).toHaveBeenCalledTimes(LOGGED_PATHS_MAX + 1)
-    expect(probe.loggedCount()).toBeLessThanOrEqual(LOGGED_PATHS_MAX)
+    await Promise.all(first)
+    for (let i = 0; i < LOGGED_PATHS_MAX + 5; i++) await stuck(`C:\\p${i}`)
+    expect(log.mock.calls.length).toBeGreaterThan(LOGGED_PATHS_MAX)
+    expect(stuck.loggedCount()).toBeLessThanOrEqual(LOGGED_PATHS_MAX)
+    expect(await probe('C:\\x')).toBe('present')
   })
 
   it('a hung call that finally rejects after its timeout is swallowed, not left unhandled', async () => {
@@ -129,99 +165,129 @@ describe('createProber', () => {
       process.off('unhandledRejection', unhandled)
     }
   })
+})
 
-  it('never has more than four calls in flight that are still within their time', async () => {
-    let inFlight = 0
-    let peak = 0
-    const ds: ReturnType<typeof deferred<void>>[] = []
-    const access = () => {
-      const d = deferred<void>()
-      ds.push(d)
-      inFlight++
-      peak = Math.max(peak, inFlight)
-      return d.promise.finally(() => inFlight--)
-    }
-    const probe = createProber({ access, pool: createProbePool(PROBE_CONCURRENCY), log: () => {} })
-    const results = Array.from({ length: 10 }, (_, i) => probe(`C:\\p${i}`))
-    await flush()
-    expect(ds).toHaveLength(4)
-    for (let i = 0; i < 10; i++) {
-      ds[i].resolve()
-      await flush()
-    }
-    expect(await Promise.all(results)).toEqual(Array(10).fill('present'))
-    expect(peak).toBe(4)
+describe('the PATH probe pool, against a model of the threadpool', () => {
+  it('never has more than 2 calls in flight, nor more than 1 per root, however many dead roots PATH holds', async () => {
+    vi.useFakeTimers()
+    const dead = ['z:\\', 'y:\\', '\\\\nas\\share\\', 'x:\\']
+    const tp = threadpool(dead)
+    const probe = createProber({ access: tp.access, pool: createProbePool(), log: () => {} })
+    const paths: string[] = []
+    for (const d of ['Z:', 'Y:', '\\\\nas\\share', 'X:']) for (const dir of ['a\\bin', 'b\\cmd', 'c']) for (const f of ['git.exe', 'bash.exe']) paths.push(`${d}\\${dir}\\${f}`)
+    for (let i = 0; i < 8; i++) paths.push(`C:\\local${i}\\bash.exe`)
+    const results = paths.map((p) => probe(p))
+    // Walk the clock past every timeout; the hung calls never settle.
+    for (let i = 0; i < 20; i++) await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS / 2)
+    const answered = await Promise.all(results)
+    expect(answered).toHaveLength(paths.length)
+    expect(tp.peak().total).toBeLessThanOrEqual(2)
+    expect(tp.peak().perRoot).toBe(1)
+    // Two stuck calls in all, whatever the number of dead roots: the rest never reached the disk.
+    expect(tp.hung).toHaveLength(2)
+    expect(tp.inFlight()).toBe(2)
   })
 
-  it('a reachable path queued behind four hung probes is found: its time starts when its call starts', async () => {
+  it('a second probe on a root waits for the first, and answers timeout at once when the first times out', async () => {
     vi.useFakeTimers()
-    const z = offlineZ()
-    const probe = createProber({ access: z.access, pool: createProbePool(PROBE_CONCURRENCY), log: () => {} })
-    const hung = ['Z:\\a\\pwsh.exe', 'Z:\\b\\pwsh.exe', 'Z:\\a\\powershell.exe', 'Z:\\b\\powershell.exe'].map((p) => probe(p))
-    let local: string | undefined
-    void probe('C:\\Windows\\System32\\cmd.exe').then((r) => (local = r))
+    const tp = threadpool(['z:\\'])
+    const probe = createProber({ access: tp.access, pool: createProbePool(), log: () => {} })
+    const a = probe('Z:\\a\\git.exe')
+    const b = probe('Z:\\b\\git.exe')
+    const c = probe('C:\\Windows\\System32\\cmd.exe')
     await flush()
-    expect(z.started).toHaveLength(4)
-    // The four are cut at 1.5 s and give their slots back although their calls still hang.
+    expect(tp.started).toEqual(['Z:\\a\\git.exe', 'C:\\Windows\\System32\\cmd.exe'])
+    expect(await c).toBe('present')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect([await a, await b]).toEqual(['timeout', 'timeout'])
+    expect(tp.started).toHaveLength(2)
+  })
+
+  it('a reachable path queued behind a stuck root is found: its own time starts when its call starts', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['z:\\'])
+    const probe = createProber({ access: tp.access, pool: createProbePool(), log: () => {} })
+    const hung = ['Z:\\a\\pwsh.exe', 'Z:\\b\\pwsh.exe', 'Z:\\a\\powershell.exe', 'Z:\\b\\powershell.exe'].map((p) => probe(p))
+    const local = probe('C:\\Windows\\System32\\cmd.exe')
     await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
     expect(await Promise.all(hung)).toEqual(Array(4).fill('timeout'))
-    await flush()
-    expect(local).toBe('present')
+    expect(await local).toBe('present')
+    expect(tp.hung).toHaveLength(1)
   })
 
-  it('a root with a call still hung answers timeout at once, without another call, until that call ends', async () => {
+  it('once two calls are stuck, PATH probes answer timeout without a call until one of them settles', async () => {
     vi.useFakeTimers()
-    const z = offlineZ()
-    const probe = createProber({ access: z.access, pool: createProbePool(), log: () => {} })
-    const first = probe('Z:\\a')
+    const dead = ['z:\\', 'y:\\']
+    const tp = threadpool(dead)
+    const probe = createProber({ access: tp.access, pool: createProbePool(), log: () => {} })
+    const first = [probe('Z:\\a'), probe('Y:\\a')]
     await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
-    expect(await first).toBe('timeout')
-    expect(await probe('Z:\\b')).toBe('timeout')
-    expect(z.started).toEqual(['Z:\\a'])
-    // The drive comes back: the hung call ends, and the root may be asked again.
-    z.hung[0].d.resolve()
+    await Promise.all(first)
+    expect(await probe('C:\\healthy')).toBe('timeout')
+    expect(tp.started).toEqual(['Z:\\a', 'Y:\\a'])
+    // Z: comes back: its call settles, one slot is free again, and the root may be asked again.
+    dead.splice(0, 1)
+    tp.hung[0].d.resolve()
     await flush()
-    const again = probe('Z:\\b')
-    await flush()
-    expect(z.started).toEqual(['Z:\\a', 'Z:\\b'])
-    z.hung[1].d.resolve()
-    expect(await again).toBe('present')
+    expect(await probe('C:\\healthy')).toBe('present')
+    expect(await probe('Z:\\b')).toBe('present')
   })
 
-  it('a probe that skips the queue (the cwd) answers while four queued probes hang', async () => {
+  it('a stuck call is let go after the ceiling (a POSIX hard mount), logged once, and its root may be asked again', async () => {
     vi.useFakeTimers()
-    const z = offlineZ()
-    const pool = createProbePool(PROBE_CONCURRENCY)
-    const pathProbe = createProber({ access: z.access, pool, log: () => {} })
-    const cwdProbe = createProber({ access: z.access, pool, log: () => {}, skipQueue: true })
-    const hung = ['Z:\\1', 'Z:\\2', 'Z:\\3', 'Z:\\4', 'Z:\\5'].map((p) => pathProbe(p))
-    await flush()
-    expect(await cwdProbe('C:\\work\\proj')).toBe('present')
+    const tp = threadpool(['/mnt/nas'])
+    const log = vi.fn()
+    const probe = createProber({ access: tp.access, pool: createProbePool(), log })
+    const a = probe('/mnt/nas/bin/bash')
     await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
-    await Promise.all(hung)
+    expect(await a).toBe('timeout')
+    expect(await probe('/mnt/nas/other')).toBe('timeout')
+    expect(tp.started).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+    const ceilingLines = log.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('ceiling'))
+    expect(ceilingLines).toHaveLength(1)
+    void probe('/mnt/nas/again')
+    await flush()
+    expect(tp.started).toEqual(['/mnt/nas/bin/bash', '/mnt/nas/again'])
+    // The old call settling late must not free a second slot.
+    tp.hung[0].d.resolve()
+    await flush()
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS * 2)
+    expect(log.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('ceiling'))).toHaveLength(2)
   })
 })
 
-describe('createLimiter', () => {
-  it('runs at most n tasks at once and starts the next as one finishes', async () => {
-    const run = createLimiter(2)
-    const ds = [deferred(), deferred(), deferred()]
-    const started: number[] = []
-    const all = ds.map((d, i) => run(async () => { started.push(i); await d.promise; return i }))
+describe('the cwd probe', () => {
+  it('is issued at once while PATH roots hang, and answers', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['z:\\', 'y:\\'])
+    const pool = createProbePool()
+    const pathProbe = createProber({ access: tp.access, pool, log: () => {} })
+    const cwdProbe = createProber({ access: tp.access, pool, log: () => {}, skipQueue: true })
+    const hung = ['Z:\\a', 'Z:\\b', 'Y:\\a', 'Y:\\b', 'X:\\a'].map((p) => pathProbe(p))
     await flush()
-    expect(started).toEqual([0, 1])
-    ds[1].resolve()
+    const r = cwdProbe('C:\\work\\proj')
     await flush()
-    expect(started).toEqual([0, 1, 2])
-    ds[0].resolve()
-    ds[2].resolve()
-    expect(await Promise.all(all)).toEqual([0, 1, 2])
+    expect(tp.started).toContain('C:\\work\\proj')
+    expect(await r).toBe('present')
+    // And again once both PATH calls are stuck.
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    await Promise.all(hung)
+    expect(await cwdProbe('C:\\work\\other')).toBe('present')
+    expect(tp.started).toContain('C:\\work\\other')
   })
 
-  it('a task that throws frees its slot and passes the error to its own caller', async () => {
-    const run = createLimiter(1)
-    await expect(run(async () => { throw new Error('boom') })).rejects.toThrow('boom')
-    expect(await run(async () => 7)).toBe(7)
+  it('answers timeout at once for a folder on a root with a stuck call', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['z:\\'])
+    const pool = createProbePool()
+    const pathProbe = createProber({ access: tp.access, pool, log: () => {} })
+    const cwdProbe = createProber({ access: tp.access, pool, log: () => {}, skipQueue: true })
+    const a = pathProbe('Z:\\bin\\git.exe')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    await a
+    expect(await cwdProbe('z:/projects/app')).toBe('timeout')
+    expect(tp.started).toEqual(['Z:\\bin\\git.exe'])
   })
 })
 

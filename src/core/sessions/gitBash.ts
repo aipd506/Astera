@@ -90,7 +90,7 @@ function gitBashProbePaths(env: Record<string, string | undefined>): string[] {
 }
 
 /**
- * `findGitBash` over an async probe: every candidate is probed at once (the probe's own limiter bounds
+ * `findGitBash` over an async probe: every candidate is probed at once (the probe's pool bounds
  * how many are in flight), then the same search runs over the answers, so the order it prefers — Git
  * for Windows, then a plain bash, never a WSL launcher — is exactly the sync one. A probe that timed out
  * counts as absent. Pure apart from `probe`.
