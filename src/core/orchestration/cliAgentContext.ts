@@ -161,7 +161,7 @@ const SESSION = {
       { name: 'merge', about: 'merge the worktrees before deleting' },
       {
         name: 'remove-worktrees',
-        about: 'delete the worktree folders too (with --merge, a folder with uncommitted or unchecked changes is kept and listed in worktreesKept)'
+        about: 'delete the worktree folders too (a folder with uncommitted or unchecked changes is kept and listed in worktreesKept)'
       }
     ]
   },

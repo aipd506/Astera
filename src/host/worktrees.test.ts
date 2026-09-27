@@ -192,6 +192,18 @@ describe('createHostWorktrees', () => {
     const p = await h.wt.makeRunWorktree({ repoPath: repo, name: 'run-a' })
     expect((await onDisk()).items.map((w: { path: string }) => w.path)).toEqual([p])
   })
+  // run-delete --remove-worktrees without --merge: a folder holding uncommitted work is kept, with its
+  // session left open, and said so; nothing in it is lost.
+  it('keeps a worktree with uncommitted changes, and closes nothing in it', async () => {
+    const h = rig()
+    const p = await h.wt.fork({ repoPath: repo, name: 'dirty' })
+    h.session('ses_d', p)
+    await fs.writeFile(path.join(p, 'unsaved.txt'), 'x')
+    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 1, dirty: [p] })
+    await expect(fs.stat(path.join(p, 'unsaved.txt'))).resolves.toBeTruthy()
+    expect(h.ptys.liveEntries()).toHaveLength(1)
+    expect((await onDisk()).items).toHaveLength(1)
+  })
   // Rule 11 and R9: the Host closes the finished worker in the tree and removes it.
   it('removes a worktree after closing the finished session in it', async () => {
     const a = { dispatches: [] as OrchState['dispatches'] }
@@ -199,7 +211,7 @@ describe('createHostWorktrees', () => {
     const p = await h.wt.fork({ repoPath: repo, name: 'a' })
     h.session('ses_w', p)
     a.dispatches = [dispatch('ses_w', p, { endedAt: '2026-09-24T01:00:00.000Z', outcome: 'succeeded' })]
-    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [] })
+    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [], uncommitted: 0 })
     expect(h.ptys.liveEntries()).toEqual([])
     await expect(fs.stat(p)).rejects.toThrow()
     expect((await onDisk()).items).toEqual([])
@@ -212,7 +224,7 @@ describe('createHostWorktrees', () => {
       const held = rig({ state: () => ({ ...emptyState(), dispatches: [dispatch('ses_w', p, end)] }) })
       // the same registry file and the same live session, seen by a Host that holds that Dispatch
       held.session('ses_w', p)
-      expect(await held.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+      expect(await held.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
       expect(held.ptys.liveEntries()).toHaveLength(1)
       await fs.stat(p)
     }
@@ -222,7 +234,7 @@ describe('createHostWorktrees', () => {
     const p = await h.wt.fork({ repoPath: repo, name: 'a' })
     h.open('pty_run', p, { kind: 'run', id: 'r1', restore: { configName: 'dev' } })
     expect(h.wt.isPathInUse(p)).toBe('RUN:dev')
-    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
     await fs.stat(p)
   })
   // Review M3: a reap closes sessions only, and does not wait on what it may not close.
@@ -232,7 +244,7 @@ describe('createHostWorktrees', () => {
     h.open('pty_run', p, { kind: 'run', id: 'r1', restore: { configName: 'dev' } })
     h.open('pty_sh', p, { kind: 'terminal', id: 't1', restore: {} })
     const started = Date.now()
-    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
     expect(Date.now() - started).toBeLessThan(2_000)
     expect(h.ptys.liveEntries().map((e) => e.id)).toEqual(['pty_run', 'pty_sh'])
   })
@@ -242,7 +254,7 @@ describe('createHostWorktrees', () => {
     const p = await h.wt.fork({ repoPath: repo, name: 'a' })
     const broken = rig({ ptys: { liveEntries: () => { throw new Error('registry gone') }, kill: () => {} } })
     expect(broken.wt.isPathInUse(p)).toBe('UNKNOWN')
-    expect(await broken.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+    expect(await broken.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
     await fs.stat(p)
     void h
   })
@@ -277,13 +289,13 @@ describe('createHostWorktrees', () => {
     const p = await h.wt.fork({ repoPath: repo, name: 'a' })
     h.ptys.open({ id: 'pty_nocwd', file: 'x', args: [], opts: { cols: 80, rows: 24, env: {} } as never, meta: { kind: 'session', id: 's0', restore: {} } })
     expect(h.wt.isPathInUse(p)).toBeNull()
-    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+    expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
     await fs.stat(p)
     expect(h.logs.some((l) => /state gone/.test(l))).toBe(true)
     const q = await h.wt.fork({ repoPath: repo, name: 'b' })
     const fine = rig()
     fine.ptys.open({ id: 'pty_nocwd', file: 'x', args: [], opts: { cols: 80, rows: 24, env: {} } as never, meta: { kind: 'session', id: 's0', restore: {} } })
-    expect(await fine.wt.removeWorktrees([q])).toEqual({ failed: [] })
+    expect(await fine.wt.removeWorktrees([q])).toEqual({ failed: [], uncommitted: 0 })
     expect(fine.ptys.liveEntries()).toHaveLength(1)
   })
   // Binding 7 (the ruling on plan risk 3): an attached app is asked about what it runs itself.
@@ -296,7 +308,7 @@ describe('createHostWorktrees', () => {
       const a = appSays(async () => null)
       const h = rig({ app: a.app })
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [], uncommitted: 0 })
       expect(a.asked).toEqual([[HOST_ACT_PATH_IN_USE, [p]], [HOST_ACT_PATH_IN_USE, [p]]])
     })
     it('keeps the folder, and closes nothing, when the app runs something there', async () => {
@@ -304,7 +316,7 @@ describe('createHostWorktrees', () => {
       const h = rig({ app: a.app })
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
       h.session('ses_w', p)
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
       expect(h.ptys.liveEntries()).toHaveLength(1)
       await fs.stat(p)
       expect(h.logs.some((l) => /SESSION:local shell/.test(l))).toBe(true)
@@ -313,7 +325,7 @@ describe('createHostWorktrees', () => {
       for (const answer of [async () => { throw new AppUnreachable('the Astera app is attached but did not answer') }, async () => { throw new Error('this app cannot do worktreePathInUse') }, async () => 42]) {
         const h = rig({ app: appSays(answer).app })
         const p = await h.wt.fork({ repoPath: repo, name: `a${Math.random().toString(36).slice(2, 6)}` })
-        expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+        expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
         await fs.stat(p)
       }
     })
@@ -324,7 +336,7 @@ describe('createHostWorktrees', () => {
       const h = rig({ app: a.app })
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
       h.session('ses_w', p)
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
       expect(a.asked).toHaveLength(2)
       expect(h.ptys.liveEntries()).toEqual([])
       await fs.stat(p)
@@ -335,14 +347,14 @@ describe('createHostWorktrees', () => {
     it('keeps the folder when asking about the app throws', async () => {
       const h = rig({ app: { hasApp: () => { throw new Error('server gone') }, act: async () => null } })
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
       await fs.stat(p)
     })
     it('asks nobody when no app is attached', async () => {
       const a = appSays(async () => 'SESSION:x')
       const h = rig({ app: { ...a.app, hasApp: () => false } })
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [], uncommitted: 0 })
       expect(a.asked).toEqual([])
     })
   })
@@ -387,14 +399,14 @@ describe('createHostWorktrees', () => {
     it('proceeds when no app has said it is running', async () => {
       const h = rig()
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [], uncommitted: 0 })
       await expect(fs.stat(p)).rejects.toThrow()
     })
     it('proceeds when the app that said so has ended', async () => {
       const h = rig()
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
       await appPid(await deadPid())
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [], uncommitted: 0 })
       await expect(fs.stat(p)).rejects.toThrow()
     })
     it('asks the app instead when it is attached', async () => {
@@ -402,7 +414,7 @@ describe('createHostWorktrees', () => {
       const h = rig({ app: { hasApp: () => true, act: async (name, args) => { asked.push([name, args]); return null } } })
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
       await appPid(process.pid)
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [], uncommitted: 0 })
       expect(asked).toEqual([[HOST_ACT_PATH_IN_USE, [p]], [HOST_ACT_PATH_IN_USE, [p]]])
     })
     // The app can leave between the start of the removal and the folder itself.
@@ -411,7 +423,7 @@ describe('createHostWorktrees', () => {
       const h = rig({ app: { hasApp: () => attached, act: async () => { attached = false; return null } } })
       const p = await h.wt.fork({ repoPath: repo, name: 'a' })
       await appPid(process.pid)
-      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p] })
+      expect(await h.wt.removeWorktrees([p])).toEqual({ failed: [p], uncommitted: 0 })
       await fs.stat(p)
     })
   })

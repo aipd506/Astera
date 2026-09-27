@@ -961,10 +961,10 @@ export function hostOrchDeps(a: {
   const madeHere = new Set<string>()
   const discardRunWorktree = async (path: string): Promise<{ removed: boolean; inUse: boolean }> => {
     const local = a.local
-    const remove: (paths: string[]) => Promise<{ failed: string[] }> =
+    const remove: NonNullable<OrchServerDeps['removeWorktrees']> =
       local && local.owns('removeWorktrees', [])
         ? (paths) => local.removeWorktrees(paths)
-        : (forward('removeWorktrees', false) as (paths: string[]) => Promise<{ failed: string[] }>)
+        : (forward('removeWorktrees', false) as NonNullable<OrchServerDeps['removeWorktrees']>)
     try {
       const { failed } = await remove([path])
       const inUse = failed.length > 0

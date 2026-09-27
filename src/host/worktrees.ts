@@ -308,7 +308,8 @@ export function createHostWorktrees(d: HostWorktreesDeps): HostWorktrees {
   const deps = worktreeDeps({
     integrate: integrateInto,
     reap,
-    log: d.log
+    log: d.log,
+    git: d.git
   })
 
   const fork = async (a: { repoPath: string; name?: string }): Promise<string> => {

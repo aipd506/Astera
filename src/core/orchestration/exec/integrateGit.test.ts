@@ -105,6 +105,23 @@ describe('integrateWorktrees — the rules of the one automatic writer into a re
     expect(r).toMatchObject({ kind: 'human' }); expect((r as { reason: string }).reason).toContain('CHERRY_PICK_HEAD')
     expect(ops).toEqual([])
   })
+  // Rule 3's markers are asked asynchronously, with a time limit (worktrees/presence.ts): a sync look
+  // froze the thread on a git dir on a dead share. A marker whose presence is not known is not read as
+  // absent: nothing is merged, and the reason says the check could not be made.
+  it('never merges when a marker could not be checked, and never looks at it synchronously', async () => {
+    const a = await worked('a')
+    const asked: string[] = []
+    const r = await integrateWorktrees(repo, [a], {}, ctx({ presence: async (p) => { asked.push(p); return 'unreachable' } }))
+    expect(r).toMatchObject({ kind: 'human' })
+    expect((r as { reason: string }).reason).toContain('확인하지 못해')
+    expect(asked.length).toBeGreaterThan(0)
+    expect(ops).toEqual([])
+  })
+  it('reads the markers through the presence check (present means busy)', async () => {
+    const a = await worked('a')
+    const r = await integrateWorktrees(repo, [a], {}, ctx({ presence: async (p) => (p.endsWith('REVERT_HEAD') ? 'present' : 'missing') }))
+    expect(r).toMatchObject({ kind: 'human' }); expect((r as { reason: string }).reason).toContain('REVERT_HEAD')
+  })
   // Rule 4's other half: a status that could not be read is said as such, not read as clean.
   // Mutation check: drop the `!status.ok` refusal; red.
   it('never merges when the folder status cannot be read', async () => {
@@ -344,10 +361,17 @@ describe('reapWorktree (rule 11)', () => {
     expect(logs.join('\n')).toMatch(/is not an app worktree/)
   })
 })
+/** A git whose `status --porcelain` answers per folder: a string is its output, null is a failure. */
+const statusGit = (by: Record<string, string | null>): typeof git =>
+  (async (args: string[], opts?: { cwd?: string }) => {
+    const out = args[0] === 'status' ? by[opts?.cwd ?? ''] : ''
+    return out === null || out === undefined ? { ok: false, stdout: '', stderr: 'boom' } : { ok: true, stdout: out, stderr: '' }
+  }) as typeof git
+const cleanGit = (async () => ({ ok: true, stdout: '', stderr: '' })) as unknown as typeof git
 describe('worktreeDeps', () => {
   it('mergeWorktrees skips folders already gone, and nothing left is success', async () => {
     const calls: unknown[] = []
-    const d = worktreeDeps({ integrate: async (...a) => { calls.push(a); return { kind: 'merged', uncommitted: 0 } }, reap: async () => true, log: (m) => logs.push(m), exists: () => false })
+    const d = worktreeDeps({ integrate: async (...a) => { calls.push(a); return { kind: 'merged', uncommitted: 0 } }, reap: async () => true, log: (m) => logs.push(m), presence: async () => 'missing' })
     expect(await d.mergeWorktrees('D:/p', ['D:/gone'])).toEqual({ ok: true, merged: [], uncommitted: 0 })
     expect(calls).toEqual([])   // no git runs over an empty list (it would still check the folder)
     expect(logs.join('\n')).toMatch(/skipping 1 removed worktree/)
@@ -357,7 +381,7 @@ describe('worktreeDeps', () => {
       integrate: async () => ({ kind: 'merged', uncommitted: 0, unchecked: ['D:/wt/a'] }),
       reap: async () => true,
       log: () => {},
-      exists: () => true
+      presence: async () => 'present'
     })
     expect(await d.mergeWorktrees('D:/p', ['D:/wt/a'])).toEqual({
       ok: true,
@@ -372,7 +396,7 @@ describe('worktreeDeps', () => {
       integrate: async () => ({ kind: 'merged', uncommitted: 3, dirty: ['D:/wt/a'] }),
       reap: async () => true,
       log: () => {},
-      exists: () => true
+      presence: async () => 'present'
     })
     expect(await d.mergeWorktrees('D:/p', ['D:/wt/a', 'D:/wt/b'])).toEqual({
       ok: true,
@@ -384,15 +408,69 @@ describe('worktreeDeps', () => {
 
   it('mergeWorktrees merges without reaping and turns a refusal into a reason', async () => {
     const calls: unknown[] = []
-    const d = worktreeDeps({ integrate: async (into, paths, opts) => { calls.push([into, paths, opts]); return { kind: 'human', reason: 'dirty' } }, reap: async () => true, log: () => {}, exists: () => true })
+    const d = worktreeDeps({ integrate: async (into, paths, opts) => { calls.push([into, paths, opts]); return { kind: 'human', reason: 'dirty' } }, reap: async () => true, log: () => {}, presence: async () => 'present' })
     expect(await d.mergeWorktrees('D:/p', ['D:/a'])).toEqual({ ok: false, reason: 'dirty' })
     expect(calls).toEqual([['D:/p', ['D:/a'], { reap: false }]])
   })
   it('removeWorktrees does not count a folder already gone as failed, and reports the ones it could not remove', async () => {
     // A real reap refuses a folder that is gone ("not an app worktree"), so only the skip keeps it out of failed.
     const tried: string[] = []
-    const d = worktreeDeps({ integrate: async () => ({ kind: 'merged', uncommitted: 0 }), reap: async (p) => { tried.push(p); return p === 'D:/ok' }, log: () => {}, exists: (p) => p !== 'D:/gone' })
-    expect(await d.removeWorktrees(['D:/gone', 'D:/ok', 'D:/stuck'])).toEqual({ failed: ['D:/stuck'] })
+    const d = worktreeDeps({ integrate: async () => ({ kind: 'merged', uncommitted: 0 }), reap: async (p) => { tried.push(p); return p === 'D:/ok' }, log: () => {}, presence: async (p) => (p === 'D:/gone' ? 'missing' : 'present'), git: cleanGit })
+    expect(await d.removeWorktrees(['D:/gone', 'D:/ok', 'D:/stuck'])).toEqual({ failed: ['D:/stuck'], uncommitted: 0 })
     expect(tried).toEqual(['D:/ok', 'D:/stuck'])
+  })
+  // 폴더가 있는지는 비동기로 묻는다(presence.ts). 확인하지 못한 폴더는 없는 것이 아니다.
+  it('mergeWorktrees does not drop a folder it could not reach: not merged, reported unchecked', async () => {
+    const calls: unknown[] = []
+    const d = worktreeDeps({
+      integrate: async (_i, paths) => { calls.push(paths); return { kind: 'merged', uncommitted: 0 } },
+      reap: async () => true, log: (m) => logs.push(m),
+      presence: async (p) => (p === 'D:/dead' ? 'unreachable' : p === 'D:/busy' ? 'refused' : 'present')
+    })
+    expect(await d.mergeWorktrees('D:/p', ['D:/ok', 'D:/dead', 'D:/busy'])).toEqual({
+      ok: true, merged: ['D:/ok'], uncommitted: 0, unchecked: ['D:/dead', 'D:/busy']
+    })
+    expect(calls).toEqual([['D:/ok']])
+    expect(logs.join('\n')).toMatch(/could not reach 2 worktree/)
+  })
+  it('mergeWorktrees with only unreachable folders merges nothing and says so', async () => {
+    const d = worktreeDeps({ integrate: async () => { throw new Error('must not run') }, reap: async () => true, log: () => {}, presence: async () => 'unreachable' })
+    expect(await d.mergeWorktrees('D:/p', ['D:/dead'])).toEqual({ ok: true, merged: [], uncommitted: 0, unchecked: ['D:/dead'] })
+  })
+  // run-delete --remove-worktrees 가 --merge 없이도 커밋되지 않은 변경을 지우지 않는다.
+  it('removeWorktrees keeps a dirty folder, and one whose status or presence is unknown; removes the rest', async () => {
+    const tried: string[] = []
+    const d = worktreeDeps({
+      integrate: async () => ({ kind: 'merged', uncommitted: 0 }),
+      reap: async (p) => { tried.push(p); return true },
+      log: (m) => logs.push(m),
+      presence: async (p) => (p === 'D:/dead' ? 'unreachable' : p === 'D:/busy' ? 'refused' : 'present'),
+      git: statusGit({ 'D:/clean': '', 'D:/dirty': ' M a.txt\n?? b.txt', 'D:/nostatus': null })
+    })
+    expect(await d.removeWorktrees(['D:/clean', 'D:/dirty', 'D:/nostatus', 'D:/dead', 'D:/busy'])).toEqual({
+      failed: ['D:/dirty', 'D:/nostatus', 'D:/dead', 'D:/busy'],
+      uncommitted: 2,
+      dirty: ['D:/dirty'],
+      unchecked: ['D:/nostatus', 'D:/dead', 'D:/busy']
+    })
+    expect(tried).toEqual(['D:/clean'])
+  })
+  it('removeWorktrees never runs git in a folder it could not reach', async () => {
+    const cwds: (string | undefined)[] = []
+    const d = worktreeDeps({
+      integrate: async () => ({ kind: 'merged', uncommitted: 0 }), reap: async () => true, log: () => {},
+      presence: async () => 'unreachable',
+      git: (async (_a: string[], o?: { cwd?: string }) => { cwds.push(o?.cwd); return { ok: true, stdout: '', stderr: '' } }) as typeof git
+    })
+    await d.removeWorktrees(['D:/dead'])
+    expect(cwds).toEqual([])
+  })
+  it('a presence check that rejects counts as unknown, never as gone', async () => {
+    const d = worktreeDeps({
+      integrate: async () => ({ kind: 'merged', uncommitted: 0 }), reap: async () => true, log: () => {},
+      presence: async () => { throw new Error('boom') }, git: cleanGit
+    })
+    expect(await d.removeWorktrees(['D:/x'])).toEqual({ failed: ['D:/x'], uncommitted: 0, unchecked: ['D:/x'] })
+    expect(await d.mergeWorktrees('D:/p', ['D:/x'])).toEqual({ ok: true, merged: [], uncommitted: 0, unchecked: ['D:/x'] })
   })
 })

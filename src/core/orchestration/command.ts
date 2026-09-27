@@ -248,8 +248,19 @@ export interface OrchServerDeps {
   >
   /** 이 경로들의 워크트리를 폴더째 지운다 — `run-delete --remove-worktrees` 가 부른다. 그 안에서
    *  도는 세션을 닫는 일까지 배선이 한다(removeWorktree 의 isPathInUse 가 그러지 않으면 거절한다).
-   *  실패한 경로는 돌려준다 — 삭제를 막지는 않지만 응답에 실어 사람이 알 수 있게 한다. */
-  removeWorktrees?(paths: string[]): Promise<{ failed: string[] }>
+   *  실패한 경로는 돌려준다 — 삭제를 막지는 않지만 응답에 실어 사람이 알 수 있게 한다.
+   *
+   *  **커밋되지 않은 변경이 있거나 그것을 확인하지 못한 폴더는 지우지 않는다**(배선은
+   *  integrateGit.ts 의 worktreeDeps). `failed` 는 지워지지 않은 경로 전부이고, 그 가운데 이유가
+   *  있어 남긴 것을 `dirty`(변경이 있다)와 `unchecked`(폴더에 닿지 못했거나 status 를 읽지 못했다)가
+   *  말한다. `uncommitted` 는 센 변경의 수다. 셋 다 optional 이다: 그것을 모르는 배선(옛 앱)은
+   *  `failed` 만 준다. */
+  removeWorktrees?(paths: string[]): Promise<{
+    failed: string[]
+    uncommitted?: number
+    dirty?: string[]
+    unchecked?: string[]
+  }>
   /** Risk-6's orphan cleanup: best-effort removal of a Run worktree `run-start` just made with
    *  `makeRunWorktree`, once starting the coordinator then failed. **Never decides that command's
    *  status** — a refused or failed cleanup is logged wherever it is wired (the Host's own version,
@@ -2031,7 +2042,6 @@ export async function handleCommand(
         mergeFacts = { uncommitted: merged.uncommitted ?? 0, unchecked: merged.unchecked ?? [], dirty: merged.dirty ?? [] }
       }
       const keep = new Set([...(mergeFacts?.dirty ?? []), ...(mergeFacts?.unchecked ?? [])])
-      const worktreesKept = worktrees.filter((p) => keep.has(p))
       const toRemove = worktrees.filter((p) => !keep.has(p))
       // 백업은 지우기 전에. reset 과 같은 관례이고 같은 이유다 — 되돌릴 수 없는 삭제에 .bak 하나는
       // 값이 싸다. 실패해도 삭제를 막지 않는다(deps.backup 이 스스로 접는다).
@@ -2039,23 +2049,37 @@ export async function handleCommand(
       // 폴더 삭제는 상태를 지우기 전에 한다 — 지운 뒤에는 어느 워크트리였는지 상태에서 읽을 수 없다.
       // 실패한 경로는 응답에 실어 보낸다: 삭제 자체를 막을 이유는 없고(기록을 지우는 것과 폴더를
       // 지우는 것은 다른 일이다) 사람이 남은 것을 알아야 한다.
+      //
+      // **--merge 없이도 같은 규칙이다.** 지우는 쪽(removeWorktrees)이 폴더마다 status 를 읽어,
+      // 커밋되지 않은 변경이 있거나 확인하지 못한 폴더는 남기고 그 사실을 돌려준다. 그 폴더는
+      // `worktreesFailed` 가 아니라 `worktreesKept` 로 싣는다 — 실패가 아니라 이유가 있어 남긴 것이다.
       let worktreesFailed: string[] = []
+      let removeFacts: { uncommitted?: number; dirty: string[]; unchecked: string[] } | null = null
       // **세 조건이 모두 참이어야 폴더가 지워진다.** 어느 하나가 거짓이면 조용히 아무 일도 일어나지
       // 않고, 사용자에게는 "체크했는데 폴더가 남았다"로 보인다 — 실제로 그렇게 보고됐고, 그때 로그에
       // 아무 흔적이 없어서 어느 조건이 걸렸는지 알 수 없었다. reapWorktree 는 자기 결과를 남기지만
       // 그것은 불린 뒤의 이야기다. 여기서 한 줄을 남기면 그 물음이 로그로 답해진다.
+      if (args.removeWorktrees === true && toRemove.length > 0 && deps.removeWorktrees) {
+        const r = await deps.removeWorktrees(toRemove)
+        removeFacts = { uncommitted: r.uncommitted, dirty: r.dirty ?? [], unchecked: r.unchecked ?? [] }
+        const keptHere = new Set([...removeFacts.dirty, ...removeFacts.unchecked])
+        for (const p of keptHere) keep.add(p)
+        worktreesFailed = r.failed.filter((p) => !keptHere.has(p))
+      } else if (args.removeWorktrees === true && keep.size === 0)
+        deps.log?.(
+          `run-delete ${id}: asked to remove worktrees but did not — ` +
+            `worktrees=${worktrees.length} wired=${deps.removeWorktrees !== undefined}`
+        )
+      const worktreesKept = worktrees.filter((p) => keep.has(p))
       if (args.removeWorktrees === true && worktreesKept.length > 0)
         deps.log?.(
           `run-delete ${id}: kept ${worktreesKept.length} worktree(s) with uncommitted or unchecked changes: ` +
             worktreesKept.join(', ')
         )
-      if (args.removeWorktrees === true && toRemove.length > 0 && deps.removeWorktrees)
-        worktreesFailed = (await deps.removeWorktrees(toRemove)).failed
-      else if (args.removeWorktrees === true && worktreesKept.length === 0)
-        deps.log?.(
-          `run-delete ${id}: asked to remove worktrees but did not — ` +
-            `worktrees=${worktrees.length} wired=${deps.removeWorktrees !== undefined}`
-        )
+      // 센 사실. 병합이 셌거나 지우는 쪽이 셌을 때만 싣는다 — 아무도 세지 않았으면 0 이 아니라 모른다.
+      const counted = mergeFacts !== null || removeFacts?.uncommitted !== undefined
+      const uncommitted = (mergeFacts?.uncommitted ?? 0) + (removeFacts?.uncommitted ?? 0)
+      const uncommittedUnchecked = [...(mergeFacts?.unchecked ?? []), ...(removeFacts?.unchecked ?? [])]
       const before = s.tasks.filter((t) => t.runId !== undefined && doomed.has(t.runId)).length
       // Job 을 지목했으면 계획째, 회차를 지목했으면 그 기록만.
       await deps.setState(
@@ -2065,9 +2089,9 @@ export async function handleCommand(
         deleted: id,
         tasks: before,
         ...(worktreesFailed.length > 0 ? { worktreesFailed } : {}),
-        // run-merge 와 같은 이름이다. 병합했을 때만 싣는다 — 병합하지 않았으면 센 적이 없다
-        ...(mergeFacts ? { uncommitted: mergeFacts.uncommitted } : {}),
-        ...(mergeFacts && mergeFacts.unchecked.length > 0 ? { uncommittedUnchecked: mergeFacts.unchecked } : {}),
+        // run-merge 와 같은 이름이다. 병합했거나 지우는 쪽이 셌을 때만 싣는다 — 아니면 센 적이 없다
+        ...(counted ? { uncommitted } : {}),
+        ...(uncommittedUnchecked.length > 0 ? { uncommittedUnchecked } : {}),
         ...(args.removeWorktrees === true && worktreesKept.length > 0 ? { worktreesKept } : {})
       })
     }

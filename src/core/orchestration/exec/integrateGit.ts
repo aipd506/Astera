@@ -6,7 +6,6 @@
 //
 // This module must stay importable by the Host: no electron, nothing from src/main.
 
-import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { OrchServerDeps } from '../command'
 import { isSamePath } from '../../files/tree'
@@ -14,6 +13,7 @@ import { createWorktree } from '../../worktrees/create'
 import { workerBaseFailure } from '../../worktrees/base'
 import { git as realGit, gitDir, gitVersionAtLeast, listGitWorktrees, GIT_WRITE_TIMEOUT_MS } from '../../worktrees/git'
 import { removeWorktree } from '../../worktrees/remove'
+import { defaultPresenceCheck, type CheckResult, type PresenceCheck } from '../../worktrees/presence'
 import type { WorktreeStore } from '../../worktrees/registry'
 
 /** 프로젝트 폴더가 **서 있는 브랜치**에서 워크트리를 하나 만들고 그 경로를 낸다.
@@ -108,6 +108,9 @@ export interface IntegrateContext {
    *  produced by a real repository. Default to the real ones. */
   git?: typeof realGit
   gitAtLeast?: typeof gitVersionAtLeast
+  /** Whether a marker file is in the git dir, asked asynchronously with a time limit. Test seam;
+   *  defaults to the process-wide presence check (worktrees/presence.ts). */
+  presence?: PresenceCheck
 }
 
 /** 워크트리에서 끝난 일을 **합칠 폴더에 실제로 합친다.** 그 폴더는 부르는 쪽이 정한다 —
@@ -189,16 +192,34 @@ export async function integrateWorktrees(
         `이 Gate 를 해결해 주세요.`
     }
   // 표시 파일과 사람에게 보일 이름. rebase-apply 는 `git am` 도 쓴다.
-  const busy = (
-    [
-      ['rebase-merge', 'rebase'],
-      ['rebase-apply', 'rebase 또는 am'],
-      ['BISECT_LOG', 'bisect'],
-      ['CHERRY_PICK_HEAD', 'cherry-pick'],
-      ['REVERT_HEAD', 'revert'],
-      ['MERGE_HEAD', '병합']
-    ] as const
-  ).find(([marker]) => existsSync(path.join(dir, marker)))
+  //
+  // **표시 파일은 비동기로, 시간 제한을 두고 묻는다**(worktrees/presence.ts). 동기 existsSync 는 끊긴
+  // 네트워크 공유 위의 git 디렉터리에서 스레드를 20~60초 세웠다. 있는지 모르는 표시 파일은 없는 것으로
+  // 읽지 않는다 — 진행 중인 작업 위에 병합을 거는 것이 이 확인이 막으려는 바로 그것이다.
+  const markers = [
+    ['rebase-merge', 'rebase'],
+    ['rebase-apply', 'rebase 또는 am'],
+    ['BISECT_LOG', 'bisect'],
+    ['CHERRY_PICK_HEAD', 'cherry-pick'],
+    ['REVERT_HEAD', 'revert'],
+    ['MERGE_HEAD', '병합']
+  ] as const
+  let busy: (typeof markers)[number] | undefined
+  for (const m of markers) {
+    const at = await (ctx.presence ?? defaultPresenceCheck)(path.join(dir, m[0])).catch(() => 'unreachable' as const)
+    if (at === 'missing') continue
+    if (at === 'present') {
+      busy = m
+      break
+    }
+    return {
+      kind: 'human',
+      reason:
+        `합칠 폴더의 git 디렉터리(${dir})에서 진행 중인 작업이 있는지 확인하지 못해 워크트리를 합치지 ` +
+        `않았습니다(${m[0]} 에 닿지 못했습니다 — 네트워크 드라이브가 끊겼을 수 있습니다). 폴더에 닿는지 ` +
+        `확인한 뒤 이 Gate 를 해결해 주세요.`
+    }
+  }
   if (busy)
     return {
       kind: 'human',
@@ -498,12 +519,35 @@ export function worktreeDeps(ctx: {
   integrate(into: string, paths: string[], opts: { reap?: boolean }): Promise<Integration>
   reap(p: string): Promise<boolean>
   log(m: string): void
-  /** Test seam; defaults to existsSync. */
-  exists?(p: string): boolean
+  /** Whether a folder is there, asked asynchronously with a time limit. Test seam; defaults to the
+   *  process-wide presence check (worktrees/presence.ts). */
+  presence?: PresenceCheck
+  /** Test seam for the status reads; defaults to the real git. */
+  git?: typeof realGit
 }): {
   mergeWorktrees: NonNullable<OrchServerDeps['mergeWorktrees']>
   removeWorktrees: NonNullable<OrchServerDeps['removeWorktrees']>
 } {
+  // **폴더가 있는지는 비동기로, 시간 제한을 두고 묻는다**(worktrees/presence.ts). 동기 existsSync 는
+  // 끊긴 네트워크 공유 위의 워크트리 하나에서 앱의 메인 스레드나 Host 의 스레드를 20~60초 세웠다.
+  // 그리고 **"없다"는 부모가 답하는 ENOENT 뿐이다.** 시간 초과·거절·그 밖의 오류는 "모른다"이고,
+  // 모르는 폴더는 없는 것으로 치지 않는다: 합치지도, 지우지도 않고 unchecked 로 올린다. 그 폴더에서
+  // git 을 돌리지도 않는다 — 닿지 않는 폴더를 cwd 로 띄우는 것 자체가 같은 자리에서 멈출 수 있다.
+  const presenceOf = async (p: string): Promise<CheckResult> => {
+    try {
+      return await (ctx.presence ?? defaultPresenceCheck)(p)
+    } catch {
+      return 'unreachable'
+    }
+  }
+  const sort = async (paths: string[]): Promise<{ alive: string[]; gone: string[]; unknown: string[] }> => {
+    const answers = await Promise.all(paths.map((p) => presenceOf(p)))
+    return {
+      alive: paths.filter((_, i) => answers[i] === 'present'),
+      gone: paths.filter((_, i) => answers[i] === 'missing'),
+      unknown: paths.filter((_, i) => answers[i] !== 'present' && answers[i] !== 'missing')
+    }
+  }
   return {
     // `run-merge`(사람이 상세 창에서 누른다)와 `run-delete --merge` 가 부른다.
     // integrateWorktrees 의 'agent'(충돌 → 에이전트에게 넘김)도 여기서는 실패다 — 사람이 결과를
@@ -520,42 +564,82 @@ export function worktreeDeps(ctx: {
     // 띄워 넣은, 살아서 일하고 있는 워크트리가 레지스트리 필터 때문에 조용히 걸러지던 것이 바로
     // 그 결함이었다. 재료 `paths`(runWorktrees, `Dispatch.cwd` 를 본다)에 남을 수 있는 건 이제
     // 하나뿐이다: 폴더 자체가 사라진 경우(통합 병합이 이미 걷어 갔거나 예약 회차가 걷혔다) —
-    // 그것만 거른다. 존재 확인은 동기다: 폴더가 없으면 합칠 것이 없고, 있으면 그 뒤는 git 의 일이다.
+    // 그것만 거른다. 닿지 않는 폴더는 합치지 않고 unchecked 로 올린다: 그 폴더의 커밋되지 않은
+    // 변경을 셀 수 없고, `run-delete --merge --remove-worktrees` 는 unchecked 인 폴더를 남긴다.
     mergeWorktrees: async (runCwd, paths) => {
-      const alive = paths.filter((p) => (ctx.exists ?? existsSync)(p))
-      const gone = paths.filter((p) => !(ctx.exists ?? existsSync)(p))
+      const { alive, gone, unknown } = await sort(paths)
       if (gone.length > 0)
         ctx.log(`merge: skipping ${gone.length} removed worktree(s): ${gone.join(', ')}`)
+      if (unknown.length > 0)
+        ctx.log(`merge: could not reach ${unknown.length} worktree(s), not merged: ${unknown.join(', ')}`)
+      const unreached = unknown.length > 0 ? { unchecked: unknown } : {}
       // 남은 것이 없으면 성공이다 — 합칠 것이 없는 것은 실패가 아니고, 여기서 실패로 내면 사람이
       // 손쓸 수 없는 이유로 병합 버튼과 삭제가 막힌다.
-      if (alive.length === 0) return { ok: true, merged: [], uncommitted: 0 }
+      if (alive.length === 0) return { ok: true, merged: [], uncommitted: 0, ...unreached }
       const r = await ctx.integrate(runCwd, alive, { reap: false })
-      return r.kind === 'merged'
-        ? {
-            ok: true,
-            merged: alive,
-            uncommitted: r.uncommitted,
-            ...(r.unchecked ? { unchecked: r.unchecked } : {}),
-            ...(r.dirty ? { dirty: r.dirty } : {})
-          }
-        : { ok: false, reason: r.reason }
+      if (r.kind !== 'merged') return { ok: false, reason: r.reason }
+      const unchecked = [...(r.unchecked ?? []), ...unknown]
+      return {
+        ok: true,
+        merged: alive,
+        uncommitted: r.uncommitted,
+        ...(unchecked.length > 0 ? { unchecked } : {}),
+        ...(r.dirty ? { dirty: r.dirty } : {})
+      }
     },
     // `run-delete --remove-worktrees` 가 부른다. 순차로 지운다 — reapWorktree 가 세션을 닫고
     // 상태가 바뀌기를 기다리므로, 병렬로 돌리면 서로의 폴링이 남의 세션을 기다린다.
+    //
+    // **커밋되지 않은 변경이 있거나 그것을 확인하지 못한 폴더는 지우지 않는다.** reap 은 --force 로
+    // 지우므로, 그 변경은 폴더와 함께 조용히 사라진다. `run-delete --merge` 는 병합이 센 사실로 이미
+    // 그런 폴더를 남겼지만, --merge 없이는 아무도 세지 않았다. 그래서 여기서 폴더마다 status 를
+    // 읽는다(`--porcelain` 의 기본값: 추적되지 않는 파일도 센다, integrateWorktrees 와 같다). 읽지
+    // 못한 status 는 0 이 아니라 "모른다"다. 남긴 폴더는 `failed`(지워지지 않았다)에도 들고,
+    // `dirty`·`unchecked` 가 그 이유를 말한다. 자동 통합 병합의 reap 은 이 길을 지나지 않는다.
     removeWorktrees: async (paths) => {
       const failed: string[] = []
+      const dirty: string[] = []
+      const unchecked: string[] = []
+      let uncommitted = 0
       for (const p of paths) {
+        const at = await presenceOf(p)
         // **이미 없는 폴더는 실패가 아니다.** Dispatch 의 cwd 는 워크트리를 지운 뒤에도 상태에 남으므로
         // 그런 경로가 여기까지 온다 — reapWorktree 는 그것을 "앱 워크트리가 아니다" 로 거절하고 false 를
         // 내는데, 그것을 failed 에 담으면 사용자에게 "이 폴더를 지우지 못했습니다" 로 보고된다.
         // 요청한 끝 상태는 이미 그것이다. mergeWorktrees 가 같은 이유로 같은 판정을 한다.
-        if (!(ctx.exists ?? existsSync)(p)) {
+        if (at === 'missing') {
           ctx.log(`remove: skipping already removed worktree ${p}`)
+          continue
+        }
+        if (at !== 'present') {
+          ctx.log(`remove: could not reach worktree ${p} (${at}), kept`)
+          unchecked.push(p)
+          failed.push(p)
+          continue
+        }
+        const st = await (ctx.git ?? realGit)(['status', '--porcelain'], { cwd: p })
+        if (!st.ok) {
+          ctx.log(`remove: could not check uncommitted changes in ${p}, kept: git status failed: ${st.stderr}`)
+          unchecked.push(p)
+          failed.push(p)
+          continue
+        }
+        const n = st.stdout === '' ? 0 : st.stdout.split('\n').length
+        if (n > 0) {
+          ctx.log(`remove: ${p} has ${n} uncommitted change(s), kept`)
+          uncommitted += n
+          dirty.push(p)
+          failed.push(p)
           continue
         }
         if (!(await ctx.reap(p))) failed.push(p)
       }
-      return { failed }
+      return {
+        failed,
+        uncommitted,
+        ...(dirty.length > 0 ? { dirty } : {}),
+        ...(unchecked.length > 0 ? { unchecked } : {})
+      }
     }
   }
 }

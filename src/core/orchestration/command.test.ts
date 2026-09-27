@@ -3903,6 +3903,58 @@ describe('run-delete — 병합·워크트리 선택', () => {
     expect(r.body).not.toHaveProperty('uncommittedUnchecked')
   })
 
+  // --merge 없이도 같은 규칙이다. 폴더를 지우는 쪽(removeWorktrees)이 폴더마다 status 를 읽고,
+  // 커밋되지 않은 변경이 있거나 확인하지 못한 폴더는 남긴다. 응답은 --merge 때와 같은 이름으로 싣는다.
+  it('merge 없이 removeWorktrees 만 골라도 커밋되지 않은 변경이나 확인하지 못한 폴더는 남긴 것으로 알린다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      removeWorktrees: async () => ({
+        failed: ['D:/wt/a'],
+        uncommitted: 3,
+        dirty: ['D:/wt/a']
+      })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 3, worktreesKept: ['D:/wt/a'] })
+    // 남긴 폴더는 실패가 아니다 — 이유가 있어 남긴 것이다
+    expect(r.body).not.toHaveProperty('worktreesFailed')
+    expect(r.body).not.toHaveProperty('uncommittedUnchecked')
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+
+  it('merge 없이 removeWorktrees 만 골랐고 상태를 확인하지 못한 폴더는 uncommittedUnchecked 와 worktreesKept 에 싣는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      removeWorktrees: async () => ({ failed: ['D:/wt/a'], uncommitted: 0, unchecked: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 0, uncommittedUnchecked: ['D:/wt/a'], worktreesKept: ['D:/wt/a'] })
+    expect(r.body).not.toHaveProperty('worktreesFailed')
+  })
+
+  it('merge 없이 removeWorktrees 만 골랐고 모두 지웠으면 센 수만 싣고 worktreesKept 는 싣지 않는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, { removeWorktrees: async () => ({ failed: [] as string[], uncommitted: 0 }) })
+    const r = await call(deps, 'run-delete', { id: runId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 0 })
+    expect(r.body).not.toHaveProperty('worktreesKept')
+  })
+
+  it('merge 와 함께일 때 지우는 쪽이 새로 남긴 폴더도 worktreesKept 에 더한다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async (_cwd: string, paths: string[]) => ({ ok: true as const, merged: paths, uncommitted: 0 }),
+      removeWorktrees: async () => ({ failed: ['D:/wt/a'], uncommitted: 1, dirty: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 1, worktreesKept: ['D:/wt/a'] })
+    expect(r.body).not.toHaveProperty('worktreesFailed')
+  })
+
   it('워크트리를 쓰지 않은 Run 은 merge 를 골라도 병합을 부르지 않는다', async () => {
     const merged: string[][] = []
     const deps = Object.assign(makeDeps(), {
