@@ -35,7 +35,7 @@ import type { ExternalGitChange, GitRef, PendingGitOperation } from '../../core/
 import { classifyTransition } from '../../core/git/transition'
 import { isAsteraOperation, OPERATION_GRACE_MS } from '../../core/git/provenance'
 import { explainedByHostMerges, type HostMergeRecord } from '../../core/git/hostMerges'
-import { isSamePath } from '../../core/files/tree'
+import { comparablePath, isSamePath } from '../../core/files/tree'
 import type { SessionCheck, SessionWorkUnit } from '../../core/workUnit/types'
 import type { OpenSessionTask } from '../../core/types'
 import { isOpen } from '../../core/workUnit/status'
@@ -50,6 +50,15 @@ import type { ProjectGitSnapshot, WorkUnitState, WorkUnitStore } from './store'
  *  계속 덧붙이는 동안 우리도 정확히 그 조건에 놓인다. */
 const DEBOUNCE_MS = 150
 const MAX_WAIT_MS = 1000
+
+/** `.git` 이벤트를 한 회차로 모으는 창. git 한 동작(commit, pull, checkout)은 index·HEAD·refs 를
+ *  잇달아 건드려 감시자가 이벤트를 여러 번 내는데, 회차마다 프로젝트당 git 을 여러 번 띄우므로
+ *  (Windows 에서는 프로세스 하나마다 바이러스 백신 값이 붙는다) 그 무더기를 회차 하나로 받는다.
+ *  트랜스크립트 쪽 디바운스(DEBOUNCE_MS)보다 넓고, 상한(MAX_WAIT_MS)은 그대로 적용된다.
+ *
+ *  **회차가 도는 동안 온 git 이벤트는 타이머를 걸지 않는다** — 그 회차가 끝난 뒤 이 창만큼 기다려
+ *  회차 하나를 더 부른다(onGitChanged, flush). 몇 개가 왔든 뒤따르는 회차는 하나다. */
+export const GIT_COALESCE_MS = 300
 
 /** 지금 보고 있는 세션 하나. **수집기는 세션을 스스로 찾지 않는다** — 어느 세션이 어느 프로바이더의
  *  어느 파일을 쓰는지는 ipc.ts 만 아는 일이고(claude 는 statusLine 페이로드, codex 는 rollout 경로),
@@ -193,6 +202,16 @@ export class WorkUnitCollector {
   /** 디바운스 상한이 만료되는 시각. null 이면 대기 중인 방아쇠가 없다 */
   private ceilingAt: number | null = null
   private pendingGit = false
+  /** git 이벤트의 창(GIT_COALESCE_MS)이 끝나는 시각. 이보다 먼저는 발화하지 않는다(상한 안에서).
+   *  null 이면 걸린 창이 없다 */
+  private gitWindowUntil: number | null = null
+  /** flush 의 회차 고리가 **지금 돌고 있다.** 그 사이 온 git 이벤트는 타이머 대신 gitFollowUp 을 든다 */
+  private flushRunning = false
+  /** 도는 회차 사이에 git 이벤트가 왔다 — 그 회차가 끝나면 회차 하나를 더 건다 */
+  private gitFollowUp = false
+  /** 큐에 올랐지만 **아직 시작하지 않은** flush. 그 사이 부른 flush 는 새 회차를 올리지 않고 이것에
+   *  합류한다 — 시작하지 않은 회차는 시작할 때 모든 상태를 새로 읽으므로 따로 돌 이유가 없다 */
+  private queuedFlush: Promise<void> | null = null
   /** 회차를 겹치지 않게 한다. FileWatcher·GitWatcher 의 직렬화 고리와 같은 관례 */
   private chain: Promise<void> = Promise.resolve()
   /** 프로젝트마다 "이 실행에서 마지막으로 물어본 git 상태". gitWatcher 의 콜백은 인자가 없으므로
@@ -334,6 +353,7 @@ export class WorkUnitCollector {
     this.running = false
     this.disarm()
     this.pendingGit = false
+    this.gitFollowUp = false
     this.seeded = false
     return this.enqueue(() => this.closeAll())
   }
@@ -638,7 +658,13 @@ export class WorkUnitCollector {
    *  다음 회차가 직접 읽는다 (gitWatcher 의 emit 은 인자가 없는 콜백이다) */
   onGitChanged(): void {
     this.pendingGit = true
-    this.arm()
+    // 회차가 도는 중이다 — 그 회차가 끝난 뒤 하나만 더 돈다(flush 의 끝). 여기서 타이머를 걸면
+    // 도는 동안 창이 여러 번 닫혀 뒤따르는 회차가 여럿 줄을 선다
+    if (this.flushRunning) {
+      this.gitFollowUp = true
+      return
+    }
+    this.arm(GIT_COALESCE_MS)
   }
 
   /** 에이전트가 한 턴을 시작했다 (session:busy → true). **그 구간을 등록 목록에 넣는다.**
@@ -872,16 +898,34 @@ export class WorkUnitCollector {
   /** 한 회차를 지금 돌린다. **디바운스를 거치지 않는 유일한 길**이다 — 대기 중인 타이머는 취소한다.
    *  테스트가 150ms 를 기다리지 않고 확인할 수 있는 것이 이 메서드 덕분이다. */
   flush(): Promise<void> {
+    // 아직 시작하지 않은 회차가 있으면 그것에 합류한다 — 그 회차가 시작할 때 이 부름이 보려던
+    // 상태를 전부 읽는다(queuedFlush)
+    if (this.queuedFlush) return this.queuedFlush
     const round = this.enqueue(async () => {
-      this.disarm()
-      if (!this.running) return
-      const wantGit = this.pendingGit
-      this.pendingGit = false
-      await this.round(wantGit)
+      this.queuedFlush = null
+      this.flushRunning = true
+      try {
+        this.disarm()
+        if (!this.running) return
+        const wantGit = this.pendingGit
+        this.pendingGit = false
+        await this.round(wantGit)
+      } finally {
+        this.flushRunning = false
+        // 도는 동안 git 이벤트가 왔다 — 몇 개였든 회차 하나를 더 건다. 창만큼 기다리므로 회차가
+        // 끝난 직후에 오는 이벤트도 같은 회차로 모인다. (그 사이 이미 다른 flush 가 줄을 섰다면
+        // 그것이 pendingGit 을 읽으므로 따로 걸지 않는다.)
+        if (this.gitFollowUp) {
+          this.gitFollowUp = false
+          if (this.pendingGit && this.queuedFlush === null) this.arm(GIT_COALESCE_MS)
+        }
+      }
     })
     // **After the round, not in it.** Each call below enqueues its own link, which can only run
     // once the round's link is done — so this must not be awaited from inside that link.
-    return round.then(() => this.applyGoalSignals())
+    const p = round.then(() => this.applyGoalSignals())
+    this.queuedFlush = p
+    return p
   }
 
   /** Turn the boundaries this round saw into declarations. Runs outside the round's own link.
@@ -1058,7 +1102,10 @@ export class WorkUnitCollector {
   // ── 회차 ────────────────────────────────────────────────────────────
 
   /** 한 회차. 트랜스크립트는 늘 따라잡고(증분이라 싸다), git 은 방아쇠가 있었을 때만 묻는다 —
-   *  `readGitRef` 는 프로세스를 둘 띄우므로 매 회차마다 부를 수 있는 값이 아니다. */
+   *  `readGitRef` 도 프로세스를 띄우므로 매 회차마다 부를 수 있는 값이 아니다.
+   *
+   *  **같은 읽기는 한 회차 안에서 한 번이다**(`RoundReads`). 같은 폴더를 다른 철자로 적은 두
+   *  프로젝트(대소문자, 끝 구분자)는 그룹이 둘이어도 ref·status·조상·범위를 한 번씩만 묻는다. */
   private async round(doGit: boolean): Promise<void> {
     const sessions = await this.deps.listSessions()
     for (const s of sessions) this.known.set(s.sessionId, s)
@@ -1068,11 +1115,12 @@ export class WorkUnitCollector {
       return
     }
     await this.syncWatchers(sessions)
+    const reads = new RoundReads()
     for (const [projectPath, group] of groupByProject(sessions)) {
       const state = this.stateOf(projectPath)
       let dirty = false
       for (const s of group) dirty = (await this.tail(state, s)) || dirty
-      if (doGit) dirty = (await this.gitRound(state, projectPath)) || dirty
+      if (doGit) dirty = (await this.gitRound(state, projectPath, reads)) || dirty
       if (dirty) await this.persist(projectPath, state)
     }
   }
@@ -1345,14 +1393,15 @@ export class WorkUnitCollector {
   }
 
   /** `.git` 이 움직였다. 전이를 판정하고, Astera 가 한 일이 아니면 외부 변경으로 남긴다 */
-  private async gitRound(state: WorkUnitState, projectPath: string): Promise<boolean> {
+  private async gitRound(state: WorkUnitState, projectPath: string, reads: RoundReads): Promise<boolean> {
+    const repo = comparablePath(projectPath)
     // **`readRef` 를 부르기 전에 찍는다 (fix round 2, review m5).** `readRef` 는 프로세스를 띄우고
     // 몇 십 ms 가 걸릴 수 있다 — 그 사이에 Host 의 병합이 끝나 `endedAt` 을 적었는데, 다 돌아온
     // 뒤에 찍으면 그 `endedAt` 이 이 스냅샷의 `capturedAt` 보다 먼저가 되어 `sinceMs` 경계
     // (`explainedByHostMerges` 호출부의 주석)에 걸려 걸러진다. 읽기 전에 찍으면 그런 경합에서도
     // 항상 앞선다.
     const capturedAt = this.nowIso()
-    const after = await this.deps.git.readRef(projectPath)
+    const after = await reads.get(`ref\0${repo}`, () => this.deps.git.readRef(projectPath))
     // **앞은 저장된 스냅샷이 먼저다.** 그것이 "Astera 가 마지막으로 견준 상태"이고, 앱이 꺼져 있던
     // 동안의 pull·브랜치 전환·rebase 가 다시 켠 첫 회차에서 **보통의 전이**로 판정되는 이유다
     // (설계 §9, EG §41-10·§42-17). 메모리 캐시를 먼저 보면 그 회차 전에 refOf 가 지금 HEAD 를
@@ -1380,17 +1429,30 @@ export class WorkUnitCollector {
     if (!before) return dirty // 처음 본 저장소 — 비교할 앞이 없으니 기준선만 잡는다
 
     // **조상 답이 쓰이는 갈래에서만 묻는다.** classifyTransition 은 브랜치가 다르면 그 답을 보지
-    // 않고, head 가 같아도 보지 않는다(transition.ts 의 갈래 순서). 그 밖에서 물으면 프로세스 셋을
+    // 않고, head 가 같아도 보지 않는다(transition.ts 의 갈래 순서). 그 밖에서 물으면 프로세스를
     // 띄워 얻은 답이 버려진다 — 이 파일 위의 "git 은 방아쇠가 있었을 때만 묻는다"와 같은 규칙이다.
     // 안 물을 때 넘기는 null 은 이미 "git 이 답하지 못했다"의 값이라 그 갈래들은 그것을 읽지 않는다.
     const needsAncestry = before.branch === after.branch && before.head !== after.head
     const type = classifyTransition(
       before,
       after,
-      needsAncestry ? await this.deps.git.isAncestor(projectPath, before.head, after.head) : null
+      needsAncestry
+        ? await reads.get(`ancestor\0${repo}\0${before.head}\0${after.head}`, () =>
+            this.deps.git.isAncestor(projectPath, before.head, after.head)
+          )
+        : null
     )
-    // 작업 트리는 전이가 없어도 바뀌어 있을 수 있다 (`git add` 가 index 만 건드린 경우)
-    const observed = this.observe(state, projectPath, await this.changedFiles(projectPath))
+    // 작업 트리는 전이가 없어도 바뀌어 있을 수 있다 (`git add` 가 index 만 건드린 경우).
+    // **열린 Unit 이 없으면 묻지 않는다** — observe 는 열린 Unit 에만 적으므로(목록도 모름 표지도)
+    // 그때 status 의 답은 어디에도 닿지 않는다. 묻는 경우에도 한 회차에 한 번이다(reads).
+    const anyOpen = state.units.some((u) => u.projectPath === projectPath && isOpen(u.status))
+    const observed = anyOpen
+      ? this.observe(
+          state,
+          projectPath,
+          await reads.get(`status\0${repo}`, () => this.changedFiles(projectPath))
+        )
+      : false
     if (type === 'none') return observed || dirty
 
     const open = state.units.filter((u) => isOpen(u.status))
@@ -1424,7 +1486,7 @@ export class WorkUnitCollector {
         projectPath,
         fromHead: before.head,
         toHead: after.head,
-        records: await this.hostMergeRecords(),
+        records: await reads.get('hostMerges', () => this.hostMergeRecords()),
         nowMs: this.deps.now(),
         // Host 는 체크아웃된 브랜치로만 병합하고 브랜치를 스스로 갈아타지 않는다(mergeRecords.ts 의
         // mergeInto). 그래서 완료된 기록의 연쇄는 브랜치가 그대로일 때만 묻는다 — 아니면 실패했거나
@@ -1457,9 +1519,11 @@ export class WorkUnitCollector {
       // git 을 더 부르지 않는다.
       // null: git could not read the range. The change is still recorded — the HEAD did move — but
       // with rangeUnknown, so its empty lists are not read as "nothing changed".
+      const from = before.head
+      const to = after.head
       const read =
-        before.head && after.head && before.head !== after.head
-          ? await this.deps.git.readRange(projectPath, before.head, after.head)
+        from && to && from !== to
+          ? await reads.get(`range\0${repo}\0${from}\0${to}`, () => this.deps.git.readRange(projectPath, from, to))
           : { commits: [], changedFiles: [] }
       const range = read ?? { commits: [], changedFiles: [] }
       const change: ExternalGitChange = {
@@ -1716,13 +1780,17 @@ export class WorkUnitCollector {
     this.deps.log?.(`work unit collector: ${m}`)
   }
 
-  /** 디바운스를 건다. 상한이 있어서, 세션이 계속 쓰는 동안에도 최소 1초마다 한 번은 발화한다 */
-  private arm(): void {
+  /** 디바운스를 건다. 상한이 있어서, 세션이 계속 쓰는 동안에도 최소 1초마다 한 번은 발화한다.
+   *  `windowMs` 가 DEBOUNCE_MS 보다 넓으면(git 이벤트, GIT_COALESCE_MS) 그 창이 끝나기 전에는
+   *  발화하지 않는다 — 뒤에 온 트랜스크립트 이벤트가 그 창을 줄이지도 않는다. 상한은 그대로다. */
+  private arm(windowMs: number = DEBOUNCE_MS): void {
     if (!this.running) return
     const now = this.deps.now()
     if (this.ceilingAt === null) this.ceilingAt = now + MAX_WAIT_MS
     if (this.timer) clearTimeout(this.timer)
-    const wait = Math.max(0, Math.min(DEBOUNCE_MS, this.ceilingAt - now))
+    if (windowMs > DEBOUNCE_MS) this.gitWindowUntil = Math.max(this.gitWindowUntil ?? 0, now + windowMs)
+    const want = Math.max(DEBOUNCE_MS, (this.gitWindowUntil ?? 0) - now)
+    const wait = Math.max(0, Math.min(want, this.ceilingAt - now))
     this.timer = setTimeout(() => {
       void this.flush()
     }, wait)
@@ -1733,6 +1801,7 @@ export class WorkUnitCollector {
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
     this.ceilingAt = null
+    this.gitWindowUntil = null
   }
 
   /** 회차를 겹치지 않게 한다. **한 번의 실패가 이후 회차를 막지 않는다** — `then(run, run)` 인
@@ -1747,6 +1816,23 @@ export class WorkUnitCollector {
     }
     const p = this.chain.then(run, run)
     this.chain = p
+    return p
+  }
+}
+
+/** 한 회차 안에서만 사는 읽기 기억. 같은 열쇠의 읽기는 처음 한 번만 돌고, 뒤에 부른 쪽은 그
+ *  Promise 를 함께 기다린다. **답을 바꾸지 않는다** — 모름(null)도 던짐도 처음 읽기의 것이 그대로
+ *  나눠진다. 회차가 끝나면 버린다: 다음 회차는 저장소가 움직였는지를 새로 물어야 한다.
+ *
+ *  Promise 는 만든 자리에서 곧바로 기다리므로 거절돼도 받는 쪽이 없는 채로 남지 않는다(R3). */
+class RoundReads {
+  private memo = new Map<string, Promise<unknown>>()
+
+  get<T>(key: string, read: () => Promise<T>): Promise<T> {
+    const known = this.memo.get(key)
+    if (known) return known as Promise<T>
+    const p = read()
+    this.memo.set(key, p)
     return p
   }
 }
