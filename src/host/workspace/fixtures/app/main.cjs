@@ -13,6 +13,11 @@ const HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Astera wor
 <script>
 window.events = []
 const note = (e) => window.events.push(e)
+// What the pointer did, for the e2e to print when a drag does not start: the event, where, which
+// buttons were down, and whether it came from real input (CDP input counts as real too).
+window.mouseLog = []
+for (const type of ['pointerdown', 'mousedown', 'mousemove', 'mouseup', 'mouseleave', 'dragstart', 'dragend', 'drop'])
+  document.addEventListener(type, (e) => { if (window.mouseLog.length < 300) window.mouseLog.push([Math.round(performance.now()), type, Math.round(e.clientX), Math.round(e.clientY), e.buttons, e.isTrusted]) }, true)
 const t = document.getElementById('t')
 t.addEventListener('paste', (e) => note({ kind: 'paste', trusted: e.isTrusted, text: e.clipboardData.getData('text/plain') }))
 document.getElementById('src').addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', 'card-1'))

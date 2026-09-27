@@ -261,6 +261,10 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
         ].join('\n')
       )
       const body = second.body as { log: string[]; error?: unknown }
+      // Printed on every run: what the page saw of the pointer, and whether drag() fell back to the
+      // display's own pointer (CI run 36310700864 failed the CDP drag and printed nothing of either).
+      const mouseLog = await read2(port, 'JSON.stringify(window.mouseLog)').catch((err: unknown) => `unreadable: ${String(err)}`)
+      console.log(`drag diagnostics: error=${JSON.stringify(body.error ?? null)} desk=${JSON.stringify(h.log.filter((l) => /pointer|drag/.test(l)))} page=${String(mouseLog)}`)
       expect(body.error).toBeUndefined()
       const [windowsLine, windowShotLine, screenshotLine] = body.log
       expect(JSON.parse(windowsLine)).toEqual(expect.arrayContaining([expect.objectContaining({ title: TITLE, className: '' })]))
