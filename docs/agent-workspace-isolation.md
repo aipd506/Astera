@@ -27,7 +27,13 @@ and the Host announces `workspace` on all three.
   the display's pointer to its last pixel, bottom right, out of the centered window an Electron app
   opens with no window manager: X reports a window mapped, moved or resized under the pointer to the
   app as a mouse move with no button down, and Chromium lets that end the press `drag()` made over
-  CDP. `keys()` types text the US keyboard has keys for at xdotool's default 12 ms a character, and
+  CDP. Parking did not make CI's drag start (run 36310700864), so on Linux a CDP press that starts no
+  drag within 2 s is followed by the same drag with the display's own pointer: xdotool presses at the
+  source (the window's origin from `xdotool getwindowgeometry`, the point in it from the page's
+  frame offset, `getBoundingClientRect` and `devicePixelRatio`), moves in five steps to the target
+  and holds the button while CDP drops the intercepted data, then lets go and parks the pointer again.
+  It is real X input, but on the workspace's own display. xdotool runs with `LC_ALL=C.UTF-8` unless
+  the Host already has a UTF-8 locale, since under the C locale `xdotool type` refuses non-ASCII text. `keys()` types text the US keyboard has keys for at xdotool's default 12 ms a character, and
   text with anything else in it (Hangul, emoji, accented letters) at 100 ms a character, all of it,
   since xdotool binds each such character to a spare key just for it and Chromium, reading the
   binding late, drops some at the default. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
