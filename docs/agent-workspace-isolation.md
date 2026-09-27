@@ -87,8 +87,9 @@ changed one of them:
   runs inside it with its heap limited to 256 MB. The child ends itself when its memory passes 512 MB,
   which counts ArrayBuffer and TypedArray memory the heap limit does not see, and the script reports
   `at: "memory"`. A child that dies any other way reports `at: "crashed"`. The deadline, Stop, Close,
-  the session ending and the Host leaving all end the child's process tree. Memory a script takes can no
-  longer take the Host down.
+  the session ending and the Host's orderly exit all end the child's process tree. If the Host crashes,
+  the child sees its channel close and ends itself, but a process the script started is not ended with
+  it. Memory a script takes can no longer take the Host down.
 
 Two more limits, found only once a real desktop and a real helper were driven (Task 3, Task 10):
 

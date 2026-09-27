@@ -171,11 +171,14 @@ export const SCRIPT_MEMORY_CAP_MB = 512
 export const SCRIPT_HEAP_LIMIT_MB = 256
 /** How often the child reads its own rss. */
 export const SCRIPT_MEMORY_WATCH_MS = 250
+/** The code the child exits with when it ends itself over the rss cap. The Host reads it as `memory`
+ *  even when the report sent just before it was never read. */
+export const SCRIPT_MEMORY_EXIT_CODE = 75
 
 /** The child's main thread, sent over the IPC channel as its first message and run with `new Function`,
  *  so the build needs no second entry and the command line stays one short line. It starts the worker
  *  from WORKER_SOURCE with the heap limit, relays every message both ways unchanged, and watches rss.
- *  `init` is `{ workerSource, workerData, heapMb, capMb, watchMs }`. Plain ES2020, no template literals. */
+ *  `init` is `{ workerSource, workerData, heapMb, capMb, watchMs, memoryExitCode }`. Plain ES2020, no template literals. */
 export const CHILD_SOURCE = String.raw`
 'use strict'
 const { Worker } = require('node:worker_threads')
@@ -231,9 +234,9 @@ if (worker) {
   const watch = setInterval(() => {
     if (process.memoryUsage().rss <= cap) return
     clearInterval(watch)
-    send({ type: 'memory' }, () => leave(75))
+    send({ type: 'memory' }, () => leave(init.memoryExitCode))
     // A Host too busy to take the report does not keep this process growing.
-    setTimeout(() => leave(75), 200)
+    setTimeout(() => leave(init.memoryExitCode), 200)
   }, init.watchMs)
 }
 `
@@ -294,9 +297,14 @@ const alive = (c: ChildProcess): boolean => c.exitCode === null && c.signalCode 
 
 /** Ends the child and anything it started. The script cannot reach `require`, but the vm is no boundary,
  *  so a process it started is ended with it: taskkill /T on win32, the child's own process group (it is
- *  spawned detached) elsewhere. The plain kill follows either way, so a failed tree kill still ends it. */
-function endChild(c: ChildProcess): void {
-  if (!alive(c) || c.pid === undefined) return
+ *  spawned detached) elsewhere. The plain kill follows either way, so a failed tree kill still ends it.
+ *  Off win32 the group is killed even when the child has already exited, since what it started may
+ *  still be in the group (ESRCH, an empty group, is fine). On win32 taskkill /T walks the tree from a
+ *  live parent, so a child already gone leaves nothing it can find. Exported for its tests. */
+export function endChild(c: ChildProcess, platform: NodeJS.Platform = process.platform, kill: typeof process.kill = process.kill): void {
+  if (c.pid === undefined) return
+  const tree = treeKillCommand(platform, c.pid)
+  if (tree && !alive(c)) return
   const hard = (): void => {
     try {
       if (alive(c)) c.kill('SIGKILL')
@@ -304,7 +312,6 @@ function endChild(c: ChildProcess): void {
       /* already gone */
     }
   }
-  const tree = treeKillCommand(process.platform, c.pid)
   if (tree) {
     try {
       execFile(tree.file, tree.args, { windowsHide: true, timeout: 10_000 }, hard)
@@ -314,9 +321,9 @@ function endChild(c: ChildProcess): void {
     return
   }
   try {
-    process.kill(-c.pid, 'SIGKILL')
+    kill(-c.pid, 'SIGKILL')
   } catch {
-    /* no group: the plain kill below */
+    /* no group left (ESRCH): the plain kill below */
   }
   hard()
 }
@@ -465,26 +472,30 @@ export async function runScriptInWorker(a: {
     child.on('error', (err) => {
       if (!heard) finish(couldNotStart(err).error)
     })
+    // A child that dies without a report is judged on 'close', which comes after 'exit' once its stderr
+    // and its IPC channel have both closed, so every message it sent has been read by then. Its exit
+    // code says the rest: SCRIPT_MEMORY_EXIT_CODE is the rss cap (the report sent just before it can
+    // still lose the race with the exit), and V8 ending it for want of memory says so on stderr. A
+    // process the script started can hold stderr open past the child's end, so 'close' is waited for
+    // 2 s at most.
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null
+    let closeCap: ReturnType<typeof setTimeout> | undefined
+    const judge = (): void => {
+      clearTimeout(closeCap)
+      if (over || !exited) return
+      if (exited.code === SCRIPT_MEMORY_EXIT_CODE) return outOfMemory(`the script used more than ${capMb} MB of memory and was ended`)
+      if (FATAL_OOM.test(stderr)) return outOfMemory('the script ran out of memory and its process ended')
+      const how = exited.signal ? `signal ${exited.signal}` : `code ${exited.code}`
+      finish({ message: `the script's process ended unexpectedly (${how})`, at: 'crashed' })
+    }
     child.on('exit', (code, signal) => {
-      if (over) return
-      // A child that dies without a report is judged once its stderr is read and any last message is in:
-      // V8 ending it for want of memory says so there.
-      const judge = (): void => {
-        if (over) return
-        if (FATAL_OOM.test(stderr)) return outOfMemory('the script ran out of memory and its process ended')
-        finish({ message: `the script's process ended unexpectedly (${signal ? `signal ${signal}` : `code ${code}`})`, at: 'crashed' })
-      }
-      const err = child.stderr
-      if (!err || err.readableEnded) return void setImmediate(judge)
-      const cap = setTimeout(judge, 500)
-      err.once('end', () => {
-        clearTimeout(cap)
-        setImmediate(judge)
-      })
+      exited = { code, signal }
+      if (!over) closeCap = setTimeout(judge, 2_000)
     })
+    child.on('close', judge)
 
     try {
-      child.send({ source: CHILD_SOURCE, init: { workerSource: WORKER_SOURCE, workerData: { script: a.script, names, help: helpTexts(a.guide) }, heapMb, capMb, watchMs: SCRIPT_MEMORY_WATCH_MS } })
+      child.send({ source: CHILD_SOURCE, init: { workerSource: WORKER_SOURCE, workerData: { script: a.script, names, help: helpTexts(a.guide) }, heapMb, capMb, watchMs: SCRIPT_MEMORY_WATCH_MS, memoryExitCode: SCRIPT_MEMORY_EXIT_CODE } })
     } catch (err) {
       finish(couldNotStart(err).error)
     }

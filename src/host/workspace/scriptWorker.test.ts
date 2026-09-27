@@ -10,16 +10,21 @@
 import { afterAll, describe, it, expect, vi } from 'vitest'
 import { Interrupted } from '../../core/agentBrowser/script'
 import { workspaceHelpers, type HelperDeps } from '../../core/workspace/helpers'
-import { runScriptInWorker, scriptChildEnv } from './scriptWorker'
+import { endChild, runScriptInWorker, scriptChildEnv } from './scriptWorker'
 
 // Records every child process the runner spawns, delegating to the real spawn, so a test can say none
 // was started, reach one to kill it from outside, and check at the end that none is left running.
-const made = vi.hoisted(() => ({ children: [] as import('node:child_process').ChildProcess[] }))
+const made = vi.hoisted(() => ({ children: [] as import('node:child_process').ChildProcess[], dropMemoryReport: false }))
 vi.mock('node:child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('node:child_process')>()
   const spawn = ((...a: Parameters<typeof real.spawn>) => {
     const c = (real.spawn as (...b: unknown[]) => import('node:child_process').ChildProcess)(...a)
     made.children.push(c)
+    // Simulates the Host reading the exit before the report: the child's memory message never arrives.
+    if (made.dropMemoryReport) {
+      const emit = c.emit.bind(c)
+      c.emit = ((ev: string, ...rest: unknown[]) => (ev === 'message' && (rest[0] as { type?: string })?.type === 'memory' ? false : emit(ev, ...rest))) as typeof c.emit
+    }
     return c
   }) as typeof real.spawn
   return { ...real, spawn, default: { ...real, spawn } }
@@ -282,6 +287,19 @@ describe('memory and crashes end only the child', () => {
     expect(await run("log('alive')")).toEqual({ log: ['alive'] })
   })
 
+  it('a child that ends itself for memory is "memory" even when its report is never read', { timeout: 40_000 }, async () => {
+    const script =
+      'const keep = []; for (let i = 0; i < 40; i++) { const b = new ArrayBuffer(16 * 1024 * 1024); new Uint8Array(b).fill(1); keep.push(b); ' +
+      "const t = Date.now() + 25; while (Date.now() < t) {} } log('survived')"
+    made.dropMemoryReport = true
+    try {
+      const r = await run(script, {}, { memoryCapMb: 160, timeoutMs: 20_000 })
+      expect(r).toEqual({ log: [], error: { at: 'memory', message: 'the script used more than 160 MB of memory and was ended' } })
+    } finally {
+      made.dropMemoryReport = false
+    }
+  })
+
   it('a heap that keeps growing hits the worker heap limit and ends at "memory"', { timeout: 40_000 }, async () => {
     const script = "const keep = []; for (let i = 0; i < 3e6; i++) keep.push({ i, s: 'x' + i, a: [i, i, i] }); log('survived')"
     const r = await run(script, {}, { heapLimitMb: 32, timeoutMs: 20_000 })
@@ -342,5 +360,27 @@ describe('the child environment', () => {
     } finally {
       for (const k of keys) delete process.env[k]
     }
+  })
+})
+
+describe('ending the child', () => {
+  const deadChild = () => ({ pid: 4242, exitCode: 1, signalCode: null, kill: vi.fn() }) as unknown as import('node:child_process').ChildProcess
+
+  it('off win32, kills the process group even when the child itself has already exited', () => {
+    const kill = vi.fn(() => {
+      throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' })
+    })
+    const c = deadChild()
+    expect(() => endChild(c, 'linux', kill)).not.toThrow()
+    expect(kill).toHaveBeenCalledWith(-4242, 'SIGKILL')
+    expect(c.kill).not.toHaveBeenCalled()
+  })
+
+  it('on win32, leaves a child that has already exited alone', () => {
+    const kill = vi.fn()
+    const c = deadChild()
+    endChild(c, 'win32', kill)
+    expect(kill).not.toHaveBeenCalled()
+    expect(c.kill).not.toHaveBeenCalled()
   })
 })
