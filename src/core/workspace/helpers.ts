@@ -367,6 +367,9 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
     const { pid, port } = launched
     const began = deps.now()
     const left = (): number => leftMs - (deps.now() - began) - LAUNCH_MARGIN_MS
+    // A launch the script left behind (Stop, the deadline) waits for nothing more: the app keeps
+    // running, and the next script finds it launched.
+    if (deps.stopped()) throw new Error(`${at}: stopped`)
     const budget = Math.max(0, Math.min(waitMs, left()))
     const cdp = await deps.connectCdp(port, budget)
     // A stopped launch keeps waiting on the port. If a newer script relaunched (or closed and launched)
@@ -392,6 +395,8 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
           after
       )
     }
+    // Stopped while the port wait ran: the connection is kept for the next script, the page not waited for.
+    if (deps.stopped()) throw new Error(`${at}: stopped`)
     await pageSettled(cdp, deps, deps.now() + Math.max(0, Math.min(PAGE_READY_MS, left())))
     return { pid, port }
   }

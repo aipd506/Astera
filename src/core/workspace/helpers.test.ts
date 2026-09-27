@@ -180,6 +180,35 @@ describe('launch', () => {
     expect(plain.deps.connectCdp).toHaveBeenCalledWith(9333, CDP_WAIT_MS)
   })
 
+  it('a launch stopped by the time its port wait would begin waits for nothing, and says it was stopped', async () => {
+    let stopped = false
+    const end = vi.fn()
+    const r = rig({
+      stopped: () => stopped,
+      launchWait: () => {
+        stopped = true
+        return { leftMs: 0, end }
+      }
+    })
+    await expect(r.h.launch({ command: 'app.exe' })).rejects.toThrow('launch: stopped')
+    expect(r.deps.connectCdp).not.toHaveBeenCalled()
+    expect(r.state.launched?.pid).toBe(501)
+    expect(end).toHaveBeenCalledTimes(1)
+  })
+
+  it('a launch stopped while its port wait ran keeps the connection but does not wait for the page', async () => {
+    let stopped = false
+    const r = rig({ stopped: () => stopped })
+    r.deps.connectCdp = vi.fn(async () => {
+      stopped = true
+      return r.cdp
+    })
+    r.cdp.evaluates(...Array.from({ length: 100 }, () => false))
+    await expect(r.h.launch({ command: 'app.exe' })).rejects.toThrow('launch: stopped')
+    expect(r.state.cdp).toBe(r.cdp)
+    expect(r.cdp.calls.filter((c) => c.method === 'Runtime.evaluate')).toHaveLength(0)
+  })
+
   it('ends its launch wait whether the port opens or not, and relaunch takes a longer waitMs as launch does', async () => {
     const end = vi.fn()
     const failed = rig({ launchWait: () => ({ leftMs: 100_000, end }), connectCdp: vi.fn(async () => null) })

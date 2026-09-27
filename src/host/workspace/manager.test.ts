@@ -776,6 +776,23 @@ describe('long launches', () => {
     expect(m.list()).toEqual([expect.objectContaining({ sessionId: 's1', running: false, helper: null })])
   })
 
+  // Review follow-up: a launch the script left behind when it timed out (held here until after the
+  // timeout, in desk.launch) reaches its port wait with the run already over. It must not wait there.
+  it('a launch left behind by a timeout does not wait for the port at all', { timeout: 40_000 }, async () => {
+    let release!: () => void
+    FakeDesk.hold = new Promise((r) => {
+      release = r
+    })
+    const connectCdp = vi.fn(async () => fakeCdp())
+    const { m, settle } = await rig({ scriptTimeoutMs: 3_000, connectCdp })
+    const r = await m.run('s1', "await launch({ command: 'app.exe' }, { waitMs: 300000 })")
+    expect(body(r).error?.at).toBe('timeout')
+    release()
+    await vi.waitFor(() => expect(FakeDesk.made[0]?.launches).toHaveLength(1))
+    await settle()
+    expect(connectCdp).not.toHaveBeenCalled()
+  })
+
   it('Stop during a long launch ends the script at once, well past where the deadline would have been', { timeout: 40_000 }, async () => {
     let waiting = false
     const { m } = await rig({

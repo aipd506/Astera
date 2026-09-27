@@ -197,6 +197,16 @@ describe('ScriptDeadline', () => {
     clock.dispose()
   })
 
+  it('a launch wait begun after the run is over may last nothing, so a leftover launch never waits minutes', () => {
+    const { clock, expired } = make()
+    clock.dispose()
+    const wait = clock.launchWait()
+    expect(wait.leftMs).toBe(0)
+    wait.end()
+    vi.advanceTimersByTime(LAUNCH_WAIT_MAX_MS * 2)
+    expect(expired).not.toHaveBeenCalled()
+  })
+
   it('dispose stops the clock: nothing expires after it', () => {
     const { clock, expired } = make()
     const wait = clock.launchWait()

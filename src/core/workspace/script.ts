@@ -20,7 +20,8 @@ import { gateHelpers as gate } from '../agentBrowser/scriptGate'
 export const LAUNCH_WAIT_MAX_MS = 300_000
 
 /** One launch wait in progress. `leftMs` is how long it may last: what is left of the launch cap plus
- *  the script's own time left. `end` resumes the deadline; a second call does nothing. */
+ *  the script's own time left, and 0 once the run is over. `end` resumes the deadline; a second call
+ *  does nothing. */
 export interface LaunchWait {
   readonly leftMs: number
   end(): void
@@ -85,6 +86,9 @@ export class ScriptDeadline implements ScriptClock {
   }
 
   launchWait(): LaunchWait {
+    // A launch the script left behind (Stop, the deadline) reaches its wait after the run is over: it
+    // may wait for nothing, rather than for the rest of the launch cap.
+    if (this.over) return { leftMs: 0, end: () => {} }
     this.settle()
     this.waits += 1
     this.arm()

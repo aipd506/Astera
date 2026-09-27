@@ -143,8 +143,10 @@ export const SLOW_ANSWER_PING_LEAD_MS = 1_000
  * Does a command that does not wait get the late-answer notice at all?
  *
  * **Every one but the two script runners.** `browser js` and `app js` run a script that may
- * legitimately take many seconds, bounded by its own 60 second deadline, so a slow answer there is
- * the script working rather than a Host in trouble. And an agent is who calls them: its tool output
+ * legitimately take many seconds, so a slow answer there is the script working rather than a Host in
+ * trouble. `browser js` is bounded by its 60 second deadline; `app js` by the same 60 seconds plus up
+ * to LAUNCH_WAIT_MAX_MS (5 minutes) spent waiting for the app to start, which that deadline does not
+ * count (core/workspace/script.ts). And an agent is who calls them: its tool output
  * would fill with lines that say nothing it needs.
  */
 export function slowAnswerNotice(cmd: string): boolean {
