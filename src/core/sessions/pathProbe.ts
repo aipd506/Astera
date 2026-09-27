@@ -20,10 +20,16 @@
 // - **Once PROBE_CONCURRENCY calls are stuck, every PATH probe answers `timeout` without a call** until
 //   one settles. So the stuck threads never pass 2, however many dead roots PATH holds. A healthy path
 //   is then reported absent for a while; the caches keep such answers for PROBE_DEGRADED_TTL_MS only.
-// - **The session folder's probe (`skipQueue`) is issued at once**, outside the cap and the per-root
-//   rule, so a local folder is never judged unreachable because PATH probes hang. It answers `timeout`
-//   without a call only when its own root already has a stuck call — a folder on a drive known to hang
-//   is not reachable, and saying so at once is the point. One such call per spawn attempt at most.
+// - **The session folder's probe (`skipQueue`) does not wait behind PATH probes**: it is outside the
+//   PATH cap, so a local folder is never judged unreachable because PATH probes hang. It answers
+//   `timeout` without a call when its own root already has a stuck call — a folder on a drive known to
+//   hang is not reachable, and saying so at once is the point.
+// - **At most one session-folder call per root at a time.** Several prepares can ask about one offline
+//   folder within the same 1.5 s (a roll, the Host spawner, a retry); each starting its own call would
+//   hang one thread apiece and, with the 2 stuck PATH calls, fill the pool. So a later probe on that
+//   root waits for the call in flight: the same folder shares its answer; another folder answers
+//   `timeout` if that call timed out, and makes its own call if it answered (the root is alive). So the
+//   stuck session-folder calls number at most one per dead root the user tried.
 // - **A stuck call is let go after PROBE_STUCK_CEILING_MS** (a POSIX hard mount may never settle): it
 //   stops counting, its root may be probed again, and that is logged once for the call.
 //
@@ -105,6 +111,8 @@ export class ProbePool {
   /** root → calls on it (PATH or cwd) that timed out and have not settled. */
   private stuck = new Map<string, number>()
   private queue: Waiter[] = []
+  /** root → the session-folder call in flight on it, and the answer it will give. */
+  private cwdCalls = new Map<string, { p: string; answer: Promise<ProbeResult> }>()
 
   constructor(
     private max: number = PROBE_CONCURRENCY,
@@ -120,12 +128,46 @@ export class ProbePool {
         return
       }
       if (job.skipQueue) {
-        this.start(job, root, resolve, false)
+        this.startCwd(job, root, resolve)
         return
       }
       this.queue.push({ job, root, resolve })
       this.pump()
     })
+  }
+
+  /** A session-folder probe: one call per root at a time (see the rules at the top of this file). */
+  private startCwd(job: ProbeJob, root: string, resolve: (r: ProbeResult) => void): void {
+    if (this.stuck.has(root)) {
+      job.note(job.p, `${root} has a call that gave no answer yet`)
+      resolve('timeout')
+      return
+    }
+    const current = this.cwdCalls.get(root)
+    if (current) {
+      void current.answer.then((r) => {
+        if (current.p === job.p) resolve(r)
+        else if (r === 'timeout') {
+          job.note(job.p, `${root} gave no answer to ${current.p}`)
+          resolve('timeout')
+        } else this.startCwd(job, root, resolve)
+      })
+      return
+    }
+    let answered!: (r: ProbeResult) => void
+    const entry = { p: job.p, answer: new Promise<ProbeResult>((res) => (answered = res)) }
+    this.cwdCalls.set(root, entry)
+    this.start(
+      job,
+      root,
+      (r) => {
+        // Taken down at the answer (or the timeout): after a timeout the stuck map refuses the root.
+        if (this.cwdCalls.get(root) === entry) this.cwdCalls.delete(root)
+        answered(r)
+        resolve(r)
+      },
+      false
+    )
   }
 
   /** Starts, refuses or keeps each waiter, in order. Runs whenever a call settles or times out. */

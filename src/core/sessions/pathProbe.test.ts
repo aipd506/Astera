@@ -34,13 +34,21 @@ const flush = async () => {
  * Paths on a dead root (by rootOf) hang until the test settles them; the rest answer at once. It
  * records the peak of calls in flight, overall and per root, for the probes it was built for.
  */
-function threadpool(deadRoots: string[], present: (p: string) => boolean = () => true) {
+function threadpool(deadRoots: string[], present: (p: string) => boolean = () => true, threads = 4) {
   const started: string[] = []
   const hung: { p: string; d: ReturnType<typeof deferred<void>> }[] = []
   const inFlight = new Map<string, number>()
   let total = 0
   let peakTotal = 0
   let peakPerRoot = 0
+  // libuv's pool: a call runs only on a free thread, and waits for one otherwise. A local call stuck
+  // behind hung ones never runs, so the prober's timer cuts it — a starved thread shows as a timeout.
+  let running = 0
+  const waiting: (() => void)[] = []
+  const freeThread = (): void => {
+    running--
+    waiting.shift()?.()
+  }
   const access = (p: string): Promise<void> => {
     started.push(p)
     const root = rootOf(p)
@@ -52,14 +60,19 @@ function threadpool(deadRoots: string[], present: (p: string) => boolean = () =>
       total--
       inFlight.set(root, inFlight.get(root)! - 1)
     }
-    let call: Promise<void>
-    if (deadRoots.includes(root)) {
-      const d = deferred<void>()
-      hung.push({ p, d })
-      call = d.promise
-    } else {
-      call = present(p) ? Promise.resolve() : Promise.reject(new Error('ENOENT'))
+    const run = (): Promise<void> => {
+      running++
+      let call: Promise<void>
+      if (deadRoots.includes(root)) {
+        const d = deferred<void>()
+        hung.push({ p, d })
+        call = d.promise
+      } else {
+        call = present(p) ? Promise.resolve() : Promise.reject(new Error('ENOENT'))
+      }
+      return call.finally(freeThread)
     }
+    const call = running < threads ? run() : new Promise<void>((res, rej) => waiting.push(() => void run().then(res, rej)))
     return call.finally(done)
   }
   return {
@@ -258,6 +271,62 @@ describe('the PATH probe pool, against a model of the threadpool', () => {
 })
 
 describe('the cwd probe', () => {
+  it('the harness shows a starved thread: a local call behind 4 hung calls times out', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['z:\\'])
+    for (const p of ['Z:\\1', 'Z:\\2', 'Z:\\3', 'Z:\\4']) void tp.access(p).catch(() => {})
+    const probe = createProber({ access: tp.access, pool: createProbePool(), log: () => {}, skipQueue: true })
+    const r = probe('C:\\work\\proj')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await r).toBe('timeout')
+  })
+
+  it('makes one call per root at a time: probes on the same folder share its answer, others on that root answer timeout with it', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['w:\\'])
+    const cwdProbe = createProber({ access: tp.access, pool: createProbePool(), log: () => {}, skipQueue: true })
+    const same = [cwdProbe('W:\\proj'), cwdProbe('W:\\proj'), cwdProbe('W:\\proj')]
+    const other = [cwdProbe('W:\\other'), cwdProbe('w:/third')]
+    await flush()
+    expect(tp.started).toEqual(['W:\\proj'])
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await Promise.all(same)).toEqual(['timeout', 'timeout', 'timeout'])
+    expect(await Promise.all(other)).toEqual(['timeout', 'timeout'])
+    expect(tp.started).toEqual(['W:\\proj'])
+  })
+
+  it('a probe on the same root but another folder makes its own call once the first one answers', async () => {
+    const tp = threadpool([], (p) => p !== 'C:\\gone')
+    const cwdProbe = createProber({ access: tp.access, pool: createProbePool(), log: () => {}, skipQueue: true })
+    const a = cwdProbe('C:\\gone')
+    const b = cwdProbe('C:\\here')
+    const c = cwdProbe('C:\\gone')
+    expect([await a, await b, await c]).toEqual(['absent', 'present', 'absent'])
+    expect(tp.started.filter((p) => p === 'C:\\gone')).toHaveLength(1)
+    expect(tp.started).toContain('C:\\here')
+  })
+
+  it('confirms a local folder while 2 PATH calls are stuck and several cwd probes hit one offline folder at once', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['z:\\', 'y:\\', 'w:\\'])
+    const pool = createProbePool()
+    const pathProbe = createProber({ access: tp.access, pool, log: () => {} })
+    const cwdProbe = createProber({ access: tp.access, pool, log: () => {}, skipQueue: true })
+    // Two dead PATH roots: two calls stuck, two threads left.
+    const stuck = [pathProbe('Z:\\bin\\git.exe'), pathProbe('Y:\\bin\\git.exe')]
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    await Promise.all(stuck)
+    // A roll, the Host spawner and a retry all prepare the same offline folder within the same 1.5 s.
+    const offline = [cwdProbe('W:\\proj'), cwdProbe('W:\\proj'), cwdProbe('W:\\proj'), cwdProbe('W:\\proj\\sub')]
+    await flush()
+    // Meanwhile a session on a local folder is prepared.
+    const local = cwdProbe('C:\\work\\proj')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await local).toBe('present')
+    expect(await Promise.all(offline)).toEqual(Array(4).fill('timeout'))
+    expect(tp.started.filter((p) => p.startsWith('W:'))).toHaveLength(1)
+  })
+
   it('is issued at once while PATH roots hang, and answers', async () => {
     vi.useFakeTimers()
     const tp = threadpool(['z:\\', 'y:\\'])
