@@ -36,7 +36,7 @@
 //
 // The text is plain, not JSON, and no part of it needs a Host. `--help` is for a person, and a
 // person asking what the commands are must get an answer with nothing running.
-import { BROWSER_VERBS, NOUNS, camel, leadingGlobals, renamedTo, verbsOf } from './cliArgs'
+import { APP_VERBS, BROWSER_VERBS, NOUNS, camel, leadingGlobals, renamedTo, verbsOf } from './cliArgs'
 
 /** `jobs-wait`, `host-start`, … — every noun/verb pair `NOUNS` declares. */
 type NounCommand = {
@@ -434,7 +434,7 @@ export const spelledCommand = (cmd: string): string => {
   if (dash < 0) return cmd
   const noun = cmd.slice(0, dash)
   const verb = cmd.slice(dash + 1)
-  const verbs: readonly string[] | undefined = noun === 'browser' ? BROWSER_VERBS : verbsOf(noun)
+  const verbs: readonly string[] | undefined = noun === 'browser' ? BROWSER_VERBS : noun === 'app' ? APP_VERBS : verbsOf(noun)
   return verbs?.includes(verb) === true ? `${noun} ${verb}` : cmd
 }
 

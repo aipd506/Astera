@@ -337,6 +337,19 @@ const SESSION = {
     summary: "record that this session's work was dropped",
     flags: [{ name: 'reason', value: '<text>', about: 'why' }]
   },
+  'app-js': {
+    summary: "run one script against this session's app on a desktop the person never sees",
+    detail:
+      'One script: --script, --file, or the whole of stdin when neither is given. Giving both is refused. It needs a session Astera started, the Agent app workspace setting, and Windows. The Host answers it whether or not the app is open.',
+    flags: [
+      { name: 'script', value: '<js|->', about: 'the script (a value of `-` reads it from stdin)' },
+      { name: 'file', value: '<path>', about: 'read the script from this file' }
+    ]
+  },
+  'app-help': {
+    summary: 'the agent app workspace guide',
+    flags: [{ name: 'skills-dir', value: '<path>', about: 'read the guide from this folder instead of the one beside this build' }]
+  },
   handoff: {
     summary: "save this session's Smart Resume memo",
     detail: 'Needs Smart Resume switched on. The memo is a JSON document.',
@@ -359,8 +372,8 @@ export type AgentCommand = PublicCommand | SessionCommand
  * The commands `handleCommand`'s `switch` must **not** have a `case` for, each for one of three
  * reasons.
  *
- * *Answered by the CLI itself, so they never reach the command layer:* `help` and `browser-help`
- * read a guide off disk, `agent-context` prints this file, the three `host-*` commands ask
+ * *Answered by the CLI itself, so they never reach the command layer:* `help`, `browser-help` and
+ * `app-help` read a guide off disk, `agent-context` prints this file, the three `host-*` commands ask
  * about the Host rather than about orchestration (src/cli/host.ts), and the two `skills-*` commands
  * read and write the profile's files with no Host at all (src/cli/skills.ts).
  *
@@ -372,11 +385,12 @@ export type AgentCommand = PublicCommand | SessionCommand
  * receipt, and receipts live in the Host's memory rather than in the orchestration state (request
  * receipts design §4), so there is nothing here for a `case` to read. It sits beside `state-get`
  * and `state-put` in `src/host/orch.ts`, and a Host too old to know it answers 501 — exit 9 — for
- * free.
+ * free. `app-js` too: the agent app workspace lives in the Host whether or not an app is open, and
+ * it is answered below the receipt line beside `requests-show` (agent workspace plan ruling P2).
  *
  * **This is a hand-kept list, and `satisfies` is not the check it looks like.** It proves only that
- * these eleven names exist in the schema, which keeps a typo from quietly widening
- * `SwitchedCommand`. It proves nothing about anything answering them: a twelfth name added here would
+ * these thirteen names exist in the schema, which keeps a typo from quietly widening
+ * `SwitchedCommand`. It proves nothing about anything answering them: a fourteenth name added here would
  * compile, would pass the exhaustiveness check, and would 501 at runtime with no `case` and no
  * branch. cliAgentContext.test.ts carries the witness for that half — it asserts each name is
  * mentioned in one of the four files that can answer it. A text witness is weak, but it is the
@@ -390,6 +404,8 @@ const NOT_SWITCHED = [
   'host-status',
   'host-stop',
   'browser-js',
+  'app-help',
+  'app-js',
   'handoff',
   'requests-show',
   'skills-list',

@@ -243,7 +243,7 @@ export function clientTimeoutMs(a: { cmd: string; args: Record<string, unknown> 
   const defaultForCmd =
     a.cmd === 'ask'
       ? DEFAULT_ASK_TIMEOUT_MS
-      : a.cmd === 'browser-js'
+      : a.cmd === 'browser-js' || a.cmd === 'app-js'
         ? SCRIPT_TIMEOUT_MS
         : // **기다리는 명령은 서버와 같은 마감을 써야 한다.** 짧은 값을 쓰면 서버가 답을
           // 준비하는 사이에 클라이언트가 연결을 끊고, "타임아웃은 정보다" 는 계약이 깨진다
@@ -842,8 +842,9 @@ export function resolveGuidePath(a: {
   env: NodeJS.ProcessEnv
   /** The skills folder beside this binary, or undefined when none was found. */
   bundled?: string
-  /** Which guide. `astera help` is the orchestration guide; `astera browser help` the browser's. */
-  guide?: 'orchestration' | 'browser'
+  /** Which guide. `astera help` is the orchestration guide; `astera browser help` the browser's;
+   *  `astera app help` the agent app workspace's. */
+  guide?: 'orchestration' | 'browser' | 'app'
 }): { ok: true; path: string } | { ok: false; error: string } {
   const dir =
     typeof a.args.skillsDir === 'string' && a.args.skillsDir.length > 0
@@ -855,7 +856,7 @@ export function resolveGuidePath(a: {
       error:
         'ASTERA_SKILLS is not set, no --skills-dir was given, and no resources/skills was found beside this build'
     }
-  const file = a.guide === 'browser' ? 'browser-guide.md' : 'orchestration-guide.md'
+  const file = a.guide === 'browser' ? 'browser-guide.md' : a.guide === 'app' ? 'app-guide.md' : 'orchestration-guide.md'
   return { ok: true, path: path.join(dir, file) }
 }
 
@@ -1042,6 +1043,16 @@ export async function main(): Promise<void> {
     process.exit(0)
   }
 
+  // The app workspace guide works without a server too, the same shape as browser-help above.
+  if (parsed.cmd === 'app-help') {
+    const resolved = resolveGuidePath({ args: parsed.args, env: process.env, bundled: bundledSkills(), guide: 'app' })
+    if (!resolved.ok) fail({ code: 'FAILED', message: resolved.error })
+    const guide = readGuide(resolved.path)
+    if (!guide.ok) fail({ code: 'FAILED', message: guide.error })
+    out(guide.content)
+    process.exit(0)
+  }
+
   // **세션 밖에서도 Host 를 찾는다**(설계 §4). 세션 안이면 앱이 자기 프로필 폴더를 실어 보내고
   // (`ASTERA_PROFILE_DIR`), 주소도 보고 큐도 그 폴더에서 나온다. 주소 하나로는 못 한다 — 주소는 그
   // Host 가 어느 프로필을 쓰는지 말해 주지 않고, 못 보낸 보고를 적을 곳이 거기서 나온다(F43).
@@ -1188,8 +1199,8 @@ export async function main(): Promise<void> {
     process.exit(0)
   }
 
-  // `astera browser js --file check.js` — the script from a file instead of stdin
-  if (parsed.cmd === 'browser-js' && typeof args.file === 'string') {
+  // `astera browser js --file check.js` and `astera app js --file check.js`: the script from a file
+  if ((parsed.cmd === 'browser-js' || parsed.cmd === 'app-js') && typeof args.file === 'string') {
     try {
       args = { ...args, script: readFileSync(args.file, 'utf8') }
     } catch (e) {

@@ -543,6 +543,10 @@ describe('resolveGuidePath', () => {
     const r = resolveGuidePath({ args: {}, env: { ASTERA_SKILLS: '/opt/skills' }, bundled: '/app/resources/skills' })
     expect(r).toEqual({ ok: true, path: path.join('/opt/skills', 'orchestration-guide.md') })
   })
+  it('names the app guide for astera app help', () => {
+    const r = resolveGuidePath({ args: {}, env: { ASTERA_SKILLS: '/opt/skills' }, guide: 'app' })
+    expect(r).toEqual({ ok: true, path: path.join('/opt/skills', 'app-guide.md') })
+  })
   it('둘 다 없으면 ASTERA_SKILLS를 언급하는 명확한 에러를 낸다', () => {
     const r = resolveGuidePath({ args: {}, env: {} })
     expect(r.ok).toBe(false)
@@ -585,6 +589,9 @@ describe('browser commands', () => {
   })
   it('an explicit --timeout-ms still wins for browser-js', () => {
     expect(clientTimeoutMs({ cmd: 'browser-js', args: { timeoutMs: 5000 } })).toBe(5000 + 30_000)
+  })
+  it('app-js waits for the whole script plus headroom, like browser-js', () => {
+    expect(clientTimeoutMs({ cmd: 'app-js', args: {} })).toBe(60_000 + 30_000)
   })
 })
 

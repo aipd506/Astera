@@ -124,6 +124,8 @@ const NOT_SWITCHED = [
   'host-status',
   'host-stop',
   'browser-js',
+  'app-help',
+  'app-js',
   'handoff',
   'requests-show',
   'skills-list',
@@ -155,7 +157,7 @@ describe('agent-context — 명령 집합은 handleCommand 가 실제로 가르�
   // 영수증은 상태 파일이 아니라 Host 의 메모리에 있어서(설계 §4) `state-get`·`state-put` 옆에서
   // 답한다. 이 목록에서 빠뜨리면 그 이름은 "아무 데서도 비교되지 않는" 것이 되고, 그것은 이
   // 단언이 잡으려는 결함과 같은 모양의 거짓 경보다.
-  it('CLI 나 Host 가 직접 답한다는 열하나는 네 파일의 코드에서 비교된다', () => {
+  it('CLI 나 Host 가 직접 답한다는 열셋은 네 파일의 코드에서 비교된다', () => {
     const here = path.dirname(fileURLToPath(import.meta.url))
     const stripped = ['../../cli/run.ts', '../../cli/host.ts', './command.ts', '../../host/orch.ts']
       .map((rel) => readFileSync(path.resolve(here, rel), 'utf8'))
@@ -164,6 +166,16 @@ describe('agent-context — 명령 집합은 handleCommand 가 실제로 가르�
       .join('\n')
     for (const cmd of NOT_SWITCHED)
       expect(stripped.includes(`'${cmd}'`), `${cmd} is compared nowhere`).toBe(true)
+  })
+})
+
+describe('agent-context: the agent app workspace commands are session commands (W2)', () => {
+  it('lists app js and app help, not public, with their flags', () => {
+    const js = ctx.commands.find((c) => c.name === 'app-js')
+    const help = ctx.commands.find((c) => c.name === 'app-help')
+    expect(js).toMatchObject({ public: false, usage: expect.stringMatching(/^astera app js/) })
+    expect(js?.flags.map((f) => f.name).sort()).toEqual(['file', 'script'])
+    expect(help).toMatchObject({ public: false })
   })
 })
 

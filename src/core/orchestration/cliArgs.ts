@@ -79,6 +79,12 @@ export const BROWSER_VERBS = ['js', 'help'] as const
 
 const BROWSER_SUBCOMMANDS = new Set<string>(BROWSER_VERBS)
 
+/** `astera app <sub>`: the agent app workspace (agent workspace design). Session commands, like the
+ *  coordinator's (W2: no public surface), so they are not in NOUNS and not in USAGE. */
+export const APP_VERBS = ['js', 'help'] as const
+
+const APP_SUBCOMMANDS = new Set<string>(APP_VERBS)
+
 /**
  * 두 낱말로 치는 명령들 — `astera jobs list`. **공개 표면은 전부 이 모양이다**(공개 CLI 설계 §5).
  *
@@ -188,6 +194,12 @@ export function parseArgs(all: string[]): ParsedArgs | { error: string } {
     if (!BROWSER_SUBCOMMANDS.has(sub)) return { error: `unknown browser subcommand: ${sub} (expected js or help)` }
     cmd = `browser-${sub}`
     first = 2
+  } else if (cmd === 'app') {
+    const sub = argv[1]
+    if (sub === undefined || sub.startsWith('-')) return { error: 'app needs a subcommand: js or help' }
+    if (!APP_SUBCOMMANDS.has(sub)) return { error: `unknown app subcommand: ${sub} (expected js or help)` }
+    cmd = `app-${sub}`
+    first = 2
   } else if (verbs !== undefined && !(BARE_NOUNS.has(cmd) && (argv[1] === undefined || argv[1].startsWith('-')))) {
     const sub = argv[1]
     if (sub === undefined || sub.startsWith('-'))
@@ -268,10 +280,11 @@ export function parseArgs(all: string[]): ParsedArgs | { error: string } {
     }
     args[key] = next
   }
-  if (cmd === 'browser-js') {
+  if (cmd === 'browser-js' || cmd === 'app-js') {
+    const spoken = cmd === 'browser-js' ? 'browser js' : 'app js'
     const hasFile = args.file !== undefined || wantsStdin.includes('file')
     const hasScript = args.script !== undefined || wantsStdin.includes('script')
-    if (hasFile && hasScript) return { error: 'browser js takes one script: --file or --script, not both' }
+    if (hasFile && hasScript) return { error: `${spoken} takes one script: --file or --script, not both` }
     // `astera browser js <<'EOF' … EOF` — the script is the whole of stdin, with no flag to say so.
     // Only when neither --script nor --file was given; `--script -` already asked.
     if (!hasScript && !hasFile) wantsStdin.push('script')

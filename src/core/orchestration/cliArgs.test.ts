@@ -139,6 +139,20 @@ describe('반복되는 플래그', () => {
   it('browser with an unknown subcommand is refused', () => {
     expect(parseArgs(['browser', 'fly'])).toEqual({ error: 'unknown browser subcommand: fly (expected js or help)' })
   })
+  it('app js is one command, app-js, and reads its script from stdin by default', () => {
+    expect(parseArgs(['app', 'js'])).toMatchObject({ cmd: 'app-js', wantsStdin: ['script'] })
+    expect(parseArgs(['app', 'js', '--script', '-'])).toMatchObject({ cmd: 'app-js', wantsStdin: ['script'] })
+    const r = parseArgs(['app', 'js', '--file', 'check.js']) as { cmd: string; args: Record<string, unknown>; wantsStdin: string[] }
+    expect(r).toMatchObject({ cmd: 'app-js', args: { file: 'check.js' }, wantsStdin: [] })
+  })
+  it('app js takes one script', () => {
+    expect(parseArgs(['app', 'js', '--file', 'a.js', '--script', 'log(1)'])).toEqual({ error: 'app js takes one script: --file or --script, not both' })
+  })
+  it('app help is app-help; app alone and an unknown verb name the subcommands', () => {
+    expect(parseArgs(['app', 'help'])).toMatchObject({ cmd: 'app-help', wantsStdin: [] })
+    expect(parseArgs(['app'])).toEqual({ error: 'app needs a subcommand: js or help' })
+    expect(parseArgs(['app', 'run'])).toEqual({ error: 'unknown app subcommand: run (expected js or help)' })
+  })
 })
 
 describe('공개 표면 — 두 낱말 명령', () => {

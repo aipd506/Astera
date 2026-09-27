@@ -63,6 +63,11 @@ describe('cliUsage — 세 층', () => {
     expect(text).toContain('astera run-configs list --job <jobId>')
   })
 
+  it('spelledCommand: app js 와 app help', () => {
+    expect(spelledCommand('app-js')).toBe('app js')
+    expect(spelledCommand('app-help')).toBe('app help')
+  })
+
   it('한 낱말짜리 명령은 대시를 쪼개지 않는다', () => {
     const text = (usageFor(['agent-context', '--help']) as { text: string }).text
     expect(text).toContain('astera agent-context')
