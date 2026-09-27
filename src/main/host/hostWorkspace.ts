@@ -24,8 +24,11 @@ function frameOf(v: unknown): WorkspaceFrame | null {
 /** The event a push carries, or null when it is not one this app can read. */
 function eventOf(v: unknown): WorkspaceEvent | null {
   if (!isRecord(v) || typeof v.sessionId !== 'string' || v.sessionId === '') return null
-  if (v.kind === 'state' && typeof v.open === 'boolean' && typeof v.running === 'boolean' && (v.helper === null || typeof v.helper === 'string'))
-    return { kind: 'state', sessionId: v.sessionId, open: v.open, running: v.running, helper: v.helper }
+  if (v.kind === 'state' && typeof v.open === 'boolean' && typeof v.running === 'boolean' && (v.helper === null || typeof v.helper === 'string')) {
+    // How long the app has been starting (stage 4, task 2): carried only when it is a count.
+    const launching = typeof v.launching === 'number' && Number.isFinite(v.launching) && v.launching >= 0 ? { launching: v.launching } : {}
+    return { kind: 'state', sessionId: v.sessionId, open: v.open, running: v.running, helper: v.helper, ...launching }
+  }
   if (v.kind === 'frame') {
     const frame = frameOf(v.frame)
     return frame ? { kind: 'frame', sessionId: v.sessionId, frame } : null

@@ -1063,6 +1063,7 @@ export const en: Record<keyof typeof ko, string> = {
   'workspace.tab.running': 'The agent is driving its app on a hidden desktop',
   'workspace.pane.title': "{session}'s app",
   'workspace.pane.running': 'Running: {helper}',
+  'workspace.pane.launching': 'Starting the app… {seconds}s',
   'workspace.pane.idle': 'Idle (the app is still running)',
   'workspace.pane.closed': 'Closed',
   'workspace.pane.waiting': 'Waiting for the first picture',

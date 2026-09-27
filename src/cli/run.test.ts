@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { GIT_WRITE_TIMEOUT_MS } from '../core/worktrees/git'
 import { MERGE_CLIENT_TIMEOUT_MS } from '../core/orchestration/cliKeepalive'
+import { SCRIPT_TIMEOUT_MS } from '../core/agentBrowser/script'
+import { LAUNCH_WAIT_MAX_MS } from '../core/workspace/script'
 import { exitCodeFor } from '../core/orchestration/cliOutput'
 import { promises as fs, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -235,6 +237,14 @@ describe('clientTimeoutMs', () => {
     const headroom = clientTimeoutMs({ cmd: 'check', args: {} }) - DEFAULT_CHECK_TIMEOUT_MS
     expect(clientTimeoutMs({ cmd: 'run-merge', args: { run: 'r' } })).toBe(MERGE_CLIENT_TIMEOUT_MS + headroom)
     expect(clientTimeoutMs({ cmd: 'run-delete', args: { id: 'r', merge: true } })).toBe(MERGE_CLIENT_TIMEOUT_MS + headroom)
+  })
+  // app js 의 스크립트는 60 초 마감에 더해, 앱이 뜨기를 기다리는 시간(launch 대기)을 LAUNCH_WAIT_MAX_MS 까지
+  // 쓸 수 있다. CLI 가 그보다 먼저 끊으면 앱은 떴는데 에이전트는 "Host 가 답하지 않았다" 만 본다.
+  it('app-js 는 launch 대기 한도와 스크립트 마감을 합친 것보다 길게 기다리고, browser-js 는 그대로다', () => {
+    const headroom = clientTimeoutMs({ cmd: 'check', args: {} }) - DEFAULT_CHECK_TIMEOUT_MS
+    expect(clientTimeoutMs({ cmd: 'app-js', args: {} })).toBe(LAUNCH_WAIT_MAX_MS + SCRIPT_TIMEOUT_MS + headroom)
+    expect(clientTimeoutMs({ cmd: 'app-js', args: {} })).toBeGreaterThan(LAUNCH_WAIT_MAX_MS + SCRIPT_TIMEOUT_MS)
+    expect(clientTimeoutMs({ cmd: 'browser-js', args: {} })).toBe(SCRIPT_TIMEOUT_MS + headroom)
   })
   it('병합하지 않는 run-delete 는 check 의 시한 그대로다', () => {
     expect(clientTimeoutMs({ cmd: 'run-delete', args: { id: 'r' } })).toBe(clientTimeoutMs({ cmd: 'check', args: {} }))
@@ -604,8 +614,8 @@ describe('browser commands', () => {
   it('an explicit --timeout-ms still wins for browser-js', () => {
     expect(clientTimeoutMs({ cmd: 'browser-js', args: { timeoutMs: 5000 } })).toBe(5000 + 30_000)
   })
-  it('app-js waits for the whole script plus headroom, like browser-js', () => {
-    expect(clientTimeoutMs({ cmd: 'app-js', args: {} })).toBe(60_000 + 30_000)
+  it('app-js waits for the launch wait cap and the whole script, plus headroom (launch waits do not count against its deadline)', () => {
+    expect(clientTimeoutMs({ cmd: 'app-js', args: {} })).toBe(300_000 + 60_000 + 30_000)
   })
 })
 

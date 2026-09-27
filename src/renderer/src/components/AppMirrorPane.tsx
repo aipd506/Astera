@@ -2,7 +2,7 @@
 // agent's app on a desktop the person never sees, in the agent's violet frame, with the helper that is
 // running, a Stop and a Close. The person watches; they do not drive.
 import { useI18n } from '../i18n/I18nProvider'
-import type { MirrorEntry } from '../lib/workspaceMirror'
+import { mirrorStatus, type MirrorEntry } from '../lib/workspaceMirror'
 
 export function AppMirrorPane(props: {
   sessionTitle: string
@@ -13,7 +13,8 @@ export function AppMirrorPane(props: {
   const { t } = useI18n()
   const m = props.mirror
   const open = m?.open === true
-  const status = m?.running ? t('workspace.pane.running', { helper: m.helper ?? '...' }) : open ? t('workspace.pane.idle') : t('workspace.pane.closed')
+  const s = mirrorStatus(m)
+  const status = 'params' in s ? t(s.key, s.params) : t(s.key)
   return (
     <div className="app-mirror">
       <div className="app-mirror-bar">

@@ -2,7 +2,9 @@ import { describe, it, expect, vi } from 'vitest'
 import type { RunContext } from '../agentBrowser/scriptRunner'
 import { clickScript, snapshotScript } from '../agentBrowser/guestScripts'
 import type { DeskWindow } from './protocol'
+import { LAUNCH_WAIT_MAX_MS } from './script'
 import {
+  CDP_WAIT_MS,
   DRAG_CDP_MS,
   LAYOUT_TRIES,
   NO_CDP,
@@ -108,7 +110,7 @@ const rig = (over: Partial<HelperDeps> = {}) => {
     recordLaunch: vi.fn(),
     changed: vi.fn(),
     cleanup: vi.fn(async () => {}),
-    deadline: () => 100_000,
+    launchWait: () => ({ leftMs: 100_000, end: () => {} }),
     now: () => 0,
     stopped: () => false,
     guide: '# guide\n\n## launch(spec)\nStarts it.\n\n## windows()\nLists them.\n',
@@ -144,10 +146,50 @@ describe('launch', () => {
     expect(parseLaunchSpec({ command: 'x', cwd: 'sub' })).toEqual({ command: 'x', cwd: 'sub' })
   })
 
-  it('waits for the port no longer than the script has left, minus a margin (ruling P1)', async () => {
-    const r = rig({ deadline: () => 10_000, now: () => 0 })
+  it('waits for the port no longer than the launch wait may last, minus a margin (ruling P1)', async () => {
+    const r = rig({ launchWait: () => ({ leftMs: 10_000, end: () => {} }), now: () => 0 })
     await r.h.launch({ command: 'app.exe' }, { waitMs: 60_000 })
     expect(r.deps.connectCdp).toHaveBeenCalledWith(9333, 8_000)
+  })
+
+  // Stage 4, task 2: a first dev build can take longer than a script may run. The wait is a launch
+  // wait, which the script's deadline does not count, so launch may ask for up to LAUNCH_WAIT_MAX_MS.
+  it('honours a waitMs above the default, up to LAUNCH_WAIT_MAX_MS, and waits 90 s when the port takes that long', async () => {
+    let t = 0
+    const end = vi.fn()
+    const launchWait = vi.fn(() => ({ leftMs: LAUNCH_WAIT_MAX_MS + 60_000, end }))
+    const r = rig({
+      launchWait,
+      now: () => t,
+      connectCdp: vi.fn(async (_port: number, waitMs: number) => {
+        // The port answers after 90 s, inside what was asked for.
+        t += 90_000
+        return 90_000 <= waitMs ? r.cdp : null
+      })
+    })
+    expect(await r.h.launch({ command: 'app.exe' }, { waitMs: 120_000 })).toEqual({ pid: 501, port: 9333 })
+    expect(r.deps.connectCdp).toHaveBeenCalledWith(9333, 120_000)
+    expect(launchWait).toHaveBeenCalledTimes(1)
+    expect(end).toHaveBeenCalledTimes(1)
+
+    const big = rig({ launchWait: () => ({ leftMs: LAUNCH_WAIT_MAX_MS * 2, end: () => {} }) })
+    await big.h.launch({ command: 'app.exe' }, { waitMs: 3_600_000 })
+    expect(big.deps.connectCdp).toHaveBeenCalledWith(9333, LAUNCH_WAIT_MAX_MS)
+    const plain = rig({ launchWait: () => ({ leftMs: LAUNCH_WAIT_MAX_MS * 2, end: () => {} }) })
+    await plain.h.launch({ command: 'app.exe' })
+    expect(plain.deps.connectCdp).toHaveBeenCalledWith(9333, CDP_WAIT_MS)
+  })
+
+  it('ends its launch wait whether the port opens or not, and relaunch takes a longer waitMs as launch does', async () => {
+    const end = vi.fn()
+    const failed = rig({ launchWait: () => ({ leftMs: 100_000, end }), connectCdp: vi.fn(async () => null) })
+    await expect(failed.h.launch({ command: 'app.exe' })).rejects.toThrow('debugging port')
+    expect(end).toHaveBeenCalledTimes(1)
+    const relaunched = rig({ launchWait: () => ({ leftMs: 100_000, end }) })
+    await relaunched.h.launch({ command: 'app.exe' })
+    await relaunched.h.relaunch({ waitMs: 200_000 })
+    expect(relaunched.deps.connectCdp).toHaveBeenLastCalledWith(9333, 100_000 - 2_000)
+    expect(end).toHaveBeenCalledTimes(3)
   })
 
   it('a stop that lands before the desktop, or before the launch, starts neither (ruling F1)', async () => {
@@ -197,7 +239,7 @@ describe('launch', () => {
 
   it('a page that never settles holds launch no longer than PAGE_READY_MS, then launch succeeds', async () => {
     let t = 0
-    const r = rig({ now: () => (t += 1_000), deadline: () => 1_000_000 })
+    const r = rig({ now: () => (t += 1_000), launchWait: () => ({ leftMs: 1_000_000, end: () => {} }) })
     r.cdp.evaluates(...Array.from({ length: 100 }, () => false))
     expect(await r.h.launch({ command: 'app.exe' })).toEqual({ pid: 501, port: 9333 })
     const polls = r.cdp.calls.filter((c) => c.method === 'Runtime.evaluate').length

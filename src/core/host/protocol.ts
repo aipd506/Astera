@@ -207,9 +207,11 @@ export interface WorkspaceFrame {
   at: number
 }
 
-/** What the mirror tab hears. `open: false` means the desktop is gone. */
+/** What the mirror tab hears. `open: false` means the desktop is gone. `launching`, present only while
+ *  the running script's `launch` or `relaunch` waits for the app's port or page, is how many whole
+ *  seconds it has waited so far (stage 4, task 2); the Host says it again every second. */
 export type WorkspaceEvent =
-  | { kind: 'state'; sessionId: string; open: boolean; running: boolean; helper: string | null }
+  | { kind: 'state'; sessionId: string; open: boolean; running: boolean; helper: string | null; launching?: number }
   | { kind: 'frame'; sessionId: string; frame: WorkspaceFrame }
 
 /** One open workspace, as `workspace-list` answers it for an app that attaches later. */

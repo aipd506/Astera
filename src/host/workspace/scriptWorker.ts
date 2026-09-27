@@ -29,7 +29,7 @@ import { treeKillCommand } from '../../core/run/kill'
 import { Interrupted, SCRIPT_TIMEOUT_MS, type RunError, type RunResult } from '../../core/agentBrowser/script'
 import type { RunContext } from '../../core/agentBrowser/scriptRunner'
 import { helpTexts } from '../../core/workspace/helpers'
-import { WORKSPACE_SYNCHRONOUS_HELPERS, gateHelpers } from '../../core/workspace/script'
+import { ScriptDeadline, WORKSPACE_SYNCHRONOUS_HELPERS, gateHelpers, type ScriptClock } from '../../core/workspace/script'
 
 /** The worker's whole code, loaded with `eval: true` so the build needs no second entry. It imports
  *  nothing from this repository. Plain ES2020, no template literals, so it sits in this string as is. */
@@ -333,14 +333,21 @@ export function endChild(c: ChildProcess, platform: NodeJS.Platform = process.pl
  *  result, `at`, log order and Stop and deadline mapping. `stop` and the deadline both end the child,
  *  whatever it is doing. Memory the script takes ends the child too, at `at: 'memory'`, and a child
  *  that dies without saying why ends the run at `at: 'crashed'`. The caps are parameters for the tests;
- *  the Host uses the defaults. */
+ *  the Host uses the defaults.
+ *
+ *  The deadline is a ScriptDeadline, handed to the helpers as their clock: the time a helper on this
+ *  thread spends in a launch wait (the app's port and page) does not count, up to LAUNCH_WAIT_MAX_MS
+ *  over the run (stage 4, task 2). This thread knows exactly when one is in flight, since the helpers
+ *  run here. A busy loop in the worker still ends at `timeoutMs` of time outside launch waits, and Stop
+ *  never waits for the clock. */
 export async function runScriptInWorker(a: {
   script: string
-  helpers: (ctx: RunContext) => Record<string, unknown>
+  helpers: (ctx: RunContext, clock: ScriptClock) => Record<string, unknown>
   stop: AbortSignal
   onHelper(name: string | null): void
   guide: string
   timeoutMs?: number
+  launchWaitMaxMs?: number
   memoryCapMb?: number
   heapLimitMb?: number
 }): Promise<RunResult> {
@@ -351,10 +358,22 @@ export async function runScriptInWorker(a: {
   const heapMb = a.heapLimitMb ?? SCRIPT_HEAP_LIMIT_MB
   const ctx: RunContext = { at: 'script' }
   const inner = new AbortController()
-  const gated = gateHelpers(a.helpers(ctx), ctx, inner.signal, a.onHelper)
+  // Set below, once the run's promise exists. The gap is synchronous, so no expiry can fall in it.
+  let expire = (): void => {}
+  const clock = new ScriptDeadline({ timeoutMs, launchMaxMs: a.launchWaitMaxMs, onExpire: () => expire() })
+  let gated: Record<string, unknown>
+  try {
+    gated = gateHelpers(a.helpers(ctx, clock), ctx, inner.signal, a.onHelper)
+  } catch (err) {
+    clock.dispose()
+    throw err
+  }
   const names = Object.keys(gated).filter((n) => typeof gated[n] === 'function' && n !== 'help' && n !== 'log')
   for (const n of names)
-    if (WORKSPACE_SYNCHRONOUS_HELPERS.has(n)) throw new Error(`the script worker cannot proxy the synchronous helper ${n}`)
+    if (WORKSPACE_SYNCHRONOUS_HELPERS.has(n)) {
+      clock.dispose()
+      throw new Error(`the script worker cannot proxy the synchronous helper ${n}`)
+    }
   const lines: string[] = []
   const couldNotStart = (err: unknown): RunResult => ({ log: [], error: { message: `the script could not start: ${messageOf(err)}`, at: 'script' } })
 
@@ -373,6 +392,7 @@ export async function runScriptInWorker(a: {
       detached: true
     })
   } catch (err) {
+    clock.dispose()
     inner.abort()
     return couldNotStart(err)
   }
@@ -387,7 +407,7 @@ export async function runScriptInWorker(a: {
     const finish = (error?: RunError): void => {
       if (over) return
       over = true
-      clearTimeout(timer)
+      clock.dispose()
       a.stop.removeEventListener('abort', onStop)
       // Every way out aborts the gate, so a helper the manager is still running stops asking for more.
       inner.abort()
@@ -439,11 +459,11 @@ export async function runScriptInWorker(a: {
       finish({ message: 'stopped', at: 'stopped' })
     }
 
-    const timer = setTimeout(() => {
+    expire = (): void => {
       // "Never awaited": the body was entered and its synchronous part has not returned yet.
       const never = begun && !started ? ' (it never awaited)' : ''
       finish({ message: `script did not finish within ${timeoutMs} ms${never}`, at: 'timeout' })
-    }, timeoutMs)
+    }
 
     const outOfMemory = (message: string): void => {
       ctx.at = 'memory'

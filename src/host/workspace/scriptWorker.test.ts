@@ -11,6 +11,7 @@ import { afterAll, describe, it, expect, vi } from 'vitest'
 import { Interrupted } from '../../core/agentBrowser/script'
 import { workspaceHelpers, type HelperDeps } from '../../core/workspace/helpers'
 import { endChild, runScriptInWorker, scriptChildEnv } from './scriptWorker'
+import type { ScriptClock } from '../../core/workspace/script'
 
 // Records every child process the runner spawns, delegating to the real spawn, so a test can say none
 // was started, reach one to kill it from outside, and check at the end that none is left running.
@@ -247,6 +248,69 @@ describe('helpers cross to this thread', () => {
     release()
     await new Promise((r) => setTimeout(r, 50))
     expect(after).not.toHaveBeenCalled()
+  })
+})
+
+// Stage 4, task 2: the time a launch spends waiting for the app's port and page is not the script's.
+// Scaled down: a 3 s deadline (long enough for a child to start on a shared CI runner) and a launch
+// wait longer than it. The wait is marked the way the real launch helper marks it, through the clock
+// the runner hands the helpers.
+describe('launch waits do not count against the deadline', () => {
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+  const withLaunch = (script: string, launch: (clock: ScriptClock) => Promise<unknown>, over: { stop?: AbortSignal } = {}) =>
+    runScriptInWorker({
+      script,
+      guide: GUIDE,
+      stop: over.stop ?? new AbortController().signal,
+      onHelper: () => {},
+      timeoutMs: TIMEOUT_MS,
+      helpers: (_ctx, clock) => ({ launch: () => launch(clock), nop: async () => {} })
+    })
+
+  it('a launch that waits longer than the whole deadline succeeds, and the script goes on after it', { timeout: LOOP_TEST_MS }, async () => {
+    const r = await withLaunch("log(await launch()); log('after')", async (clock) => {
+      const w = clock.launchWait()
+      try {
+        await sleep(TIMEOUT_MS + 1_500)
+        return 'up'
+      } finally {
+        w.end()
+      }
+    })
+    expect(r).toEqual({ log: ['up', 'after'] })
+  })
+
+  it('a busy loop after the launch is still cut, at the deadline counted without the wait', { timeout: LOOP_TEST_MS }, async () => {
+    let endedAt = 0
+    const r = await withLaunch(`await launch(); log('launched'); { const end = Date.now() + ${LOOP_MS}; while (Date.now() < end) {} } log('never')`, async (clock) => {
+      const w = clock.launchWait()
+      await sleep(TIMEOUT_MS + 1_500)
+      w.end()
+      endedAt = Date.now()
+    })
+    expect(r.log).toEqual(['launched'])
+    expect(r.error?.at).toBe('timeout')
+    expect(r.error?.message).toMatch(new RegExp(`^script did not finish within ${TIMEOUT_MS} ms`))
+    expect(Date.now() - endedAt).toBeLessThan(LOOP_MS - 10_000)
+  })
+
+  it('Stop during a long launch wait ends the script at once, past where the deadline would have been', { timeout: LOOP_TEST_MS }, async () => {
+    const stop = new AbortController()
+    let waitingSince = 0
+    const r = withLaunch('await launch()', (clock) => {
+      clock.launchWait()
+      waitingSince = Date.now()
+      return new Promise<never>(() => {})
+    }, { stop: stop.signal })
+    let settled = false
+    void r.then(() => (settled = true))
+    await vi.waitFor(() => expect(waitingSince).toBeGreaterThan(0), { timeout: 15_000, interval: 20 })
+    await sleep(TIMEOUT_MS + 500)
+    expect(settled).toBe(false)
+    const t0 = Date.now()
+    stop.abort()
+    expect(await r).toEqual({ log: [], error: { message: 'stopped', at: 'stopped' } })
+    expect(Date.now() - t0).toBeLessThan(1_000)
   })
 })
 

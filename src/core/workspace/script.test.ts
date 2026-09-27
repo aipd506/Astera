@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest'
-import { ScriptSlots, gateHelpers, runWorkspaceScript } from './script'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { LAUNCH_WAIT_MAX_MS, ScriptDeadline, ScriptSlots, gateHelpers, runWorkspaceScript } from './script'
 
 describe('ScriptSlots', () => {
   it('holds one script per session', () => {
@@ -99,5 +99,110 @@ describe('gateHelpers', () => {
       throw new Error('mirror down')
     }) as Record<string, () => Promise<string>>
     await expect(g.url()).resolves.toBe('u')
+  })
+})
+
+// The script's deadline counts only time outside launch waits (stage 4, task 2): a first dev build can
+// take longer than a whole script may run, and the wait for it must not be what ends the script.
+describe('ScriptDeadline', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const make = (timeoutMs = 60_000) => {
+    vi.useFakeTimers()
+    const expired = vi.fn()
+    const clock = new ScriptDeadline({ timeoutMs, onExpire: expired })
+    return { clock, expired }
+  }
+
+  it('the cap on launch waits is five minutes, and a launch may ask for all of it', () => {
+    expect(LAUNCH_WAIT_MAX_MS).toBe(300_000)
+  })
+
+  it('with no launch wait, expires at the timeout, once', () => {
+    const { clock, expired } = make()
+    vi.advanceTimersByTime(59_999)
+    expect(expired).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
+    expect(expired).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(600_000)
+    expect(expired).toHaveBeenCalledTimes(1)
+    clock.dispose()
+  })
+
+  it('a launch wait of 90 s does not count: the script still has its 60 s after it', () => {
+    const { clock, expired } = make()
+    vi.advanceTimersByTime(10_000)
+    const wait = clock.launchWait()
+    // What the wait may last: the rest of the launch cap plus the script's own time left.
+    expect(wait.leftMs).toBe(LAUNCH_WAIT_MAX_MS + 50_000)
+    vi.advanceTimersByTime(90_000)
+    expect(expired).not.toHaveBeenCalled()
+    wait.end()
+    vi.advanceTimersByTime(49_999)
+    expect(expired).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
+    expect(expired).toHaveBeenCalledTimes(1)
+    clock.dispose()
+  })
+
+  it('a busy loop after a long launch is still cut at 60 s of time outside launch waits', () => {
+    const { clock, expired } = make()
+    const wait = clock.launchWait()
+    vi.advanceTimersByTime(200_000)
+    wait.end()
+    // The script spins from here: nothing it does stops the clock again.
+    vi.advanceTimersByTime(60_000)
+    expect(expired).toHaveBeenCalledTimes(1)
+    clock.dispose()
+  })
+
+  it('launch waits past the cap count against the script again, so a wait never holds it forever', () => {
+    const { clock, expired } = make()
+    const wait = clock.launchWait()
+    vi.advanceTimersByTime(LAUNCH_WAIT_MAX_MS + 59_999)
+    expect(expired).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
+    expect(expired).toHaveBeenCalledTimes(1)
+    wait.end()
+    clock.dispose()
+  })
+
+  it('the cap is for the whole run: a second wait gets only what the first left', () => {
+    const { clock, expired } = make()
+    const first = clock.launchWait()
+    vi.advanceTimersByTime(250_000)
+    first.end()
+    const second = clock.launchWait()
+    expect(second.leftMs).toBe(50_000 + 60_000)
+    vi.advanceTimersByTime(110_000)
+    expect(expired).toHaveBeenCalledTimes(1)
+    second.end()
+    clock.dispose()
+  })
+
+  it('two waits at once pause the clock once, until both end; end is idempotent', () => {
+    const { clock, expired } = make()
+    const a = clock.launchWait()
+    const b = clock.launchWait()
+    vi.advanceTimersByTime(100_000)
+    a.end()
+    a.end()
+    vi.advanceTimersByTime(100_000)
+    expect(expired).not.toHaveBeenCalled()
+    b.end()
+    vi.advanceTimersByTime(60_000)
+    expect(expired).toHaveBeenCalledTimes(1)
+    clock.dispose()
+  })
+
+  it('dispose stops the clock: nothing expires after it', () => {
+    const { clock, expired } = make()
+    const wait = clock.launchWait()
+    clock.dispose()
+    wait.end()
+    vi.advanceTimersByTime(LAUNCH_WAIT_MAX_MS * 2)
+    expect(expired).not.toHaveBeenCalled()
   })
 })

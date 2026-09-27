@@ -12,18 +12,37 @@ export interface MirrorEntry {
   running: boolean
   helper: string | null
   frame: WorkspaceFrame | null
+  /** Seconds the running script's launch has waited for the app so far; absent when it is not waiting. */
+  launching?: number
 }
 
 export type Mirrors = Record<string, MirrorEntry>
 
 export function applyWorkspaceEvent(prev: Mirrors, e: WorkspaceEvent): Mirrors {
   const was = prev[e.sessionId]
-  if (e.kind === 'frame')
-    return { ...prev, [e.sessionId]: { sessionId: e.sessionId, open: true, running: was?.running ?? false, helper: was?.helper ?? null, frame: e.frame } }
+  if (e.kind === 'frame') {
+    const launching = was?.launching !== undefined ? { launching: was.launching } : {}
+    return { ...prev, [e.sessionId]: { sessionId: e.sessionId, open: true, running: was?.running ?? false, helper: was?.helper ?? null, frame: e.frame, ...launching } }
+  }
+  const running = e.open && e.running
+  const launching = running && e.launching !== undefined ? { launching: e.launching } : {}
   return {
     ...prev,
-    [e.sessionId]: { sessionId: e.sessionId, open: e.open, running: e.open && e.running, helper: e.open ? e.helper : null, frame: was?.frame ?? null }
+    [e.sessionId]: { sessionId: e.sessionId, open: e.open, running, helper: e.open ? e.helper : null, frame: was?.frame ?? null, ...launching }
   }
+}
+
+/** The mirror bar's status line, as a message key and its parameters: the app starting (with the
+ *  seconds the Host counts), a helper running, idle, or closed. */
+export function mirrorStatus(
+  m: MirrorEntry | null
+):
+  | { key: 'workspace.pane.launching'; params: { seconds: number } }
+  | { key: 'workspace.pane.running'; params: { helper: string } }
+  | { key: 'workspace.pane.idle' | 'workspace.pane.closed' } {
+  if (m?.running && m.launching !== undefined) return { key: 'workspace.pane.launching', params: { seconds: m.launching } }
+  if (m?.running) return { key: 'workspace.pane.running', params: { helper: m.helper ?? '...' } }
+  return { key: m?.open === true ? 'workspace.pane.idle' : 'workspace.pane.closed' }
 }
 
 export function mirrorsFromList(list: WorkspaceSummary[]): Mirrors {

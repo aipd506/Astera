@@ -1007,6 +1007,7 @@ export const ja: Catalog = {
   'workspace.tab.running': 'エージェントが見えないデスクトップでアプリを操作しています',
   'workspace.pane.title': '{session} のアプリ',
   'workspace.pane.running': '実行中: {helper}',
+  'workspace.pane.launching': 'アプリを起動しています… {seconds}秒',
   'workspace.pane.idle': '待機中（アプリは起動したままです）',
   'workspace.pane.closed': '閉じました',
   'workspace.pane.waiting': '最初の画面を待っています',

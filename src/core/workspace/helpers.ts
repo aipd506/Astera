@@ -12,6 +12,7 @@ import { clickScript, embedJson, fillScript, snapshotScript, waitForScript } fro
 import { section } from '../agentBrowser/section'
 import { cdpPortRef } from './platform'
 import type { DeskLaunched, DeskShot, DeskWindow } from './protocol'
+import { LAUNCH_WAIT_MAX_MS, type LaunchWait } from './script'
 
 export interface Cdp {
   /** One CDP command; resolves with its result, rejects with its error or when the socket closes. */
@@ -123,8 +124,11 @@ export interface HelperDeps {
   changed(): void
   /** `close()`: kill the tree, close the desktop, end the helper, without stopping this script. */
   cleanup(): Promise<void>
-  /** When this script's deadline falls, epoch ms (plan ruling P1). */
-  deadline(): number
+  /** A launch wait begins (stage 4, task 2): the script's deadline stops counting until its `end`,
+   *  for up to LAUNCH_WAIT_MAX_MS over the whole script, and `leftMs` says how long the wait may last
+   *  (plan ruling P1 bounds the port and page waits by it). `launch` and `relaunch` hold one while
+   *  they wait for the app's port and its page. */
+  launchWait(): LaunchWait
   now(): number
   /** The script was stopped (Stop, the session ending, the Host leaving) while a helper was still on
    *  its way: `launch` asks before it creates the desktop and before it starts the app, so a stop that
@@ -137,6 +141,8 @@ export interface HelperDeps {
   platform?: string
 }
 
+/** How long `launch` waits for the port when the script names no `waitMs`. A longer one is honoured up
+ *  to LAUNCH_WAIT_MAX_MS: the wait is a launch wait, which the script's deadline does not count. */
 export const CDP_WAIT_MS = 60_000
 export const LAUNCH_MARGIN_MS = 2_000
 export const NO_CDP = 'no CDP connection'
@@ -298,7 +304,7 @@ async function centerOf(cdp: Cdp, sel: string, at: string, tries = LAYOUT_TRIES)
 
 const waitOf = (opts: unknown): number => {
   if (!isRecord(opts) || typeof opts.waitMs !== 'number' || !Number.isFinite(opts.waitMs)) return CDP_WAIT_MS
-  return Math.max(0, Math.min(opts.waitMs, CDP_WAIT_MS))
+  return Math.max(0, Math.min(opts.waitMs, LAUNCH_WAIT_MAX_MS))
 }
 
 const NO_SUCH_HELPER: readonly [string, string] = ['no helper named ', ': run help() for the list']
@@ -346,7 +352,22 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
     const launched: Launched = { ...started, port, spec }
     deps.state.launched = launched
     deps.recordLaunch(launched)
-    const budget = Math.max(0, Math.min(waitMs, deps.deadline() - deps.now() - LAUNCH_MARGIN_MS))
+    // The port and page waits are one launch wait: the script's deadline does not count them, and
+    // every way out of them ends it (a port that never opens, a stopped launch, a page that settles).
+    const wait = deps.launchWait()
+    try {
+      return await connect(at, launched, waitMs, wait.leftMs)
+    } finally {
+      wait.end()
+    }
+  }
+
+  /** Waits for the launched app's port, then for its page, both within the launch wait's `leftMs`. */
+  const connect = async (at: string, launched: Launched, waitMs: number, leftMs: number): Promise<{ pid: number; port: number }> => {
+    const { pid, port } = launched
+    const began = deps.now()
+    const left = (): number => leftMs - (deps.now() - began) - LAUNCH_MARGIN_MS
+    const budget = Math.max(0, Math.min(waitMs, left()))
     const cdp = await deps.connectCdp(port, budget)
     // A stopped launch keeps waiting on the port. If a newer script relaunched (or closed and launched)
     // meanwhile, the state is no longer this launch's: its late result must not overwrite the newer
@@ -366,13 +387,13 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
           ? 'The app is still running, but on macOS only its page can be driven, so the helpers other than close() and relaunch() cannot reach it until it opens the port.'
           : `The app is still running, so windows(), windowShot() and keys() work; the page helpers throw "${NO_CDP}".`
       throw new Error(
-        `${at}: the app started (pid ${started.pid}) but nothing answered on its debugging port ${port} within ${Math.round(budget / 1000)} s. ` +
+        `${at}: the app started (pid ${pid}) but nothing answered on its debugging port ${port} within ${Math.round(budget / 1000)} s. ` +
           `Start Electron with --remote-debugging-port=${portRef} (for example: electron . --remote-debugging-port=${portRef}). ` +
           after
       )
     }
-    await pageSettled(cdp, deps, deps.now() + Math.max(0, Math.min(PAGE_READY_MS, deps.deadline() - deps.now() - LAUNCH_MARGIN_MS)))
-    return { pid: started.pid, port }
+    await pageSettled(cdp, deps, deps.now() + Math.max(0, Math.min(PAGE_READY_MS, left())))
+    return { pid, port }
   }
 
   const dragEvents = async (cdp: Cdp, x: number, y: number, data: unknown): Promise<void> => {

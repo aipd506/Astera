@@ -1233,6 +1233,7 @@ export const ko = {
   'workspace.tab.running': '에이전트가 보이지 않는 데스크톱에서 앱을 조작하고 있습니다',
   'workspace.pane.title': '{session} 의 앱',
   'workspace.pane.running': '실행 중: {helper}',
+  'workspace.pane.launching': '앱을 시작하는 중… {seconds}초',
   'workspace.pane.idle': '대기 중 (앱은 떠 있습니다)',
   'workspace.pane.closed': '닫혔습니다',
   'workspace.pane.waiting': '첫 화면을 기다리는 중',

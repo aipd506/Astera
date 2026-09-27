@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import type { Cdp, DeskHandle } from '../../core/workspace/helpers'
 import type { DeskShot, DeskWindow } from '../../core/workspace/protocol'
 import type { DesktopHelper } from './desktopHelper'
-import { DISPOSE_CAP_MS, createWorkspaceManager, disposeWithin, type WorkspaceEvent, type WorkspaceManager, type WorkspaceManagerDeps } from './manager'
+import { DISPOSE_CAP_MS, FRAME_EVERY_MS, createWorkspaceManager, disposeWithin, type WorkspaceEvent, type WorkspaceManager, type WorkspaceManagerDeps } from './manager'
 
 // Records the child processes the script runner spawns (scriptWorker.ts), delegating to the real spawn.
 const spawned = vi.hoisted(() => ({ children: [] as import('node:child_process').ChildProcess[] }))
@@ -737,6 +737,65 @@ describe('Stop, Close, the session, the helper, idleness', () => {
     await m.dispose()
     expect(FakeDesk.made.every((d) => d.closed)).toBe(true)
     expect((await m.run('s1', 'log(1)')).status).toBe(409)
+  })
+})
+
+// Stage 4, task 2: a first dev build can take longer than a whole script may run. The wait for the
+// app's port and page is a launch wait, which the script's deadline does not count (up to
+// LAUNCH_WAIT_MAX_MS in all), so such an app can be launched at all. Scaled down: a 3 s deadline, long
+// enough for the script's child to start on a shared CI runner, and a port that answers after 4.5 s.
+describe('long launches', () => {
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+  it('a launch whose port answers after the deadline would have passed succeeds, with the waitMs the script asked for', { timeout: 40_000 }, async () => {
+    const connectCdp = vi.fn(async () => {
+      await sleep(4_500)
+      return fakeCdp()
+    })
+    const { m } = await rig({ scriptTimeoutMs: 3_000, connectCdp })
+    const r = await m.run('s1', "const a = await launch({ command: 'app.exe' }, { waitMs: 120000 }); log(a.pid)")
+    expect(body(r)).toEqual({ log: ['501'] })
+    expect(connectCdp).toHaveBeenCalledWith(expect.any(Number), 120_000)
+  })
+
+  it('the mirror hears how long the app has been starting, each second, and hears the end of it', { timeout: 40_000 }, async () => {
+    let answer!: () => void
+    const { m, events, tick } = await rig({ connectCdp: vi.fn(() => new Promise<Cdp | null>((r) => (answer = () => r(fakeCdp())))) })
+    const run = m.run('s1', "await launch({ command: 'app.exe' }, { waitMs: 120000 })")
+    await vi.waitFor(() => expect(answer).toBeTypeOf('function'), { timeout: 15_000 })
+    tick(FRAME_EVERY_MS)
+    tick(FRAME_EVERY_MS)
+    const launching = events.filter((e) => e.kind === 'state' && e.launching !== undefined)
+    expect(launching.map((e) => e.kind === 'state' && e.launching)).toEqual(expect.arrayContaining([1, 2]))
+    expect(launching.every((e) => e.kind === 'state' && e.open && e.running)).toBe(true)
+    answer()
+    expect(body(await run).error).toBeUndefined()
+    const last = events.filter((e) => e.kind === 'state').at(-1)
+    expect(last).toMatchObject({ kind: 'state', sessionId: 's1', open: true, running: false })
+    expect(last).not.toHaveProperty('launching')
+    expect(m.list()).toEqual([expect.objectContaining({ sessionId: 's1', running: false, helper: null })])
+  })
+
+  it('Stop during a long launch ends the script at once, well past where the deadline would have been', { timeout: 40_000 }, async () => {
+    let waiting = false
+    const { m } = await rig({
+      scriptTimeoutMs: 1_000,
+      connectCdp: vi.fn(() => {
+        waiting = true
+        return new Promise<Cdp | null>(() => {})
+      })
+    })
+    let settled = false
+    const run = m.run('s1', "await launch({ command: 'app.exe' }, { waitMs: 300000 })")
+    void run.then(() => (settled = true))
+    await vi.waitFor(() => expect(waiting).toBe(true), { timeout: 15_000 })
+    await sleep(1_500)
+    expect(settled).toBe(false)
+    const t0 = Date.now()
+    expect(m.stop('s1')).toBe(true)
+    expect(body(await run).error).toEqual({ message: 'stopped', at: 'stopped' })
+    expect(Date.now() - t0).toBeLessThan(1_000)
+    expect(FakeDesk.made[0].closed).toBe(false)
   })
 })
 

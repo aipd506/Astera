@@ -1019,6 +1019,7 @@ export const es: Catalog = {
   'workspace.tab.running': 'El agente está manejando su app en un escritorio oculto',
   'workspace.pane.title': 'App de {session}',
   'workspace.pane.running': 'En curso: {helper}',
+  'workspace.pane.launching': 'Iniciando la app… {seconds} s',
   'workspace.pane.idle': 'En espera (la app sigue abierta)',
   'workspace.pane.closed': 'Cerrado',
   'workspace.pane.waiting': 'Esperando la primera imagen',

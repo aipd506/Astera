@@ -12,6 +12,103 @@ import { createLog, SCRIPT_TIMEOUT_MS, type RunResult } from '../agentBrowser/sc
 import { runScript, type RunContext } from '../agentBrowser/scriptRunner'
 import { gateHelpers as gate } from '../agentBrowser/scriptGate'
 
+/** How long, in all over one script, its launch waits may hold its deadline (stage 4, task 2). A first
+ *  dev build of an Electron or webpack app can take longer than a whole script may run, so the time
+ *  `launch` and `relaunch` spend waiting for the app's port and page is not the script's: its deadline
+ *  counts only the time outside those waits, up to this cap. A launch may ask for all of it
+ *  (`{ waitMs }`). Past the cap, a wait counts against the script again, so no wait holds it forever. */
+export const LAUNCH_WAIT_MAX_MS = 300_000
+
+/** One launch wait in progress. `leftMs` is how long it may last: what is left of the launch cap plus
+ *  the script's own time left. `end` resumes the deadline; a second call does nothing. */
+export interface LaunchWait {
+  readonly leftMs: number
+  end(): void
+}
+
+/** What the runner hands the helpers: the script's deadline, which a launch wait holds. */
+export interface ScriptClock {
+  launchWait(): LaunchWait
+}
+
+/** A script's deadline that launch waits hold (LAUNCH_WAIT_MAX_MS). `onExpire` is called once, when
+ *  `timeoutMs` of time outside launch waits has passed; time inside them past the cap counts too. Two
+ *  waits at once hold it once. Only a timer: Stop, which never waits for it, is the runner's own. */
+export class ScriptDeadline implements ScriptClock {
+  private left: number
+  private launchLeft: number
+  private since: number
+  private waits = 0
+  private timer: ReturnType<typeof setTimeout> | undefined
+  private over = false
+  private readonly now: () => number
+
+  constructor(private readonly o: { timeoutMs: number; launchMaxMs?: number; onExpire(): void; now?: () => number }) {
+    this.now = o.now ?? Date.now
+    this.left = o.timeoutMs
+    this.launchLeft = o.launchMaxMs ?? LAUNCH_WAIT_MAX_MS
+    this.since = this.now()
+    this.arm()
+  }
+
+  /** Charges the time since the last settle: to the launch cap while a wait holds the deadline, and
+   *  whatever the cap cannot take, to the script. */
+  private settle(): void {
+    const t = this.now()
+    let spent = Math.max(0, t - this.since)
+    this.since = t
+    if (this.waits > 0) {
+      const held = Math.min(spent, this.launchLeft)
+      this.launchLeft -= held
+      spent -= held
+    }
+    this.left -= spent
+  }
+
+  private arm(): void {
+    clearTimeout(this.timer)
+    this.timer = undefined
+    if (this.over) return
+    const held = this.waits > 0 && this.launchLeft > 0
+    if (!held && this.left <= 0) {
+      this.over = true
+      this.o.onExpire()
+      return
+    }
+    this.timer = setTimeout(
+      () => {
+        this.settle()
+        this.arm()
+      },
+      held ? this.launchLeft : this.left
+    )
+  }
+
+  launchWait(): LaunchWait {
+    this.settle()
+    this.waits += 1
+    this.arm()
+    let ended = false
+    return {
+      leftMs: this.launchLeft + Math.max(0, this.left),
+      end: () => {
+        if (ended) return
+        ended = true
+        this.settle()
+        this.waits -= 1
+        this.arm()
+      }
+    }
+  }
+
+  /** The run is over: no expiry after this. */
+  dispose(): void {
+    this.over = true
+    clearTimeout(this.timer)
+    this.timer = undefined
+  }
+}
+
 /** Helpers a script may call without `await`. They cannot park, so a stopped run throws instead. */
 export const WORKSPACE_SYNCHRONOUS_HELPERS: ReadonlySet<string> = new Set(['help'])
 

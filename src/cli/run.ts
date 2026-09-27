@@ -60,6 +60,7 @@ import {
   DEFAULT_WAIT_TIMEOUT_MS
 } from '../core/orchestration/types'
 import { SCRIPT_TIMEOUT_MS } from '../core/agentBrowser/script'
+import { LAUNCH_WAIT_MAX_MS } from '../core/workspace/script'
 import {
   queueableReportProblem,
   pendingReportFileName,
@@ -249,9 +250,13 @@ export function clientTimeoutMs(a: { cmd: string; args: Record<string, unknown> 
   const defaultForCmd =
     a.cmd === 'ask'
       ? DEFAULT_ASK_TIMEOUT_MS
-      : a.cmd === 'browser-js' || a.cmd === 'app-js'
+      : a.cmd === 'browser-js'
         ? SCRIPT_TIMEOUT_MS
-        : // **기다리는 명령은 서버와 같은 마감을 써야 한다.** 짧은 값을 쓰면 서버가 답을
+        : // app js 의 60 초 마감은 앱이 뜨기를 기다리는 시간(launch 대기)을 세지 않고, 그 대기는
+          // LAUNCH_WAIT_MAX_MS 까지 간다. 그 둘을 합친 것보다 먼저 끊으면 앱은 떴는데 CLI 만 끝난다.
+          a.cmd === 'app-js'
+          ? SCRIPT_TIMEOUT_MS + LAUNCH_WAIT_MAX_MS
+          : // **기다리는 명령은 서버와 같은 마감을 써야 한다.** 짧은 값을 쓰면 서버가 답을
           // 준비하는 사이에 클라이언트가 연결을 끊고, "타임아웃은 정보다" 는 계약이 깨진다
           // (ask 의 기본값이 서버보다 짧아서 실제로 그러였다).
           a.cmd === 'jobs-wait' || a.cmd === 'runs-wait' || (a.cmd === 'sessions-send' && a.args.wait === true)

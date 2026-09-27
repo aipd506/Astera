@@ -9,7 +9,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { SCRIPT_TIMEOUT_MS } from '../../core/agentBrowser/script'
 import { evictionPlan } from '../../core/preview/pick/shots'
-import { ScriptSlots } from '../../core/workspace/script'
+import { ScriptSlots, type ScriptClock } from '../../core/workspace/script'
 import { workspaceHelpers, type AppState, type Cdp, type Desk, type DeskHandle, type HelperDeps, type LaunchSpec, type ResolvedLaunch } from '../../core/workspace/helpers'
 import {
   idleExpired,
@@ -112,6 +112,9 @@ interface Entry {
    *  to start while this is set is told closed, once (the Task 5 deferred minor: the mirror must not
    *  keep showing a workspace that never came to exist). */
   told: boolean
+  /** The running script's launch is waiting for the app's port or page (stage 4, task 2): since when,
+   *  and which script's it is. The mirror shows "Starting the app" with the seconds from `since`. */
+  launching: { since: number; owner: AbortController } | null
 }
 
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err))
@@ -144,7 +147,16 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   }
   const emitState = (e: Entry, open: boolean): void => {
     e.told = open
-    safeEmit({ kind: 'state', sessionId: e.sessionId, open, running: slots.isRunning(e.sessionId), helper: e.helper })
+    // Only the running script's own launch: a stopped one still waiting on the port is not shown.
+    const l = open && e.launching && e.launching.owner === e.script ? e.launching : null
+    safeEmit({
+      kind: 'state',
+      sessionId: e.sessionId,
+      open,
+      running: slots.isRunning(e.sessionId),
+      helper: e.helper,
+      ...(l ? { launching: Math.max(0, Math.floor((now() - l.since) / 1_000)) } : {})
+    })
   }
 
   /** Writes what is open now. Serialised, so the last call's picture is the one on disk (R3: logged). */
@@ -174,7 +186,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   const entryOf = (sessionId: string): Entry => {
     let e = entries.get(sessionId)
     if (!e) {
-      e = { sessionId, desk: null, deskStarting: null, state: { launched: null, cdp: null }, lastActivityAt: now(), helper: null, frame: null, capturing: false, dirty: false, stopFrames: null, script: null, told: false }
+      e = { sessionId, desk: null, deskStarting: null, state: { launched: null, cdp: null }, lastActivityAt: now(), helper: null, frame: null, capturing: false, dirty: false, stopFrames: null, script: null, told: false, launching: null }
       entries.set(sessionId, e)
     }
     return e
@@ -373,7 +385,34 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     close: () => desk.close()
   })
 
-  const helperDeps = (e: Entry, cwd: string, deadline: number, stop: AbortController): HelperDeps => ({
+  /** A launch wait of the script `stop` belongs to: the runner's clock holds the deadline, and the
+   *  mirror hears that the app is starting, then that it is no longer (FRAME_EVERY_MS re-tells the
+   *  seconds). Two at once (a launch the script did not await) are shown as one, from the first. */
+  const launchWaits = (e: Entry, clock: ScriptClock, stop: AbortController): HelperDeps['launchWait'] => {
+    let waits = 0
+    return () => {
+      const w = clock.launchWait()
+      waits += 1
+      // A stopped script's launch still waiting on the port never takes the place of a newer one's.
+      if (waits === 1 && e.script === stop) e.launching = { since: now(), owner: stop }
+      if (isOpen(e)) emitState(e, true)
+      let ended = false
+      return {
+        leftMs: w.leftMs,
+        end: () => {
+          if (ended) return
+          ended = true
+          w.end()
+          waits -= 1
+          if (waits > 0 || e.launching?.owner !== stop) return
+          e.launching = null
+          if (isOpen(e)) emitState(e, true)
+        }
+      }
+    }
+  }
+
+  const helperDeps = (e: Entry, cwd: string, clock: ScriptClock, stop: AbortController): HelperDeps => ({
     state: e.state,
     // Ruling F1: a desktop that finishes starting after this script was stopped, with nothing launched
     // on it, is closed at once, unless a newer script holds the session and is using it (review minor
@@ -395,7 +434,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
       void captureFrame(e).catch(() => undefined)
     },
     cleanup: () => cleanup(e, 'close()', false),
-    deadline: () => deadline,
+    launchWait: launchWaits(e, clock, stop),
     now,
     guide: d.guide(),
     platform: d.platform
@@ -466,6 +505,8 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
       e.lastActivityAt = startedAt
       if (isOpen(e)) emitState(e, true)
       e.stopFrames = every(FRAME_EVERY_MS, () => {
+        // While the app is starting, the mirror's seconds move on with each frame tick.
+        if (e.launching?.owner === ac && isOpen(e)) emitState(e, true)
         void captureFrame(e).catch(() => undefined)
       })
       try {
@@ -479,7 +520,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
             e.helper = name
             if (isOpen(e)) emitState(e, true)
           },
-          helpers: (ctx) => workspaceHelpers(helperDeps(e, cwd, startedAt + timeoutMs, ac), ctx)
+          helpers: (ctx, clock) => workspaceHelpers(helperDeps(e, cwd, clock, ac), ctx)
         })
         return { status: 200, body: result }
       } finally {
@@ -488,6 +529,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
         ac.abort()
         slots.end(sessionId, ac)
         if (e.script === ac) e.script = null
+        if (e.launching?.owner === ac) e.launching = null
         e.stopFrames?.()
         e.stopFrames = null
         e.helper = null

@@ -27,6 +27,19 @@ describe('createHostWorkspaceView', () => {
     expect(view.current()).toEqual([])
   })
 
+  // Stage 4, task 2: while a launch waits for the app, the Host's state says for how many seconds.
+  it('carries how long the app has been starting, and leaves out a count it cannot read', () => {
+    const { view, changed } = rig()
+    view.pushed({ t: 'workspace', event: { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'launch', launching: 7 } })
+    view.pushed({ t: 'workspace', event: { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'launch', launching: 'soon' } } as never)
+    view.pushed({ t: 'workspace', event: { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'launch', launching: -1 } } as never)
+    expect(changed).toEqual([
+      { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'launch', launching: 7 },
+      { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'launch' },
+      { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'launch' }
+    ])
+  })
+
   it('drops a push from a Host that did not announce it, and a push it cannot read', () => {
     const quiet = rig([])
     quiet.view.pushed({ t: 'workspace', event: { kind: 'state', sessionId: 's1', open: true, running: false, helper: null } })

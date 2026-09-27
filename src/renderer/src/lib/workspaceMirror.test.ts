@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { appTab, sessionTab } from '../../../core/panes/tabId'
 import { createGroup, leaves, type PaneNode } from '../../../core/panes/tree'
-import { applyWorkspaceEvent, mirrorsFromList, newlyOpened, openSessionIds, placeAppTabs, removeAppTab, type Mirrors } from './workspaceMirror'
+import { applyWorkspaceEvent, mirrorStatus, mirrorsFromList, newlyOpened, openSessionIds, placeAppTabs, removeAppTab, type Mirrors } from './workspaceMirror'
 
 const frame = { jpeg: '/9j/', width: 4, height: 3, at: 1 }
 
@@ -13,6 +13,26 @@ describe('the mirror state', () => {
     expect(m.s1).toEqual({ sessionId: 's1', open: true, running: true, helper: 'launch', frame })
     m = applyWorkspaceEvent(m, { kind: 'state', sessionId: 's1', open: false, running: false, helper: null })
     expect(m.s1).toEqual({ sessionId: 's1', open: false, running: false, helper: null, frame })
+  })
+
+  // Stage 4, task 2: a long first build holds launch for minutes, and the mirror says so, with the
+  // seconds the Host counts, rather than only "Running: launch".
+  it('keeps how long the app has been starting while the Host says so, across frames, and drops it after', () => {
+    let m: Mirrors = {}
+    m = applyWorkspaceEvent(m, { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'launch', launching: 12 })
+    expect(m.s1.launching).toBe(12)
+    m = applyWorkspaceEvent(m, { kind: 'frame', sessionId: 's1', frame })
+    expect(m.s1.launching).toBe(12)
+    expect(mirrorStatus(m.s1)).toEqual({ key: 'workspace.pane.launching', params: { seconds: 12 } })
+    m = applyWorkspaceEvent(m, { kind: 'state', sessionId: 's1', open: true, running: true, helper: 'snapshot' })
+    expect(m.s1).not.toHaveProperty('launching')
+    expect(mirrorStatus(m.s1)).toEqual({ key: 'workspace.pane.running', params: { helper: 'snapshot' } })
+    m = applyWorkspaceEvent(m, { kind: 'state', sessionId: 's1', open: true, running: false, helper: null, launching: 3 })
+    expect(m.s1).not.toHaveProperty('launching')
+    expect(mirrorStatus(m.s1)).toEqual({ key: 'workspace.pane.idle' })
+    expect(mirrorStatus({ ...m.s1, open: false })).toEqual({ key: 'workspace.pane.closed' })
+    expect(mirrorStatus(null)).toEqual({ key: 'workspace.pane.closed' })
+    expect(mirrorStatus({ ...m.s1, running: true, helper: null })).toEqual({ key: 'workspace.pane.running', params: { helper: '...' } })
   })
 
   it('a frame for a session it has not heard of opens it', () => {
