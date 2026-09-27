@@ -348,6 +348,11 @@ export async function checkCwd(cwd: string, probe: Probe = defaultCwdProbe, miss
  * Whether `file` sits in any directory of `pathValue`, and whether any directory timed out (a
  * caller caches such an answer only briefly). The directories are probed together; the probe's own
  * pool bounds how many at once, and one that times out counts as not holding it.
+ *
+ * `at` is where it sits: the full path in the first directory, in PATH order, that answered present.
+ * A caller that spawns the file hands over `at`, never the bare name, because a spawner given a bare
+ * name walks PATH again itself, synchronously (node-pty's conpty.cc does), and one dead entry then
+ * freezes the spawning thread.
  */
 export async function findOnPath(
   pathValue: string,
@@ -355,10 +360,12 @@ export async function findOnPath(
   probe: Probe,
   delimiter: string = path.delimiter,
   join: (...parts: string[]) => string = path.join
-): Promise<{ found: boolean; timedOut: boolean }> {
+): Promise<{ found: boolean; timedOut: boolean; at: string | null }> {
   const dirs = pathValue.split(delimiter).filter((d) => d !== '')
-  const results = await Promise.all(dirs.map((dir) => probe(join(dir, file))))
-  return { found: results.includes('present'), timedOut: results.includes('timeout') }
+  const paths = dirs.map((dir) => join(dir, file))
+  const results = await Promise.all(paths.map((p) => probe(p)))
+  const first = results.indexOf('present')
+  return { found: first >= 0, timedOut: results.includes('timeout'), at: first >= 0 ? paths[first] : null }
 }
 
 interface Entry<V> {

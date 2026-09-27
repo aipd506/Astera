@@ -1,7 +1,15 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import type { PtyFactory, PtyLike, PtySpawnOptions } from '../core/sessions/pty'
 import { win32 } from 'node:path'
-import { PROBE_CACHE_TTL_MS, PROBE_DEGRADED_TTL_MS, PathKeyedCache, type ProbeResult } from '../core/sessions/pathProbe'
+import {
+  PROBE_CACHE_TTL_MS,
+  PROBE_DEGRADED_TTL_MS,
+  PROBE_TIMEOUT_MS,
+  PathKeyedCache,
+  createProbePool,
+  createProber,
+  type ProbeResult
+} from '../core/sessions/pathProbe'
 import { TerminalManager, createOnPath } from './terminalManager'
 
 class FakePty implements PtyLike {
@@ -30,9 +38,15 @@ function setup(platform: NodeJS.Platform = 'win32') {
     spawned.push({ file, args, opts, pty })
     return pty
   }
-  const mgr = new TerminalManager(factory, platform, async (f) => f === 'pwsh.exe', undefined)
+  const mgr = new TerminalManager(factory, platform, async (f) => (f === 'pwsh.exe' ? 'C:\\PS7\\pwsh.exe' : null), undefined, {
+    cwdProbe: async () => 'present'
+  })
   return { mgr, spawned }
 }
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 describe('TerminalManager', () => {
   it('looks for every candidate shell at once, and still takes the first one in order', async () => {
@@ -43,17 +57,65 @@ describe('TerminalManager', () => {
     }
     const asked: string[] = []
     const gates: (() => void)[] = []
-    const exists = (f: string) => {
+    const locate = (f: string) => {
       asked.push(f)
-      return new Promise<boolean>((res) => gates.push(() => res(f !== 'pwsh.exe')))
+      return new Promise<string | null>((res) => gates.push(() => res(f !== 'pwsh.exe' ? `C:\\Windows\\System32\\${f}` : null)))
     }
-    const mgr = new TerminalManager(factory, 'win32', exists, undefined)
+    const mgr = new TerminalManager(factory, 'win32', locate, undefined, { cwdProbe: async () => 'present' })
     const opening = mgr.open('D:\\p')
-    await Promise.resolve()
-    expect(asked).toEqual(['pwsh.exe', 'powershell.exe', 'cmd.exe'])
+    await vi.waitFor(() => expect(asked).toEqual(['pwsh.exe', 'powershell.exe', 'cmd.exe']))
     gates.forEach((g) => g())
     await opening
-    expect(spawned).toEqual(['powershell.exe'])
+    expect(spawned).toEqual(['C:\\Windows\\System32\\powershell.exe'])
+  })
+
+  // node-pty (conpty.cc) walks PATH itself, synchronously, for a relative file name. So the pty must
+  // be handed the absolute path the async lookup found, or one dead PATH entry freezes the thread.
+  it('hands the pty the absolute path the lookup found, never a bare name', async () => {
+    const { mgr, spawned } = setup()
+    await mgr.open('D:\\p')
+    expect(spawned[0].file).toBe('C:\\PS7\\pwsh.exe')
+  })
+
+  it('falls back to cmd.exe under SystemRoot, by absolute path, when no candidate was found', async () => {
+    const files: string[] = []
+    const factory: PtyFactory = (file) => (files.push(file), new FakePty())
+    const mgr = new TerminalManager(factory, 'win32', async () => null, undefined, {
+      cwdProbe: async () => 'present',
+      systemRoot: 'C:\\WINDOWS'
+    })
+    await mgr.open('D:\\p')
+    expect(files).toEqual(['C:\\WINDOWS\\System32\\cmd.exe'])
+  })
+
+  it('a project folder that is not there fails with CWD_MISSING, and no pty is started', async () => {
+    const files: string[] = []
+    const factory: PtyFactory = (file) => (files.push(file), new FakePty())
+    const mgr = new TerminalManager(factory, 'win32', async () => 'C:\\PS7\\pwsh.exe', undefined, { cwdProbe: async () => 'absent' })
+    await expect(mgr.open('D:\\gone')).rejects.toThrow('CWD_MISSING: D:\\gone')
+    expect(files).toEqual([])
+    expect(mgr.list('D:\\gone')).toEqual([])
+  })
+
+  it('a project folder whose probe never answers fails at 1.5 s with "folder not reachable", and no pty is started', async () => {
+    vi.useFakeTimers()
+    const files: string[] = []
+    const factory: PtyFactory = (file) => (files.push(file), new FakePty())
+    const cwdProbe = createProber({ access: () => new Promise<void>(() => {}), log: () => {}, pool: createProbePool(), skipQueue: true })
+    const cwd = '\\\\offline-server\\share\\proj'
+    const mgr = new TerminalManager(factory, 'win32', async () => 'C:\\PS7\\pwsh.exe', undefined, { cwdProbe })
+    const outcome = mgr.open(cwd).then(
+      () => 'resolved',
+      (e: Error) => e.message
+    )
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS - 1)
+    let settled = false
+    void outcome.then(() => (settled = true))
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await outcome).toBe(`CWD_UNREACHABLE: folder not reachable: ${cwd}`)
+    expect(files).toEqual([])
   })
 
   it('해석된 셸을 프로젝트 경로 cwd로 spawn한다', async () => {
@@ -62,7 +124,7 @@ describe('TerminalManager', () => {
     expect(info.projectPath).toBe('D:\\work\\proj')
     expect(info.id).toBeTruthy()
     expect(spawned).toHaveLength(1)
-    expect(spawned[0].file).toBe('pwsh.exe')
+    expect(spawned[0].file).toBe('C:\\PS7\\pwsh.exe')
     expect(spawned[0].args).toEqual([])
     expect(spawned[0].opts.cwd).toBe('D:\\work\\proj')
   })
@@ -196,7 +258,7 @@ describe('TerminalManager', () => {
       spawned.push({ file })
       return new FakePty()
     }
-    const mgr = new TerminalManager(factory, 'linux', async () => false, '/bin/zsh')
+    const mgr = new TerminalManager(factory, 'linux', async () => null, '/bin/zsh', { cwdProbe: async () => 'present' })
     await mgr.open('/home/u/p')
     expect(spawned[0].file).toBe('/bin/zsh')
   })
@@ -305,20 +367,21 @@ describe('createOnPath — the default shell lookup', () => {
       return p === 'C:\\Windows\\System32\\cmd.exe' ? 'present' : 'absent'
     }
     const onPath = createOnPath(probe, () => 'Z:\\tools;C:\\Windows\\System32', new PathKeyedCache(PROBE_CACHE_TTL_MS, () => t), ';', win32.join)
-    expect(await onPath('pwsh.exe')).toBe(false)
+    expect(await onPath('pwsh.exe')).toBeNull()
     const first = probes
     t += PROBE_DEGRADED_TTL_MS - 1
-    expect(await onPath('pwsh.exe')).toBe(false)
+    expect(await onPath('pwsh.exe')).toBeNull()
     expect(probes).toBe(first)
     t += 1
     offline = false
-    expect(await onPath('pwsh.exe')).toBe(false)
+    expect(await onPath('pwsh.exe')).toBeNull()
     expect(probes).toBeGreaterThan(first)
     // Clean now: kept for the full time.
     const second = probes
     t += PROBE_CACHE_TTL_MS - 1
-    expect(await onPath('pwsh.exe')).toBe(false)
+    expect(await onPath('pwsh.exe')).toBeNull()
     expect(probes).toBe(second)
-    expect(await onPath('cmd.exe')).toBe(true)
+    // The answer is where the file is, so the pty never walks PATH itself.
+    expect(await onPath('cmd.exe')).toBe('C:\\Windows\\System32\\cmd.exe')
   })
 })

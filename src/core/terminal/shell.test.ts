@@ -60,17 +60,31 @@ describe('resolveShell — non-win32', () => {
 })
 
 describe('resolveShellAsync', () => {
-  const hasAsync = (...present: string[]) => async (file: string) => present.includes(file)
+  const locateIn =
+    (dir: string, ...present: string[]) =>
+    async (file: string): Promise<string | null> =>
+      present.includes(file) ? `${dir}\\${file}` : null
 
-  it('answers what resolveShell answers, candidate order kept', async () => {
-    for (const present of [['pwsh.exe', 'cmd.exe'], ['powershell.exe', 'cmd.exe'], ['cmd.exe'], []]) {
-      expect(await resolveShellAsync('win32', hasAsync(...present))).toEqual(resolveShell('win32', has(...present)))
-    }
+  // node-pty walks PATH itself, synchronously, for a bare name; so the answer is the absolute path.
+  it('takes the first candidate in order, by the absolute path the lookup found', async () => {
+    expect(await resolveShellAsync('win32', locateIn('C:\\bin', 'pwsh.exe', 'cmd.exe'))).toEqual({ file: 'C:\\bin\\pwsh.exe', args: [] })
+    expect(await resolveShellAsync('win32', locateIn('C:\\bin', 'powershell.exe', 'cmd.exe'))).toEqual({
+      file: 'C:\\bin\\powershell.exe',
+      args: []
+    })
+    expect(await resolveShellAsync('win32', locateIn('C:\\bin', 'cmd.exe'))).toEqual({ file: 'C:\\bin\\cmd.exe', args: [] })
+  })
+
+  it('falls back to the path it is given when no candidate is found', async () => {
+    expect(await resolveShellAsync('win32', locateIn('C:\\bin'), undefined, 'C:\\Windows\\System32\\cmd.exe')).toEqual({
+      file: 'C:\\Windows\\System32\\cmd.exe',
+      args: []
+    })
   })
 
   it('probes nothing off win32', async () => {
     let probed = 0
-    const shell = await resolveShellAsync('linux', async () => (probed++, true), '/bin/zsh')
+    const shell = await resolveShellAsync('linux', async () => (probed++, '/x'), '/bin/zsh')
     expect(shell).toEqual({ file: '/bin/zsh', args: [] })
     expect(probed).toBe(0)
   })

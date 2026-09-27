@@ -446,12 +446,25 @@ describe('findOnPath', () => {
       asked.push(p)
       return p === 'C:\\b\\pwsh.exe' ? ('present' as const) : ('absent' as const)
     }
-    expect(await findOnPath('C:\\a;;C:\\b', 'pwsh.exe', probe, ';', win32.join)).toEqual({ found: true, timedOut: false })
+    expect(await findOnPath('C:\\a;;C:\\b', 'pwsh.exe', probe, ';', win32.join)).toEqual({
+      found: true,
+      timedOut: false,
+      at: 'C:\\b\\pwsh.exe'
+    })
     expect(asked.sort()).toEqual(['C:\\a\\pwsh.exe', 'C:\\b\\pwsh.exe'])
-    expect(await findOnPath('C:\\a', 'pwsh.exe', probe, ';', win32.join)).toEqual({ found: false, timedOut: false })
+    expect(await findOnPath('C:\\a', 'pwsh.exe', probe, ';', win32.join)).toEqual({ found: false, timedOut: false, at: null })
   })
 
   it('a directory that times out counts as not holding the file, and says a timeout was in it', async () => {
-    expect(await findOnPath('Z:\\off', 'cmd.exe', async () => 'timeout', ';', win32.join)).toEqual({ found: false, timedOut: true })
+    expect(await findOnPath('Z:\\off', 'cmd.exe', async () => 'timeout', ';', win32.join)).toEqual({
+      found: false,
+      timedOut: true,
+      at: null
+    })
+  })
+
+  it('says where the file is: the first directory, in PATH order, that holds it', async () => {
+    const probe = async (p: string) => (p.startsWith('C:\\a') ? ('absent' as const) : ('present' as const))
+    expect((await findOnPath('C:\\a;D:\\b;C:\\c', 'pwsh.exe', probe, ';', win32.join)).at).toBe('D:\\b\\pwsh.exe')
   })
 })

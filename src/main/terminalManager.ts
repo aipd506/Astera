@@ -9,6 +9,8 @@ import {
   PROBE_CACHE_TTL_MS,
   PROBE_DEGRADED_TTL_MS,
   PathKeyedCache,
+  checkCwd,
+  defaultCwdProbe,
   defaultProbe,
   findOnPath,
   type Probe
@@ -18,27 +20,35 @@ import { resolveShellAsync } from '../core/terminal/shell'
 const OUTPUT_LIMIT = 200_000 // Cap on the recent-output buffer kept for re-entry — same value as RunManager
 
 /**
- * Looks for an executable in each PATH directory — the default exists implementation for
- * resolveShellAsync. Async and time-limited (core/sessions/pathProbe.ts): the directories are probed
- * together, off the main thread, and one on an offline drive counts as not holding it after 1.5 s. The
- * answer is kept per PATH string and file for about five minutes, or for PROBE_DEGRADED_TTL_MS when a
- * timeout went into it (the drive may come back holding the preferred shell).
+ * Looks for an executable in each PATH directory and answers its absolute path, or null — the default
+ * lookup for resolveShellAsync. Async and time-limited (core/sessions/pathProbe.ts): the directories
+ * are probed together, off the main thread, and one on an offline drive counts as not holding it after
+ * 1.5 s. The answer is kept per PATH string and file for about five minutes, or for
+ * PROBE_DEGRADED_TTL_MS when a timeout went into it (the drive may come back holding the preferred
+ * shell). The path, not a yes, because node-pty walks PATH itself, synchronously, for a bare name.
  */
 export function createOnPath(
   probe: Probe,
   pathValue: () => string,
-  cache: PathKeyedCache<{ found: boolean; timedOut: boolean }> = new PathKeyedCache(),
+  cache: PathKeyedCache<{ found: boolean; timedOut: boolean; at: string | null }> = new PathKeyedCache(),
   delimiter: string = path.delimiter,
   join: (...parts: string[]) => string = path.join
-): (file: string) => Promise<boolean> {
+): (file: string) => Promise<string | null> {
   const ttlOf = (r: { timedOut: boolean }): number => (r.timedOut ? PROBE_DEGRADED_TTL_MS : PROBE_CACHE_TTL_MS)
   return async (file) => {
     const value = pathValue()
-    return (await cache.get(value, file, () => findOnPath(value, file, probe, delimiter, join), ttlOf)).found
+    return (await cache.get(value, file, () => findOnPath(value, file, probe, delimiter, join), ttlOf)).at
   }
 }
 
 const onPath = createOnPath(defaultProbe, () => process.env.PATH ?? '')
+
+export interface TerminalDeps {
+  /** The project folder's check before the pty starts. Defaults to the session folder's probe. */
+  cwdProbe?: Probe
+  /** Where cmd.exe is taken from when no candidate was found on PATH. Defaults to %SystemRoot%. */
+  systemRoot?: string
+}
 
 interface LiveTerminal {
   id: string
@@ -55,14 +65,24 @@ export class TerminalManager {
   constructor(
     private ptyFactory: PtyFactory,
     private platform: NodeJS.Platform = process.platform,
-    private exists: (file: string) => Promise<boolean> = onPath,
-    private envShell: string | undefined = process.env.SHELL
+    private locate: (file: string) => Promise<string | null> = onPath,
+    private envShell: string | undefined = process.env.SHELL,
+    private deps: TerminalDeps = {}
   ) {}
 
   /** Spawns a shell with the project path as cwd. env is the app environment as-is — this is a plain shell, not a
-   *  session bound to an account, so account isolation variables like CLAUDE_CONFIG_DIR are not injected. */
+   *  session bound to an account, so account isolation variables like CLAUDE_CONFIG_DIR are not injected.
+   *
+   *  Nothing here may wait on a file synchronously: the pty is created on Electron main or the Host's
+   *  only thread. So the project folder is probed first, async and time-limited (CWD_MISSING, or
+   *  CWD_UNREACHABLE for a folder on an offline drive, which CreateProcess would have waited on), and the
+   *  shell is handed over by absolute path (node-pty walks PATH synchronously for a bare name). */
   async open(projectPath: string, cols?: number, rows?: number): Promise<TerminalInfo> {
-    const shell = await resolveShellAsync(this.platform, this.exists, this.envShell)
+    const fallback = path.win32.join(this.deps.systemRoot ?? process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'cmd.exe')
+    const [, shell] = await Promise.all([
+      checkCwd(projectPath, this.deps.cwdProbe ?? defaultCwdProbe),
+      resolveShellAsync(this.platform, this.locate, this.envShell, fallback)
+    ])
     const id = randomUUID()
     const pty = this.ptyFactory(shell.file, shell.args, {
       cwd: projectPath,
