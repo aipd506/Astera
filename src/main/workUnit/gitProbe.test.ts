@@ -4,7 +4,8 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { makeRepo, tempDir, gitSync } from '../../core/worktrees/testRepo'
 import { classifyTransition } from '../../core/git/transition'
-import { readGitRef, isAncestorOf, readRange, readChangedFiles } from './gitProbe'
+import { readGitRef, isAncestorOf, readRange, readChangedFiles, type GitRun } from './gitProbe'
+import { git, type GitResult } from '../../core/worktrees/git'
 
 const run = (repo: string, args: string[]): void => {
   gitSync(repo, args)
@@ -227,5 +228,78 @@ describe('readChangedFiles', () => {
   it('폴더가 없어 git 을 띄우지도 못하면 null(모름)이다', async () => {
     const parent = await tempDir('astera-gitprobe-changed-gone-')
     expect(await readChangedFiles(path.join(parent, 'gone'))).toBeNull()
+  })
+})
+
+// ── git 을 몇 번 띄우는가 (stage 4, task 4) ────────────────────────────
+// 감시 회차마다 도는 두 물음이다. 프로세스 하나하나가 Windows 에서는 바이러스 백신 검사 값을 치른다.
+
+const counting = (): { calls: string[][]; run: GitRun } => {
+  const calls: string[][] = []
+  return {
+    calls,
+    run: (args, opts) => {
+      calls.push(args)
+      return git(args, opts)
+    }
+  }
+}
+
+/** git 을 띄우지 않고 정해진 답을 주는 runner — 시간 초과처럼 진짜로 만들기 어려운 답을 흉내 낸다 */
+const answering = (answer: GitResult): GitRun => async () => answer
+
+describe('readGitRef — 띄우는 수', () => {
+  it('보통의 저장소에서는 git 한 번으로 브랜치와 HEAD 를 함께 읽는다', async () => {
+    const repo = await makeRepo()
+    const { calls, run } = counting()
+    const ref = await readGitRef(repo, run)
+    expect(ref).toEqual({ branch: 'main', head: headHash(repo) })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('브랜치와 같은 이름의 태그가 있어도 symbolic-ref --short 와 같은 이름을 준다', async () => {
+    const repo = await makeRepo()
+    run(repo, ['tag', 'main'])
+    const expected = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
+      cwd: repo,
+      windowsHide: true,
+      encoding: 'utf8'
+    }).trim()
+    expect((await readGitRef(repo)).branch).toBe(expected)
+  })
+
+  it('git 이 답하지 못하면(시간 초과) 둘 다 null 이다 — 지어내지 않는다', async () => {
+    const repo = await makeRepo()
+    const ref = await readGitRef(repo, answering({ ok: false, stdout: '', stderr: 'timed out', timedOut: true }))
+    expect(ref).toEqual({ branch: null, head: null })
+  })
+})
+
+describe('isAncestorOf — 띄우는 수와 모름', () => {
+  it('두 커밋이 있으면 merge-base 한 번으로 답한다', async () => {
+    const repo = await makeRepo()
+    const before = headHash(repo)
+    await fs.writeFile(path.join(repo, 'g.txt'), 'y', 'utf8')
+    run(repo, ['add', 'g.txt'])
+    run(repo, ['commit', '-m', 'second'])
+    const after = headHash(repo)
+    const { calls, run: counted } = counting()
+    expect(await isAncestorOf(repo, before, after, counted)).toBe(true)
+    expect(await isAncestorOf(repo, after, before, counted)).toBe(false)
+    expect(calls).toHaveLength(2)
+  })
+
+  it('merge-base 가 답하지 못하면(종료 코드 없음) null — false 가 아니다', async () => {
+    const repo = await makeRepo()
+    const h = headHash(repo)
+    const timedOut = answering({ ok: false, stdout: '', stderr: 'timed out', timedOut: true })
+    expect(await isAncestorOf(repo, h, h, timedOut)).toBeNull()
+  })
+
+  it('종료 코드 1 만 "조상이 아니다"이고, 그 밖의 실패 코드는 null 이다', async () => {
+    const repo = await makeRepo()
+    const h = headHash(repo)
+    expect(await isAncestorOf(repo, h, h, answering({ ok: false, stdout: '', stderr: '', exitCode: 1 }))).toBe(false)
+    expect(await isAncestorOf(repo, h, h, answering({ ok: false, stdout: '', stderr: 'fatal', exitCode: 128 }))).toBeNull()
   })
 })
