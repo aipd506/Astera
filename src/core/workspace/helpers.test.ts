@@ -4,6 +4,7 @@ import { clickScript, snapshotScript } from '../agentBrowser/guestScripts'
 import type { DeskWindow } from './protocol'
 import {
   NO_CDP,
+  PAGE_READY_MS,
   cdpKeyEvents,
   launchEnv,
   parseLaunchSpec,
@@ -163,6 +164,40 @@ describe('launch', () => {
     expect(during.deps.recordLaunch).not.toHaveBeenCalled()
   })
 
+  // Measured by the real desktop e2e (Task 10): the page target answers while its document is still
+  // parsing, and a snapshot() straight after launch() threw on a null document.body.
+  it('returns only once the page has finished parsing, so the next helper finds a document', async () => {
+    const r = rig()
+    r.cdp.evaluates(false, false, true)
+    await r.h.launch({ command: 'app.exe' })
+    const polls = r.cdp.calls.filter((c) => c.method === 'Runtime.evaluate')
+    expect(polls).toHaveLength(3)
+    expect(String(polls[0].params?.expression)).toContain("document.readyState !== 'loading'")
+    expect(String(polls[0].params?.expression)).toContain("'about:blank'")
+  })
+
+  it('a poll that fails (the page navigating) is asked again', async () => {
+    const r = rig()
+    let n = 0
+    r.cdp.answers.set('Runtime.evaluate', () => {
+      n++
+      if (n === 1) throw new Error('Execution context was destroyed')
+      return { result: { value: true } }
+    })
+    await r.h.launch({ command: 'app.exe' })
+    expect(n).toBe(2)
+  })
+
+  it('a page that never settles holds launch no longer than PAGE_READY_MS, then launch succeeds', async () => {
+    let t = 0
+    const r = rig({ now: () => (t += 1_000), deadline: () => 1_000_000 })
+    r.cdp.evaluates(...Array.from({ length: 100 }, () => false))
+    expect(await r.h.launch({ command: 'app.exe' })).toEqual({ pid: 501, port: 9333 })
+    const polls = r.cdp.calls.filter((c) => c.method === 'Runtime.evaluate').length
+    expect(polls).toBeGreaterThan(1)
+    expect(polls).toBeLessThanOrEqual(PAGE_READY_MS / 1_000 + 1)
+  })
+
   it('a port that never opens fails launch with the hint, and the native helpers still work', async () => {
     const r = rig({ connectCdp: vi.fn(async () => null) })
     await expect(r.h.launch({ command: 'app.exe' })).rejects.toThrow('--remote-debugging-port=%ASTERA_APP_CDP_PORT%')
@@ -206,6 +241,7 @@ describe('the page helpers', () => {
   it('snapshot and url evaluate in the page', async () => {
     const r = rig()
     await r.h.launch({ command: 'app.exe' })
+    r.cdp.calls = [] // the launch's own readiness poll
     r.cdp.evaluates({ title: 'T', url: 'app://x', headings: [], interactive: [], landmarks: [], text: '' }, 'app://x/')
     const snap = (await r.h.snapshot()) as { title: string }
     expect(snap.title).toBe('T')
@@ -223,6 +259,7 @@ describe('the page helpers', () => {
   it('click follows links, reports a miss and a disabled control, and marks the screen changed', async () => {
     const r = rig()
     await r.h.launch({ command: 'app.exe' })
+    r.cdp.calls = [] // the launch's own readiness poll
     r.cdp.evaluates({ found: true, clicked: true }, { found: false }, { found: true, disabled: true })
     await r.h.click('#go')
     expect(r.cdp.calls.filter((c) => c.method === 'Runtime.evaluate')[0].params?.expression).toBe(clickScript('#go', true))

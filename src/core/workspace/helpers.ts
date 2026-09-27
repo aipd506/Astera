@@ -92,6 +92,12 @@ export const NO_CDP = 'no CDP connection'
 const NOTHING_LAUNCHED = 'nothing launched: call launch() first'
 const CTRL = 2
 const DRAG_START_MS = 5_000
+/** How long `launch` waits, after the port answers, for the page to finish parsing. A page that has
+ *  not settled by then is handed over as it is: the page helpers speak for themselves. */
+export const PAGE_READY_MS = 10_000
+const PAGE_POLL_MS = 100
+/** Parsed, and past the blank page an Electron window shows before its first loadURL. */
+const PAGE_READY = "document.readyState !== 'loading' && location.href !== 'about:blank'"
 
 /** Key names `press` and `keys` accept besides a single character. The Windows helper's `Vk` switch
  *  in desk.ts knows the same names. */
@@ -177,6 +183,22 @@ export function pngSize(data: string): { width: number; height: number } {
   return { width: b.readUInt32BE(16), height: b.readUInt32BE(20) }
 }
 
+/** Waits until the page reports it has parsed its document, or `until` passes. The page target
+ *  answers on the debugging port while its document is still loading (measured on the real desktop,
+ *  Task 10), so a helper straight after `launch` could find no document.body. Only an explicit
+ *  `false` means "not yet"; a poll that fails (the page navigating) is asked again. */
+async function pageSettled(cdp: Cdp, deps: HelperDeps, until: number): Promise<void> {
+  for (;;) {
+    const left = until - deps.now()
+    const ready = await withTimeout(cdp.send('Runtime.evaluate', { expression: PAGE_READY, returnByValue: true }), Math.max(1, left), 'launch').then(
+      (r) => (r.result as { value?: unknown } | undefined)?.value,
+      () => false
+    )
+    if (ready !== false || deps.now() >= until) return
+    await new Promise((r) => setTimeout(r, PAGE_POLL_MS))
+  }
+}
+
 async function evaluate(cdp: Cdp, expression: string, at: string): Promise<unknown> {
   const r = await withTimeout(cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }), WAIT_TIMEOUT_MS + 5_000, at)
   const ex = r.exceptionDetails as { text?: string; exception?: { description?: string } } | undefined
@@ -232,6 +254,7 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
           'Start Electron with --remote-debugging-port=%ASTERA_APP_CDP_PORT% (for example: electron . --remote-debugging-port=%ASTERA_APP_CDP_PORT%). ' +
           `The app is still running, so windows(), windowShot() and keys() work; the page helpers throw "${NO_CDP}".`
       )
+    await pageSettled(cdp, deps, deps.now() + Math.max(0, Math.min(PAGE_READY_MS, deps.deadline() - deps.now() - LAUNCH_MARGIN_MS)))
     return { pid: started.pid, port }
   }
 
