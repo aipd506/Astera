@@ -27,8 +27,11 @@ class FakeDesk implements DesktopHelper {
   onExit(cb: (why: string) => void): void {
     this.exits.push(cb)
   }
+  /** While set, every launch waits for it after being recorded: an app that is still starting. */
+  static hold: Promise<void> | null = null
   async launch(a: { command: string; cwd: string; env: Record<string, string> }) {
     this.launches.push(a)
+    if (FakeDesk.hold) await FakeDesk.hold
     return { pid: 500 + FakeDesk.made.indexOf(this) * 10 + this.launches.length, startedAt: 3_000 }
   }
   async kill(pid: number, startedAt: number) {
@@ -80,6 +83,7 @@ const managers: WorkspaceManager[] = []
 afterEach(async () => {
   for (const m of managers.splice(0)) await m.dispose()
   FakeDesk.made = []
+  FakeDesk.hold = null
   for (const d of dirs.splice(0)) await fs.rm(d, { recursive: true, force: true })
 })
 
@@ -321,7 +325,7 @@ describe('Stop, Close, the session, the helper, idleness', () => {
 
   it('the session ending while the desktop is being created closes it once and launches nothing (ruling F1)', async () => {
     let started!: () => void
-    const { m, settle } = await rig({
+    const { m, events, settle } = await rig({
       startDesk: vi.fn(
         (name: string) =>
           new Promise<DesktopHelper>((r) => {
@@ -339,7 +343,119 @@ describe('Stop, Close, the session, the helper, idleness', () => {
     expect(FakeDesk.made[0].closes).toBe(1)
     expect(FakeDesk.made[0].launches).toEqual([])
     expect(m.list()).toEqual([])
+    // Review minor 4: two cleanups racing over one desktop tell the app it closed once.
+    expect(events.filter((e) => e.kind === 'state' && !e.open)).toHaveLength(1)
   })
+
+  it('Close and the session ending at once tell the app it closed once (review minor 4)', async () => {
+    const { m, events, settle } = await rig()
+    await m.run('s1', "await launch({ command: 'app.exe' })")
+    const closing = m.close('s1')
+    m.sessionEnded('s1')
+    expect(await closing).toBe(true)
+    await settle()
+    expect(FakeDesk.made[0].closes).toBe(1)
+    expect(events.filter((e) => e.kind === 'state' && !e.open)).toHaveLength(1)
+  })
+
+  it('a stale Stop does not close the desktop a newer script is starting on (review minor 3)', async () => {
+    let started!: () => void
+    const { m } = await rig({
+      startDesk: vi.fn(
+        (name: string) =>
+          new Promise<DesktopHelper>((r) => {
+            started = () => r(new FakeDesk(name))
+          })
+      )
+    })
+    const first = m.run('s1', "await launch({ command: 'a.exe' })")
+    await vi.waitFor(() => expect(started).toBeTypeOf('function'))
+    expect(m.stop('s1')).toBe(true)
+    expect(body(await first).error?.at).toBe('stopped')
+    const second = m.run('s1', "log(await launch({ command: 'b.exe' }))")
+    await new Promise((r) => setTimeout(r, 20))
+    started()
+    const r = await second
+    expect(body(r).error).toBeUndefined()
+    expect(FakeDesk.made).toHaveLength(1)
+    expect(FakeDesk.made[0].closed).toBe(false)
+    expect(FakeDesk.made[0].launches.map((l) => l.command)).toEqual(['b.exe'])
+    expect(m.list()).toHaveLength(1)
+  })
+
+  it('a launch the script did not await opens nothing once the script has ended (review critical 1)', async () => {
+    let resolved!: () => void
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    try {
+      const { m, deps, settle } = await rig({
+        resolveLaunch: ({ cwd }) =>
+          new Promise((r) => {
+            resolved = () => r({ command: 'app.exe', cwd, env: {} })
+          })
+      })
+      const r = await m.run('s1', "launch({ command: 'a.exe' }).catch(() => {}); log('done')")
+      expect(body(r)).toEqual({ log: ['done'] })
+      resolved()
+      await settle()
+      expect(deps.startDesk).not.toHaveBeenCalled()
+      expect(m.list()).toEqual([])
+      expect(await fs.stat(deps.recordFile).then(() => true, () => false)).toBe(false)
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      process.off('unhandledRejection', unhandled)
+    }
+  })
+
+  it('an un-awaited launch that is quicker than the script end leaves nothing either (review critical 1)', async () => {
+    const { m, deps, settle } = await rig()
+    await m.run('s1', "launch({ command: 'a.exe' }).catch(() => {}); log('done')")
+    await settle()
+    await m.dispose()
+    expect(FakeDesk.made.every((k) => k.closed)).toBe(true)
+    const launched = FakeDesk.made.flatMap((k) => k.launches)
+    if (launched.length > 0) expect(FakeDesk.made.flatMap((k) => k.kills)).toContain(501)
+    await vi.waitFor(async () => expect(await fs.stat(deps.recordFile).then(() => true, () => false)).toBe(false))
+  })
+
+  it('a launch still on its way when the script times out opens nothing (review critical 1)', async () => {
+    let resolved!: () => void
+    const { m, deps, settle } = await rig({
+      scriptTimeoutMs: 50,
+      resolveLaunch: ({ cwd }) =>
+        new Promise((r) => {
+          resolved = () => r({ command: 'app.exe', cwd, env: {} })
+        })
+    })
+    const r = await m.run('s1', "await launch({ command: 'a.exe' })")
+    expect(body(r).error).toBeDefined()
+    resolved()
+    await settle()
+    expect(deps.startDesk).not.toHaveBeenCalled()
+    expect(m.list()).toEqual([])
+  })
+
+  for (const way of ['close', 'sessionEnded', 'dispose'] as const)
+    it(`${way} while the app is starting ends the app once it has started (review important 2)`, async () => {
+      let release!: () => void
+      FakeDesk.hold = new Promise((r) => {
+        release = r
+      })
+      const { m, deps, settle } = await rig({ startTimes: vi.fn(async () => new Map([[501, 3_000]])) })
+      const run = m.run('s1', "await launch({ command: 'app.exe' })")
+      await vi.waitFor(() => expect(FakeDesk.made[0]?.launches).toHaveLength(1))
+      if (way === 'close') expect(await m.close('s1')).toBe(true)
+      else if (way === 'sessionEnded') m.sessionEnded('s1')
+      else await m.dispose()
+      await vi.waitFor(() => expect(FakeDesk.made[0].closed).toBe(true))
+      release()
+      expect(body(await run).error?.at).toBe('stopped')
+      await vi.waitFor(() => expect(deps.killTree).toHaveBeenCalledWith(501))
+      expect(deps.startTimes).toHaveBeenCalledWith([501])
+      await settle()
+      expect(m.list()).toEqual([])
+      expect(await fs.stat(deps.recordFile).then(() => true, () => false)).toBe(false)
+    })
 
   it('the session ending before the desktop exists opens none (ruling F1)', async () => {
     let resolved!: () => void

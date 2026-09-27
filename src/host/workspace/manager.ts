@@ -10,7 +10,7 @@ import path from 'node:path'
 import { SCRIPT_TIMEOUT_MS } from '../../core/agentBrowser/script'
 import { evictionPlan } from '../../core/preview/pick/shots'
 import { ScriptSlots, runWorkspaceScript } from '../../core/workspace/script'
-import { workspaceHelpers, type AppState, type Cdp, type HelperDeps, type LaunchSpec, type ResolvedLaunch } from '../../core/workspace/helpers'
+import { workspaceHelpers, type AppState, type Cdp, type Desk, type HelperDeps, type LaunchSpec, type ResolvedLaunch } from '../../core/workspace/helpers'
 import {
   idleExpired,
   leftoverPidsToKill,
@@ -97,6 +97,9 @@ interface Entry {
   capturing: boolean
   dirty: boolean
   stopFrames: (() => void) | null
+  /** The script that holds this session's slot now, or null (review minor 3: a stale continuation of
+   *  a stopped script must not clean up a desktop a newer script is using). */
+  script: AbortController | null
 }
 
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err))
@@ -156,7 +159,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   const entryOf = (sessionId: string): Entry => {
     let e = entries.get(sessionId)
     if (!e) {
-      e = { sessionId, desk: null, deskStarting: null, state: { launched: null, cdp: null }, lastActivityAt: now(), helper: null, frame: null, capturing: false, dirty: false, stopFrames: null }
+      e = { sessionId, desk: null, deskStarting: null, state: { launched: null, cdp: null }, lastActivityAt: now(), helper: null, frame: null, capturing: false, dirty: false, stopFrames: null, script: null }
       entries.set(sessionId, e)
     }
     return e
@@ -200,6 +203,10 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   }
 
   const ensureDesk = (e: Entry): Promise<DesktopHelper> => {
+    // Ruling F1's other half (review critical 1): an entry the manager has already forgotten (its
+    // script ended and nothing was open) or a Host that is leaving never gets a desktop, which nothing
+    // would record, list or close.
+    if (disposed || entries.get(e.sessionId) !== e) return Promise.reject(new Error('launch: stopped (this workspace has ended)'))
     if (e.desk && e.desk.alive()) return Promise.resolve(e.desk)
     if (!e.deskStarting) {
       const name = `${prefix}-${++counter}`
@@ -227,6 +234,8 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     // session that ends while a stopped launch closes its fresh desktop must not close it twice).
     const desk = e.desk ?? (e.deskStarting ? await e.deskStarting.then((k) => (e.desk === k ? k : null), () => null) : null)
     const launched = e.state.launched
+    // Review minor 4: a cleanup that finds nothing left (another one took it) tells the app nothing.
+    const took = desk !== null || launched !== null
     e.state.cdp?.close()
     e.state.cdp = null
     e.state.launched = null
@@ -243,7 +252,8 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     }
     d.log(`workspace ${e.sessionId}: cleaned up (${why})`)
     persist()
-    finish(e)
+    if (took) finish(e)
+    else if (!slots.isRunning(e.sessionId) && !isOpen(e) && entries.get(e.sessionId) === e) entries.delete(e.sessionId)
   }
 
   const frameOf = async (e: Entry): Promise<WorkspaceFrame | null> => {
@@ -317,16 +327,40 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     return file
   }
 
-  const helperDeps = (e: Entry, cwd: string, deadline: number, stop: AbortSignal): HelperDeps => ({
+  /** The desktop as a script's helpers see it. A launch that resolves after its desktop was cleaned up
+   *  (Close, the session ending, the Host leaving, while the app was starting) started an app nobody
+   *  holds: it is ended at once, by pid and start time, and the launch fails as stopped (review
+   *  important 2). */
+  const guardedDesk = (e: Entry, desk: DesktopHelper): Desk => ({
+    name: desk.name,
+    launch: async (a) => {
+      const started = await desk.launch(a)
+      if (e.desk !== desk || entries.get(e.sessionId) !== e) {
+        d.log(`workspace ${e.sessionId}: the desktop closed while pid ${started.pid} was starting; ending it`)
+        await killRecordedLogged(e.sessionId, started)
+        throw new Error('launch: stopped (the workspace closed while the app was starting; the app was ended)')
+      }
+      return started
+    },
+    kill: (pid, startedAt) => desk.kill(pid, startedAt),
+    windows: () => desk.windows(),
+    shot: (a) => desk.shot(a),
+    keys: (a) => desk.keys(a),
+    close: () => desk.close()
+  })
+
+  const helperDeps = (e: Entry, cwd: string, deadline: number, stop: AbortController): HelperDeps => ({
     state: e.state,
     // Ruling F1: a desktop that finishes starting after this script was stopped, with nothing launched
-    // on it, is closed at once; `launch` then refuses to start the app (it asks `stopped()` again).
+    // on it, is closed at once, unless a newer script holds the session and is using it (review minor
+    // 3); `launch` then refuses to start the app (it asks `stopped()` again).
     desk: async () => {
       const desk = await ensureDesk(e)
-      if ((stop.aborted || disposed) && !e.state.launched && e.desk === desk) await cleanup(e, 'stopped before the launch', false)
-      return desk
+      const newer = e.script !== null && e.script !== stop
+      if ((stop.signal.aborted || disposed) && !newer && !e.state.launched && e.desk === desk) await cleanup(e, 'stopped before the launch', false)
+      return guardedDesk(e, desk)
     },
-    stopped: () => stop.aborted || disposed,
+    stopped: () => stop.signal.aborted || disposed,
     deskIfOpen: () => e.desk,
     resolveLaunch: (spec) => d.resolveLaunch({ sessionId: e.sessionId, cwd, spec }),
     freePort: () => d.freePort(),
@@ -386,6 +420,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
       const ac = slots.begin(sessionId)
       if (!ac) return { status: 409, body: { error: 'a script is already running' } }
       const e = entryOf(sessionId)
+      e.script = ac
       const startedAt = now()
       const timeoutMs = d.scriptTimeoutMs ?? SCRIPT_TIMEOUT_MS
       e.lastActivityAt = startedAt
@@ -402,11 +437,15 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
             e.helper = name
             if (isOpen(e)) emitState(e, true)
           },
-          helpers: (ctx) => workspaceHelpers(helperDeps(e, cwd, startedAt + timeoutMs, ac.signal), ctx)
+          helpers: (ctx) => workspaceHelpers(helperDeps(e, cwd, startedAt + timeoutMs, ac), ctx)
         })
         return { status: 200, body: result }
       } finally {
+        // The runner aborts only its own controller; this one is what `stopped()` reads, so a launch
+        // the script left behind (not awaited, or cut off by the timeout) stops too (review critical 1).
+        ac.abort()
         slots.end(sessionId, ac)
+        if (e.script === ac) e.script = null
         e.stopFrames?.()
         e.stopFrames = null
         e.helper = null
