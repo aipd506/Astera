@@ -5,22 +5,40 @@ import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import type { PtyFactory, PtyLike } from '../core/sessions/pty'
 import type { TerminalBuffer, TerminalInfo } from '../core/types'
-import { PathKeyedCache, defaultProbe, findOnPath } from '../core/sessions/pathProbe'
+import {
+  PROBE_CACHE_TTL_MS,
+  PROBE_DEGRADED_TTL_MS,
+  PathKeyedCache,
+  defaultProbe,
+  findOnPath,
+  type Probe
+} from '../core/sessions/pathProbe'
 import { resolveShellAsync } from '../core/terminal/shell'
 
 const OUTPUT_LIMIT = 200_000 // Cap on the recent-output buffer kept for re-entry — same value as RunManager
 
-/** What onPath found, per PATH string and file, for this process (about five minutes, or until PATH changes). */
-const onPathCache = new PathKeyedCache<boolean>()
-
-/** Looks for the executable in each PATH directory — the default exists implementation for
- *  resolveShellAsync. Async and time-limited (core/sessions/pathProbe.ts): the directories are probed
- *  together, off the main thread, and one on an offline drive counts as not holding it after 1.5 s,
- *  once per PATH string rather than on every terminal opened. */
-function onPath(file: string): Promise<boolean> {
-  const pathValue = process.env.PATH ?? ''
-  return onPathCache.get(pathValue, file, () => findOnPath(pathValue, file, defaultProbe, path.delimiter, path.join))
+/**
+ * Looks for an executable in each PATH directory — the default exists implementation for
+ * resolveShellAsync. Async and time-limited (core/sessions/pathProbe.ts): the directories are probed
+ * together, off the main thread, and one on an offline drive counts as not holding it after 1.5 s. The
+ * answer is kept per PATH string and file for about five minutes, or for PROBE_DEGRADED_TTL_MS when a
+ * timeout went into it (the drive may come back holding the preferred shell).
+ */
+export function createOnPath(
+  probe: Probe,
+  pathValue: () => string,
+  cache: PathKeyedCache<{ found: boolean; timedOut: boolean }> = new PathKeyedCache(),
+  delimiter: string = path.delimiter,
+  join: (...parts: string[]) => string = path.join
+): (file: string) => Promise<boolean> {
+  const ttlOf = (r: { timedOut: boolean }): number => (r.timedOut ? PROBE_DEGRADED_TTL_MS : PROBE_CACHE_TTL_MS)
+  return async (file) => {
+    const value = pathValue()
+    return (await cache.get(value, file, () => findOnPath(value, file, probe, delimiter, join), ttlOf)).found
+  }
 }
+
+const onPath = createOnPath(defaultProbe, () => process.env.PATH ?? '')
 
 interface LiveTerminal {
   id: string

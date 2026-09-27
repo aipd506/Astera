@@ -12,7 +12,7 @@
 // The plain 'node:path' takes the host's semantics, which turned these tests red on the macOS and
 // Linux legs of the CI matrix while passing on a Windows developer machine.
 import { win32 as path } from 'node:path'
-import { PathKeyedCache, type ProbeResult } from './pathProbe'
+import { PROBE_CACHE_TTL_MS, PROBE_DEGRADED_TTL_MS, PathKeyedCache, type ProbeResult } from './pathProbe'
 
 /** Where a Git for Windows install keeps the bash that hooks need, relative to the install root. */
 const BIN_BASH = path.join('bin', 'bash.exe')
@@ -99,11 +99,25 @@ export async function findGitBashAsync(
   env: Record<string, string | undefined>,
   probe: (p: string) => Promise<ProbeResult>
 ): Promise<string | null> {
-  if (env.CLAUDE_CODE_GIT_BASH_PATH) return null
+  return (await searchGitBash(env, probe)).bash
+}
+
+/** What one search found, and whether a timeout went into it — then an earlier candidate may have been
+ *  missed, and the answer is kept only briefly (PROBE_DEGRADED_TTL_MS). */
+export interface GitBashSearch {
+  bash: string | null
+  timedOut: boolean
+}
+
+async function searchGitBash(
+  env: Record<string, string | undefined>,
+  probe: (p: string) => Promise<ProbeResult>
+): Promise<GitBashSearch> {
+  if (env.CLAUDE_CODE_GIT_BASH_PATH) return { bash: null, timedOut: false }
   const paths = gitBashProbePaths(env)
   const results = await Promise.all(paths.map((p) => probe(p)))
   const present = new Set(paths.filter((_, i) => results[i] === 'present'))
-  return findGitBash(env, (p) => present.has(p))
+  return { bash: findGitBash(env, (p) => present.has(p)), timedOut: results.includes('timeout') }
 }
 
 export interface GitBashResolver {
@@ -118,18 +132,20 @@ const pathValueOf = (env: Record<string, string | undefined>): string => {
   return (key ? env[key] : undefined) ?? ''
 }
 
-/** A per-process cache over `findGitBashAsync`, keyed by the PATH string: an offline drive on PATH
- *  costs its probe timeout once, not on every spawn. A user-set CLAUDE_CODE_GIT_BASH_PATH is answered
- *  (null, nothing to add) without probing or caching. */
+/** A per-process cache over the async search, keyed by the PATH string: an offline drive on PATH costs
+ *  its probe timeout once, not on every spawn. A search a timeout went into is kept for
+ *  PROBE_DEGRADED_TTL_MS only, since the drive may come back and hold the preferred bash. A user-set
+ *  CLAUDE_CODE_GIT_BASH_PATH is answered (null, nothing to add) without probing or caching. */
 export function createGitBashResolver(
   probe: (p: string) => Promise<ProbeResult>,
-  cache: PathKeyedCache<string | null> = new PathKeyedCache()
+  cache: PathKeyedCache<GitBashSearch> = new PathKeyedCache()
 ): GitBashResolver {
+  const ttlOf = (r: GitBashSearch): number => (r.timedOut ? PROBE_DEGRADED_TTL_MS : PROBE_CACHE_TTL_MS)
   return {
-    resolve: (env) =>
+    resolve: async (env) =>
       env.CLAUDE_CODE_GIT_BASH_PATH
-        ? Promise.resolve(null)
-        : cache.get(pathValueOf(env), 'gitBash', () => findGitBashAsync(env, probe)),
-    peek: (env) => (env.CLAUDE_CODE_GIT_BASH_PATH ? null : cache.peek(pathValueOf(env), 'gitBash'))
+        ? null
+        : (await cache.get(pathValueOf(env), 'gitBash', () => searchGitBash(env, probe), ttlOf)).bash,
+    peek: (env) => (env.CLAUDE_CODE_GIT_BASH_PATH ? null : cache.peek(pathValueOf(env), 'gitBash')?.bash)
   }
 }

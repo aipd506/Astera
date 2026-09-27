@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import type { PtyFactory, PtyLike, PtySpawnOptions } from '../core/sessions/pty'
-import { TerminalManager } from './terminalManager'
+import { win32 } from 'node:path'
+import { PROBE_CACHE_TTL_MS, PROBE_DEGRADED_TTL_MS, PathKeyedCache, type ProbeResult } from '../core/sessions/pathProbe'
+import { TerminalManager, createOnPath } from './terminalManager'
 
 class FakePty implements PtyLike {
   pid = 999
@@ -289,5 +291,34 @@ describe('TerminalManager', () => {
       expect(mgr.adopt({ kind: 'terminal', id: 'term-from-host', pty: new FakePty(), restore: {} })).toBeNull()
       expect(mgr.list('D:/p')).toEqual([])
     })
+  })
+})
+
+describe('createOnPath — the default shell lookup', () => {
+  it('keeps a clean answer for the full cache time, and one a timeout went into for 10 s only', async () => {
+    let t = 0
+    let probes = 0
+    let offline = true
+    const probe = async (p: string): Promise<ProbeResult> => {
+      probes++
+      if (p.startsWith('Z:')) return offline ? 'timeout' : 'absent'
+      return p === 'C:\\Windows\\System32\\cmd.exe' ? 'present' : 'absent'
+    }
+    const onPath = createOnPath(probe, () => 'Z:\\tools;C:\\Windows\\System32', new PathKeyedCache(PROBE_CACHE_TTL_MS, () => t), ';', win32.join)
+    expect(await onPath('pwsh.exe')).toBe(false)
+    const first = probes
+    t += PROBE_DEGRADED_TTL_MS - 1
+    expect(await onPath('pwsh.exe')).toBe(false)
+    expect(probes).toBe(first)
+    t += 1
+    offline = false
+    expect(await onPath('pwsh.exe')).toBe(false)
+    expect(probes).toBeGreaterThan(first)
+    // Clean now: kept for the full time.
+    const second = probes
+    t += PROBE_CACHE_TTL_MS - 1
+    expect(await onPath('pwsh.exe')).toBe(false)
+    expect(probes).toBe(second)
+    expect(await onPath('cmd.exe')).toBe(true)
   })
 })

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { createGitBashResolver, findGitBash, findGitBashAsync } from './gitBash'
-import type { ProbeResult } from './pathProbe'
+import { PROBE_DEGRADED_TTL_MS, PathKeyedCache, type ProbeResult } from './pathProbe'
 
 /** A probe that says yes only for the listed absolute paths. */
 const only = (...paths: string[]) => (p: string): boolean => paths.includes(p)
@@ -168,6 +168,44 @@ describe('createGitBashResolver', () => {
     expect(await r.resolve({ ...env })).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
     expect(probes).toBe(first)
     expect(r.peek(env)).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+  })
+
+  it('keeps a search that a timeout went into for PROBE_DEGRADED_TTL_MS only, not five minutes', async () => {
+    let t = 0
+    let probes = 0
+    const r = createGitBashResolver(
+      async (p) => {
+        probes++
+        return p.startsWith('Z:') ? 'timeout' : 'absent'
+      },
+      new PathKeyedCache(undefined, () => t)
+    )
+    const env = { PATH: 'Z:\\off;C:\\a' }
+    await r.resolve(env)
+    const first = probes
+    t += PROBE_DEGRADED_TTL_MS - 1
+    await r.resolve(env)
+    expect(probes).toBe(first)
+    t += 1
+    await r.resolve(env)
+    expect(probes).toBeGreaterThan(first)
+  })
+
+  it('keeps a clean search for the full cache time', async () => {
+    let t = 0
+    let probes = 0
+    const r = createGitBashResolver(
+      async () => {
+        probes++
+        return 'absent'
+      },
+      new PathKeyedCache(undefined, () => t)
+    )
+    await r.resolve({ PATH: 'C:\\a' })
+    const first = probes
+    t += PROBE_DEGRADED_TTL_MS * 10
+    await r.resolve({ PATH: 'C:\\a' })
+    expect(probes).toBe(first)
   })
 
   it('probes again when the PATH string changes', async () => {
