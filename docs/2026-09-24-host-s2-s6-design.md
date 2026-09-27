@@ -2144,7 +2144,7 @@ source text) was left as it is.
   the greeting, and off again stops it" and "a greeting before the Host holds any state owes the
   baseline, and the first write pays it"; `appJournal.test.ts`, "after a reconnect to a journal Host, it
   sends journal-reload again; to an older Host it sends nothing"; the two wiring guards.
-- **A136. A lock is not corruption (review I2).** Both connections, the writer (`ContinuityJournal`) and
+- **A136. A lock is not corruption (review I2) (amended by A141).** Both connections, the writer (`ContinuityJournal`) and
   the reader (`JournalReader`), set `PRAGMA busy_timeout` (`BUSY_TIMEOUT_MS`, 5000 ms) before anything
   else, so a lock the other process holds for a moment is waited out. The file is moved aside only when
   SQLite reports corruption (`SQLITE_CORRUPT` or `SQLITE_NOTADB`) or its header is not SQLite's. Any
@@ -2234,6 +2234,43 @@ it leaves is under "Known limits after the public shim junction".
   foreign astera.cmd stays". Checked by hand on Windows with OEM code page 949, for the public and the
   session shuttle alike: a raw shim for `…\설치 폴더\Astera.exe` failed with "지정된 경로를 찾을 수
   없습니다", and the junction shim printed its argv.
+
+## Amendments (journal reads on the main thread, 2026-09-28)
+
+Stage 3 of the performance pass, task 1. The principle is the user's: slow is acceptable, but nothing may
+freeze or look frozen. The app reads the Job Journal on Electron's main thread through `node:sqlite`,
+which is synchronous, so every wait in a read is a frozen window. This list is the record, in A1's form.
+
+- **A141. The reader waits 250 ms for a lock, the writer still waits 5 s (amends A136).**
+  `JournalReader` sets its own busy timeout, `READER_BUSY_TIMEOUT_MS` (250 ms), unless a caller passes
+  one. `BUSY_TIMEOUT_MS` (5000 ms) stays the writer's, as A136 settled it. A reader that meets a lock
+  past its timeout still throws `SQLITE_BUSY` (P13). The run detail window answers such a read with the
+  rows it last read for that Run and `journal.busy`, and one quiet line says so; the window asks again
+  at the next snapshot change, or after 2 s. The reconciler asks a busy journal again up to 8 times, 250 ms apart on the
+  event loop, and past that reads it as "cannot say", never as "no rows". The Host's own reader, for
+  `runs follow`, takes the short timeout too. What shipped: `journalReader.test.ts`, "under a held
+  write lock, a read gives up busy within about 300 ms, not the writer's 5 s"; `appJournal.test.ts`,
+  "under a held write lock, answers within about 300 ms, empty with the busy flag, and reads again
+  later" and "a busy read shows the rows it last read for that Run"; `reconciler.test.ts`, the two
+  busy tests.
+- **A142. Bounded reads, and an index on `dispatch_id`.** `eventsFor(runId, page?)` takes an
+  `EventsPage`: the newest `limit` rows that match, oldest first, `before` as the cursor for the next
+  older page, and `types` and `dispatchId` to narrow them before the limit. Without a page it reads
+  every row as before, which only the Host's own reads still do. The run detail reads only the two
+  kinds of row its timeline shows, 500 at a time (`TIMELINE_PAGE`), and "Show older journal entries"
+  asks for one more page. The reconciler asks two questions of one row each: whether any row names the
+  dispatch, and whether its prompt write was confirmed. `journal_events_dispatch` is added with `CREATE
+  INDEX IF NOT EXISTS`, so a v3 file gains it at the writer's next open. The shape of the rows does not
+  change, so `SCHEMA_VERSION` stays 3 and an older build reads the file as before. What shipped:
+  `journal.test.ts` and `journalReader.test.ts`, the bounded read and index tests; `appJournal.test.ts`,
+  "reads only the newest page of timeline rows"; `reconciler.test.ts`, "asks only bounded, per-dispatch
+  reads"; `RunDetailJournal.test.ts`.
+- **A143. `synchronous` stays FULL.** Under WAL, NORMAL would skip the fsync at each commit, which is
+  slow on OneDrive and on slow disks. It keeps the file consistent after a crash of the process, but a
+  power loss can drop the last commits. The P0 design chose FULL on purpose ("the durability of an
+  intent record is the point", spec §6.1), and the spec's case D names power loss as one the Durable
+  Journal must recover from. So FULL stays. The cost lands on the Host's thread, not the app's main
+  thread, except for an app in front of an older Host that writes the journal itself.
 
 ## Known limits after S3
 
@@ -2846,6 +2883,19 @@ Each was left as it is when A140 closed the non-ASCII install folder limit of th
   about the app doing the uninstall. A development build in an ASCII folder that uninstalls the public
   shim removes the junction a running installed build's sessions use; the Host puts it back at its next
   first spawn after a restart, and the app at its next boot.
+
+## Known limits after the journal reads pass
+
+Each was left as it is when A141 to A143 bounded the app's journal reads.
+
+- **A busy read on main still blocks for up to 250 ms** (A141). `node:sqlite` has no asynchronous read,
+  so the short timeout bounds the stall rather than removing it. In WAL mode a reader meets a lock only
+  in rare moments, such as WAL recovery.
+- **The validation diff base and the reconciler's first checkpoint read as unknown while busy** (A141).
+  Both are single row reads through the same short timeout, and a busy one answers null as any failed
+  read does.
+- **Every commit still waits for an fsync** (A143). On OneDrive or a slow disk that is the Host's
+  thread, or main in front of an older Host.
 
 ## 0. The problem, measured
 
