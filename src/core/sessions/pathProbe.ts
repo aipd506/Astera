@@ -34,9 +34,11 @@
 //   can still add one stuck call past 3, once: its timeout forgets that it answered, so it is risky
 //   from then on. That is the price of keeping C: answered.)
 //   **The one exception is a probe a person is waiting on** (`pastCap`: gateRoot, a worktree's repo
-//   folder): a root with no stuck or in-flight call of its own gets that one call past the cap, so
-//   dead drives elsewhere never make a live local root "not reachable" for good. It may cost one more
-//   thread when that root is dead too, once per root, and a root stuck itself is refused as always.
+//   folder, the presence action lane): when the cap is full, a root with no stuck or in-flight call of
+//   its own may take **the one extra slot** — a single call past the cap for the whole process — so
+//   dead drives elsewhere never make a live local root "not reachable" for good. While that call is
+//   stuck, other unknown roots are refused as before, so dead roots hold at most PROBE_STUCK_MAX + 1
+//   threads however many a person touches. A root stuck itself is refused as always.
 // - **Within that, the PATH pool keeps its own caps.** At most PROBE_CONCURRENCY (2) PATH probe calls
 //   exist at once, stuck ones included; once 2 PATH calls are stuck, every PATH probe answers `timeout`
 //   without a call until one settles; and at most one PATH call per root. A healthy path may then be
@@ -149,6 +151,9 @@ export class ProbeBudget {
   /** root → when a call on it last answered in time. */
   private answeredAt = new Map<string, number>()
   private generation = 0
+  /** The one call admitted past the cap for a probe a person waits on (enter's `pastCap`), while it is
+   *  in flight or stuck. */
+  private over: { entry: Promise<boolean>; stuck: boolean } | null = null
 
   constructor(
     private maxStuck: number = PROBE_STUCK_MAX,
@@ -172,17 +177,22 @@ export class ProbeBudget {
     this.stuck.clear()
     this.stuckTotal = 0
     this.answeredAt.clear()
+    this.over = null
   }
 
   /** A ticket for one call on `root`, or why none is given. Waits while another lane's call on the
    *  root is in flight. Never rejects.
    *
-   *  `pastCap`: a person is waiting on this one call (gateRoot, a worktree creation). A root that is
-   *  stuck itself is still refused at once, and the call on a root in flight is still waited for —
-   *  one call per root — but a root merely not known to be alive gets its call past PROBE_STUCK_MAX.
-   *  Otherwise three dead VPN drives made a local D: "not reachable" for every operation, with no way
-   *  back: a refusal made no call, so D: never answered, so it was never fresh again. The cap still
-   *  holds every probe that does not ask for this — the PATH lookups, the sweeps, the background lanes. */
+   *  `pastCap`: a person is waiting on this one call (gateRoot, a worktree creation, the presence
+   *  action lane). A root that is stuck itself is still refused at once, and the call on a root in
+   *  flight is still waited for — one call per root. Past that, when the cap is full, such a call gets
+   *  **the one extra slot**: a single call past PROBE_STUCK_MAX, for the whole process. Otherwise three
+   *  dead VPN drives made a local D: "not reachable" for every operation, with no way back: a refusal
+   *  made no call, so D: never answered, so it was never fresh again. While the extra call is in
+   *  flight, another past-cap call waits for it; once it is stuck, other roots not known to be alive
+   *  are refused until it settles or reaches the ceiling — so dead roots, however many a person
+   *  touches, hold at most PROBE_STUCK_MAX + 1 threads. Every probe that does not ask for this (the
+   *  PATH lookups, the sweeps, the background lanes) keeps to PROBE_STUCK_MAX. */
   async enter(root: string, opts: { pastCap?: boolean } = {}): Promise<ProbeTicket | string> {
     for (;;) {
       if (this.stuck.has(root)) return `${root} has a call that gave no answer yet`
@@ -196,7 +206,14 @@ export class ProbeBudget {
       if (!fresh) {
         // A root not known to be alive may become one more stuck call. Those, the stuck ones and the
         // ones in flight on such roots, never pass PROBE_STUCK_MAX together.
-        if (opts.pastCap) return this.admit(root, true)
+        const full = this.stuckTotal + this.risky.size >= this.maxStuck
+        if (full && opts.pastCap) {
+          const over = this.over
+          if (over === null) return this.admit(root, true, true)
+          if (over.stuck) return `the call past the stuck-call cap gave no answer yet, only a root that answered recently is probed until it ends`
+          await over.entry
+          continue
+        }
         if (this.stuckTotal >= this.maxStuck)
           return `${this.stuckTotal} probe calls are stuck, only a root that answered recently is probed until one ends`
         if (this.stuckTotal + this.risky.size >= this.maxStuck) {
@@ -208,12 +225,18 @@ export class ProbeBudget {
     }
   }
 
-  private admit(root: string, risky: boolean): ProbeTicket {
+  private admit(root: string, risky: boolean, pastCap = false): ProbeTicket {
     const gen = this.generation
     let settle!: (answered: boolean) => void
     const entry = new Promise<boolean>((r) => (settle = r))
     this.inflight.set(root, entry)
     if (risky) this.risky.set(root, entry)
+    const over = pastCap ? { entry, stuck: false } : null
+    if (over) this.over = over
+    /** The extra slot is free again: the call answered, settled late, or reached the ceiling. */
+    const freeOver = (): void => {
+      if (over && gen === this.generation && this.over === over) this.over = null
+    }
     let state: 'flying' | 'answered' | 'stuck' | 'released' = 'flying'
     const leave = (answered: boolean): void => {
       if (gen === this.generation && this.inflight.get(root) === entry) this.inflight.delete(root)
@@ -225,6 +248,7 @@ export class ProbeBudget {
         if (state !== 'flying') return
         state = 'answered'
         if (gen === this.generation) this.answeredAt.set(root, this.now())
+        freeOver()
         leave(true)
       },
       timedOut: () => {
@@ -237,11 +261,13 @@ export class ProbeBudget {
           // lets go its next call counts as risky again, inside PROBE_STUCK_MAX.
           this.answeredAt.delete(root)
         }
+        if (over) over.stuck = true
         leave(false)
       },
       release: () => {
         if (state !== 'stuck') return
         state = 'released'
+        freeOver()
         if (gen !== this.generation) return
         const n = (this.stuck.get(root) ?? 1) - 1
         if (n <= 0) this.stuck.delete(root)

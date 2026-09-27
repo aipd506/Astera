@@ -105,7 +105,8 @@ export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
  * goes ahead. The calls go through pathProbe's session-folder lane (`skipQueue`) in a pool of their
  * own, so a stuck root answers `timeout` at once, without a call, until its call settles or reaches
  * the ceiling — and then it is tried again (no PRESENCE_RETRY_MS rest: a person is asking now).
- * Stuck calls number at most one per dead root.
+ * Stuck calls number at most one per dead root. **Past the stuck-call cap** (pathProbe's `pastCap`): a
+ * root not known to be alive still gets its one call when three calls are stuck elsewhere.
  */
 export function createActionPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
   return makeCheck(d, true)
@@ -150,9 +151,13 @@ function makeCheck(d: PresenceCheckDeps, perRoot: boolean): PresenceCheck {
     // (see the header). The holders above already keep this pool to one call (per root, on the action lane).
     pool: d.pool ?? createProbePool(PRESENCE_CONCURRENCY),
     skipQueue: perRoot,
+    // The action lane is asked by a person (or a merge) waiting now: its call goes past the stuck-call
+    // cap, so dead drives elsewhere never make a live root's check "refused" (ProbeBudget.enter). A
+    // root stuck itself is still refused. The sweep's background lane stays under the cap.
+    pastCap: perRoot,
     log: d.log
   })
-  const attempt = async (p: string): Promise<Attempt> => {
+  const attempt = async (p: string, again = false): Promise<Attempt> => {
     const root = rootOf(p)
     const key = keyOf(p)
     const until = resting.get(root)
@@ -183,6 +188,15 @@ function makeCheck(d: PresenceCheckDeps, perRoot: boolean): PresenceCheck {
     }
     holders.set(key, h)
     const r = await prober(p)
+    if (!h.called && r !== 'timeout') {
+      // The pool handed this attempt the answer of a call already in flight for the same question (the
+      // same path, the same prober): no call of its own was made, so nothing lets this slot go — the
+      // next check on the root then waited forever. Let go here. `present` is the answer; for `absent`
+      // the errno that tells "removed" from "cannot say" is not known, so ask once more, now alone.
+      h.letGo()
+      // Once only: a second shared `absent` is taken as "cannot say" (error → unreachable), never as removed.
+      return r === 'present' ? 'present' : again ? 'error' : attempt(p, true)
+    }
     if (r === 'present') return 'present'
     if (r === 'absent') return h.code === 'ENOENT' ? 'enoent' : 'error'
     if (!h.called) {

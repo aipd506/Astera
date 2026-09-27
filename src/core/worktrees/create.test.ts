@@ -600,3 +600,24 @@ describe('resolveRepo', () => {
     }
   })
 })
+
+// Stage 4 T1 review follow-up: the name check (the presence action lane) is asked past the stuck-call
+// cap too, so dead drives elsewhere never stop a creation on a live local root.
+describe('createWorktree with three dead roots stuck in the budget', () => {
+  it('passes the name check on a fresh local root and creates the worktree', async () => {
+    const budget = processProbeBudget()
+    try {
+      for (const r of ['Q:/', 'R:/', 'S:/'].map(rootOf)) {
+        const t = await budget.enter(r)
+        if (typeof t === 'string') throw new Error(t)
+        t.timedOut()
+      }
+      const { info } = await createWorktree({ repoPath: repo, name: 'past-cap', registry: reg })
+      expect(info.name).toBe('past-cap')
+      expect(reg.get(info.id)?.path).toBe(info.path)
+    } finally {
+      budget.reset()
+    }
+  })
+})
+

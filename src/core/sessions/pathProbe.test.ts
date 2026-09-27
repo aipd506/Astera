@@ -492,7 +492,10 @@ describe('the process-wide probe budget, across every lane', () => {
     }
   }
 
-  it('dead roots across all lanes never hold more than one stuck call per root, nor more than 3 in all', async () => {
+  // The action lane is asked by a person, so it may take the one extra slot past the cap (enter's
+  // pastCap): the bound across every lane is PROBE_STUCK_MAX + 1, and it is exactly that — the
+  // background lanes alone keep to PROBE_STUCK_MAX (the next test).
+  it('dead roots across all lanes never hold more than one stuck call per root, nor more than 3 + the one extra slot in all', async () => {
     vi.useFakeTimers()
     const dead = ['z:\\', 'y:\\', 'x:\\', 'w:\\', 'v:\\']
     const tp = threadpool(dead)
@@ -507,9 +510,47 @@ describe('the process-wide probe budget, across every lane', () => {
     }
     await Promise.all(asks)
     expect(tp.peak().perRoot).toBe(1)
+    expect(tp.hung.length).toBeLessThanOrEqual(PROBE_STUCK_MAX + 1)
+    expect(tp.inFlight()).toBeLessThanOrEqual(PROBE_STUCK_MAX + 1)
+    expect(budget.stuckCount()).toBeLessThanOrEqual(PROBE_STUCK_MAX + 1)
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+
+  it('the background lanes alone never hold more than 3 stuck calls, however many roots are dead', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['Z:/', 'Y:/', 'X:/', 'W:/', 'V:/'].map(rootOf))
+    const budget = new ProbeBudget()
+    const l = lanes(budget, tp.access)
+    const asks: Promise<unknown>[] = []
+    for (let round = 0; round < 3; round++) {
+      for (const d of ['Z:', 'Y:', 'X:', 'W:', 'V:']) asks.push(l.path(`${d}/bin/git.exe`), l.cwd(`${d}/proj`), l.sweep(`${d}/wt/a`))
+      for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS / 2)
+    }
+    await Promise.all(asks)
+    expect(tp.peak().perRoot).toBe(1)
     expect(tp.hung.length).toBeLessThanOrEqual(PROBE_STUCK_MAX)
-    expect(tp.inFlight()).toBeLessThanOrEqual(PROBE_STUCK_MAX)
     expect(budget.stuckCount()).toBeLessThanOrEqual(PROBE_STUCK_MAX)
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+
+  it('past the cap there is one extra slot: while its call is stuck, a second person on another unknown root is refused without a call', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['Z:/', 'Y:/', 'X:/', 'W:/', 'V:/'].map(rootOf))
+    const budget = new ProbeBudget()
+    const l = lanes(budget, tp.access)
+    const first = [l.path('Z:/bin/git.exe'), l.sweep('Y:/wt/a'), l.cwd('X:/proj')]
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    await Promise.all(first)
+    expect(budget.stuckCount()).toBe(PROBE_STUCK_MAX)
+    const w = l.action('W:/wt/b')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await w).toBe('unreachable')
+    expect(budget.stuckCount()).toBe(PROBE_STUCK_MAX + 1)
+    const before = tp.started.length
+    const v = l.action('V:/wt/c')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await v).toBe('refused')
+    expect(tp.started.length).toBe(before)
     await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
   })
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createProbePool, createProber, processProbeBudget, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
+import { createProbePool, createProber, processProbeBudget, ProbeBudget, rootOf, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
 import { askUntilAnswered, ASK_TRIES, createActionPresenceCheck, createPresenceCheck, PresenceCache, type CheckResult, type Presence } from './presence'
 
 const enoent = (): Error => Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
@@ -342,3 +342,45 @@ describe('askUntilAnswered', () => {
     expect(await askUntilAnswered(async () => { throw new Error('boom') }, 'C:/x')).toBe('unreachable')
   })
 })
+
+// Stage 4 T1 review follow-up: a check a person waits on (the action lane) gets its call past the
+// stuck-call cap; the sweep's background lane stays under it.
+describe('the stuck-call cap and the two lanes', () => {
+  it('with three roots stuck, the action lane asks a fresh root and the sweep lane is refused', async () => {
+    const budget = new ProbeBudget()
+    for (const r of ['Q:/', 'R:/', 'S:/'].map(rootOf)) {
+      const t = await budget.enter(r)
+      if (typeof t === 'string') throw new Error(t)
+      t.timedOut()
+    }
+    const access = vi.fn(async () => {})
+    const action = createActionPresenceCheck({ access, pool: createProbePool(1, PROBE_STUCK_CEILING_MS, budget), log: () => {} })
+    expect(await action('D:/wt/a')).toBe('present')
+    expect(access).toHaveBeenCalledTimes(1)
+    const sweepAccess = vi.fn(async () => {})
+    const sweep = createPresenceCheck({ access: sweepAccess, pool: createProbePool(1, PROBE_STUCK_CEILING_MS, budget), log: () => {} })
+    expect(await sweep('E:/wt/b')).toBe('refused')
+    expect(sweepAccess).not.toHaveBeenCalled()
+  })
+})
+
+// Stage 4 T1 follow-up: an answer the pool shares from another call (same path, same kind) made no call
+// of this attempt's own, so nothing let its slot go — the next check on that root waited forever. Two
+// creations checking two missing names on one drive ask the same witness (the drive) back to back.
+describe('an attempt answered by a shared call lets its slot go', () => {
+  it('two missing names on one drive, asked together, leave the drive free for the next check', async () => {
+    const enoent = (): Error => Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+    const access = vi.fn(async (p: string) => {
+      if (p.length <= 3) return // the drive itself (the witness)
+      throw enoent()
+    })
+    const check = createActionPresenceCheck({ access, log: () => {}, pool: createProbePool(2, PROBE_STUCK_CEILING_MS, new ProbeBudget()) })
+    for (let round = 0; round < 20; round++) {
+      const both = await Promise.all([check(`C:/wt/a${round}`), check(`C:/wt/b${round}`)])
+      expect(both).toEqual(['missing', 'missing'])
+    }
+    const next = await Promise.race([check('C:/wt/c'), new Promise((r) => setTimeout(() => r('hung'), 2_000))])
+    expect(next).toBe('missing')
+  })
+})
+
