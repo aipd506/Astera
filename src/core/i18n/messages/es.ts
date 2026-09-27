@@ -730,6 +730,7 @@ export const es: Catalog = {
   'history.resume.pickFolder': 'Elegir carpeta',
   // WorktreePanel.tsx — status labels
   'worktree.status.orphanDir': 'Registro de git perdido',
+  'worktree.status.unreachable': 'Carpeta no accesible',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'Eliminar worktree',
   'worktree.remove.body':

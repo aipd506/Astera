@@ -15,12 +15,14 @@ import { PushBadge } from './PushBadge'
 import { rowSlot } from './rowSlot'
 import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react'
 
-/** 상태 라벨. **'폴더 없음' 은 없다** — 폴더가 사라진 항목은 listWithStatus 가 목록을 만들면서
- *  레지스트리에서 걷으므로 이 자리에 도달하지 않는다. 그 줄은 눌러도 할 일이 없는 정보였고,
- *  예약 작업이 워크트리를 쌓으면서 스물일곱 개까지 늘어 하나씩 지워야 했다. */
+/** 상태 라벨. **'폴더 없음' 은 없다** — 폴더가 사라졌다고 확인된 항목은 listWithStatus 가 목록을
+ *  만들면서 레지스트리에서 걷으므로 이 자리에 도달하지 않는다. 그 줄은 눌러도 할 일이 없는 정보였고,
+ *  예약 작업이 워크트리를 쌓으면서 스물일곱 개까지 늘어 하나씩 지워야 했다. '닿을 수 없음' 은 다르다 —
+ *  멈춘 네트워크 드라이브처럼 확인이 확답을 주지 못한 항목이라 잊지 않고 그렇게 보여 준다. */
 const STATUS_LABEL: Record<WorktreeListItem['status'], MessageKey | null> = {
   ok: null,
-  'orphan-dir': 'worktree.status.orphanDir'
+  'orphan-dir': 'worktree.status.orphanDir',
+  unreachable: 'worktree.status.unreachable'
 }
 
 /** Sidebar worktree list — only the worktrees this app created (per the registry) */

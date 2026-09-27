@@ -64,3 +64,34 @@ describe('listWithStatus', () => {
     expect(reg.list().map((w) => w.id)).toEqual([a.id])
   })
 })
+
+// 폴더 확인이 확답을 주지 못한 항목(멈춘 네트워크 드라이브, 권한 오류)은 잊지 않는다 — 폴더가
+// 사라졌다고 확인된 것(ENOENT)만 걷는다
+describe('listWithStatus — 확인이 불확실할 때', () => {
+  it('멈춘 폴더는 unreachable 로 남고 레지스트리에서 지워지지 않는다', async () => {
+    const repo = await makeRepo('astera-wt-ls4-')
+    const root = await tempDir('astera-wt-ls4root-')
+    const regDir = await tempDir('astera-wt-ls4reg-')
+    const reg = new WorktreeRegistry(path.join(regDir, 'worktrees.json'), root)
+    await reg.load()
+    const a = (await createWorktree({ repoPath: repo, name: 'hung', registry: reg })).info
+    const b = (await createWorktree({ repoPath: repo, name: 'fine', registry: reg })).info
+    const items = await listWithStatus(reg, async (p) => (p === a.path ? 'unreachable' : 'present'))
+    const byId = new Map(items.map((w) => [w.id, w.status]))
+    expect(byId.get(a.id)).toBe('unreachable')
+    expect(byId.get(b.id)).toBe('ok')
+    expect(reg.list().map((w) => w.id).sort()).toEqual([a.id, b.id].sort())
+  })
+
+  it('ENOENT 로 확인된(missing) 항목은 여전히 걷힌다', async () => {
+    const repo = await makeRepo('astera-wt-ls5-')
+    const root = await tempDir('astera-wt-ls5root-')
+    const regDir = await tempDir('astera-wt-ls5reg-')
+    const reg = new WorktreeRegistry(path.join(regDir, 'worktrees.json'), root)
+    await reg.load()
+    const a = (await createWorktree({ repoPath: repo, name: 'gone', registry: reg })).info
+    const items = await listWithStatus(reg, async () => 'missing')
+    expect(items.some((w) => w.id === a.id)).toBe(false)
+    expect(reg.list()).toHaveLength(0)
+  })
+})

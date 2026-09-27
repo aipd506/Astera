@@ -118,10 +118,11 @@ export interface ResumeDefaults {
   schedule: ScheduleConfig | null
 }
 
-/** 워크트리 항목의 상태. **'missing' 은 없다** — 폴더가 사라진 항목은 listWithStatus 가 목록을
- *  만들면서 레지스트리에서 걷으므로(그쪽 주석) 화면까지 오지 않는다. 남는 질문은 "git 이 이 폴더를
- *  아는가" 하나다. */
-export type WorktreeStatus = 'ok' | 'orphan-dir'
+/** 워크트리 항목의 상태. **'missing' 은 없다** — 폴더가 사라졌다고 확인된 항목은 listWithStatus 가
+ *  목록을 만들면서 레지스트리에서 걷으므로(그쪽 주석) 화면까지 오지 않는다. 'unreachable' 은 폴더
+ *  확인이 확답을 주지 못한 항목이다(멈춘 네트워크 드라이브, 빠진 드라이브, 권한 오류) — 잊지 않고
+ *  그대로 보여 준다. 나머지 질문은 "git 이 이 폴더를 아는가" 하나다. */
+export type WorktreeStatus = 'ok' | 'orphan-dir' | 'unreachable'
 
 /** A git worktree record the app created — persisted in worktrees.json */
 export interface WorktreeInfo {

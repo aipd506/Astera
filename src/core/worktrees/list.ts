@@ -1,8 +1,8 @@
-import { existsSync } from 'node:fs'
 import { isSamePath } from '../files/tree'
 import type { WorktreeListItem, WorktreeStatus } from '../types'
 import { git, listGitWorktrees } from './git'
 import type { WorktreeStore } from './registry'
+import { defaultPresenceCheck, type Presence, type PresenceCheck } from './presence'
 
 /**
  * Status from cross-checking the registry against git worktree list. git is called once per repo.
@@ -16,11 +16,16 @@ import type { WorktreeStore } from './registry'
  * 그것). 걷지 않으면 저장소에 잔해가 남는다. 저장소를 읽을 수 없으면 prune 은 건너뛰고 레지스트리
  * 항목만 지운다 — 그쪽에 닿을 수 없으니 할 수 있는 것이 그것뿐이다.
  *
- * **대가**: 워크트리를 담은 드라이브가 잠깐 빠진 동안 목록을 부르면 그 항목들을 잊는다. 폴더와
- * 브랜치는 그대로 남으므로 잃는 것은 "앱이 이것을 관리한다"는 기록뿐이고, 되돌리려면 그 폴더를
- * 지우거나 다시 만들면 된다. 그 드문 경우를 위해 "폴더 없음" 줄을 늘 남겨 두는 것보다 낫다고 보았다.
+ * **폴더가 사라졌다고 확인된 것만 걷는다.** 폴더 확인(presence.ts)이 ENOENT 로 답하고 그 드라이브는
+ * 답할 때(`missing`)뿐이다. 시간 안에 답이 없거나(멈춘 네트워크 드라이브, OneDrive, `\\wsl$`) 다른
+ * 오류가 나거나 드라이브 자체가 없으면 `unreachable` 로 남긴다 — 드라이브가 잠깐 빠진 동안 목록을
+ * 불렀다고 그 항목을 잊던 것이 이 자리의 예전 대가였다. 확인은 비동기이고 시간 제한이 있어, 목록을
+ * 부르는 동안 메인 스레드가 멈추지 않는다.
  */
-export async function listWithStatus(registry: WorktreeStore): Promise<WorktreeListItem[]> {
+export async function listWithStatus(
+  registry: WorktreeStore,
+  check: PresenceCheck = defaultPresenceCheck
+): Promise<WorktreeListItem[]> {
   const items = registry.list()
   const repos = [...new Set(items.map((w) => w.repoPath))]
   const rowsByRepo = new Map<string, Array<{ path: string }> | null>()
@@ -31,7 +36,10 @@ export async function listWithStatus(registry: WorktreeStore): Promise<WorktreeL
       rowsByRepo.set(repo, null) // repo unreachable — prune 을 부를 수 없다(아래)
     }
   }
-  const dead = items.filter((w) => !existsSync(w.path))
+  // 항목들을 함께 묻는다 — 동시에 몇 개가 실제로 도는지는 pathProbe 의 풀이 정한다
+  const presence = new Map<string, Presence>()
+  await Promise.all(items.map(async (w) => presence.set(w.id, await check(w.path))))
+  const dead = items.filter((w) => presence.get(w.id) === 'missing')
   // prune 은 저장소마다 한 번이다 — 같은 저장소의 항목 여럿이 사라졌을 때 그 수만큼 git 을 부르지
   // 않는다(한 번이 그 저장소의 잔해를 모두 걷는다).
   for (const repo of new Set(dead.filter((w) => rowsByRepo.get(w.repoPath) !== null).map((w) => w.repoPath)))
@@ -41,6 +49,9 @@ export async function listWithStatus(registry: WorktreeStore): Promise<WorktreeL
   return items
     .filter((w) => !deadIds.has(w.id))
     .map((w) => {
+      // 폴더에 닿지 못했다 — git 이 아는가보다 그것을 먼저 말한다. orphan-dir 로 보이면 사람이 지워도
+      // 되는 잔해로 읽는다
+      if (presence.get(w.id) === 'unreachable') return { ...w, status: 'unreachable' as const }
       const rows = rowsByRepo.get(w.repoPath)
       const registered = rows?.some((r) => isSamePath(r.path, w.path)) ?? false
       // 여기 오는 항목은 폴더가 있다(위에서 걸렀다) — 남은 질문은 git 이 아는가 하나다

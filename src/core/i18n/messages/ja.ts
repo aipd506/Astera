@@ -722,6 +722,7 @@ export const ja: Catalog = {
   'history.resume.pickFolder': 'フォルダを選択',
   // WorktreePanel.tsx — status labels
   'worktree.status.orphanDir': 'git 登録が消失',
+  'worktree.status.unreachable': 'フォルダーに接続できません',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'worktree の削除',
   'worktree.remove.body':
