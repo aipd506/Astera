@@ -208,6 +208,8 @@ import { goneWorktreeProjects } from '../core/worktrees/hiddenHistory'
 import { deleteProjectHistory } from './historyDeletion'
 import { removeWorktree } from '../core/worktrees/remove'
 import { listWithStatus } from '../core/worktrees/list'
+import { PresenceCache, PRESENCE_SWEEP_MS } from '../core/worktrees/presence'
+import { probeLog } from '../core/sessions/pathProbe'
 import {
   git,
   repoRoot,
@@ -1383,6 +1385,33 @@ export function registerIpc(
    *  renderer has turned off (and nothing turns it off again), and two overlapping list calls can
    *  settle in the wrong order, leaving main pushing project A to a renderer showing B. */
   let orchRequest = 0
+  /** The last state pushOrchState folded, so a presence answer that lands later can fold it again. */
+  let orchLastPushed: OrchState | null = null
+  let orchRepushQueued = false
+  /** 워크트리 폴더가 아직 있는가 — 비동기로 묻고, 시간 제한이 있고, 캐시된다(core/worktrees/presence.ts).
+   *  **푸시 경로는 캐시만 읽는다.** 동기 existsSync 였을 때는 네트워크 공유·OneDrive·`\\wsl$` 위의
+   *  워크트리 하나가 모든 setState 마다 메인 스레드를 20~60초씩 세웠다. 답이 아직 없으면 unknown 이고
+   *  (사라졌다고 하지 않는다) 확인이 예약된다. 답이 새로 오거나 바뀌면 마지막 상태를 한 번 더 접어
+   *  보낸다 — sameSnapshot 이 달라진 것이 없으면 버린다. 여러 답이 한꺼번에 와도 다시 접는 것은 한 번이다. */
+  const worktreePresence = new PresenceCache({
+    onChange: () => {
+      if (orchRepushQueued) return
+      orchRepushQueued = true
+      setTimeout(() => {
+        orchRepushQueued = false
+        // orch.list 가 접은 상태는 pushOrchState 를 지나지 않으므로 지금 상태를 먼저 읽는다
+        try {
+          const state = orch ? orch.deps.getState() : orchLastPushed
+          if (state) pushOrchState(state)
+        } catch (err) {
+          orchLog(`orch:state re-push after a worktree presence answer failed: ${String(err)}`)
+        }
+      }, 0)
+    },
+    log: probeLog
+  })
+  // 주기적으로 알려진 경로 전부와 레지스트리의 워크트리를 다시 묻는다. 타이머는 프로세스를 붙잡지 않는다.
+  worktreePresence.start(PRESENCE_SWEEP_MS, () => core.worktrees.list().map((w) => w.path))
   const orchSnapshotOf = (state: OrchState, projectPath: string): OrchSnapshot => {
     // The set is built once per fold rather than per Task — sessions.list() copies every SessionInfo.
     const known = new Set(core.sessions.list().map((s) => s.id))
@@ -1396,12 +1425,14 @@ export function registerIpc(
       core.worktrees.list(),
       // 예약 템플릿의 다음 발화 — 무장은 배치 루프가 들고 있다(N3). bootOrch 전에는 null 이다.
       (runId) => orchLoop?.nextFireOf(runId) ?? null,
-      // 폴더가 아직 있는가. 동기 확인인 이유는 이 폴드가 모든 setState 뒤에 돌기 때문이다 — Run 하나에
-      // 워크트리 몇 개이므로 호출 수는 작고, 비동기로 만들면 이 함수와 그 호출자 셋이 전부 async 가 된다.
-      (p) => existsSync(p)
+      // 폴더가 아직 있는가 — 캐시만 읽는다(worktreePresence). 이 폴드는 모든 setState 뒤에 메인
+      // 스레드에서 돌므로 fs 를 동기로 만지지 않는다. 확인된 missing 만 뺀다: unknown(아직 묻는 중)과
+      // unreachable(닿지 못했다)은 사라졌다는 증거가 아니다.
+      (p) => worktreePresence.peek(p) !== 'missing'
     )
   }
   const pushOrchState = (state: OrchState): void => {
+    orchLastPushed = state
     if (orchProject === null) return // the renderer has not asked for a project, or it unwatched
     // The push is a notification and runs inside the awaited setState (below), so a throw here would
     // reject a write that has **already been persisted** — every CLI command would start answering
@@ -3923,7 +3954,7 @@ export function registerIpc(
     if (r) return `RUN:${r.configName}`
     return null
   }
-  ipcMain.handle('worktrees.list', () => listWithStatus(core.worktrees))
+  ipcMain.handle('worktrees.list', () => listWithStatus(core.worktrees, (p) => worktreePresence.refresh(p)))
   ipcMain.handle('worktrees.create', (_e, opts: { repoPath: string; name?: string; baseRef?: string }) =>
     createWorktree({
       repoPath: opts.repoPath,
