@@ -99,6 +99,8 @@ export const es: Catalog = {
   'worktree.include.overLimit': 'Omitido, supera el límite de copia (200 MB): {entry}',
   'worktree.include.linkFailed': 'Omitido, no se pudo recrear un enlace: {entry} ({detail})',
   'worktree.include.unsafeDest': 'No se copió bajo {path}: es un enlace y escribir a través de él saldría del worktree ({entry})',
+  'worktree.include.linkTargetMissing': 'No se recreó un enlace de carpeta porque su destino dentro del repositorio no está en el worktree: {path} ({entry})',
+  'worktree.include.outsideLinkSkipped': 'No se recreó un enlace de carpeta que apunta fuera del repositorio porque no se pudo crear un enlace simbólico ({detail}). Créalo a mano si lo necesitas: {path} ({entry})',
   'worktree.include.overFileCount': 'Omitido, más de {max} elementos: {entry}',
   'worktree.include.copyFailed': 'Error al copiar: {entry} ({detail})',
   'worktree.create.fetchFailed':
@@ -128,6 +130,7 @@ export const es: Catalog = {
   'worktree.error.rollbackIncomplete': 'No se pudo deshacer la creación del worktree. Elimina a mano la carpeta {path} y la rama {branch}.',
   'worktree.error.gitRemoveFailed': 'No se pudo eliminar el worktree de git.',
   'worktree.error.unreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se eliminó nada. Vuelve a intentarlo cuando sea accesible.',
+  'worktree.error.linksUnverified': 'No se pudieron comprobar y quitar todos los enlaces de la carpeta del worktree, así que no se eliminó nada. Eliminarla de todos modos podría borrar archivos de fuera a través de una unión (junction). Vuelve a intentarlo o quita los enlaces a mano.',
   'worktree.error.rootUnreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
@@ -682,6 +685,7 @@ export const es: Catalog = {
   // parcial aún no tiene el resto de las claves conversation.* (se sustituyen por en/ko); estas tres
   // se añaden antes que las demás.
   'conversation.indexingFiles': 'Indexando archivos…',
+  'conversation.filesUnavailable': 'La lista de archivos no está disponible para esta carpeta.',
   'conversation.exited.withCode': 'Esta sesión ha terminado (código {code})',
   'conversation.exited.detail': 'Detalles',
   'conversation.exited.restart': 'Reiniciar',

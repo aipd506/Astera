@@ -2,12 +2,12 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { promises as fs, existsSync } from 'node:fs'
 import path from 'node:path'
-import { createWorktree, rollbackAdd } from './create'
+import { createWorktree, rollbackAdd, probedRollbackFs, type RollbackFs } from './create'
 import type { WorktreeCreateProgress } from '../types'
 import { WorktreeRegistry } from './registry'
 import { git, localBranchExists } from './git'
 import { makeRepo, addOrigin, tempDir } from './testRepo'
-import { createProbePool, ProbeBudget, PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
+import { createProbePool, createProber, rootOf, ProbeBudget, PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
 
 let repo: string
 let root: string
@@ -234,19 +234,24 @@ describe('createWorktree, taking back the repo folder', () => {
     expect(existsSync(path.join(target, 'keep.txt'))).toBe(true)
   })
 
-  it('does not wait on a cleanup that hangs past the probe limit', async () => {
+  // Stage 2 final review, I1: the rmdir is mutating work with its own deadline, outside the probe
+  // budget. A hung one is not waited on past that deadline, and it marks no drive stuck.
+  it('does not wait on a cleanup that hangs past its own deadline, and marks no root stuck', async () => {
     const started = Date.now()
     let asked = false
+    const budget = new ProbeBudget()
     await expect(
       createWorktree({
         repoPath: repo, name: 'full', registry: reg,
         presence: async () => 'present',
         removeDirAccess: () => { asked = true; return new Promise<void>(() => {}) },
-        cleanupPool: createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, new ProbeBudget())
+        cleanupPool: createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, budget),
+        fsWorkTimeoutMs: PROBE_TIMEOUT_MS + 500
       })
     ).rejects.toThrow(/NAME_EXHAUSTED/)
     expect(asked).toBe(true)
     expect(Date.now() - started).toBeLessThan(PROBE_TIMEOUT_MS + 8_000)
+    expect(budget.stuckCount()).toBe(0)
   }, 20_000)
 })
 
@@ -466,5 +471,74 @@ describe('rollbackAdd — 이 호출이 만든 것만', () => {
     await fs.mkdir(empty)
     expect(await rollbackAdd(repo, empty, 'Test-User/none')).toEqual([])
     expect(existsSync(empty)).toBe(false)
+  })
+})
+
+// Stage 2 final review, C1: the links are taken out before git removes the worktree. When that walk
+// cannot finish, git is not run on the folder at all: it is kept and reported unverified.
+describe('rollbackAdd — the links are taken out first', () => {
+  it('keeps the worktree and reports unverified when the link walk fails', async () => {
+    const mine = path.join(root, 'walk-fails')
+    gitIn(repo, ['worktree', 'add', '-b', 'Test-User/walk', mine, 'main'])
+    const real = probedRollbackFs()
+    const removed: string[] = []
+    const rfs: RollbackFs = {
+      ...real,
+      detachLinks: async () => false,
+      removeOwned: async (p) => { removed.push(p); return true },
+      removeIfEmpty: async (p) => { removed.push(p); return true }
+    }
+    const remains = await rollbackAdd(repo, mine, 'Test-User/walk', rfs)
+    expect(remains).toContain('unverified')
+    expect(remains).toContain('folder')
+    expect(removed).toEqual([])
+    expect(existsSync(path.join(mine, 'f.txt'))).toBe(true)
+    expect(gitIn(repo, ['worktree', 'list', '--porcelain'])).toContain('walk-fails')
+  })
+
+  it('does not walk or remove a folder whose check did not answer', async () => {
+    const mine = path.join(root, 'no-answer')
+    gitIn(repo, ['worktree', 'add', '-b', 'Test-User/noanswer', mine, 'main'])
+    let walked = false
+    const rfs: RollbackFs = {
+      exists: async () => 'unknown',
+      detachLinks: async () => { walked = true; return true },
+      removeOwned: async () => true,
+      removeIfEmpty: async () => true
+    }
+    expect(await rollbackAdd(repo, mine, 'Test-User/noanswer', rfs)).toContain('unverified')
+    expect(walked).toBe(false)
+    expect(existsSync(path.join(mine, 'f.txt'))).toBe(true)
+  })
+})
+
+// Stage 2 final review, I1: only the existence checks go through the probe budget. A slow rm is mutating
+// work with its own deadline, so it never marks its drive stuck, and a probe of that drive still answers.
+describe('rollback fs — slow removal is not a probe', () => {
+  it('a slow rm does not mark the root stuck, and a session probe on that root still answers', async () => {
+    const budget = new ProbeBudget()
+    const pool = createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, budget)
+    const dir = await tempDir('astera-wt-slowrm-')
+    const rfs = probedRollbackFs(pool, {
+      rmTree: () => new Promise<void>((r) => setTimeout(r, PROBE_TIMEOUT_MS + 1_000))
+    })
+    const removing = rfs.removeOwned(dir)
+    await new Promise((r) => setTimeout(r, PROBE_TIMEOUT_MS + 300))
+    expect(budget.isStuck(rootOf(dir))).toBe(false)
+    expect(budget.stuckCount()).toBe(0)
+    const sessionProbe = createProber({ pool, skipQueue: true })
+    expect(await sessionProbe(dir)).toBe('present')
+    expect(await rfs.exists(dir)).toBe('yes')
+    expect(await removing).toBe(true)
+    expect(budget.stuckCount()).toBe(0)
+  }, 15_000)
+
+  it('an rm past its own deadline answers not done, still without marking the root stuck', async () => {
+    const budget = new ProbeBudget()
+    const pool = createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, budget)
+    const dir = await tempDir('astera-wt-hungrm-')
+    const rfs = probedRollbackFs(pool, { rmTree: () => new Promise<void>(() => {}), fsWorkTimeoutMs: 200 })
+    expect(await rfs.removeOwned(dir)).toBe(false)
+    expect(budget.isStuck(rootOf(dir))).toBe(false)
   })
 })

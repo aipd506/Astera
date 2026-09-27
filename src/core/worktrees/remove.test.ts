@@ -331,3 +331,59 @@ describe('removeWorktree, a refused check', () => {
     expect(existsSync(info.path)).toBe(false)
   })
 })
+
+// Stage 2 final review, C1: before git removes the folder its links are taken out (detachLinks.ts). When
+// that walk cannot finish, git is not run on the folder at all and nothing is removed.
+describe('removeWorktree, the links are taken out first', () => {
+  it('a failed link walk removes nothing and says so (LINKS_UNVERIFIED)', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'walkfail', registry: reg })
+    for (const force of [false, true]) {
+      await expect(
+        removeWorktree({
+          id: info.id, force, registry: reg, isPathInUse: noUse,
+          detach: async () => ({ ok: false, reason: 'timeout' })
+        })
+      ).rejects.toThrow(/LINKS_UNVERIFIED/)
+      expect(existsSync(path.join(info.path, 'f.txt'))).toBe(true)
+      expect(reg.get(info.id)).not.toBeNull()
+      expect(await localBranchExists(repo, info.branch)).toBe(true)
+      expect(gitIn(repo, ['worktree', 'list', '--porcelain'])).toContain('walkfail')
+    }
+  })
+
+  it('walks the folder it removes; without force git\'s tracked symlinks are spared, with force nothing is', async () => {
+    const seen: Array<{ root: string; spares: boolean }> = []
+    const detach = async (root: string, opts: { keep?: (rel: string) => boolean }) => {
+      seen.push({ root, spares: opts.keep !== undefined })
+      return { ok: true as const, unlinked: 0 }
+    }
+    const a = await createWorktree({ repoPath: repo, name: 'walk-a', registry: reg })
+    await removeWorktree({ id: a.info.id, registry: reg, isPathInUse: noUse, detach })
+    const b = await createWorktree({ repoPath: repo, name: 'walk-b', registry: reg })
+    await removeWorktree({ id: b.info.id, force: true, registry: reg, isPathInUse: noUse, detach })
+    expect(seen).toEqual([
+      { root: a.info.path, spares: true },
+      { root: b.info.path, spares: false }
+    ])
+  })
+})
+
+describe('removeWorktree without force, with a tracked symlink', () => {
+  it('spares git\'s own symlink, so the clean worktree is still removed', async (ctx) => {
+    gitIn(repo, ['config', 'core.symlinks', 'true'])
+    await fs.mkdir(path.join(repo, 'dir'))
+    await fs.writeFile(path.join(repo, 'dir', 'x.txt'), 'x', 'utf8')
+    try {
+      await fs.symlink('dir', path.join(repo, 'alias'), 'dir')
+    } catch {
+      ctx.skip('symlinks cannot be made here')
+    }
+    gitIn(repo, ['add', 'dir', 'alias'])
+    gitIn(repo, ['commit', '-m', 'tracked link'])
+    const { info } = await createWorktree({ repoPath: repo, name: 'tracked-link', registry: reg })
+    if (!(await fs.lstat(path.join(info.path, 'alias'))).isSymbolicLink()) ctx.skip('git checked the link out as a file')
+    const r = await removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse })
+    expect(r.removed).toBe(true)
+    expect(existsSync(info.path)).toBe(false)
+  })
+})

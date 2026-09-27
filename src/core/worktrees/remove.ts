@@ -11,6 +11,48 @@ import { git, gitVersionAtLeast, isCleanWorktree, listGitWorktrees, GIT_WRITE_TI
 const write = (cwd: string): { cwd: string; timeoutMs: number } => ({ cwd, timeoutMs: GIT_WRITE_TIMEOUT_MS })
 import type { WorktreeStore } from './registry'
 import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
+import { detachLinks, type DetachResult } from './detachLinks'
+
+/** The paths git tracks as symlinks in this worktree (mode 120000), relative with `/`, case folded
+ *  where the file system folds it. null when git could not say. */
+async function trackedLinks(worktreePath: string): Promise<Set<string> | null> {
+  const r = await git(['ls-files', '-s', '-z'], { cwd: worktreePath, trim: false })
+  if (!r.ok) return null
+  const fold = process.platform === 'win32' || process.platform === 'darwin'
+  const out = new Set<string>()
+  for (const rec of r.stdout.split('\0')) {
+    const tab = rec.indexOf('\t')
+    if (tab < 0 || !rec.startsWith('120000 ')) continue
+    const p = rec.slice(tab + 1)
+    out.add(fold ? p.toLowerCase() : p)
+  }
+  return out
+}
+
+/** Takes the links out of a worktree before `git worktree remove` runs on it (detachLinks.ts): Git for
+ *  Windows' remove deletes through a junction, into the folder outside it points at. Without force,
+ *  git's own tracked symlinks are spared: git never follows them, and removing one would make the
+ *  worktree dirty and the removal refused, leaving it damaged. Throws LINKS_UNVERIFIED when the walk
+ *  could not finish; nothing is removed then. */
+async function detachBeforeRemove(
+  worktreePath: string,
+  force: boolean,
+  detach: (root: string, opts: { keep?: (rel: string) => boolean }) => Promise<DetachResult>
+): Promise<void> {
+  let keep: ((rel: string) => boolean) | undefined
+  if (!force) {
+    const tracked = await trackedLinks(worktreePath)
+    if (!tracked)
+      throw new Error(`LINKS_UNVERIFIED: git could not list the tracked files, nothing was removed (${worktreePath})`)
+    const fold = process.platform === 'win32' || process.platform === 'darwin'
+    keep = (rel) => tracked.has(fold ? rel.toLowerCase() : rel)
+  }
+  const r = await detach(worktreePath, keep ? { keep } : {})
+  if (!r.ok)
+    throw new Error(
+      `LINKS_UNVERIFIED: the links in the folder could not all be checked and taken out, nothing was removed (${worktreePath}): ${r.reason}`
+    )
+}
 
 /** Dangerous paths: the repo itself, a parent that contains the repo, home, a parent that contains home, the filesystem root */
 export function isDangerousRemovalPath(
@@ -130,6 +172,8 @@ export async function removeWorktree(args: {
   isPathInUse: (worktreePath: string) => string | null
   /** Test seam; defaults to the process-wide action-lane check (presence.ts). */
   presence?: PresenceCheck
+  /** Test seam: the link walk before git removes the folder (detachLinks.ts). */
+  detach?: (root: string, opts: { keep?: (rel: string) => boolean }) => Promise<DetachResult>
 }): Promise<WorktreeRemoveResult> {
   const info = args.registry.get(args.id)
   if (!info) throw new Error(`NOT_MANAGED: not a worktree created by this app (${args.id})`)
@@ -178,10 +222,15 @@ export async function removeWorktree(args: {
     }
   } else {
     // If the directory is already gone, git status itself is impossible and there is nothing to inspect — skip the cleanliness check.
-    // With force nothing is inspected, so nothing is asked either: git itself answers for the folder.
-    if (!args.force && (await folderState(info.path, presence)) === 'present') {
-      const { clean, changedCount } = await isCleanWorktree(info.path)
-      if (!clean) throw new Error(`DIRTY: ${changedCount}`)
+    // Force or not, the folder is asked about first: before git removes it, its links are taken out
+    // (detachBeforeRemove — git would delete through a junction into the folder it points at), and
+    // that walk is not run on a folder that did not answer. Unreachable throws; nothing is removed.
+    if ((await folderState(info.path, presence)) === 'present') {
+      if (!args.force) {
+        const { clean, changedCount } = await isCleanWorktree(info.path)
+        if (!clean) throw new Error(`DIRTY: ${changedCount}`)
+      }
+      await detachBeforeRemove(info.path, args.force === true, args.detach ?? detachLinks)
     }
     const rm = await git(
       args.force

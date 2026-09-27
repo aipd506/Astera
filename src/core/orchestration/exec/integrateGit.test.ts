@@ -519,3 +519,29 @@ describe('worktreeDeps', () => {
     expect(await d.mergeWorktrees('D:/p', ['D:/x'])).toEqual({ ok: true, merged: [], uncommitted: 0, notMerged: ['D:/x'] })
   })
 })
+
+// Stage 2 final review, C1: Git for Windows' `worktree remove` deletes through a junction into the
+// folder it points at. The run-delete removal (worktreeDeps.removeWorktrees → reapWorktree →
+// removeWorktree) takes the links out first. Real git, real junction, so Windows only.
+describe.runIf(process.platform === 'win32')('run-delete removal of a worktree holding a junction to an outside folder', () => {
+  it('removes the worktree and leaves the outside folder whole', async () => {
+    const outside = await tempDir('astera-integrate-junc-out-')
+    await fs.writeFile(path.join(outside, 'keep.txt'), 'precious')
+    await fs.appendFile(path.join(repo, '.git', 'info', 'exclude'), '\nnode_modules/\n')
+    const a = await worked('a')
+    await fs.mkdir(path.join(a, 'node_modules'))
+    await fs.symlink(outside, path.join(a, 'node_modules', 'pkg'), 'junction')
+    const reapCtx: ReapContext = {
+      registry, sessions: { inTree: () => [], anyRunningIn: () => false, kill: () => {} },
+      dispatches: () => [], isPathInUse: () => null, log: (m) => logs.push(m), closeTimeoutMs: 300, pollMs: 10
+    }
+    const d = worktreeDeps({
+      integrate: async () => { throw new Error('must not merge') },
+      reap: (p) => reapWorktree(p, reapCtx),
+      log: (m) => logs.push(m)
+    })
+    expect(await d.removeWorktrees([a])).toEqual({ failed: [], uncommitted: 0 })
+    await expect(fs.stat(a)).rejects.toThrow()
+    expect(await fs.readFile(path.join(outside, 'keep.txt'), 'utf8')).toBe('precious')
+  })
+})

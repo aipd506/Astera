@@ -3,7 +3,7 @@ import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { git } from './git'
 import { comparablePath, isPathWithin } from '../files/tree'
-import { createProber } from '../sessions/pathProbe'
+import { runFsWork } from './fsWork'
 import { cancelledError, isCancelledError, throwIfCancelled } from './cancel'
 import type { Message } from '../i18n'
 
@@ -225,35 +225,75 @@ export interface IncludeCopyProgress {
 /** Makes one link — fs.symlink by default; a test seam. */
 export type MakeLink = (target: string, linkPath: string, type: 'file' | 'dir' | 'junction') => Promise<void>
 
+/** Where a recreated link points: inside the entry's copy, elsewhere inside the worktree (a folder link
+ *  whose target was inside the source repository), or outside both. */
+export type LinkPlace = 'entry' | 'repo' | 'outside'
+
 /** Where a copied link should point, and as what.
  *
- *  A link whose target lies inside the entry being copied is pointed at the same place **in the copy** —
- *  a relative link keeps its text (it resolves the same way from the copy), an absolute one is rewritten.
- *  A link pointing outside the entry keeps pointing at the same place, written absolute so that moving
- *  it into the worktree does not change what a relative text resolves to. On Windows a folder link is
- *  made as a junction, which needs no privilege but must be absolute. The entry's real path is checked
- *  as well as the given one: a junction's text is always a real, absolute path. */
+ *  - A link whose target lies inside the entry being copied is pointed at the same place **in the
+ *    copy**. A relative link keeps its text (it resolves the same way from the copy); an absolute one is
+ *    rewritten.
+ *  - A **folder** link whose target lies elsewhere inside the source repository is pointed at the same
+ *    relative place **in the worktree** (`repo`): a pnpm workspace's `node_modules/@x/pkg` then leads to
+ *    the worktree's own `packages/pkg`, not the main repo's.
+ *  - Anything else keeps pointing at the same place, written absolute so that moving it into the
+ *    worktree does not change what a relative text resolves to (`outside`).
+ *
+ *  A folder link is a junction on Windows only when it stays inside the worktree (`entry`, `repo`); the
+ *  caller still checks that the target resolves there before making one. A folder link `outside` is
+ *  always a directory symlink, never a junction: Git for Windows' `worktree remove` deletes through a
+ *  junction, into the folder it points at. The entry's and the repository's real paths are checked as
+ *  well as the given ones: a junction's text is always a real, absolute path. */
 export function linkTargetFor(a: {
   srcRoot: string
   srcRootReal: string
   destRoot: string
+  repoRoot: string
+  repoRootReal: string
+  worktreeRoot: string
   linkAbs: string
   raw: string
   isDir: boolean
   platform?: NodeJS.Platform
-}): { target: string; type: 'file' | 'dir' | 'junction' } {
+}): { target: string; type: 'file' | 'dir' | 'junction'; place: LinkPlace } {
   const platform = a.platform ?? process.platform
   const resolved = path.resolve(path.dirname(a.linkAbs), a.raw)
-  const type = a.isDir ? (platform === 'win32' ? 'junction' : 'dir') : 'file'
-  let rel: string | null = null
+  const inside = a.isDir ? (platform === 'win32' ? 'junction' : 'dir') : 'file'
+  const within = (base: string): string | null =>
+    isPathWithin(base, resolved, platform) ? path.relative(base, resolved) : null
   if (a.linkAbs !== a.srcRoot) {
-    if (isPathWithin(a.srcRoot, resolved, platform)) rel = path.relative(a.srcRoot, resolved)
-    else if (isPathWithin(a.srcRootReal, resolved, platform)) rel = path.relative(a.srcRootReal, resolved)
+    const rel = within(a.srcRoot) ?? within(a.srcRootReal)
+    if (rel !== null) {
+      const mapped = path.join(a.destRoot, rel)
+      if (inside === 'junction' || path.isAbsolute(a.raw)) return { target: mapped, type: inside, place: 'entry' }
+      return { target: a.raw, type: inside, place: 'entry' }
+    }
   }
-  if (rel === null) return { target: resolved, type }
-  const mapped = path.join(a.destRoot, rel)
-  if (type === 'junction' || path.isAbsolute(a.raw)) return { target: mapped, type }
-  return { target: a.raw, type }
+  if (a.isDir) {
+    const rel = within(a.repoRoot) ?? within(a.repoRootReal)
+    if (rel !== null) return { target: path.join(a.worktreeRoot, rel), type: inside, place: 'repo' }
+  }
+  return { target: resolved, type: a.isDir ? 'dir' : 'file', place: 'outside' }
+}
+
+/** Whether `p` resolves inside `rootReal` (a real path): the real path of its nearest existing ancestor,
+ *  with the rest appended, must lie within it. A link on the way that leads outside is caught by the
+ *  realpath; a part not made yet is taken as written. */
+async function resolvesWithin(rootReal: string, p: string): Promise<boolean> {
+  let at = path.resolve(p)
+  const rest: string[] = []
+  for (;;) {
+    try {
+      const real = await fs.realpath(at)
+      return isPathWithin(rootReal, path.join(real, ...rest.reverse()))
+    } catch {
+      const up = path.dirname(at)
+      if (up === at) return false
+      rest.push(path.basename(at))
+      at = up
+    }
+  }
 }
 
 async function copyOneFile(
@@ -295,8 +335,12 @@ class LinkFailed extends Error {}
  *  Every entry is measured first (bounded — see measureTree), then copied: folders, then links, then the
  *  files one by one, so `onProgress` can report bytes and files against known totals. Links are
  *  recreated as links (linkTargetFor), 0 bytes each; a file link that needs a privilege the user lacks
- *  (EPERM, Windows without Developer Mode) is copied as the file instead. Any other failure to make a
- *  link skips the whole entry, with what was already made of it removed. `signal` stops the work between
+ *  (EPERM, Windows without Developer Mode) is copied as the file instead. **No junction ever points
+ *  outside the worktree** (Git for Windows' `worktree remove` deletes through one): a folder link into
+ *  the source repository points at the same place in the worktree, and is skipped with a warning when
+ *  that place is not there; a folder link outside both is a directory symlink, and is skipped with a
+ *  warning when one cannot be made. Any other failure to make a link skips the whole entry, with what
+ *  was already made of it removed. `signal` stops the work between
  *  files, and inside a large one, with WORKTREE_CANCELLED; what was already copied is left to the
  *  caller's rollback, which removes the whole worktree. Any other copy failure of one entry is still only
  *  a warning. */
@@ -325,6 +369,8 @@ export async function copyWorktreeInclude(
   const { warnings } = parsed
   const entries = collapseIncludeEntries(parsed.entries)
   onProgress?.({})
+  const repoReal = await fs.realpath(repoPath).catch(() => repoPath)
+  const worktreeReal = await fs.realpath(worktreePath).catch(() => worktreePath)
   let budget = MAX_COPY_TOTAL_BYTES
   const planned: PlannedEntry[] = []
   for (const entry of entries) {
@@ -392,19 +438,17 @@ export async function copyWorktreeInclude(
   const report = (): void => onProgress?.({ ...progress })
   // The cleanup after a failed link: what this call made of the entry, newest first — files and links
   // unlinked, folders removed only when empty. Never a recursive delete: the checkout's own files can
-  // share those folders. One time-limited call for the lot.
-  let undo: string[] = []
-  const cleanupProbe = createProber({
-    access: async () => {
+  // share those folders. This is mutating work, so it runs outside the probe budget with its own
+  // deadline (fsWork.ts): a long cleanup must never mark the drive stuck for every session on it.
+  const cleanup = (undo: string[]): Promise<unknown> =>
+    runFsWork(async () => {
       for (const x of [...undo].reverse()) {
         const st = await fs.lstat(x).catch(() => null)
         if (!st) continue
-        if (st.isDirectory()) await fs.rmdir(x).catch(() => {})
+        if (st.isDirectory() && !st.isSymbolicLink()) await fs.rmdir(x).catch(() => {})
         else await fs.unlink(x).catch(() => {})
       }
-    },
-    skipQueue: true
-  })
+    })
   const safeDirs = createSafeDirs(worktreePath)
   report()
   for (const p of planned) {
@@ -416,7 +460,6 @@ export async function copyWorktreeInclude(
       filesTotal: progress.filesTotal
     }
     const made: string[] = []
-    undo = made
     /** Links found on the way (absolute), each reported once; everything under one is skipped. */
     const blocked: string[] = []
     const warnBlocked = (bad: string): void => {
@@ -454,9 +497,39 @@ export async function copyWorktreeInclude(
           const linkAbs = l.rel === '' ? p.src : path.join(p.src, l.rel)
           const linkDest = l.rel === '' ? p.dest : path.join(p.dest, l.rel)
           if (!(await reach(path.dirname(linkDest)))) continue
-          const { target, type } = linkTargetFor({
-            srcRoot: p.src, srcRootReal, destRoot: p.dest, linkAbs, raw: l.raw, isDir: l.isDir
+          const planned = linkTargetFor({
+            srcRoot: p.src, srcRootReal, destRoot: p.dest, repoRoot: repoPath, repoRootReal: repoReal,
+            worktreeRoot: worktreePath, linkAbs, raw: l.raw, isDir: l.isDir
           })
+          const { target } = planned
+          let { type, place } = planned
+          const where = path.relative(worktreePath, linkDest).split(path.sep).join('/')
+          if (l.isDir && place === 'repo' && !(await fs.lstat(target).then(() => true, () => false))) {
+            // Its place in the repository is not in the worktree (not checked out, not copied yet)
+            warnings.push({ key: 'worktree.include.linkTargetMissing', params: { entry: p.entry, path: where } })
+            continue
+          }
+          // A junction only when its target resolves inside the worktree. One that leads outside (a
+          // link on the way) is an outside link: Git for Windows' `worktree remove` deletes through a
+          // junction, into the folder it points at.
+          if (type === 'junction' && !(await resolvesWithin(worktreeReal, target))) {
+            type = 'dir'
+            place = 'outside'
+          }
+          if (l.isDir && place === 'outside') {
+            // A directory symlink, never a junction. Without the privilege (EPERM: Windows without
+            // Developer Mode) this one link is skipped, with a warning; the rest of the entry is copied.
+            try {
+              await makeLink(target, linkDest, 'dir')
+              made.push(linkDest)
+            } catch (err) {
+              warnings.push({
+                key: 'worktree.include.outsideLinkSkipped',
+                params: { entry: p.entry, path: where, detail: err instanceof Error ? err.message : String(err) }
+              })
+            }
+            continue
+          }
           try {
             await makeLink(target, linkDest, type)
             made.push(linkDest)
@@ -506,8 +579,8 @@ export async function copyWorktreeInclude(
       if (isCancelledError(err)) throw err
       if (err instanceof LinkFailed) {
         // take out what this call made of the entry, and its share of the totals — no half-copied entry.
-        // Time-limited: a root that stopped answering costs the probe limit, not a hang.
-        await cleanupProbe(p.dest)
+        // Bounded by its own deadline (fsWork.ts), outside the probe budget.
+        await cleanup(made)
         progress.bytesCopied = at.bytes
         progress.filesCopied = at.files
         progress.bytesTotal = at.bytesTotal - p.plan.bytes

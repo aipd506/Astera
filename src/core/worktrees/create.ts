@@ -14,6 +14,8 @@ import { copyWorktreeInclude } from './include'
 import type { WorktreeStore } from './registry'
 import type { Message } from '../i18n'
 import { createProber, type ProbePool } from '../sessions/pathProbe'
+import { runFsWork, FS_WORK_TIMEOUT_MS } from './fsWork'
+import { detachLinks } from './detachLinks'
 import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
 
 const WORKTREE_ADD_TIMEOUT_MS = 180_000
@@ -22,44 +24,61 @@ const WORKTREE_ADD_TIMEOUT_MS = 180_000
  *  already there, or the probe's `absent` / `timeout`. */
 export type MakeDirResult = 'created' | 'present' | 'absent' | 'timeout'
 
-/** Makes a folder (recursively) through the session folder's probe lane (pathProbe.ts): cut at
- *  PROBE_TIMEOUT_MS, inside the process-wide probe budget. `created` only when this call made it. */
+/** Makes a folder (recursively). Whether its drive answers is asked first, through the session
+ *  folder's probe lane (pathProbe.ts): an lstat cut at PROBE_TIMEOUT_MS, inside the process-wide probe
+ *  budget, so a dead root answers `timeout` at once. The mkdir itself is mutating work and runs outside
+ *  the budget with its own deadline (fsWork.ts). `created` only when this call made it. */
 async function defaultMakeDir(p: string): Promise<MakeDirResult> {
+  const reach = await createProber({ access: (d) => fs.lstat(d).then(() => undefined), skipQueue: true })(p)
+  if (reach === 'timeout') return 'timeout'
   let made = false
-  const probe = createProber({
-    access: (d) =>
-      fs.mkdir(d, { recursive: true }).then((first) => {
-        made = first !== undefined
-      }),
-    skipQueue: true
-  })
-  const r = await probe(p)
-  return r === 'present' ? (made ? 'created' : 'present') : r
+  const r = await runFsWork(() =>
+    fs.mkdir(p, { recursive: true }).then((first) => {
+      made = first !== undefined
+    })
+  )
+  if (r === 'timeout') return 'timeout'
+  if (r === 'failed') return 'absent'
+  return made ? 'created' : 'present'
 }
 
-/** The fs side of a rollback: whether the path is there, removing a folder this call owns, and removing
- *  one it cannot prove it owns (only when empty). Each runs through a time-limited probe (pathProbe.ts)
- *  inside the process-wide budget, so a root that stops answering mid-rollback costs at most the probe
- *  limit — the answer is then "could not tell", never a wait. */
+/** The fs side of a rollback: whether the path is there, taking the links out of it before git removes
+ *  it (detachLinks.ts), removing a folder this call owns, and removing one it cannot prove it owns (only
+ *  when empty).
+ *
+ *  Only `exists` is a probe: an lstat through the process-wide probe budget, so a root that stopped
+ *  answering costs at most the probe limit and answers "could not tell". The rest changes the disk and
+ *  can be slow for good reasons (a large tree), so it runs outside the budget with its own deadline
+ *  (fsWork.ts): a slow rm must never mark the drive stuck for every session on it. */
 export interface RollbackFs {
   exists(p: string): Promise<'yes' | 'no' | 'unknown'>
+  /** Takes every link out of the folder, never following one. False when that could not be finished. */
+  detachLinks(p: string): Promise<boolean>
   removeOwned(p: string): Promise<boolean>
   removeIfEmpty(p: string): Promise<boolean>
 }
 
-function probedRollbackFs(pool?: ProbePool): RollbackFs {
-  const probe = (access: (p: string) => Promise<void>): ((p: string) => Promise<'present' | 'absent' | 'timeout'>) =>
-    createProber({ access, skipQueue: true, ...(pool ? { pool } : {}) })
-  const lstat = probe((p) => fs.lstat(p).then(() => undefined))
-  const rmTree = probe((p) => fs.rm(p, { recursive: true, force: true, maxRetries: 3 }))
-  const rmEmpty = probe(removeOwnEmptyDir)
+/** The default RollbackFs. Exported for its tests, with seams for the probe pool, the tree removal and
+ *  the mutating work's deadline. */
+export function probedRollbackFs(
+  pool?: ProbePool,
+  deps: { rmTree?: (p: string) => Promise<void>; fsWorkTimeoutMs?: number } = {}
+): RollbackFs {
+  const lstat = createProber({
+    access: (p) => fs.lstat(p).then(() => undefined),
+    skipQueue: true,
+    ...(pool ? { pool } : {})
+  })
+  const rmTree = deps.rmTree ?? ((p: string) => fs.rm(p, { recursive: true, force: true, maxRetries: 3 }))
+  const timeoutMs = deps.fsWorkTimeoutMs ?? FS_WORK_TIMEOUT_MS
   return {
     exists: async (p) => {
       const r = await lstat(p)
       return r === 'present' ? 'yes' : r === 'absent' ? 'no' : 'unknown'
     },
-    removeOwned: async (p) => (await rmTree(p)) === 'present',
-    removeIfEmpty: async (p) => (await rmEmpty(p)) === 'present'
+    detachLinks: async (p) => (await detachLinks(p, { timeoutMs })).ok,
+    removeOwned: async (p) => (await runFsWork(() => rmTree(p), timeoutMs)) === 'done',
+    removeIfEmpty: async (p) => (await runFsWork(() => removeOwnEmptyDir(p), timeoutMs)) === 'done'
   }
 }
 
@@ -72,6 +91,11 @@ function probedRollbackFs(pool?: ProbePool): RollbackFs {
  *  else's and is left alone. A folder git no longer knows is removed by hand only when this call owned
  *  the worktree, otherwise only when it is empty — a folder that appeared from elsewhere is never
  *  deleted. The branch is deleted with `branch -D` (git refuses while any worktree has it out).
+ *
+ *  Before git removes the worktree, every link in it is taken out (detachLinks.ts): Git for Windows'
+ *  `worktree remove` deletes through a junction, into whatever folder outside it points at. When the
+ *  folder cannot be checked, or its links cannot all be taken out, git is not run on it at all and the
+ *  folder is kept, reported `unverified`.
  *
  *  Then it **checks**: what is still there comes back by name ('folder', 'branch', 'git-worktree',
  *  'unverified'), so the caller can say so instead of claiming a clean rollback. */
@@ -89,8 +113,14 @@ export async function rollbackAdd(
   }
   const entry = rows.find((w) => isSamePath(w.path, wtPath))
   const owned = entry !== undefined && entry.branch === branch
-  if (owned) await git(['worktree', 'remove', '--force', '--force', wtPath], { cwd: repo })
-  if (!entry || owned) {
+  /** The folder could not be checked, or its links could not all be taken out: nothing touches it. */
+  let kept = false
+  if (owned) {
+    const at = await rfs.exists(wtPath)
+    if (at === 'unknown' || (at === 'yes' && !(await rfs.detachLinks(wtPath)))) kept = true
+    else await git(['worktree', 'remove', '--force', '--force', wtPath], { cwd: repo })
+  }
+  if (!kept && (!entry || owned)) {
     if ((await rfs.exists(wtPath)) === 'yes') {
       if (owned) await rfs.removeOwned(wtPath)
       else await rfs.removeIfEmpty(wtPath)
@@ -100,9 +130,10 @@ export async function rollbackAdd(
   if (await localBranchExists(repo, branch)) await git(['branch', '-D', branch], { cwd: repo })
 
   const remains: string[] = []
+  if (kept) remains.push('unverified')
   const left = await rfs.exists(wtPath)
   if (left === 'yes') remains.push('folder')
-  else if (left === 'unknown') remains.push('unverified')
+  else if (left === 'unknown' && !kept) remains.push('unverified')
   if (await localBranchExists(repo, branch)) remains.push('branch')
   try {
     if ((await listGitWorktrees(repo)).some((w) => isSamePath(w.path, wtPath))) remains.push('git-worktree')
@@ -153,10 +184,12 @@ export async function createWorktree(args: {
    *  under the root. Default to the process-wide action-lane check and a time-limited mkdir. */
   presence?: PresenceCheck
   makeDir?: (p: string) => Promise<MakeDirResult>
-  /** Test seams for taking the repo folder back: the fs work, run inside a time-limited probe call,
-   *  and the pool that call goes through (the process-wide budget by default). */
+  /** Test seams for taking the repo folder back and for the rollback: the removal itself (mutating work,
+   *  run with its own deadline outside the probe budget), the pool the existence checks go through (the
+   *  process-wide budget by default), and that deadline (FS_WORK_TIMEOUT_MS by default). */
   removeDirAccess?: (p: string) => Promise<void>
   cleanupPool?: ProbePool
+  fsWorkTimeoutMs?: number
   /** Test seam: the deadline of `worktree add` (WORKTREE_ADD_TIMEOUT_MS by default). */
   addTimeoutMs?: number
   /** Stage and copy progress (fetch → checkout → copy-includes). Optional; a throwing callback is ignored. */
@@ -260,22 +293,27 @@ export async function createWorktree(args: {
     }
   } finally {
     // The repo's folder was made before a name was picked. When none was, it is taken back — but only
-    // when **this call made it** (never one that was there before, a link or a junction included), only
-    // when the root is still answering, and only through a time-limited probe call inside the
-    // process-wide budget: a cleanup never waits past the probe limit. rmdir is not recursive, so a
-    // sibling worktree keeps the folder. What the cleanup answers changes nothing.
+    // when **this call made it** (never one that was there before, a link or a junction included), and
+    // only when the root is still answering: that is asked first with a time-limited probe inside the
+    // process-wide budget. The rmdir itself is mutating work and runs outside the budget with its own
+    // deadline, so a slow one never marks the drive stuck. rmdir is not recursive, so a sibling worktree
+    // keeps the folder. What the cleanup answers changes nothing.
     if (!slug && !unreachable && made === 'created') {
-      const cleanup = createProber({
-        access: args.removeDirAccess ?? removeOwnEmptyDir,
+      const there = await createProber({
+        access: (d) => fs.lstat(d).then(() => undefined),
         skipQueue: true,
         ...(args.cleanupPool ? { pool: args.cleanupPool } : {})
-      })
-      await cleanup(parent)
+      })(parent)
+      if (there === 'present')
+        await runFsWork(() => (args.removeDirAccess ?? removeOwnEmptyDir)(parent), args.fsWorkTimeoutMs)
     }
   }
   if (!slug) throw new Error(`NAME_EXHAUSTED: no name starting with '${baseSlug}' is available (20 attempts)`)
 
-  const rfs = probedRollbackFs(args.cleanupPool)
+  const rfs = probedRollbackFs(
+    args.cleanupPool,
+    args.fsWorkTimeoutMs !== undefined ? { fsWorkTimeoutMs: args.fsWorkTimeoutMs } : {}
+  )
   try {
     throwIfCancelled(signal)
     report({ stage: 'checkout' })

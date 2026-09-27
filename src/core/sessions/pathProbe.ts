@@ -13,9 +13,12 @@
 // default, and every async fs call in the process shares them — so the rules below are about threads.
 //
 // **The budget is process-wide and shared by every lane** (ProbeBudget): the PATH pool, the session
-// folder's lane (`skipQueue`, also the worktree folder maker in worktrees/create.ts), and the worktree
+// folder's lane (`skipQueue`, also the existence checks of worktrees/create.ts), and the worktree
 // presence checks (the sweep's and the action lane's, worktrees/presence.ts). Each lane has its own
-// pool for its own rules, but every pool asks the one budget before it makes a call:
+// pool for its own rules, but every pool asks the one budget before it makes a call. **A probe is an
+// existence check only** (lstat, access). Work that changes the disk (mkdir, rm, rmdir, a copy, the
+// link walk before a removal) can be slow for good reasons and must never mark a root stuck, so it runs
+// outside the budget with its own deadline (worktrees/fsWork.ts). The rules the budget keeps:
 //
 // - **One call per root at a time, across all lanes.** A probe on a root with a call in flight in any
 //   lane waits for it; if that call timed out, the waiter answers `timeout` at once, without a call.
@@ -28,7 +31,8 @@
 //   that answered within PROBE_FRESH_MS — a local drive such as C: keeps working — and every other root
 //   answers `timeout` without a call. So at least one of libuv's
 //   4 threads stays free for roots known to be alive. (A root that answered a moment ago and then dies
-//   can still add a stuck call past 3; that is the price of keeping C: answered.)
+//   can still add one stuck call past 3, once: its timeout forgets that it answered, so it is risky
+//   from then on. That is the price of keeping C: answered.)
 // - **Within that, the PATH pool keeps its own caps.** At most PROBE_CONCURRENCY (2) PATH probe calls
 //   exist at once, stuck ones included; once 2 PATH calls are stuck, every PATH probe answers `timeout`
 //   without a call until one settles; and at most one PATH call per root. A healthy path may then be
@@ -213,6 +217,9 @@ export class ProbeBudget {
         if (gen === this.generation) {
           this.stuck.set(root, (this.stuck.get(root) ?? 0) + 1)
           this.stuckTotal++
+          // It answered before, and has stopped: it is no longer known to be alive, so once this call
+          // lets go its next call counts as risky again, inside PROBE_STUCK_MAX.
+          this.answeredAt.delete(root)
         }
         leave(false)
       },

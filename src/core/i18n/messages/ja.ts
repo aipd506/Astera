@@ -98,6 +98,8 @@ export const ja: Catalog = {
   'worktree.include.overLimit': 'コピー上限 (200MB) を超えたためスキップしました: {entry}',
   'worktree.include.linkFailed': 'リンクを再作成できなかったためスキップしました: {entry} ({detail})',
   'worktree.include.unsafeDest': '{path} はリンクのため、その下はコピーしませんでした (worktree の外に書き込むため): {entry}',
+  'worktree.include.linkTargetMissing': 'フォルダーリンクの指すリポジトリ内の場所が worktree にないため、リンクを再作成しませんでした: {path} ({entry})',
+  'worktree.include.outsideLinkSkipped': 'リポジトリの外を指すフォルダーリンクをシンボリックリンクとして作成できなかったため、スキップしました ({detail})。必要なら手動で作成してください: {path} ({entry})',
   'worktree.include.overFileCount': '項目数が {max} を超えたためスキップしました: {entry}',
   'worktree.include.copyFailed': 'コピーに失敗しました: {entry} ({detail})',
   'worktree.create.fetchFailed':
@@ -127,6 +129,7 @@ export const ja: Catalog = {
   'worktree.error.rollbackIncomplete': 'worktree の作成を元に戻せませんでした。フォルダー {path} とブランチ {branch} を手動で削除してください。',
   'worktree.error.gitRemoveFailed': 'git worktree の削除に失敗しました。',
   'worktree.error.unreachable': 'worktree のフォルダーに到達できないか確認できなかったため、何も削除していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
+  'worktree.error.linksUnverified': 'worktree フォルダー内のリンクをすべて確認して取り除けなかったため、何も削除していません。このまま削除するとジャンクションを通じてフォルダーの外のファイルまで削除される可能性があります。再試行するか、リンクを手動で削除してください。',
   'worktree.error.rootUnreachable': 'worktree のフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
@@ -675,6 +678,7 @@ export const ja: Catalog = {
   // ConversationPane.tsx — exited banner (session-failure-visibility design D2/F2). この部分カタログには
   // 他の conversation.* キーがまだ無く(en/ko で代替される)、この3つだけを先に入れる。
   'conversation.indexingFiles': 'ファイル一覧を作成しています…',
+  'conversation.filesUnavailable': 'このフォルダーのファイル一覧を取得できません。',
   'conversation.exited.withCode': 'このセッションは終了しました (コード {code})',
   'conversation.exited.detail': '詳細',
   'conversation.exited.restart': '再開',

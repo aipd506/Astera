@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import type { TestContext } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { promises as fs } from 'node:fs'
+import { promises as fs, existsSync } from 'node:fs'
 import path from 'node:path'
-import { parseWorktreeInclude, copyWorktreeInclude, collapseIncludeEntries, dirSize, measureTree } from './include'
+import { parseWorktreeInclude, copyWorktreeInclude, collapseIncludeEntries, dirSize, measureTree, linkTargetFor, type MakeLink } from './include'
 import { makeRepo, tempDir } from './testRepo'
 
 /** symlink 생성 실패가 권한 문제(EPERM/EACCES)면 실패가 아니라 스킵으로 처리한다(리뷰 Finding 5) —
@@ -343,7 +343,8 @@ describe('copyWorktreeInclude — 링크를 통해 쓰지 않는다', () => {
     const wt = await tempDir('astera-wt-inc-up-dest-')
     await copyWorktreeInclude(repo, wt)
     expect((await fs.lstat(path.join(wt, 'deps', 'up'))).isSymbolicLink()).toBe(true)
-    expect(await fs.realpath(path.join(wt, 'deps', 'up'))).toBe(await fs.realpath(repo))
+    // 저장소 안(여기서는 저장소 뿌리)을 가리키던 폴더 링크는 워크트리 안의 같은 자리로 옮겨진다(최종 리뷰 C1)
+    expect(await fs.realpath(path.join(wt, 'deps', 'up'))).toBe(await fs.realpath(wt))
     const after = await snapshot(repo).then((s) => Object.keys(s).filter((k) => !k.startsWith('.git')).sort())
     expect(after).toEqual(before)
     expect((await fs.stat(path.join(repo, 'big.bin'))).mtimeMs).toBe(beforeBig)
@@ -408,5 +409,121 @@ describe('copyWorktreeInclude — 깊은 자리의 링크', () => {
     ])
     expect(await fs.readFile(path.join(outside, 'target.txt'), 'utf8')).toBe('ORIGINAL')
     expect(await fs.readFile(path.join(wt, 'a', 'other.txt'), 'utf8')).toBe('o')
+  })
+})
+
+// Stage 2 final review, C1. Git for Windows' `worktree remove` deletes through a junction into the folder
+// it points at, so the copy never makes a junction whose target is outside the worktree. A folder link
+// into the source repository points at the same place in the worktree; one outside both is a directory
+// symlink, skipped with a warning when that cannot be made, never a junction.
+describe('linkTargetFor — where a folder link may be a junction', () => {
+  const base = {
+    srcRoot: 'C:\\r\\nm', srcRootReal: 'C:\\r\\nm', destRoot: 'C:\\w\\nm',
+    repoRoot: 'C:\\r', repoRootReal: 'C:\\r', worktreeRoot: 'C:\\w', platform: 'win32' as const
+  }
+  it.runIf(process.platform === 'win32')('a folder link outside both the repository and the worktree is a directory symlink, not a junction', () => {
+    expect(linkTargetFor({ ...base, linkAbs: 'C:\\r\\nm\\pkg', raw: 'D:\\shared\\pkg', isDir: true })).toEqual({
+      target: 'D:\\shared\\pkg', type: 'dir', place: 'outside'
+    })
+    // the entry itself being a link changes nothing
+    expect(linkTargetFor({ ...base, linkAbs: 'C:\\r\\nm', raw: 'D:\\venv', isDir: true }).type).toBe('dir')
+  })
+  it.runIf(process.platform === 'win32')('a folder link into the repository points at the same place in the worktree', () => {
+    expect(linkTargetFor({ ...base, linkAbs: 'C:\\r\\nm\\@x\\pkg', raw: 'C:\\r\\packages\\pkg', isDir: true })).toEqual({
+      target: 'C:\\w\\packages\\pkg', type: 'junction', place: 'repo'
+    })
+  })
+})
+
+describe('copyWorktreeInclude — no junction to outside the worktree', () => {
+  /** Makes the link for real, and records the type every call asked for. */
+  const recording = (asked: Array<{ type: string; path: string }>, refuseDir = false): MakeLink =>
+    async (t, p, type) => {
+      asked.push({ type, path: p })
+      if (refuseDir && type === 'dir') throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+      await fs.symlink(t, p, type)
+    }
+
+  it('an outside-pointing folder link never becomes a junction, nested or the entry itself', async () => {
+    const outside = await tempDir('astera-wt-inc-nojunc-out-')
+    await fs.writeFile(path.join(outside, 'keep.txt'), 'k', 'utf8')
+    const repo = await includeRepo('astera-wt-inc-nojunc-', ['deps/', 'venv'], ['deps', 'venv'])
+    await fs.mkdir(path.join(repo, 'deps'))
+    await fs.writeFile(path.join(repo, 'deps', 'own.txt'), 'o', 'utf8')
+    await fs.symlink(outside, path.join(repo, 'deps', 'pkg'), 'junction')
+    await fs.symlink(outside, path.join(repo, 'venv'), 'junction')
+    const wt = await tempDir('astera-wt-inc-nojunc-dest-')
+    const asked: Array<{ type: string; path: string }> = []
+    const warnings = await copyWorktreeInclude(repo, wt, { makeLink: recording(asked) })
+    expect(warnings).toEqual([])
+    expect(asked.map((a) => a.type)).toEqual(['dir', 'dir'])
+    expect(await fs.realpath(path.join(wt, 'deps', 'pkg'))).toBe(await fs.realpath(outside))
+    expect(await fs.readFile(path.join(wt, 'deps', 'own.txt'), 'utf8')).toBe('o')
+  })
+
+  it('without the symlink privilege the outside link is skipped with a warning, never made as a junction', async () => {
+    const outside = await tempDir('astera-wt-inc-noperm-out-')
+    const repo = await includeRepo('astera-wt-inc-noperm-', ['deps/'], ['deps'])
+    await fs.mkdir(path.join(repo, 'deps'))
+    await fs.writeFile(path.join(repo, 'deps', 'own.txt'), 'o', 'utf8')
+    await fs.symlink(outside, path.join(repo, 'deps', 'pkg'), 'junction')
+    const wt = await tempDir('astera-wt-inc-noperm-dest-')
+    const asked: Array<{ type: string; path: string }> = []
+    const warnings = await copyWorktreeInclude(repo, wt, { makeLink: recording(asked, true) })
+    expect(asked.map((a) => a.type)).toEqual(['dir'])
+    expect(warnings).toEqual([
+      {
+        key: 'worktree.include.outsideLinkSkipped',
+        params: { entry: 'deps', path: 'deps/pkg', detail: 'EPERM: operation not permitted' }
+      }
+    ])
+    expect(existsSync(path.join(wt, 'deps', 'pkg'))).toBe(false)
+    expect(await fs.readFile(path.join(wt, 'deps', 'own.txt'), 'utf8')).toBe('o') // the rest of the entry is copied
+  })
+
+  it('a folder link into the repository points at the worktree copy of that place', async () => {
+    // A pnpm workspace: node_modules/@x/pkg leads to <repo>/packages/pkg. The worktree has its own
+    // packages/pkg from the checkout, and the recreated link must lead there, not to the main repo's.
+    const repo = await includeRepo('astera-wt-inc-ws-', ['node_modules/'], ['node_modules'])
+    await fs.mkdir(path.join(repo, 'packages', 'pkg'), { recursive: true })
+    await fs.writeFile(path.join(repo, 'packages', 'pkg', 'index.js'), 'main', 'utf8')
+    await fs.mkdir(path.join(repo, 'node_modules', '@x'), { recursive: true })
+    await fs.symlink(path.join(repo, 'packages', 'pkg'), path.join(repo, 'node_modules', '@x', 'pkg'), 'junction')
+    const wt = await tempDir('astera-wt-inc-ws-dest-')
+    await fs.mkdir(path.join(wt, 'packages', 'pkg'), { recursive: true })
+    await fs.writeFile(path.join(wt, 'packages', 'pkg', 'index.js'), 'worktree', 'utf8')
+    expect(await copyWorktreeInclude(repo, wt)).toEqual([])
+    expect(await fs.realpath(path.join(wt, 'node_modules', '@x', 'pkg'))).toBe(
+      await fs.realpath(path.join(wt, 'packages', 'pkg'))
+    )
+    expect(await fs.readFile(path.join(wt, 'node_modules', '@x', 'pkg', 'index.js'), 'utf8')).toBe('worktree')
+  })
+
+  it('a folder link into the repository whose place is not in the worktree is skipped with a warning', async () => {
+    const repo = await includeRepo('astera-wt-inc-wsmiss-', ['node_modules/'], ['node_modules'])
+    await fs.mkdir(path.join(repo, 'packages', 'pkg'), { recursive: true })
+    await fs.mkdir(path.join(repo, 'node_modules', '@x'), { recursive: true })
+    await fs.writeFile(path.join(repo, 'node_modules', 'a.txt'), 'a', 'utf8')
+    await fs.symlink(path.join(repo, 'packages', 'pkg'), path.join(repo, 'node_modules', '@x', 'pkg'), 'junction')
+    const wt = await tempDir('astera-wt-inc-wsmiss-dest-')
+    expect(await copyWorktreeInclude(repo, wt)).toEqual([
+      { key: 'worktree.include.linkTargetMissing', params: { entry: 'node_modules', path: 'node_modules/@x/pkg' } }
+    ])
+    expect(existsSync(path.join(wt, 'node_modules', '@x', 'pkg'))).toBe(false)
+    expect(await fs.readFile(path.join(wt, 'node_modules', 'a.txt'), 'utf8')).toBe('a')
+  })
+
+  it.runIf(process.platform === 'win32')('a link into the repository whose worktree place leads outside through a link is not made a junction', async () => {
+    const outside = await tempDir('astera-wt-inc-esc-out-')
+    await fs.mkdir(path.join(outside, 'pkg'))
+    const repo = await includeRepo('astera-wt-inc-esc-', ['node_modules/'], ['node_modules'])
+    await fs.mkdir(path.join(repo, 'packages', 'pkg'), { recursive: true })
+    await fs.mkdir(path.join(repo, 'node_modules'))
+    await fs.symlink(path.join(repo, 'packages', 'pkg'), path.join(repo, 'node_modules', 'pkg'), 'junction')
+    const wt = await tempDir('astera-wt-inc-esc-dest-')
+    await fs.symlink(outside, path.join(wt, 'packages'), 'junction') // wt/packages leads outside
+    const asked: Array<{ type: string; path: string }> = []
+    await copyWorktreeInclude(repo, wt, { makeLink: recording(asked) })
+    expect(asked.map((a) => a.type)).toEqual(['dir'])
   })
 })

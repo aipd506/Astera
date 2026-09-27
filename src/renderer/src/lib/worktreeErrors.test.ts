@@ -136,3 +136,12 @@ describe('worktreeErrorMessage, cancel and rollback', () => {
     expect(isCancelled(raw)).toBe(false)
   })
 })
+
+// Stage 2 final review, C1: the links in the folder could not all be taken out before the removal
+describe('worktreeErrorMessage, links not verified', () => {
+  it('LINKS_UNVERIFIED goes to its own key', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: LINKS_UNVERIFIED: the links in the folder could not all be checked and taken out, nothing was removed (C:\wt\a): timeout")
+    ).toEqual({ key: 'worktree.error.linksUnverified' })
+  })
+})

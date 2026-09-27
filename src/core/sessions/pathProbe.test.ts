@@ -560,3 +560,23 @@ describe('the process-wide probe budget, across every lane', () => {
     expect(presenceSrc).not.toContain('The thread budget is 2 PATH + 1 worktree')
   })
 })
+
+// Stage 2 final review (the deferred T1 minor): a timeout forgets that the root answered before, so a
+// root that died after answering is not let past PROBE_STUCK_MAX again once its stuck call lets go.
+describe('ProbeBudget, a root that answered and then timed out', () => {
+  it('is no longer treated as known to be alive', async () => {
+    const budget = new ProbeBudget(1)
+    const first = await budget.enter('z:\\')
+    if (typeof first === 'string') throw new Error(first)
+    first.answered() // z: is alive
+    const second = await budget.enter('z:\\')
+    if (typeof second === 'string') throw new Error(second)
+    second.timedOut() // and now it is not
+    second.release()
+    const other = await budget.enter('y:\\')
+    if (typeof other === 'string') throw new Error(other)
+    other.timedOut() // the one stuck call the budget allows
+    // Before: z: still counted as fresh and was let past the cap. Now it is refused without a call.
+    expect(typeof (await budget.enter('z:\\'))).toBe('string')
+  })
+})

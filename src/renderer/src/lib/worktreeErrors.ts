@@ -19,6 +19,9 @@ const MESSAGES: Array<[string, MessageKey]> = [
   // A folder or root that did not answer in time (an offline network drive). Nothing was created or removed.
   ['WORKTREE_ROOT_UNREACHABLE', 'worktree.error.rootUnreachable'],
   ['WORKTREE_UNREACHABLE', 'worktree.error.unreachable'],
+  // The links inside the folder could not all be taken out before git removes it (a junction would carry
+  // the removal outside the folder). Nothing was removed.
+  ['LINKS_UNVERIFIED', 'worktree.error.linksUnverified'],
   ['GIT_ADD_FAILED', 'worktree.error.gitAddFailed'],
   ['GIT_REMOVE_FAILED', 'worktree.error.gitRemoveFailed'],
   // The person pressed Cancel and everything the creation made was taken back
