@@ -10,6 +10,7 @@ import { Interrupted, WAIT_TIMEOUT_MS, withTimeout } from '../../core/agentBrows
 import type { RunContext } from '../../core/agentBrowser/scriptRunner'
 import { clampSnapshot, type Snapshot } from '../../core/agentBrowser/snapshot'
 import { clickScript, fillScript, pressScript, snapshotScript, waitForScript } from '../../core/agentBrowser/guestScripts'
+import { section } from '../../core/agentBrowser/section'
 import { sanitizeUrl } from '../../core/preview/pick/payload'
 import { savePng, type CapturedImage } from '../preview/shots'
 import type { AgentBuffers } from './buffers'
@@ -341,16 +342,6 @@ function devServerHeader(servers: DevServer[]): string {
   }
   const list = pool.map((s) => `${s.name} ${s.url}`).join(', ')
   return `This project has several dev servers running from Astera's Run: ${list} — pass one to open().\n\n`
-}
-
-/** `help('reload')` → the `## reload()` section of the guide, by the name before the parenthesis. */
-function section(guide: string, name: string): string | null {
-  const lines = guide.split('\n')
-  const start = lines.findIndex((l) => l.startsWith('## ') && l.slice(3).split('(')[0].trim() === name)
-  if (start < 0) return null
-  let end = lines.findIndex((l, i) => i > start && l.startsWith('## '))
-  if (end < 0) end = lines.length
-  return lines.slice(start, end).join('\n').trimEnd()
 }
 
 export function browserHelpers(deps: HelperDeps, ctx: RunContext): Record<string, unknown> {
