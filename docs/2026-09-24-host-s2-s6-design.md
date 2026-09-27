@@ -2271,6 +2271,24 @@ which is synchronous, so every wait in a read is a frozen window. This list is t
   intent record is the point", spec §6.1), and the spec's case D names power loss as one the Durable
   Journal must recover from. So FULL stays. The cost lands on the Host's thread, not the app's main
   thread, except for an app in front of an older Host that writes the journal itself.
+- **A144. The review's fixes: the checkpoint is evidence, and busy is never read as absent.** The first
+  checkpoint is read with the reconciler's other evidence, through the same busy retry
+  (`core/continuity/busyRetry.ts`), and a read that fails or stays busy makes the whole evidence "cannot
+  say", which decide.ts turns into a person's review. Read as absent, it dropped the base head and the
+  native session, and a worker that committed on a clean tree was restarted with its commits duplicated.
+  The validation diff base (`firstCheckpointHead`) is asked again the same way and answers `'unknown'`
+  when the journal could not say, apart from null (no checkpoint). The suspicious files still fall back
+  to `filesModified` then, since skipping would lose the warning, and the log names the unreadable
+  baseline. A sweep and a live `reconcileOne` for the same dispatch act once (`inFlight`), and a
+  dispatch that stopped being a candidate during the reads is left alone before anything is journaled,
+  and so is one whose Run filled up to its concurrency limit meanwhile.
+  `runs follow` shows the rows last read while the journal is busy, and one busy spell is one log line.
+  At `TIMELINE_PAGES_MAX` pages the run detail says older entries are not shown instead of offering a
+  button that reads nothing more (`journal.capped`). What shipped: `reconciler.test.ts`, "a busy
+  checkpoint read" and "overlapping triggers"; `appJournal.test.ts`, "the validation diff base asks a
+  busy journal again" and "at the most pages"; `validation.test.ts`, "a checkpoint head the journal
+  could not read"; `hostJournal.test.ts`, "a busy journal shows the rows last read";
+  `busyRetry.test.ts`; `RunDetailJournal.test.ts`.
 
 ## Known limits after S3
 
@@ -2886,14 +2904,13 @@ Each was left as it is when A140 closed the non-ASCII install folder limit of th
 
 ## Known limits after the journal reads pass
 
-Each was left as it is when A141 to A143 bounded the app's journal reads.
+Each was left as it is when A141 to A144 bounded the app's journal reads.
 
 - **A busy read on main still blocks for up to 250 ms** (A141). `node:sqlite` has no asynchronous read,
   so the short timeout bounds the stall rather than removing it. In WAL mode a reader meets a lock only
   in rare moments, such as WAL recovery.
-- **The validation diff base and the reconciler's first checkpoint read as unknown while busy** (A141).
-  Both are single row reads through the same short timeout, and a busy one answers null as any failed
-  read does.
+- **A journal busy for the whole retry makes recovery ask a person** (A144). About 4 s of busy answers
+  is "cannot say", so a worker that could have resumed on its own waits for a review.
 - **Every commit still waits for an fsync** (A143). On OneDrive or a slow disk that is the Host's
   thread, or main in front of an older Host.
 
