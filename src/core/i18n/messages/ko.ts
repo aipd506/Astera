@@ -122,6 +122,7 @@ export const ko = {
   'worktree.include.sizeFailed': '용량 계산 실패: {entry} ({detail})',
   'worktree.include.overLimit': '복사 상한(200MB) 초과로 건너뜀: {entry}',
   'worktree.include.linkFailed': '링크를 다시 만들지 못해 이 항목은 복사하지 않음: {entry} ({detail})',
+  'worktree.include.unsafeDest': '복사할 자리로 가는 길에 링크가 있어 건너뜀(워크트리 밖에 쓰지 않는다): {entry}',
   'worktree.include.overFileCount': '항목이 {max}개를 넘어 건너뜀: {entry}',
   'worktree.include.copyFailed': '복사 실패: {entry} ({detail})',
   'worktree.create.fetchFailed': '원격 갱신에 실패해 로컬에 있는 {baseRef} 기준으로 생성했습니다',

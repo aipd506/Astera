@@ -3,7 +3,7 @@ import type { TestContext } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { parseWorktreeInclude, copyWorktreeInclude, dirSize, measureTree } from './include'
+import { parseWorktreeInclude, copyWorktreeInclude, collapseIncludeEntries, dirSize, measureTree } from './include'
 import { makeRepo, tempDir } from './testRepo'
 
 /** symlink 생성 실패가 권한 문제(EPERM/EACCES)면 실패가 아니라 스킵으로 처리한다(리뷰 Finding 5) —
@@ -286,5 +286,75 @@ describe('copyWorktreeInclude — 링크를 링크로', () => {
     await copyWorktreeInclude(repo, wt, { onProgress: (p) => seen.push({ ...p }) })
     expect(seen[0]).toEqual({}) // 재는 중 — 아직 수가 없다
     expect(seen[seen.length - 1]).toEqual({ bytesCopied: 1, bytesTotal: 1, filesCopied: 1, filesTotal: 1 })
+  })
+})
+
+// 재검토: 다시 만든 링크를 통해 쓰지 않는다. `a` 가 밖을 가리키는 링크로 다시 만들어진 뒤 `a/x/y`
+// 항목이 worktree/a/x/y 에 쓰면, 그 쓰기는 링크를 타고 워크트리 밖 — 대개 원본 자체 — 에 닿는다.
+describe('copyWorktreeInclude — 링크를 통해 쓰지 않는다', () => {
+  /** 폴더 안 파일의 내용과 mtime — 건드려졌는지 비교한다 */
+  const snapshot = async (dir: string): Promise<Record<string, string>> => {
+    const out: Record<string, string> = {}
+    const walk = async (d: string): Promise<void> => {
+      for (const e of await fs.readdir(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name)
+        if (e.isDirectory()) await walk(p)
+        else if (e.isFile()) out[path.relative(dir, p)] = `${await fs.readFile(p, 'utf8')}@${(await fs.stat(p)).mtimeMs}`
+      }
+    }
+    await walk(dir)
+    return out
+  }
+
+  it('밖을 가리키는 링크 a 와 그 아래 항목 a/x/y 가 함께 있어도 워크트리 밖에 쓰지 않는다 — 원본이 그대로다', async () => {
+    const outside = await tempDir('astera-wt-inc-nest-out-')
+    await fs.mkdir(path.join(outside, 'x'))
+    // 4MB 를 넘겨 스트림 복사('w' 로 연다)를 타게 한다 — 원본을 비워 버리는 경로다
+    await fs.writeFile(path.join(outside, 'x', 'y'), 'S'.repeat(5 * 1024 * 1024), 'utf8')
+    const repo = await includeRepo('astera-wt-inc-nest-', ['a'], ['a', 'a/x/y'])
+    await fs.symlink(outside, path.join(repo, 'a'), 'junction')
+    const before = await snapshot(outside)
+    const wt = await tempDir('astera-wt-inc-nest-dest-')
+    await copyWorktreeInclude(repo, wt)
+    expect(await snapshot(outside)).toEqual(before)
+    expect((await fs.lstat(path.join(wt, 'a'))).isSymbolicLink()).toBe(true)
+  })
+
+  it('항목의 목적지 경로에 이미 링크가 있으면(체크아웃이 만든 것 등) 그 항목을 건너뛰고 경고한다', async () => {
+    const outside = await tempDir('astera-wt-inc-dlink-out-')
+    const repo = await includeRepo('astera-wt-inc-dlink-', ['a/'], ['a/x.txt'])
+    await fs.mkdir(path.join(repo, 'a'))
+    await fs.writeFile(path.join(repo, 'a', 'x.txt'), 'x', 'utf8')
+    const wt = await tempDir('astera-wt-inc-dlink-dest-')
+    await fs.symlink(outside, path.join(wt, 'a'), 'junction')
+    const warnings = await copyWorktreeInclude(repo, wt)
+    expect(warnings).toEqual([{ key: 'worktree.include.unsafeDest', params: { entry: 'a/x.txt' } }])
+    expect(await fs.readdir(outside)).toEqual([])
+  })
+
+  it('.. 를 가리키는 링크 하나는 링크로 남고, 그것을 통해서는 아무것도 쓰지 않는다', async () => {
+    const repo = await includeRepo('astera-wt-inc-up-', ['deps/', 'big.bin'], ['deps', 'deps/up/big.bin'])
+    await fs.mkdir(path.join(repo, 'deps'))
+    await fs.writeFile(path.join(repo, 'deps', 'own.txt'), 'o', 'utf8')
+    await fs.symlink('..', path.join(repo, 'deps', 'up'), 'junction')
+    await fs.writeFile(path.join(repo, 'big.bin'), 'B'.repeat(5 * 1024 * 1024), 'utf8') // 스트림 복사 크기
+    const before = await snapshot(repo).then((s) => Object.keys(s).filter((k) => !k.startsWith('.git')).sort())
+    const beforeBig = (await fs.stat(path.join(repo, 'big.bin'))).mtimeMs
+    const wt = await tempDir('astera-wt-inc-up-dest-')
+    await copyWorktreeInclude(repo, wt)
+    expect((await fs.lstat(path.join(wt, 'deps', 'up'))).isSymbolicLink()).toBe(true)
+    expect(await fs.realpath(path.join(wt, 'deps', 'up'))).toBe(await fs.realpath(repo))
+    const after = await snapshot(repo).then((s) => Object.keys(s).filter((k) => !k.startsWith('.git')).sort())
+    expect(after).toEqual(before)
+    expect((await fs.stat(path.join(repo, 'big.bin'))).mtimeMs).toBe(beforeBig)
+    expect(await fs.readFile(path.join(repo, 'big.bin'), 'utf8')).toBe('B'.repeat(5 * 1024 * 1024))
+  })
+})
+
+describe('collapseIncludeEntries', () => {
+  it('상위 항목이 있으면 그 아래 항목은 뺀다 — 겹치는 항목이 같은 자리에 두 번 쓰지 않는다', () => {
+    expect(collapseIncludeEntries(['a/x/y', 'a', 'b', 'ab', 'a/z', 'b'], 'linux')).toEqual(['a', 'b', 'ab'])
+    expect(collapseIncludeEntries(['A/x', 'a'], 'win32')).toEqual(['a'])
+    expect(collapseIncludeEntries(['A/x', 'a'], 'linux')).toEqual(['A/x', 'a'])
   })
 })

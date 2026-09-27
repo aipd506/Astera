@@ -3,6 +3,7 @@ import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { git } from './git'
 import { isPathWithin } from '../files/tree'
+import { createProber } from '../sessions/pathProbe'
 import { cancelledError, isCancelledError, throwIfCancelled } from './cancel'
 import type { Message } from '../i18n'
 
@@ -48,6 +49,58 @@ export function parseWorktreeInclude(content: string): { entries: string[]; warn
     entries.push(norm.replace(/\/+$/, ''))
   }
   return { entries, warnings }
+}
+
+/** Drops entries another entry already covers, and duplicates: with both `a` and `a/x/y` listed, `a`
+ *  copies `a/x/y` already, and copying it again as its own entry would write into a tree that may by
+ *  then hold a recreated link (see copyWorktreeInclude). Compared by segment, with `.` segments dropped
+ *  and case folded where the file system folds it; the first spelling of a kept entry wins. */
+export function collapseIncludeEntries(entries: string[], platform: string = process.platform): string[] {
+  const fold = platform === 'win32' || platform === 'darwin'
+  const keyOf = (e: string): string => {
+    const k = e.split('/').filter((seg) => seg !== '' && seg !== '.').join('/')
+    return fold ? k.toLowerCase() : k
+  }
+  const keys = entries.map(keyOf)
+  const all = new Set(keys)
+  const coveredByOther = (k: string): boolean => {
+    const segs = k.split('/')
+    for (let i = 1; i < segs.length; i++) if (all.has(segs.slice(0, i).join('/'))) return true
+    return false
+  }
+  const seen = new Set<string>()
+  const out: string[] = []
+  entries.forEach((e, i) => {
+    const k = keys[i]
+    if (seen.has(k) || coveredByOther(k)) return
+    seen.add(k)
+    out.push(e)
+  })
+  return out
+}
+
+/** Whether writing at `dest` stays inside `root`: every component from the root down to `dest` that
+ *  already exists must be a real folder (lstat) — never a link or a junction, which would carry the
+ *  write outside the worktree, usually onto the source itself. `dest` itself may be absent; if present
+ *  it must not be a link. Components that do not exist yet are fine: they are made as real folders. */
+async function destIsSafe(root: string, dest: string): Promise<boolean> {
+  const rel = path.relative(root, dest)
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return false
+  const segs = rel.split(path.sep)
+  let at = root
+  for (let i = 0; i < segs.length; i++) {
+    at = path.join(at, segs[i])
+    let st
+    try {
+      st = await fs.lstat(at)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true // the rest will be made here
+      return false
+    }
+    if (st.isSymbolicLink()) return false
+    if (i < segs.length - 1 && !st.isDirectory()) return true // mkdir fails on it — reported as a copy failure
+  }
+  return true
 }
 
 /** A link found in a walk: where it sits, what it says (readlink, as written), and whether it leads to a
@@ -247,7 +300,9 @@ export async function copyWorktreeInclude(
   } catch {
     return [] // no file = the convention is not in use
   }
-  const { entries, warnings } = parseWorktreeInclude(content)
+  const parsed = parseWorktreeInclude(content)
+  const { warnings } = parsed
+  const entries = collapseIncludeEntries(parsed.entries)
   onProgress?.({})
   let budget = MAX_COPY_TOTAL_BYTES
   const planned: PlannedEntry[] = []
@@ -314,10 +369,26 @@ export async function copyWorktreeInclude(
     filesTotal: planned.reduce((n, p) => n + p.plan.files.length, 0)
   }
   const report = (): void => onProgress?.({ ...progress })
+  const removeProbe = createProber({
+    access: (d) => fs.rm(d, { recursive: true, force: true }),
+    skipQueue: true
+  })
   report()
+  const dropTotals = (p: PlannedEntry): void => {
+    progress.bytesTotal -= p.plan.bytes
+    progress.filesTotal -= p.plan.files.length
+    report()
+  }
   for (const p of planned) {
     throwIfCancelled(signal)
     const at = { bytes: progress.bytesCopied, files: progress.filesCopied }
+    // Checked right before this entry writes anything: an earlier entry, or the checkout, may have put a
+    // link on the way, and writing through it would land outside the worktree.
+    if (!(await destIsSafe(worktreePath, p.dest))) {
+      dropTotals(p)
+      warnings.push({ key: 'worktree.include.unsafeDest', params: { entry: p.entry } })
+      continue
+    }
     try {
       if (p.kind === 'dir') {
         await fs.mkdir(p.dest, { recursive: true })
@@ -373,12 +444,11 @@ export async function copyWorktreeInclude(
       if (isCancelledError(err)) throw err
       if (err instanceof LinkFailed) {
         // take out what was made of this entry, and its share of the totals — no half-copied entry
-        await fs.rm(p.dest, { recursive: true, force: true }).catch(() => {})
-        progress.bytesTotal -= p.plan.bytes
-        progress.filesTotal -= p.plan.files.length
+        // time-limited: a root that stopped answering costs the probe limit, not a hang
+        await removeProbe(p.dest)
         progress.bytesCopied = at.bytes
         progress.filesCopied = at.files
-        report()
+        dropTotals(p)
         warnings.push({ key: 'worktree.include.linkFailed', params: { entry: p.entry, detail: err.message } })
         continue
       }

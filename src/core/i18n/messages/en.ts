@@ -116,6 +116,7 @@ export const en: Record<keyof typeof ko, string> = {
   'worktree.include.sizeFailed': 'Failed to measure size: {entry} ({detail})',
   'worktree.include.overLimit': 'Skipped, over the 200MB copy limit: {entry}',
   'worktree.include.linkFailed': 'Skipped, a link in it could not be recreated: {entry} ({detail})',
+  'worktree.include.unsafeDest': 'Skipped, a link on the way would write outside the worktree: {entry}',
   'worktree.include.overFileCount': 'Skipped, more than {max} entries: {entry}',
   'worktree.include.copyFailed': 'Copy failed: {entry} ({detail})',
   'worktree.create.fetchFailed': 'Could not refresh from remote; created from local {baseRef}',
