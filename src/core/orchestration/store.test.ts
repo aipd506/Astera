@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { promises as fs } from 'node:fs'
+import { promises as fs, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { OrchestrationStore, RUN_TTL_MS } from './store'
@@ -536,7 +536,11 @@ describe('OrchestrationStore', () => {
         await realRename(from, to)
       })
       try {
-        await Promise.all([store.save(runState('run_first')), store.save(runState('run_second'))])
+        // 두 번째는 첫 쓰기가 이미 디스크로 떠난 뒤에 부른다 — 같은 틱에 부르면 두 save 가 한 번의
+        // 쓰기로 합쳐지고(아래 '합친다' 테스트), 그러면 이 테스트가 보려는 큐의 순서가 사라진다.
+        const first = store.save(runState('run_first'))
+        await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
+        await Promise.all([first, store.save(runState('run_second'))])
       } finally {
         spy.mockRestore()
       }
@@ -555,6 +559,10 @@ describe('OrchestrationStore', () => {
         await realRename(from, to)
       })
       const first = store.save(runState('run_first'))
+      // 기다리는 동안 거절이 먼저 올 수 있다 — 붙잡아 두고 아래에서 본다
+      first.catch(() => {})
+      // 첫 쓰기가 떠난 뒤에 — 같은 틱이면 한 번의 쓰기로 합쳐진다(위 테스트의 주석)
+      await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
       const second = store.save(runState('run_second'))
       try {
         await expect(first).rejects.toThrow('rename failed')
@@ -564,6 +572,116 @@ describe('OrchestrationStore', () => {
       }
       const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
       expect(disk.runs[0].id).toBe('run_second')
+    })
+    /** 첫 rename 을 붙잡아 두는 문. 열 때까지 첫 쓰기는 디스크에 닿지 않는다. */
+    const holdFirstRename = (): { renames: string[]; open(): void; spy: { mockRestore(): void } } => {
+      const realRename = fs.rename
+      const renames: string[] = []
+      let open!: () => void
+      const gate = new Promise<void>((r) => (open = r))
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        renames.push(String(from))
+        if (renames.length === 1) await gate
+        await realRename(from, to)
+      })
+      return { renames, open, spy }
+    }
+
+    // **쓰는 동안 들어온 커밋들은 그다음 한 번의 쓰기로 합쳐진다** — 가장 새 상태 하나만. 시간 창을
+    // 두지 않는다: 창은 모든 커밋의 응답을 그만큼 늦추고, 합칠 것이 없을 때에도 치른다. 쓰기가
+    // 이미 도는 동안에는 어차피 기다려야 하므로, 그 기다림 동안 쌓인 것만 한 번에 쓴다.
+    //
+    // **응답은 디스크 뒤다.** 각 save 의 promise 는 자기 상태(또는 그 뒤의 상태)가 파일에 닿은 뒤에만
+    // 풀린다 — CLI 의 응답·영수증이 "이 일은 일어났다" 라고 말하는 근거가 그것이다. 합친 쓰기가 닿기
+    // 전에 죽으면 파일에는 그 앞 상태가 있고, 그때 풀린 save 는 하나도 없어야 한다.
+    it('쓰는 동안 들어온 커밋들을 가장 새 상태 하나의 쓰기로 합치고, 디스크에 닿기 전에는 풀지 않는다', async () => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      const h = holdFirstRename()
+      try {
+        const settled: string[] = []
+        const first = store.save(runState('run_1'))
+        void first.then(() => settled.push('run_1'))
+        await vi.waitFor(() => expect(h.renames).toHaveLength(1))
+        const later = ['run_2', 'run_3', 'run_4'].map((id) => {
+          const p = store.save(runState(id))
+          // 풀리는 그 순간 파일을 동기로 읽는다: 응답을 받은 쪽이 믿는 것이 디스크에 있는가
+          void p.then(() => {
+            const disk = JSON.parse(readFileSync(file, 'utf8')) as OrchState
+            settled.push(`${id}@${disk.runs[0].id}`)
+          })
+          return p
+        })
+        expect(store.get().runs[0].id).toBe('run_4')
+        // 여기서 죽는다면: 파일에는 아직 아무 커밋도 없고, 풀린 save 도 없다
+        await new Promise((r) => setTimeout(r, 20))
+        expect(settled).toEqual([])
+        const crashed = new OrchestrationStore(file)
+        await crashed.load()
+        expect(crashed.get().runs).toHaveLength(0)
+
+        h.open()
+        await Promise.all([first, ...later])
+        // 두 번의 쓰기: 첫 커밋, 그리고 그동안 쌓인 셋을 합친 하나
+        expect(h.renames).toHaveLength(2)
+        expect(settled).toEqual(['run_1', 'run_2@run_4', 'run_3@run_4', 'run_4@run_4'])
+        const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+        expect(disk.runs[0].id).toBe('run_4')
+      } finally {
+        h.spy.mockRestore()
+      }
+    })
+
+    // backup 은 큐 안의 한 자리다 — 그 앞의 저장 뒤, 그 뒤의 저장 앞. 합치기가 backup 을 건너
+    // 뒤의 저장을 앞 쓰기로 끌어오면 .bak 에 reset 이 지우려던 것이 아니라 그 뒤의 상태가 남는다.
+    it('backup 을 건너서 합치지 않는다 — .bak 은 그 앞의 상태다', async () => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      await store.save(runState('run_before'))
+      const h = holdFirstRename()
+      try {
+        const a = store.save(runState('run_a'))
+        const b = store.save(runState('run_b'))
+        const bak = store.backup()
+        const c = store.save(runState('run_c'))
+        h.open()
+        await Promise.all([a, b, bak, c])
+        const backup = JSON.parse(await fs.readFile(file + '.bak', 'utf8')) as OrchState
+        expect(backup.runs[0].id).toBe('run_b')
+        const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+        expect(disk.runs[0].id).toBe('run_c')
+        expect(h.renames).toHaveLength(2)
+      } finally {
+        h.spy.mockRestore()
+      }
+    })
+
+    // 합친 쓰기가 실패하면 합쳐진 save 가 모두 그 실패를 받는다 — 하나라도 풀리면 디스크에 없는
+    // 커밋을 있다고 말한다. 그 뒤의 저장은 여전히 진행된다.
+    it('합친 쓰기가 실패하면 합쳐진 save 모두가 거절되고, 다음 저장은 진행된다', async () => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      const realRename = fs.rename
+      let calls = 0
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        calls++
+        if (calls === 1) throw new Error('rename failed')
+        await realRename(from, to)
+      })
+      try {
+        const a = store.save(runState('run_a'))
+        const b = store.save(runState('run_b'))
+        await expect(a).rejects.toThrow('rename failed')
+        await expect(b).rejects.toThrow('rename failed')
+        await store.save(runState('run_c'))
+        const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+        expect(disk.runs[0].id).toBe('run_c')
+      } finally {
+        spy.mockRestore()
+      }
     })
   })
 

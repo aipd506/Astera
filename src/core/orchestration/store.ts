@@ -482,13 +482,40 @@ export class OrchestrationStore {
    */
   async save(next: OrchState): Promise<void> {
     this.state = next
-    const run = (): Promise<void> => this.writeNow(next)
+    // **Coalesced: a write queued and not yet started takes the newest state instead of a second write
+    // being queued behind it.** While one write is on its way to the disk, every commit that lands has
+    // to wait for it anyway; writing each of them in turn rewrote the whole file once per commit, so a
+    // burst of N commits cost N whole-file writes where the last one alone is what the file ends up
+    // holding. Now it costs two: the one in flight, and one with the newest state.
+    //
+    // **No time window, and no answer before the disk.** Every caller merged into a write gets that
+    // write's promise, so its `await` still resolves only once a state at least as new as its own is
+    // on disk — the "this is on disk" that a command's reply and its request receipt stand on
+    // (request receipts design §4). A crash before that write lands leaves the previous file and no
+    // caller told otherwise. A timer would have added its whole length to every reply, burst or not.
+    const pending = this.pendingWrite
+    if (pending) {
+      pending.state = next
+      return pending.done
+    }
+    const slot: { state: OrchState; done: Promise<void> } = { state: next, done: Promise.resolve() }
+    // Taken off the tail the moment it starts: a save that lands while this write is running must
+    // queue a new one behind it, not change what this one is already writing.
+    const run = (): Promise<void> => {
+      if (this.pendingWrite === slot) this.pendingWrite = null
+      return this.writeNow(slot.state)
+    }
     // The two arguments to then(run, run) are the same — a later write has to proceed even if an
     // earlier one failed. Without onRejected, a failed queue passes every subsequent save through
     // as rejected and the disk freezes from that point on.
-    this.queue = this.queue.then(run, run)
-    return this.queue
+    slot.done = this.queue.then(run, run)
+    this.pendingWrite = slot
+    this.queue = slot.done
+    return slot.done
   }
+
+  /** The write at the tail of the queue that has not started yet, which a new save joins (see save). */
+  private pendingWrite: { state: OrchState; done: Promise<void> } | null = null
 
   /**
    * Copy the current file to `.bak`. `reset` calls this right before its destructive operation
@@ -506,6 +533,8 @@ export class OrchestrationStore {
   async backup(): Promise<void> {
     const run = (): Promise<void> =>
       fs.copyFile(this.filePath, this.filePath + '.bak').catch(() => {})
+    // A save after this must be written after the copy, so it may not join a write queued before it.
+    this.pendingWrite = null
     this.queue = this.queue.then(run, run)
     return this.queue
   }
