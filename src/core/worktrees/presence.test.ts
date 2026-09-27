@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createProbePool, createProber, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
-import { createPresenceCheck, PresenceCache, type CheckResult, type Presence } from './presence'
+import { askUntilAnswered, ASK_TRIES, createActionPresenceCheck, createPresenceCheck, PresenceCache, type CheckResult, type Presence } from './presence'
 
 const enoent = (): Error => Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
 const eperm = (): Error => Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
@@ -265,5 +265,78 @@ describe('refusals and the worktree sub-cap', () => {
     await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS * 4)
     expect(touched.length).toBe(n)
     expect(most).toBe(1)
+  })
+})
+
+// The action lane: checks a person or a merge is waiting on (create, remove, run-delete, the merge
+// markers). The sweep's one slot is for the whole process, so while it hung on a dead Z: share every
+// other check, on any drive, was refused, and a merge into C: stopped on a Gate. The action lane is
+// one call per root at a time instead: a stuck Z: never touches C:.
+describe('createActionPresenceCheck', () => {
+  const hungOnZ = (p: string): Promise<void> => (/^z:/i.test(p) ? new Promise<void>(() => {}) : Promise.resolve())
+
+  it('a stuck call on Z: does not refuse or delay a check on C:', async () => {
+    vi.useFakeTimers()
+    const check = createActionPresenceCheck({ access: hungOnZ, log: () => {} })
+    const z = check('Z:/wt/a')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await z).toBe('unreachable')
+    const c = check('C:/wt/b')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await c).toBe('present')
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+
+  it('a stuck sweep check on Z: does not refuse an action check on C:', async () => {
+    vi.useFakeTimers()
+    const sweep = createPresenceCheck({ access: hungOnZ, log: () => {} })
+    void sweep('Z:/wt/a')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await sweep('C:/wt/b')).toBe('refused') // the sweep's own slot, as before
+    const action = createActionPresenceCheck({ access: hungOnZ, log: () => {} })
+    const c = action('C:/wt/b')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await c).toBe('present')
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+
+  it('a root that timed out is tried again once its call settles (no five-minute rest)', async () => {
+    vi.useFakeTimers()
+    let release: () => void = () => {}
+    let hang = true
+    const check = createActionPresenceCheck({
+      access: (p) => (hang && /^z:/i.test(p) ? new Promise<void>((r) => (release = r)) : Promise.resolve()),
+      log: () => {}
+    })
+    const first = check('Z:/wt/a')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await first).toBe('unreachable')
+    hang = false
+    release()
+    await vi.advanceTimersByTimeAsync(0)
+    const again = check('Z:/wt/a')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await again).toBe('present')
+  })
+})
+
+describe('askUntilAnswered', () => {
+  it('a refusal is retried, within a bound, and the first real answer is kept', async () => {
+    vi.useFakeTimers()
+    const answers: CheckResult[] = ['refused', 'refused', 'missing']
+    const r = askUntilAnswered(async () => answers.shift() ?? 'present', 'C:/x')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await r).toBe('missing')
+  })
+  it('gives up after its tries and says refused, never unreachable', async () => {
+    vi.useFakeTimers()
+    let n = 0
+    const r = askUntilAnswered(async () => { n++; return 'refused' }, 'C:/x')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS * 2)
+    expect(await r).toBe('refused')
+    expect(n).toBe(ASK_TRIES)
+  })
+  it('a check that rejects is unreachable, never missing', async () => {
+    expect(await askUntilAnswered(async () => { throw new Error('boom') }, 'C:/x')).toBe('unreachable')
   })
 })

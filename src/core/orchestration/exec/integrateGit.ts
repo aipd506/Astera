@@ -13,7 +13,7 @@ import { createWorktree } from '../../worktrees/create'
 import { workerBaseFailure } from '../../worktrees/base'
 import { git as realGit, gitDir, gitVersionAtLeast, listGitWorktrees, GIT_WRITE_TIMEOUT_MS } from '../../worktrees/git'
 import { removeWorktree } from '../../worktrees/remove'
-import { defaultPresenceCheck, type CheckResult, type PresenceCheck } from '../../worktrees/presence'
+import { askUntilAnswered, defaultActionPresenceCheck, type CheckResult, type PresenceCheck } from '../../worktrees/presence'
 import type { WorktreeStore } from '../../worktrees/registry'
 
 /** 프로젝트 폴더가 **서 있는 브랜치**에서 워크트리를 하나 만들고 그 경로를 낸다.
@@ -109,7 +109,8 @@ export interface IntegrateContext {
   git?: typeof realGit
   gitAtLeast?: typeof gitVersionAtLeast
   /** Whether a marker file is in the git dir, asked asynchronously with a time limit. Test seam;
-   *  defaults to the process-wide presence check (worktrees/presence.ts). */
+   *  defaults to the process-wide action-lane check (worktrees/presence.ts): one call per root, so a
+   *  check stuck on another drive never refuses this one. */
   presence?: PresenceCheck
 }
 
@@ -206,7 +207,9 @@ export async function integrateWorktrees(
   ] as const
   let busy: (typeof markers)[number] | undefined
   for (const m of markers) {
-    const at = await (ctx.presence ?? defaultPresenceCheck)(path.join(dir, m[0])).catch(() => 'unreachable' as const)
+    // A refusal (no call made) is asked again (askUntilAnswered). On the action lane it only lasts
+    // while this same drive has a call that gave no answer, and then git itself is not answering here.
+    const at = await askUntilAnswered(ctx.presence ?? defaultActionPresenceCheck, path.join(dir, m[0]))
     if (at === 'missing') continue
     if (at === 'present') {
       busy = m
@@ -520,7 +523,7 @@ export function worktreeDeps(ctx: {
   reap(p: string): Promise<boolean>
   log(m: string): void
   /** Whether a folder is there, asked asynchronously with a time limit. Test seam; defaults to the
-   *  process-wide presence check (worktrees/presence.ts). */
+   *  process-wide action-lane check (worktrees/presence.ts). */
   presence?: PresenceCheck
   /** Test seam for the status reads; defaults to the real git. */
   git?: typeof realGit
@@ -533,13 +536,8 @@ export function worktreeDeps(ctx: {
   // 그리고 **"없다"는 부모가 답하는 ENOENT 뿐이다.** 시간 초과·거절·그 밖의 오류는 "모른다"이고,
   // 모르는 폴더는 없는 것으로 치지 않는다: 합치지도, 지우지도 않고 unchecked 로 올린다. 그 폴더에서
   // git 을 돌리지도 않는다 — 닿지 않는 폴더를 cwd 로 띄우는 것 자체가 같은 자리에서 멈출 수 있다.
-  const presenceOf = async (p: string): Promise<CheckResult> => {
-    try {
-      return await (ctx.presence ?? defaultPresenceCheck)(p)
-    } catch {
-      return 'unreachable'
-    }
-  }
+  // The action lane (one call per root), and a refusal asked again: see askUntilAnswered.
+  const presenceOf = (p: string): Promise<CheckResult> => askUntilAnswered(ctx.presence ?? defaultActionPresenceCheck, p)
   const sort = async (paths: string[]): Promise<{ alive: string[]; gone: string[]; unknown: string[] }> => {
     const answers = await Promise.all(paths.map((p) => presenceOf(p)))
     return {
@@ -564,27 +562,28 @@ export function worktreeDeps(ctx: {
     // 띄워 넣은, 살아서 일하고 있는 워크트리가 레지스트리 필터 때문에 조용히 걸러지던 것이 바로
     // 그 결함이었다. 재료 `paths`(runWorktrees, `Dispatch.cwd` 를 본다)에 남을 수 있는 건 이제
     // 하나뿐이다: 폴더 자체가 사라진 경우(통합 병합이 이미 걷어 갔거나 예약 회차가 걷혔다) —
-    // 그것만 거른다. 닿지 않는 폴더는 합치지 않고 unchecked 로 올린다: 그 폴더의 커밋되지 않은
-    // 변경을 셀 수 없고, `run-delete --merge --remove-worktrees` 는 unchecked 인 폴더를 남긴다.
+    // 그것만 거른다. 닿지 않는 폴더는 합치지 않고 notMerged 로 올린다: 그 폴더의 커밋되지 않은
+    // 변경을 셀 수 없고, `run-delete --merge --remove-worktrees` 는 그 폴더를 남긴다.
     mergeWorktrees: async (runCwd, paths) => {
       const { alive, gone, unknown } = await sort(paths)
       if (gone.length > 0)
         ctx.log(`merge: skipping ${gone.length} removed worktree(s): ${gone.join(', ')}`)
       if (unknown.length > 0)
         ctx.log(`merge: could not reach ${unknown.length} worktree(s), not merged: ${unknown.join(', ')}`)
-      const unreached = unknown.length > 0 ? { unchecked: unknown } : {}
+      // 닿지 못해 합치지 않은 것은 "변경을 확인하지 못했다"(unchecked)가 아니라 "합치지 않았다"다.
+      const unreached = unknown.length > 0 ? { notMerged: unknown } : {}
       // 남은 것이 없으면 성공이다 — 합칠 것이 없는 것은 실패가 아니고, 여기서 실패로 내면 사람이
       // 손쓸 수 없는 이유로 병합 버튼과 삭제가 막힌다.
       if (alive.length === 0) return { ok: true, merged: [], uncommitted: 0, ...unreached }
       const r = await ctx.integrate(runCwd, alive, { reap: false })
       if (r.kind !== 'merged') return { ok: false, reason: r.reason }
-      const unchecked = [...(r.unchecked ?? []), ...unknown]
       return {
         ok: true,
         merged: alive,
         uncommitted: r.uncommitted,
-        ...(unchecked.length > 0 ? { unchecked } : {}),
-        ...(r.dirty ? { dirty: r.dirty } : {})
+        ...(r.unchecked ? { unchecked: r.unchecked } : {}),
+        ...(r.dirty ? { dirty: r.dirty } : {}),
+        ...unreached
       }
     },
     // `run-delete --remove-worktrees` 가 부른다. 순차로 지운다 — reapWorktree 가 세션을 닫고

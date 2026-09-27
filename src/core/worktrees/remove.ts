@@ -10,7 +10,7 @@ import { git, gitVersionAtLeast, isCleanWorktree, listGitWorktrees, GIT_WRITE_TI
  *  are never cut short at the read default. */
 const write = (cwd: string): { cwd: string; timeoutMs: number } => ({ cwd, timeoutMs: GIT_WRITE_TIMEOUT_MS })
 import type { WorktreeStore } from './registry'
-import { defaultPresenceCheck, type PresenceCheck } from './presence'
+import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
 
 /** Dangerous paths: the repo itself, a parent that contains the repo, home, a parent that contains home, the filesystem root */
 export function isDangerousRemovalPath(
@@ -106,15 +106,21 @@ async function isBranchMerged(repo: string, branch: string): Promise<boolean> {
   return false
 }
 
-/** Whether the worktree's folder is there, asked asynchronously and with a time limit (presence.ts).
- *  A sync existsSync on a folder on a dead network share froze the calling thread (the Electron main
- *  thread, or the Host's) for 20 to 60 s. **Only `missing` counts as gone**: a timeout, a refused
- *  check or any other error is "not known", and nothing is deleted on it (the registry entry least of
- *  all), so the caller is told the folder could not be reached. */
+/** Whether the worktree's folder is there, asked asynchronously and with a time limit, on the
+ *  per-root action lane (presence.ts: a check stuck on another drive never refuses this one). A sync
+ *  existsSync on a folder on a dead network share froze the calling thread (the Electron main thread,
+ *  or the Host's) for 20 to 60 s. **Only `missing` counts as gone**: a timeout or any other error is
+ *  "not known", and nothing is deleted on it (the registry entry least of all). A refusal (no call was
+ *  made) is asked again a few times (askUntilAnswered); one that lasts is "could not check", which
+ *  deletes nothing either. */
 async function folderState(p: string, check: PresenceCheck): Promise<'present' | 'missing'> {
-  const r = await check(p).catch(() => 'unreachable' as const)
+  const r = await askUntilAnswered(check, p)
   if (r === 'present' || r === 'missing') return r
-  throw new Error(`WORKTREE_UNREACHABLE: folder not reachable, nothing was removed (${p})`)
+  throw new Error(
+    r === 'refused'
+      ? `WORKTREE_UNREACHABLE: the folder could not be checked just now, nothing was removed (${p})`
+      : `WORKTREE_UNREACHABLE: folder not reachable, nothing was removed (${p})`
+  )
 }
 
 export async function removeWorktree(args: {
@@ -122,12 +128,12 @@ export async function removeWorktree(args: {
   force?: boolean
   registry: WorktreeStore
   isPathInUse: (worktreePath: string) => string | null
-  /** Test seam; defaults to the process-wide presence check (presence.ts). */
+  /** Test seam; defaults to the process-wide action-lane check (presence.ts). */
   presence?: PresenceCheck
 }): Promise<WorktreeRemoveResult> {
   const info = args.registry.get(args.id)
   if (!info) throw new Error(`NOT_MANAGED: not a worktree created by this app (${args.id})`)
-  const presence = args.presence ?? defaultPresenceCheck
+  const presence = args.presence ?? defaultActionPresenceCheck
 
   const inUse = args.isPathInUse(info.path)
   if (inUse) throw new Error(`IN_USE: ${inUse}`)

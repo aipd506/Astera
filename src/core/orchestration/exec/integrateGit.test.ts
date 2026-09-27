@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { makeRepo, gitSync, tempDir } from '../../worktrees/testRepo'
@@ -12,6 +12,8 @@ import {
   type IntegrateContext,
   type ReapContext
 } from './integrateGit'
+import { createActionPresenceCheck } from '../../worktrees/presence'
+import { PROBE_TIMEOUT_MS } from '../../sessions/pathProbe'
 
 let repo: string, registry: WorktreeRegistry, logs: string[], ops: string[], reaped: string[]
 beforeEach(async () => {
@@ -117,6 +119,32 @@ describe('integrateWorktrees — the rules of the one automatic writer into a re
     expect(asked.length).toBeGreaterThan(0)
     expect(ops).toEqual([])
   })
+  // Review I1: a refusal means no call was made, not that the marker could not be reached. It is asked
+  // again, so a moment's refusal does not stop the merge on a Gate.
+  it('a refused marker check is asked again and does not produce a Gate', async () => {
+    const a = await worked('a')
+    const refusedOnce = new Set<string>()
+    const r = await integrateWorktrees(repo, [a], { reap: false }, ctx({
+      presence: async (p) => {
+        if (!refusedOnce.has(p)) { refusedOnce.add(p); return 'refused' }
+        return 'missing'
+      }
+    }))
+    expect(r.kind).toBe('merged')
+  }, 20_000)
+  // Review I1: the scenario. A worktree on an offline share keeps a presence call stuck; a merge into a
+  // repository on another drive goes on, with the process-wide action lane (not the sweep's slot).
+  it('a stuck presence call on another root does not stop the marker check here', async () => {
+    const a = await worked('a')
+    const lane = createActionPresenceCheck({
+      access: (p) => (p.startsWith('//nas/dead') ? new Promise<void>(() => {}) : fs.access(p)),
+      log: () => {}
+    })
+    void lane('//nas/dead/wt/x')
+    await new Promise((res) => setTimeout(res, PROBE_TIMEOUT_MS + 50))
+    const r = await integrateWorktrees(repo, [a], { reap: false }, ctx({ presence: lane }))
+    expect(r.kind).toBe('merged')
+  }, 15_000)
   it('reads the markers through the presence check (present means busy)', async () => {
     const a = await worked('a')
     const r = await integrateWorktrees(repo, [a], {}, ctx({ presence: async (p) => (p.endsWith('REVERT_HEAD') ? 'present' : 'missing') }))
@@ -428,14 +456,14 @@ describe('worktreeDeps', () => {
       presence: async (p) => (p === 'D:/dead' ? 'unreachable' : p === 'D:/busy' ? 'refused' : 'present')
     })
     expect(await d.mergeWorktrees('D:/p', ['D:/ok', 'D:/dead', 'D:/busy'])).toEqual({
-      ok: true, merged: ['D:/ok'], uncommitted: 0, unchecked: ['D:/dead', 'D:/busy']
+      ok: true, merged: ['D:/ok'], uncommitted: 0, notMerged: ['D:/dead', 'D:/busy']
     })
     expect(calls).toEqual([['D:/ok']])
     expect(logs.join('\n')).toMatch(/could not reach 2 worktree/)
   })
   it('mergeWorktrees with only unreachable folders merges nothing and says so', async () => {
     const d = worktreeDeps({ integrate: async () => { throw new Error('must not run') }, reap: async () => true, log: () => {}, presence: async () => 'unreachable' })
-    expect(await d.mergeWorktrees('D:/p', ['D:/dead'])).toEqual({ ok: true, merged: [], uncommitted: 0, unchecked: ['D:/dead'] })
+    expect(await d.mergeWorktrees('D:/p', ['D:/dead'])).toEqual({ ok: true, merged: [], uncommitted: 0, notMerged: ['D:/dead'] })
   })
   // run-delete --remove-worktrees 가 --merge 없이도 커밋되지 않은 변경을 지우지 않는다.
   it('removeWorktrees keeps a dirty folder, and one whose status or presence is unknown; removes the rest', async () => {
@@ -465,12 +493,29 @@ describe('worktreeDeps', () => {
     await d.removeWorktrees(['D:/dead'])
     expect(cwds).toEqual([])
   })
+  it('a refused presence answer is asked again before a folder is kept or skipped', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout'] })
+    try {
+      const seen = new Map<string, number>()
+      const tried: string[] = []
+      const d = worktreeDeps({
+        integrate: async (_i, paths) => ({ kind: 'merged', uncommitted: 0, ...(paths.length ? {} : {}) }),
+        reap: async (p) => { tried.push(p); return true }, log: () => {},
+        presence: async (p) => { const n = (seen.get(p) ?? 0) + 1; seen.set(p, n); return n === 1 ? 'refused' : 'present' },
+        git: cleanGit
+      })
+      const r = d.removeWorktrees(['D:/a'])
+      await vi.runAllTimersAsync()
+      expect(await r).toEqual({ failed: [], uncommitted: 0 })
+      expect(tried).toEqual(['D:/a'])
+    } finally { vi.useRealTimers() }
+  })
   it('a presence check that rejects counts as unknown, never as gone', async () => {
     const d = worktreeDeps({
       integrate: async () => ({ kind: 'merged', uncommitted: 0 }), reap: async () => true, log: () => {},
       presence: async () => { throw new Error('boom') }, git: cleanGit
     })
     expect(await d.removeWorktrees(['D:/x'])).toEqual({ failed: ['D:/x'], uncommitted: 0, unchecked: ['D:/x'] })
-    expect(await d.mergeWorktrees('D:/p', ['D:/x'])).toEqual({ ok: true, merged: [], uncommitted: 0, unchecked: ['D:/x'] })
+    expect(await d.mergeWorktrees('D:/p', ['D:/x'])).toEqual({ ok: true, merged: [], uncommitted: 0, notMerged: ['D:/x'] })
   })
 })

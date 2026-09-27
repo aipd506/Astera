@@ -318,3 +318,16 @@ describe('removeWorktree, 폴더 확인이 답하지 못할 때', () => {
     expect(reg.get(info.id)).toBeNull()
   })
 })
+
+describe('removeWorktree, a refused check', () => {
+  it('is asked again, not taken as unreachable', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'refused-once', registry: reg })
+    let n = 0
+    const r = await removeWorktree({
+      id: info.id, registry: reg, isPathInUse: noUse,
+      presence: async () => (++n === 1 ? 'refused' : 'present')
+    })
+    expect(r.removed).toBe(true)
+    expect(existsSync(info.path)).toBe(false)
+  })
+})

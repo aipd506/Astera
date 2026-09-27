@@ -161,3 +161,25 @@ describe('createWorktree, 루트에 닿지 않을 때', () => {
     expect(info.name).toBe('taken-2')
   })
 })
+
+describe('createWorktree, names and the repo folder', () => {
+  it('NAME_EXHAUSTED leaves no empty repo folder behind', async () => {
+    await expect(
+      createWorktree({ repoPath: repo, name: 'full', registry: reg, presence: async () => 'present' })
+    ).rejects.toThrow(/NAME_EXHAUSTED/)
+    expect(existsSync(path.join(root, path.basename(repo)))).toBe(false)
+  })
+
+  it('a refused candidate check is asked again, not taken as unreachable', async () => {
+    const asked = new Map<string, number>()
+    const { info } = await createWorktree({
+      repoPath: repo, name: 'again', registry: reg,
+      presence: async (p) => {
+        const n = (asked.get(p) ?? 0) + 1
+        asked.set(p, n)
+        return n === 1 ? 'refused' : 'missing'
+      }
+    })
+    expect(info.name).toBe('again')
+  })
+})

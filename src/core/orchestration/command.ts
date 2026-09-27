@@ -159,6 +159,25 @@ export type ChatSendResult =
    *  after a start), or could not say whether a card is open. Nothing was sent; try again. */
   | { sent: false; reason: 'not-held' }
 
+/** Why `removeWorktrees` did not remove `path`, when it says so: `dirty` (uncommitted changes) or
+ *  `unchecked` (its folder could not be reached, or its status could not be read). Null for a path it
+ *  did not remove for another reason — in use, or a removal that failed. Kept is not "in use". */
+export function keptBecause(
+  r: { dirty?: string[]; unchecked?: string[] },
+  path: string
+): 'dirty' | 'unchecked' | null {
+  if (r.dirty?.includes(path)) return 'dirty'
+  if (r.unchecked?.includes(path)) return 'unchecked'
+  return null
+}
+
+/** The log phrase for a kept folder. */
+export function keptPhrase(why: 'dirty' | 'unchecked'): string {
+  return why === 'dirty'
+    ? 'holds uncommitted changes'
+    : 'could not be checked (its folder did not answer, or git could not read its status)'
+}
+
 export interface OrchServerDeps {
   getState(): OrchState
   /** `rollsBack`: this commit undoes an earlier commit of **the same command**, and the command left
@@ -243,6 +262,9 @@ export interface OrchServerDeps {
         /** Worktrees that hold uncommitted changes. They are only in that folder, so `run-delete
          *  --remove-worktrees` keeps these folders rather than deleting the changes with them. */
         dirty?: string[]
+        /** Worktrees that were not merged because their folder could not be reached (an offline
+         *  drive). Their work stays on their branch; `run-delete` keeps these folders too. */
+        notMerged?: string[]
       }
     | { ok: false; reason: string }
   >
@@ -1343,8 +1365,12 @@ export async function handleCommand(
               : ` — its fresh run worktree ${orphan} could not be removed and was left behind`
         } else if (deps.removeWorktrees) {
           try {
-            const { failed } = await deps.removeWorktrees([orphan])
-            if (failed.length > 0) {
+            const r = await deps.removeWorktrees([orphan])
+            const kept = keptBecause(r, orphan)
+            if (kept !== null) {
+              deps.log?.(`orphaned run worktree ${orphan} ${keptPhrase(kept)} — left in place`)
+              orphanNote = ` — its fresh run worktree ${orphan} could not be removed and was left behind`
+            } else if (r.failed.length > 0) {
               deps.log?.(`orphaned run worktree ${orphan} is still in use — left in place`)
               orphanNote = ` — its fresh run worktree ${orphan} is still in use and was left behind`
             }
@@ -2032,16 +2058,26 @@ export async function handleCommand(
       // 상태를 확인하지 못한 폴더는 지우지 않고(worktreesKept) 그 수와 경로를 응답에 싣는다.
       // 이 명령에는 그것을 넘어서 지우라는 force 플래그가 없다 — 지우려면 사람이 그 폴더를 보고
       // 워크트리 패널에서 지운다.
-      let mergeFacts: { uncommitted: number; unchecked: string[]; dirty: string[] } | null = null
+      let mergeFacts: { uncommitted: number; unchecked: string[]; dirty: string[]; notMerged: string[] } | null = null
       if (args.merge === true && worktrees.length > 0) {
         if (!deps.mergeWorktrees) return bad('merging is not available in this build')
         const cwd = job?.cwd ?? (run && jobOf(s, run)?.cwd)
         if (cwd === undefined) return bad(`no project folder for ${String(id)}`)
         const merged = await deps.mergeWorktrees(cwd, worktrees)
         if (!merged.ok) return conflict(merged.reason)
-        mergeFacts = { uncommitted: merged.uncommitted ?? 0, unchecked: merged.unchecked ?? [], dirty: merged.dirty ?? [] }
+        mergeFacts = {
+          uncommitted: merged.uncommitted ?? 0,
+          unchecked: merged.unchecked ?? [],
+          dirty: merged.dirty ?? [],
+          notMerged: merged.notMerged ?? []
+        }
       }
-      const keep = new Set([...(mergeFacts?.dirty ?? []), ...(mergeFacts?.unchecked ?? [])])
+      // 합치지 못한 폴더(닿지 못했다)도 남긴다 — 그 폴더에 무엇이 있는지 아무도 보지 못했다.
+      const keep = new Set([
+        ...(mergeFacts?.dirty ?? []),
+        ...(mergeFacts?.unchecked ?? []),
+        ...(mergeFacts?.notMerged ?? [])
+      ])
       const toRemove = worktrees.filter((p) => !keep.has(p))
       // 백업은 지우기 전에. reset 과 같은 관례이고 같은 이유다 — 되돌릴 수 없는 삭제에 .bak 하나는
       // 값이 싸다. 실패해도 삭제를 막지 않는다(deps.backup 이 스스로 접는다).
@@ -2092,6 +2128,7 @@ export async function handleCommand(
         // run-merge 와 같은 이름이다. 병합했거나 지우는 쪽이 셌을 때만 싣는다 — 아니면 센 적이 없다
         ...(counted ? { uncommitted } : {}),
         ...(uncommittedUnchecked.length > 0 ? { uncommittedUnchecked } : {}),
+        ...(mergeFacts && mergeFacts.notMerged.length > 0 ? { notMerged: mergeFacts.notMerged } : {}),
         ...(args.removeWorktrees === true && worktreesKept.length > 0 ? { worktreesKept } : {})
       })
     }
@@ -2249,7 +2286,9 @@ export async function handleCommand(
       return okBody({
         merged: merged.merged,
         uncommitted: merged.uncommitted,
-        ...(merged.unchecked && merged.unchecked.length > 0 ? { uncommittedUnchecked: merged.unchecked } : {})
+        ...(merged.unchecked && merged.unchecked.length > 0 ? { uncommittedUnchecked: merged.unchecked } : {}),
+        // 폴더에 닿지 못해 합치지 않은 워크트리. 그 일은 브랜치에 그대로 있다.
+        ...(merged.notMerged && merged.notMerged.length > 0 ? { notMerged: merged.notMerged } : {})
       })
     }
     // 계획의 회차를 하나 더 만들고 **`jobs run` 이 한 회차를 시작하는 그대로 시작한다**(U1, F65).

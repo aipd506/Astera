@@ -13,7 +13,7 @@ import { copyWorktreeInclude } from './include'
 import type { WorktreeStore } from './registry'
 import type { Message } from '../i18n'
 import { createProber, type Probe } from '../sessions/pathProbe'
-import { defaultPresenceCheck, type PresenceCheck } from './presence'
+import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
 
 const WORKTREE_ADD_TIMEOUT_MS = 180_000
 
@@ -33,7 +33,7 @@ export async function createWorktree(args: {
   baseRef?: string
   registry: WorktreeStore
   /** Test seams: whether a candidate folder is taken (presence.ts), and making the repo's folder
-   *  under the root. Default to the process-wide presence check and a time-limited mkdir. */
+   *  under the root. Default to the process-wide action-lane check and a time-limited mkdir. */
   presence?: PresenceCheck
   makeDir?: Probe
 }): Promise<{ info: WorktreeInfo; warnings: Message[] }> {
@@ -62,7 +62,7 @@ export async function createWorktree(args: {
   // candidate is asked about asynchronously (presence.ts). A root that does not answer fails at once
   // with WORKTREE_ROOT_UNREACHABLE; a candidate whose presence is not known is never taken as free.
   const root = args.registry.getRoot()
-  const presence = args.presence ?? defaultPresenceCheck
+  const presence = args.presence ?? defaultActionPresenceCheck
   const parent = path.join(root, repoDirName(repo))
   if (!isPathWithin(root, parent)) throw new Error(`DANGEROUS_PATH: ${parent}`)
   const made = await (args.makeDir ?? defaultMakeDir)(parent)
@@ -71,19 +71,28 @@ export async function createWorktree(args: {
   let slug: string | null = null
   let branch = ''
   let wtPath = ''
-  for (let attempt = 1; attempt <= MAX_SUFFIX_ATTEMPTS; attempt++) {
-    const cand = candidateName(baseSlug, attempt)
-    const candBranch = branchNameFor(username, cand)
-    const candPath = worktreePathFor(root, repo, cand)
-    if (!isPathWithin(root, candPath)) throw new Error(`DANGEROUS_PATH: ${candPath}`)
-    if (await localBranchExists(repo, candBranch)) continue
-    const at = await presence(candPath).catch(() => 'unreachable' as const)
-    if (at === 'present') continue
-    if (at !== 'missing') throw new Error(`WORKTREE_ROOT_UNREACHABLE: could not check whether ${candPath} is free`)
-    slug = cand
-    branch = candBranch
-    wtPath = candPath
-    break
+  try {
+    for (let attempt = 1; attempt <= MAX_SUFFIX_ATTEMPTS; attempt++) {
+      const cand = candidateName(baseSlug, attempt)
+      const candBranch = branchNameFor(username, cand)
+      const candPath = worktreePathFor(root, repo, cand)
+      if (!isPathWithin(root, candPath)) throw new Error(`DANGEROUS_PATH: ${candPath}`)
+      if (await localBranchExists(repo, candBranch)) continue
+      // The action lane: a check stuck on another drive never refuses this one. A refusal is asked
+      // again (askUntilAnswered); one that lasts is "could not check", never "free".
+      const at = await askUntilAnswered(presence, candPath)
+      if (at === 'present') continue
+      if (at === 'refused') throw new Error(`WORKTREE_ROOT_UNREACHABLE: could not check just now whether ${candPath} is free`)
+      if (at !== 'missing') throw new Error(`WORKTREE_ROOT_UNREACHABLE: could not check whether ${candPath} is free`)
+      slug = cand
+      branch = candBranch
+      wtPath = candPath
+      break
+    }
+  } finally {
+    // The repo's folder was made before a name was picked. When none was, it is taken back if it is
+    // empty (rmdir is not recursive: a sibling worktree keeps it).
+    if (!slug) await fs.rmdir(parent).catch(() => {})
   }
   if (!slug) throw new Error(`NAME_EXHAUSTED: no name starting with '${baseSlug}' is available (20 attempts)`)
 

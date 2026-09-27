@@ -3955,6 +3955,17 @@ describe('run-delete — 병합·워크트리 선택', () => {
     expect(r.body).not.toHaveProperty('worktreesFailed')
   })
 
+  it('merge 가 닿지 못해 합치지 않은 폴더는 지우지 않고 worktreesKept 와 notMerged 로 알린다', async () => {
+    const { deps, runId, removed } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async () => ({ ok: true as const, merged: [] as string[], uncommitted: 0, notMerged: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(removed).toEqual([])
+    expect(r.body).toMatchObject({ notMerged: ['D:/wt/a'], worktreesKept: ['D:/wt/a'] })
+  })
+
   it('워크트리를 쓰지 않은 Run 은 merge 를 골라도 병합을 부르지 않는다', async () => {
     const merged: string[][] = []
     const deps = Object.assign(makeDeps(), {
@@ -4249,6 +4260,18 @@ describe('run-merge', () => {
     const r = await call(blind, 'run-merge', { run: runId })
     expect(r.status).toBe(200)
     expect((r.body as { uncommittedUnchecked?: string[] }).uncommittedUnchecked).toEqual(['D:/wt/a'])
+  })
+
+  // 폴더에 닿지 못해 합치지 않은 워크트리는 "확인하지 못한 변경"이 아니라 "합치지 않았다"다 — 따로 싣는다
+  it('닿지 못해 합치지 않은 워크트리는 notMerged 로 싣는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async () => ({ ok: true as const, merged: [] as string[], uncommitted: 0, notMerged: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-merge', { run: runId })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ merged: [], notMerged: ['D:/wt/a'] })
+    expect(r.body).not.toHaveProperty('uncommittedUnchecked')
   })
 
   it('모두 확인했으면 uncommittedUnchecked 는 없다', async () => {

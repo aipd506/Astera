@@ -227,13 +227,17 @@ folder and nowhere else. Before a folder is removed, its status is read. A folde
 changes is kept, and so is one whose status git could not report or that could not be reached (an
 offline network drive, for example). The rest are removed and the Job or run is deleted as usual. There
 is no flag that removes them anyway: look at a kept folder, then delete it from the worktree panel. The
-reply gains three fields, each present only when it applies:
+reply gains these fields, each present only when it applies:
 
 - `uncommitted`: how many uncommitted changes were counted, as `run-merge` reports it. With `--merge` it
   covers the merged worktrees; without it, the worktrees that were about to be removed.
 - `uncommittedUnchecked`: the worktrees whose status could not be checked.
-- `worktreesKept`: the worktree folders that were not removed for either reason. A kept folder is not
+- `worktreesKept`: the worktree folders that were not removed for any of these reasons. A kept folder is not
   listed in `worktreesFailed`.
+- `notMerged`: with `--merge`, the worktrees that were not merged because their folder could not be
+  reached. Their work stays on their branch, and their folders are kept too.
+
+`run-merge` reports `notMerged` the same way.
 
 **`astera host status` says whether this Host can do this.** `spawn` in `data.features` means it can
 start and stop workers, and `worktrees` in `data.features` means it can make, merge and remove them

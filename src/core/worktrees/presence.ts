@@ -87,21 +87,44 @@ interface Holder {
 }
 
 export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
+  return makeCheck(d, false)
+}
+
+/**
+ * The action lane: the checks a person or a merge waits on (creating and removing a worktree,
+ * run-delete, run-merge, the merge's marker files). **One call per root at a time, not one for the
+ * whole process.** The sweep's single slot is right for a background refresh, but while it hung on a
+ * dead Z: share every other check was refused, on any drive: a merge into C: stopped on a Gate and a
+ * worker's new worktree failed. Here a stuck call holds only its own root; a check on another root
+ * goes ahead. The calls go through pathProbe's session-folder lane (`skipQueue`) in a pool of their
+ * own, so a stuck root answers `timeout` at once, without a call, until its call settles or reaches
+ * the ceiling — and then it is tried again (no PRESENCE_RETRY_MS rest: a person is asking now).
+ * Stuck calls number at most one per dead root.
+ */
+export function createActionPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
+  return makeCheck(d, true)
+}
+
+function makeCheck(d: PresenceCheckDeps, perRoot: boolean): PresenceCheck {
   const access = d.access ?? ((p: string) => fs.access(p))
   const now = d.now ?? Date.now
   const ceilingMs = d.ceilingMs ?? PROBE_STUCK_CEILING_MS
-  /** The one worktree call that exists, if any (PRESENCE_CONCURRENCY). */
-  let holder: Holder | null = null
-  const waiters: Array<() => void> = []
-  const wake = (): void => {
-    for (const w of waiters.splice(0)) w()
+  /** key → the one call that exists for it. The key is the root on the action lane, '' on the sweep's
+   *  (PRESENCE_CONCURRENCY: one for the whole process). */
+  const holders = new Map<string, Holder>()
+  const waiters = new Map<string, Array<() => void>>()
+  const keyOf = (p: string): string => (perRoot ? rootOf(p) : '')
+  const wake = (key: string): void => {
+    const list = waiters.get(key) ?? []
+    waiters.delete(key)
+    for (const w of list) w()
   }
-  /** root → when it may be probed again, after a call on it timed out. */
+  /** root → when it may be probed again, after a call on it timed out (the sweep's lane only). */
   const resting = new Map<string, number>()
-  // Only one attempt runs at a time (holder), so the access wrapper knows whose call it is making.
+  // Only one attempt runs at a time per key (holders), so the access wrapper knows whose call it is making.
   const prober = createProber({
     access: (p) => {
-      const h = holder
+      const h = holders.get(keyOf(p))
       if (h) h.called = true
       // Through a promise, so an access that throws synchronously still reaches letGo below and the
       // worktree slot is released; otherwise every later check would wait on it forever.
@@ -118,20 +141,26 @@ export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
     },
     timeoutMs: d.timeoutMs,
     // Its own pool, not the PATH pool: a stuck worktree call must never take one of the two PATH slots
-    // (see the header). The holder above already keeps this pool to one call.
+    // (see the header). The holders above already keep this pool to one call (per root, on the action lane).
     pool: d.pool ?? createProbePool(PRESENCE_CONCURRENCY),
+    skipQueue: perRoot,
     log: d.log
   })
   const attempt = async (p: string): Promise<Attempt> => {
     const root = rootOf(p)
+    const key = keyOf(p)
     const until = resting.get(root)
     if (until !== undefined) {
       if (now() < until) return 'refused'
       resting.delete(root)
     }
-    while (holder) {
-      if (holder.stuck) return 'refused'
-      await new Promise<void>((r) => waiters.push(r))
+    for (let h = holders.get(key); h; h = holders.get(key)) {
+      if (h.stuck) return 'refused'
+      await new Promise<void>((r) => {
+        const list = waiters.get(key) ?? []
+        list.push(r)
+        waiters.set(key, list)
+      })
     }
     let ceiling: ReturnType<typeof setTimeout> | null = null
     const h: Holder = {
@@ -142,11 +171,11 @@ export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
         if (h.done) return
         h.done = true
         if (ceiling) clearTimeout(ceiling)
-        if (holder === h) holder = null
-        wake()
+        if (holders.get(key) === h) holders.delete(key)
+        wake(key)
       }
     }
-    holder = h
+    holders.set(key, h)
     const r = await prober(p)
     if (r === 'present') return 'present'
     if (r === 'absent') return h.code === 'ENOENT' ? 'enoent' : 'error'
@@ -156,10 +185,10 @@ export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
     }
     if (!h.done) {
       h.stuck = true
-      resting.set(root, now() + PRESENCE_RETRY_MS)
+      if (!perRoot) resting.set(root, now() + PRESENCE_RETRY_MS)
       ceiling = setTimeout(h.letGo, ceilingMs)
       ceiling.unref?.()
-      wake() // the waiters are refused now
+      wake(key) // the waiters are refused now
     }
     return 'timeout'
   }
@@ -187,6 +216,37 @@ export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
     inflight.set(p, run)
     return run
   }
+}
+
+/** How many times askUntilAnswered asks while the answer is `refused`, and how long it waits between. */
+export const ASK_TRIES = 3
+export const ASK_RETRY_MS = 500
+
+/**
+ * Asks `check` about `p`, and asks again while it answers `refused` (no call was made, nothing was
+ * learned): at most ASK_TRIES times, ASK_RETRY_MS apart, so within the probe's own 1.5 s budget. A
+ * refusal that lasts is still `refused`, never `unreachable` — the caller says "could not check".
+ * On the action lane a refusal only ever means the same root has a call that gave no answer yet.
+ * A check that rejects is `unreachable`. Never rejects.
+ */
+export async function askUntilAnswered(check: PresenceCheck, p: string): Promise<CheckResult> {
+  for (let i = 1; ; i++) {
+    let r: CheckResult
+    try {
+      r = await check(p)
+    } catch {
+      return 'unreachable'
+    }
+    if (r !== 'refused' || i >= ASK_TRIES) return r
+    await new Promise((res) => setTimeout(res, ASK_RETRY_MS))
+  }
+}
+
+let defaultAction: PresenceCheck | null = null
+/** The process-wide action-lane check (createActionPresenceCheck): fs.promises.access, one call per root. */
+export function defaultActionPresenceCheck(p: string): Promise<CheckResult> {
+  defaultAction ??= createActionPresenceCheck()
+  return defaultAction(p)
 }
 
 let defaultCheck: PresenceCheck | null = null
