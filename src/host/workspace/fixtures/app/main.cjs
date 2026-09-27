@@ -1,5 +1,6 @@
-// The agent workspace e2e fixture (src/host/workspace/desktop.e2e.test.ts): one window whose page
-// records what reaches it in window.events, which the test reads over its own CDP connection.
+// The agent workspace e2e fixture (desktop.e2e.test.ts, desktop.linux.e2e.test.ts and
+// desktop.mac.e2e.test.ts): one window whose page records what reaches it in window.events, which the
+// test reads over its own CDP connection.
 const { app, BrowserWindow } = require('electron')
 
 const HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Astera workspace fixture</title></head><body>
@@ -23,8 +24,13 @@ drop.addEventListener('dragover', (e) => e.preventDefault())
 drop.addEventListener('drop', (e) => { e.preventDefault(); note({ kind: 'files', names: Array.from(e.dataTransfer.files).map((f) => f.name) }) })
 </script></body></html>`
 
+// On macOS the workspace launches the app in the background and passes ASTERA_APP_CHROMIUM_FLAGS
+// (Linux and macOS design, L3; plan ruling R5): the fixture then never shows its window, and its page
+// still renders for CDP. Windows and Linux do not set it, so the window shows on their hidden desktop.
+const hidden = Boolean(process.env.ASTERA_APP_CHROMIUM_FLAGS)
+
 app.whenReady().then(() => {
-  const w = new BrowserWindow({ width: 900, height: 700, title: 'Astera workspace fixture' })
+  const w = new BrowserWindow({ width: 900, height: 700, title: 'Astera workspace fixture', show: !hidden })
   w.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(HTML))
 })
 app.on('window-all-closed', () => app.quit())

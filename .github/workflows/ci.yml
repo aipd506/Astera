@@ -56,3 +56,24 @@ jobs:
       - run: npm test
 
       - run: npm run build
+
+      # The agent app workspace against a real display (docs/agent-workspace-isolation.md). The unit
+      # tests above drive every desk with fakes; these two start Xvfb or a background app for real.
+      # They are gated on ASTERA_DESKTOP_E2E=1, so `npm test` collects and skips them, and a run here
+      # that reports them skipped means the gate did not open, which is a failure to read, not a pass.
+      # After the build (preflight ruling F6), so a failing or flaky e2e never skips the build step.
+      - name: Linux desktop tools for the agent workspace e2e
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb xdotool imagemagick
+
+      - name: Agent workspace e2e (Linux, Xvfb)
+        if: runner.os == 'Linux'
+        env:
+          ASTERA_DESKTOP_E2E: '1'
+        run: npx vitest run src/host/workspace/desktop.linux.e2e.test.ts
+
+      - name: Agent workspace e2e (macOS, background)
+        if: runner.os == 'macOS'
+        env:
+          ASTERA_DESKTOP_E2E: '1'
+        run: npx vitest run src/host/workspace/desktop.mac.e2e.test.ts
