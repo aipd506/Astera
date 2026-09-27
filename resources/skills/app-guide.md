@@ -41,6 +41,9 @@ script or close the desktop from there. It works the same when the Astera app is
 - **A script that never finishes is cut off at 60 s.** A busy loop such as `while (!ready) {}` is ended
   there, or when the person presses Stop, and reports `at: "timeout"` or `at: "stopped"`. Wait with
   `waitFor()` instead, which returns as soon as the selector matches.
+- **A script that takes more than 512 MB of memory is ended.** It runs in a process of its own, so this
+  ends only your script, which reports `at: "memory"`. Keep large buffers and arrays out of the script;
+  log a summary of what you measured, not the data itself.
 
 ## The pattern
 

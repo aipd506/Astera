@@ -82,6 +82,13 @@ changed one of them:
   in a worker thread, with the helpers left on its own thread behind the same gate, and ends the worker at
   the 60 second deadline or on Stop. A busy loop, before or after an `await`, is cut off and no longer
   freezes the Host or any session's terminal (`src/host/workspace/scriptWorker.ts`).
+- **P14. Each script in a process of its own (amended 2026-09-27).** The Host starts one child process
+  per `app js` script, from its own runtime with an environment built from nothing, and the worker of P13
+  runs inside it with its heap limited to 256 MB. The child ends itself when its memory passes 512 MB,
+  which counts ArrayBuffer and TypedArray memory the heap limit does not see, and the script reports
+  `at: "memory"`. A child that dies any other way reports `at: "crashed"`. The deadline, Stop, Close,
+  the session ending and the Host leaving all end the child's process tree. Memory a script takes can no
+  longer take the Host down.
 
 Two more limits, found only once a real desktop and a real helper were driven (Task 3, Task 10):
 
@@ -100,8 +107,8 @@ Known limits, beside the spec's:
 - **A closed mirror tab reappears when the Host reconnects while that workspace is still open.** The
   Close in the app ends the tab, not the workspace; a workspace the Host still holds is shown again once
   the app reconnects.
-- **A script that allocates without end can still take the Host down.** Its worker shares the Host's
-  process and memory, so running it out of memory ends the process, not only the worker.
+- **A script is ended at 512 MB of memory.** It runs in a process of its own (P14), so running out of
+  memory ends that process and reports `at: "memory"`; the Host and every other session keep running.
 - An Electron app that is not started with a debugging port gets the native helpers only.
   `snapshot().url` is empty for an address that is not http or https (a `file:` or custom scheme page).
 
