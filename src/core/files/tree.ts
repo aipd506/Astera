@@ -146,7 +146,9 @@ const CURATED_IGNORE = [
   '.git', '.hg', '.svn',
   'node_modules', '.venv', 'venv', '__pycache__', '.mypy_cache', '.pytest_cache', '.tox', '.ruff_cache',
   'target', 'build', 'dist', 'out', 'bin', 'obj', '.gradle', 'vendor',
-  '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache', '.idea'
+  '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache', '.idea',
+  // Mobile and test-tool output: CocoaPods, Dart/Flutter tooling, coverage reports
+  'Pods', '.dart_tool', 'coverage'
 ]
 
 /** The watcher's ignore matcher. Combines the curated list with the root .gitignore (when there is

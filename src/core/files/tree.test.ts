@@ -249,6 +249,14 @@ describe('buildIgnoreMatcher', () => {
     }
   })
 
+  // 모바일·테스트 도구가 만드는 무거운 생성 폴더. 감시에서만 빠지고 트리 목록에는 그대로 보인다
+  it('Pods·.dart_tool·coverage 도 감시에서 뺀다', () => {
+    const ig = buildIgnoreMatcher(null)
+    for (const p of ['Pods', 'ios/Pods/x.h', '.dart_tool', 'app/.dart_tool/pkg', 'coverage', 'coverage/lcov.info']) {
+      expect(ig(p)).toBe(true)
+    }
+  })
+
   it('루트 경로("")는 제외하지 않는다', () => {
     expect(buildIgnoreMatcher(null)('')).toBe(false)
   })
