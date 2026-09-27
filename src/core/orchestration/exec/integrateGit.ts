@@ -12,7 +12,7 @@ import type { OrchServerDeps } from '../command'
 import { isSamePath } from '../../files/tree'
 import { createWorktree } from '../../worktrees/create'
 import { workerBaseFailure } from '../../worktrees/base'
-import { git as realGit, gitDir, gitVersionAtLeast, listGitWorktrees } from '../../worktrees/git'
+import { git as realGit, gitDir, gitVersionAtLeast, listGitWorktrees, GIT_WRITE_TIMEOUT_MS } from '../../worktrees/git'
 import { removeWorktree } from '../../worktrees/remove'
 import type { WorktreeStore } from '../../worktrees/registry'
 
@@ -296,7 +296,12 @@ export async function integrateWorktrees(
     uncommitted += n
     // 같은 이름의 태그가 브랜치보다 먼저 잡히는 것을 막으려고 전체 ref 를 쓴다(remove.ts 와 같다)
     const ref = `refs/heads/${target.branch}`
-    const probe = await (ctx.git ?? realGit)(['merge-tree', '--write-tree', 'HEAD', ref], { cwd: mergeInto })
+    // merge-tree --write-tree writes tree objects and on a big repository can run long; the long write
+    // ceiling keeps a slow probe from being killed and misreported as "could not test".
+    const probe = await (ctx.git ?? realGit)(['merge-tree', '--write-tree', 'HEAD', ref], {
+      cwd: mergeInto,
+      timeoutMs: GIT_WRITE_TIMEOUT_MS
+    })
     if (!probe.ok)
       return {
         kind: 'agent',
@@ -316,7 +321,11 @@ export async function integrateWorktrees(
         worktrees: targets
       }
     // `--no-edit` 는 편집기를 막는 것이다. 이 자리에는 사람이 없고, 편집기가 뜨면 그 git 프로세스는
-    // git() 의 30초 timeout 까지 서 있다가 죽는다 — 그때 남는 저장소가 곧 병합 중간 상태다.
+    // timeout 까지 서 있다가 죽는다 — 그때 남는 저장소가 곧 병합 중간 상태다.
+    //
+    // **병합과 그 되돌리기는 GIT_WRITE_TIMEOUT_MS(10분)로 돈다.** 어댑터 기본값(30초)이면 큰 저장소의
+    // 병합이 일하는 도중에 죽어 바로 그 중간 상태를 남긴다. 느린 쓰기는 기다리고, 정말 매달린
+    // 프로세스만 이 한도가 거둔다.
     //
     // **저장소를 실제로 움직이는 자리다** — mergeInto 의 HEAD 와 index 를 옮긴다. gitWatcher 가
     // 바로 그 둘을 보고 있으므로, 이 병합을 EG §26 에 등록해 두지 않으면 Astera 자신이 방금 만든
@@ -327,12 +336,16 @@ export async function integrateWorktrees(
     // an app that opens or attaches while the merge runs finds it there.
     const mergeOpId = await ctx.gitOp.begin('job-merge', mergeInto)
     try {
-      const merged = await (ctx.git ?? realGit)(['merge', '--no-edit', ref], { cwd: mergeInto })
+      const merged = await (ctx.git ?? realGit)(['merge', '--no-edit', ref], {
+        cwd: mergeInto,
+        timeoutMs: GIT_WRITE_TIMEOUT_MS
+      })
       if (!merged.ok) {
         // 미리 검사가 통과했는데도 실패했다면 충돌이 아닌 이유다(추적되지 않는 파일과의 겹침,
         // index.lock, 훅, 서명). 되돌린 뒤 사람에게 간다 — 에이전트에게 넘기지 않는 이유는 이것이
         // "합치면 충돌한다"가 아니라 "앱이 병합을 돌릴 수 없다"이기 때문이다.
-        await (ctx.git ?? realGit)(['merge', '--abort'], { cwd: mergeInto }) // 병합이 시작되지도 않았으면 실패한다 — 무시한다
+        // 병합이 시작되지도 않았으면 실패한다 — 무시한다
+        await (ctx.git ?? realGit)(['merge', '--abort'], { cwd: mergeInto, timeoutMs: GIT_WRITE_TIMEOUT_MS })
         // **되돌아갔는지 확인해서 그 사실을 문장에 넣는다.** 앱이 저장소를 어떤 상태로 두었는지를
         // 사용자가 짐작하게 두지 않는다 — 이 경로가 있는 이유가 그것이다.
         const after = await (ctx.git ?? realGit)(['status', '--porcelain', '--untracked-files=no'], { cwd: mergeInto })

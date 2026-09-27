@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { makeRepo, gitSync, tempDir } from '../../worktrees/testRepo'
 import { WorktreeRegistry } from '../../worktrees/registry'
-import { git } from '../../worktrees/git'
+import { git, GIT_WRITE_TIMEOUT_MS } from '../../worktrees/git'
 import {
   forkWorktree,
   integrateWorktrees,
@@ -177,6 +177,19 @@ describe('integrateWorktrees — the rules of the one automatic writer into a re
     const begin = argv.find((x) => x[0] === '<begin>')!, end = argv.find((x) => x[0] === '<end>')!
     expect(at(begin)).toBe(at(merge) - 1)
     expect(at(end)).toBeGreaterThan(at(merge))
+  })
+  // A write killed part-way leaves the folder mid-merge — the adapter's 30 s default was that kill.
+  // merge, merge --abort and the merge-tree probe (it writes tree objects) all get the long write
+  // ceiling. Mutation check: drop timeoutMs from any of them; red.
+  it('runs merge, merge --abort and merge-tree with the long write timeout', async () => {
+    const a = await worked('a', 'same.txt', 'from a'); const b = await worked('b', 'same.txt', 'from b')
+    const seen: { args: string[]; timeoutMs?: number }[] = []
+    const recording: typeof git = (args, opts) => { seen.push({ args, timeoutMs: opts?.timeoutMs }); return args[0] === 'merge-tree' ? git(args, opts).then(() => ({ ok: true, stdout: '', stderr: '' })) : git(args, opts) }
+    await integrateWorktrees(repo, [a, b], {}, ctx({ git: recording }))
+    const of = (pred: (x: string[]) => boolean): (number | undefined)[] => seen.filter((x) => pred(x.args)).map((x) => x.timeoutMs)
+    expect(of((x) => x[0] === 'merge' && x[1] === '--no-edit')).toEqual([GIT_WRITE_TIMEOUT_MS, GIT_WRITE_TIMEOUT_MS])
+    expect(of((x) => x[0] === 'merge' && x[1] === '--abort')).toEqual([GIT_WRITE_TIMEOUT_MS])
+    expect(of((x) => x[0] === 'merge-tree')).toEqual([GIT_WRITE_TIMEOUT_MS, GIT_WRITE_TIMEOUT_MS])
   })
   // R24: the Host's begin writes the merge record before it answers, so the merge must wait for it.
   // Mutation check: drop the await on gitOp.begin (or on end); red.

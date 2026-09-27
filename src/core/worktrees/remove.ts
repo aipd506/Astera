@@ -3,7 +3,12 @@ import os from 'node:os'
 import path from 'node:path'
 import type { WorktreeRemoveResult } from '../types'
 import { isPathWithin, isSamePath } from '../files/tree'
-import { git, gitVersionAtLeast, isCleanWorktree, listGitWorktrees } from './git'
+import { git, gitVersionAtLeast, isCleanWorktree, listGitWorktrees, GIT_WRITE_TIMEOUT_MS } from './git'
+
+/** Options for a call that changes the repository — see GIT_WRITE_TIMEOUT_MS. A `worktree remove`
+ *  killed part-way leaves the folder half deleted with git's record of it still in place, so writes
+ *  are never cut short at the read default. */
+const write = (cwd: string): { cwd: string; timeoutMs: number } => ({ cwd, timeoutMs: GIT_WRITE_TIMEOUT_MS })
 import type { WorktreeStore } from './registry'
 
 /** Dangerous paths: the repo itself, a parent that contains the repo, home, a parent that contains home, the filesystem root */
@@ -133,7 +138,7 @@ export async function removeWorktree(args: {
 
   if (!row) {
     // git has forgotten it
-    await git(['worktree', 'prune'], { cwd: info.repoPath })
+    await git(['worktree', 'prune'], write(info.repoPath))
     if (existsSync(info.path)) {
       if (!(await isProvenOrphanDir(info.path, info.repoPath))) {
         // Without proof there is no telling our worktree from an unrelated directory — but an empty one
@@ -160,17 +165,17 @@ export async function removeWorktree(args: {
       args.force
         ? ['worktree', 'remove', '--force', info.path]
         : ['worktree', 'remove', info.path],
-      { cwd: info.repoPath }
+      write(info.repoPath)
     )
     if (!rm.ok) throw new Error(`GIT_REMOVE_FAILED: ${rm.stderr || rm.stdout}`)
-    await git(['worktree', 'prune'], { cwd: info.repoPath })
+    await git(['worktree', 'prune'], write(info.repoPath))
   }
 
   // Branch deletion: -d → squash detection → -D; on failure the branch is preserved
-  const del = await git(['branch', '-d', '--', info.branch], { cwd: info.repoPath })
+  const del = await git(['branch', '-d', '--', info.branch], write(info.repoPath))
   if (del.ok) branchDeleted = true
   else if (await isBranchMerged(info.repoPath, info.branch)) {
-    branchDeleted = (await git(['branch', '-D', '--', info.branch], { cwd: info.repoPath })).ok
+    branchDeleted = (await git(['branch', '-D', '--', info.branch], write(info.repoPath))).ok
   }
   if (!branchDeleted) {
     const head = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${info.branch}`], {
