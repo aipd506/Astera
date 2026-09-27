@@ -38,6 +38,34 @@ describe('toBatch — 한 묶음 안의 변경을 정리한다', () => {
   })
 })
 
+// rm -rf x && git checkout x 가 한 창 안에서 일어나면 마지막 종류는 addDir 이다. 그래도 렌더러가
+// 지운 폴더 아래의 캐시를 비우려면 unlinkDir 을 봐야 한다 — 그래서 unlinkDir 은 합쳐도 남긴다
+describe('toBatch — 지웠다 다시 만든 폴더', () => {
+  it('같은 창에서 unlinkDir 뒤 addDir 이 와도 unlinkDir 을 먼저 남긴다', () => {
+    const b = toBatch([
+      { path: '/r/x/sub/f', kind: 'unlink' },
+      { path: '/r/x', kind: 'unlinkDir' },
+      { path: '/r/x', kind: 'addDir' },
+      { path: '/r/x/a.ts', kind: 'add' }
+    ])
+    expect(b.changes).toEqual([
+      { path: '/r/x/sub/f', kind: 'unlink' },
+      { path: '/r/x', kind: 'unlinkDir' },
+      { path: '/r/x', kind: 'addDir' },
+      { path: '/r/x/a.ts', kind: 'add' }
+    ])
+  })
+
+  it('unlinkDir 로 끝나면 한 번만 남긴다', () => {
+    const b = toBatch([
+      { path: '/r/x', kind: 'unlinkDir' },
+      { path: '/r/x', kind: 'addDir' },
+      { path: '/r/x', kind: 'unlinkDir' }
+    ])
+    expect(b.changes).toEqual([{ path: '/r/x', kind: 'unlinkDir' }])
+  })
+})
+
 describe('createChangeBatcher — 감시 이벤트를 창 단위로 묶어 보낸다', () => {
   it('창이 닫히기 전에는 보내지 않고, 창이 닫히면 한 번 보낸다', () => {
     vi.useFakeTimers()

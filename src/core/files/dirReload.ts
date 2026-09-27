@@ -54,6 +54,61 @@ export function createDirLoadQueue(
   }
 }
 
+/** How long a folder must have been reading before its row shows the spinner. An expanded folder that
+ *  npm install keeps writing into is re-read on every 100ms batch; each read is short, and showing the
+ *  spinner for each one would make the row blink. A read that lasts past this is one worth showing. */
+export const ROW_SPINNER_DELAY_MS = 150
+
+export interface DelayedPending {
+  /** The current set of folders being read (DirLoadQueue's onChange) */
+  update: (pending: ReadonlySet<string>) => void
+  /** Drops every timer and the shown set without reporting (unmount); the object stays usable */
+  clear: () => void
+}
+
+/** Turns the queue's pending set into the set to show: a folder enters it only after it has stayed
+ *  pending for delayMs, and leaves it the moment its read ends. */
+export function createDelayedPending(
+  onChange: (shown: ReadonlySet<string>) => void,
+  delayMs: number = ROW_SPINNER_DELAY_MS
+): DelayedPending {
+  const timers = new Map<string, ReturnType<typeof setTimeout>>()
+  const shown = new Set<string>()
+  const report = (): void => onChange(new Set(shown))
+  return {
+    update: (pending) => {
+      let changed = false
+      for (const [dir, timer] of timers) {
+        if (pending.has(dir)) continue
+        clearTimeout(timer)
+        timers.delete(dir)
+      }
+      for (const dir of [...shown]) {
+        if (pending.has(dir)) continue
+        shown.delete(dir)
+        changed = true
+      }
+      for (const dir of pending) {
+        if (shown.has(dir) || timers.has(dir)) continue
+        timers.set(
+          dir,
+          setTimeout(() => {
+            timers.delete(dir)
+            shown.add(dir)
+            report()
+          }, delayMs)
+        )
+      }
+      if (changed) report()
+    },
+    clear: () => {
+      for (const timer of timers.values()) clearTimeout(timer)
+      timers.clear()
+      shown.clear()
+    }
+  }
+}
+
 /** Which folders one watcher batch re-reads. Only folders already in the cache matter (an uncached
  *  one is read fresh when it is first expanded). Of those, the root and the expanded folders are on
  *  screen and are re-read; a collapsed folder is not re-read now — its cache is dropped instead, so

@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from 'react'
 import { isSubPath } from '../../../core/files/ops'
 import { flattenVisible } from '../../../core/files/selection'
 import { onFileChanges } from '../lib/fileChanges'
-import { createDirLoadQueue, planBatchReload, type DirLoadQueue } from '../../../core/files/dirReload'
+import {
+  createDelayedPending,
+  createDirLoadQueue,
+  planBatchReload,
+  type DelayedPending,
+  type DirLoadQueue
+} from '../../../core/files/dirReload'
 
 export interface Entry {
   name: string
@@ -21,7 +27,7 @@ export interface DirState {
 export interface FileTree {
   dirs: Record<string, DirState>
   expanded: Set<string>
-  /** Folders whose children are being read right now — the row's inline loading indicator */
+  /** Folders whose children have been reading for over ROW_SPINNER_DELAY_MS — the row's inline loading indicator */
   loading: ReadonlySet<string>
   dirsRef: React.RefObject<Record<string, DirState>>
   loadDir: (dirPath: string) => void
@@ -98,8 +104,12 @@ export function useFileTree(
 
   // Every read goes through one per-folder single flight (core/files/dirReload.ts): a folder is never
   // read twice at once, and changes that arrive during a read become one more read after it.
+  // The spinner set lags the pending set by ROW_SPINNER_DELAY_MS so short re-reads do not blink the row.
+  const delayedRef = useRef<DelayedPending | null>(null)
+  if (!delayedRef.current) delayedRef.current = createDelayedPending(setLoading)
   const queueRef = useRef<DirLoadQueue | null>(null)
-  if (!queueRef.current) queueRef.current = createDirLoadQueue(readDir, setLoading)
+  if (!queueRef.current) queueRef.current = createDirLoadQueue(readDir, (p) => delayedRef.current!.update(p))
+  useEffect(() => () => delayedRef.current!.clear(), [])
   const loadDir = (dirPath: string): void => queueRef.current!.request(dirPath)
 
   const dirsRef = useRef(dirs)
@@ -111,7 +121,8 @@ export function useFileTree(
   // On re-entry the preserved cache can be stale, so the root is re-queried once.
   useEffect(() => {
     if (!root) return
-    void window.api.files.watch(root)
+    // A refused or failed watch leaves the tree working without live updates — logged, not thrown
+    window.api.files.watch(root).catch((err: unknown) => console.warn('Explorer file watch failed', err))
     loadDir(root) // re-query the root level on re-entry to pick up recent changes (deeper expanded folders catch up via later events or a refresh)
     // One message per watcher window (core/files/changeBatch.ts): its unlinkDir changes clean up the cache,
     // and its parents — already deduplicated, content changes excluded — are the folders to re-query

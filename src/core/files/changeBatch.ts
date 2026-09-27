@@ -22,18 +22,25 @@ export const FILE_CHANGE_BATCH_MS = 100
 
 /** Folds a window of events into a batch. The same path seen several times keeps its latest kind
  *  (in the position it first appeared) — unlink then add is a recreation, and what the renderer
- *  wants is the state now. */
+ *  wants is the state now. The one exception is unlinkDir: a folder deleted and recreated in the same
+ *  window (rm -rf x && git checkout x) still carries its unlinkDir, just before its latest kind, because
+ *  the renderer drops the cache under a deleted folder on that kind alone and would otherwise keep
+ *  listings of subfolders that no longer exist. */
 export function toBatch(events: readonly FileChange[]): FileChangeBatch {
   const byPath = new Map<string, FileChangeKind>()
+  const removedDirs = new Set<string>()
   const parents = new Set<string>()
   for (const e of events) {
     byPath.set(e.path, e.kind)
+    if (e.kind === 'unlinkDir') removedDirs.add(e.path)
     if (e.kind !== 'change') parents.add(parentDir(e.path))
   }
-  return {
-    parents: [...parents],
-    changes: [...byPath].map(([path, kind]) => ({ path, kind }))
+  const changes: FileChange[] = []
+  for (const [path, kind] of byPath) {
+    if (removedDirs.has(path) && kind !== 'unlinkDir') changes.push({ path, kind: 'unlinkDir' })
+    changes.push({ path, kind })
   }
+  return { parents: [...parents], changes }
 }
 
 export interface ChangeBatcher {

@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from 'vitest'
-import { createDirLoadQueue, planBatchReload } from './dirReload'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { createDirLoadQueue, planBatchReload, createDelayedPending, ROW_SPINNER_DELAY_MS } from './dirReload'
 
 /** 손으로 끝내는 load — 몇 개가 동시에 도는지, 어떤 순서로 불렸는지를 밖에서 본다 */
 function manualLoad(): {
@@ -127,5 +127,52 @@ describe('planBatchReload — 한 묶음에서 무엇을 다시 읽는가', () =
       isExpanded: () => true
     })
     expect(plan.reload).toEqual(['/r/a'])
+  })
+})
+
+// npm install 이 펼친 폴더에 100ms 마다 묶음을 보내면, 짧은 읽기마다 스피너가 켜졌다 꺼져 깜빡인다.
+// 읽기가 ROW_SPINNER_DELAY_MS 넘게 이어질 때만 보인다
+describe('createDelayedPending — 행 스피너의 보이기 지연', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('지연보다 짧은 읽기는 한 번도 보이지 않는다', () => {
+    vi.useFakeTimers()
+    const shown: string[][] = []
+    const d = createDelayedPending((s) => shown.push([...s]))
+    for (let i = 0; i < 10; i++) {
+      d.update(new Set(['/r/a']))
+      vi.advanceTimersByTime(ROW_SPINNER_DELAY_MS - 60)
+      d.update(new Set())
+      vi.advanceTimersByTime(60)
+    }
+    expect(shown).toEqual([])
+  })
+
+  it('지연을 넘긴 읽기는 보이고, 끝나면 바로 사라진다', () => {
+    vi.useFakeTimers()
+    const shown: string[][] = []
+    const d = createDelayedPending((s) => shown.push([...s]))
+    d.update(new Set(['/r/a']))
+    vi.advanceTimersByTime(ROW_SPINNER_DELAY_MS - 1)
+    expect(shown).toEqual([])
+    vi.advanceTimersByTime(1)
+    expect(shown).toEqual([['/r/a']])
+    d.update(new Set())
+    expect(shown).toEqual([['/r/a'], []])
+  })
+
+  it('clear 는 걸린 타이머를 모두 거두고, 그 뒤에도 다시 쓸 수 있다', () => {
+    vi.useFakeTimers()
+    const shown: string[][] = []
+    const d = createDelayedPending((s) => shown.push([...s]))
+    d.update(new Set(['/r/a']))
+    d.clear()
+    vi.advanceTimersByTime(ROW_SPINNER_DELAY_MS * 2)
+    expect(shown).toEqual([])
+    d.update(new Set(['/r/b']))
+    vi.advanceTimersByTime(ROW_SPINNER_DELAY_MS)
+    expect(shown).toEqual([['/r/b']])
   })
 })

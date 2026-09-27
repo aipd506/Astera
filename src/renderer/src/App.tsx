@@ -3381,7 +3381,7 @@ export default function App(): React.JSX.Element {
           root,
           pickRunSelection(r.configs, runSelectedByProject.current[root], r.runs.find((x) => x.status !== 'exited')?.configId)
         )
-      })
+      }).catch((err: unknown) => console.warn('Run config refresh after a seed file change failed', err))
     })
     return off
   }, [])

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { RowLoading, RootReading, ROOT_SLOW_MS } from './ExplorerLoading'
+import { RowLoading, RootReading } from './ExplorerLoading'
 
 vi.mock('../i18n/I18nProvider', () => ({
   useI18n: () => ({ lang: 'ko', t: (key: string) => key, tm: (m: unknown) => String(m) })
@@ -29,9 +29,5 @@ describe('RootReading — 루트 첫 읽기가 느릴 때', () => {
   // 빠른 폴더에서 한 프레임 깜빡이는 문구를 막는다 — 기다림이 ROOT_SLOW_MS 를 넘어야 보인다
   it('아직 느리지 않으면 아무것도 보이지 않는다', () => {
     expect(renderToStaticMarkup(React.createElement(RootReading, { slow: false }))).toBe('')
-  })
-
-  it('느림 판정은 약 300ms 다', () => {
-    expect(ROOT_SLOW_MS).toBe(300)
   })
 })

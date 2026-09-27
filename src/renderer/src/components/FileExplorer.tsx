@@ -669,7 +669,8 @@ export function FileExplorer({
                   <span className="fx-caret">{isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
                   <FileIcon {...resolveFolderIcon(entry.name, isOpen)} />
                   <span className="fx-name">{entry.name}</span>
-                  <RowLoading pending={tree.loading.has(entry.path)} />
+                  {/* A first read already shows 'Loading…' under the row — the spinner is for re-reads only */}
+                  <RowLoading pending={tree.loading.has(entry.path) && !!dirs[entry.path]} />
                   {gitStatus.folderCount[entry.path] > 0 && (
                     <span
                       className="fx-git-count"
