@@ -347,6 +347,72 @@ describe('Stop, Close, the session, the helper, idleness', () => {
     expect(events.filter((e) => e.kind === 'state' && !e.open)).toHaveLength(1)
   })
 
+  // Task 5 deferred minor: a Stop while the desktop starts leaves the app told `open: true` (run's
+  // finally); a desktop that then fails to start must still be told closed, once, or the mirror shows a
+  // workspace that no longer exists.
+  const failingDesk = () => {
+    let fail!: () => void
+    const startDesk = vi.fn(
+      () =>
+        new Promise<DesktopHelper>((_r, reject) => {
+          fail = () => reject(new Error('the helper would not start'))
+        })
+    )
+    return { startDesk, fail: () => fail() }
+  }
+  const closedAfterLastOpen = (events: WorkspaceEvent[]) => {
+    const states = events.filter((e) => e.kind === 'state')
+    const lastOpen = states.map((e) => e.kind === 'state' && e.open).lastIndexOf(true)
+    return states.slice(lastOpen + 1).filter((e) => e.kind === 'state' && !e.open)
+  }
+
+  it('Close after a Stop while the desktop starts, then the start fails, tells the app it closed once', async () => {
+    const { startDesk, fail } = failingDesk()
+    const { m, events, settle } = await rig({ startDesk })
+    const run = m.run('s1', "await launch({ command: 'app.exe' })")
+    await vi.waitFor(() => expect(startDesk).toHaveBeenCalled())
+    expect(m.stop('s1')).toBe(true)
+    expect(body(await run).error?.at).toBe('stopped')
+    expect(events.at(-1)).toMatchObject({ kind: 'state', sessionId: 's1', open: true })
+    const closing = m.close('s1')
+    fail()
+    expect(await closing).toBe(true)
+    await settle()
+    expect(closedAfterLastOpen(events)).toHaveLength(1)
+    expect(events.at(-1)).toMatchObject({ kind: 'state', sessionId: 's1', open: false })
+    expect(m.list()).toEqual([])
+  })
+
+  it('Close and the session ending at once, over a desktop that fails to start, tell the app it closed once', async () => {
+    const { startDesk, fail } = failingDesk()
+    const { m, events, settle } = await rig({ startDesk })
+    const run = m.run('s1', "await launch({ command: 'app.exe' })")
+    await vi.waitFor(() => expect(startDesk).toHaveBeenCalled())
+    expect(m.stop('s1')).toBe(true)
+    await run
+    const closing = m.close('s1')
+    m.sessionEnded('s1')
+    fail()
+    expect(await closing).toBe(true)
+    await settle()
+    expect(closedAfterLastOpen(events)).toHaveLength(1)
+    expect(m.list()).toEqual([])
+  })
+
+  it('a desktop that fails to start after its script was stopped tells the app it closed, with no Close', async () => {
+    const { startDesk, fail } = failingDesk()
+    const { m, events, settle } = await rig({ startDesk })
+    const run = m.run('s1', "await launch({ command: 'app.exe' })")
+    await vi.waitFor(() => expect(startDesk).toHaveBeenCalled())
+    expect(m.stop('s1')).toBe(true)
+    await run
+    fail()
+    await settle()
+    expect(closedAfterLastOpen(events)).toHaveLength(1)
+    expect(m.list()).toEqual([])
+    expect(await m.close('s1')).toBe(false)
+  })
+
   it('Close and the session ending at once tell the app it closed once (review minor 4)', async () => {
     const { m, events, settle } = await rig()
     await m.run('s1', "await launch({ command: 'app.exe' })")

@@ -85,6 +85,10 @@ interface Entry {
   /** The script that holds this session's slot now, or null (review minor 3: a stale continuation of
    *  a stopped script must not clean up a desktop a newer script is using). */
   script: AbortController | null
+  /** The app was last told this workspace is open (set by every state event). A desktop that fails
+   *  to start while this is set is told closed, once (the Task 5 deferred minor: the mirror must not
+   *  keep showing a workspace that never came to exist). */
+  told: boolean
 }
 
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err))
@@ -115,8 +119,10 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
       d.log(`workspace: an event could not be sent: ${String(err)}`)
     }
   }
-  const emitState = (e: Entry, open: boolean): void =>
+  const emitState = (e: Entry, open: boolean): void => {
+    e.told = open
     safeEmit({ kind: 'state', sessionId: e.sessionId, open, running: slots.isRunning(e.sessionId), helper: e.helper })
+  }
 
   /** Writes what is open now. Serialised, so the last call's picture is the one on disk (R3: logged). */
   const persist = (): void => {
@@ -144,7 +150,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   const entryOf = (sessionId: string): Entry => {
     let e = entries.get(sessionId)
     if (!e) {
-      e = { sessionId, desk: null, deskStarting: null, state: { launched: null, cdp: null }, lastActivityAt: now(), helper: null, frame: null, capturing: false, dirty: false, stopFrames: null, script: null }
+      e = { sessionId, desk: null, deskStarting: null, state: { launched: null, cdp: null }, lastActivityAt: now(), helper: null, frame: null, capturing: false, dirty: false, stopFrames: null, script: null, told: false }
       entries.set(sessionId, e)
     }
     return e
@@ -207,6 +213,12 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
         .finally(() => {
           e.deskStarting = null
         })
+      // A desktop that fails to start after the app was told this workspace is open (a Stop while it
+      // started: run's finally said `open: true`) is told closed here, whether or not a Close is
+      // waiting on it. Attached before any cleanup's wait, so a cleanup that follows finds `told` unset.
+      e.deskStarting.catch(() => {
+        if (e.told && !isOpen(e) && entries.get(e.sessionId) === e) finish(e)
+      })
     }
     return e.deskStarting
   }
@@ -237,6 +249,8 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     }
     d.log(`workspace ${e.sessionId}: cleaned up (${why})`)
     persist()
+    // A desktop that was starting and failed took nothing here: ensureDesk's rejection handler, which
+    // runs before this cleanup's wait resumes, has already told the app it closed (Task 5 deferred minor).
     if (took) finish(e)
     else if (!slots.isRunning(e.sessionId) && !isOpen(e) && entries.get(e.sessionId) === e) entries.delete(e.sessionId)
   }
