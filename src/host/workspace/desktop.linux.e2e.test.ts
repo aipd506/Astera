@@ -40,12 +40,13 @@ const PERSON_WAYLAND = 'astera-e2e-person-wayland'
  *  portals, notifications, tray, `wayland-0` and audio. Neither exists here either. */
 const PERSON_BUS = 'unix:path=/nonexistent/astera-e2e-person/bus'
 const PERSON_RUNTIME = '/nonexistent/astera-e2e-person'
+const PERSON_SOCKET = '99'
 const hostEnv: Record<string, string | undefined> = {
   ...process.env,
   DISPLAY: PERSON_DISPLAY,
   WAYLAND_DISPLAY: PERSON_WAYLAND,
   // An inherited compositor connection, which libwayland would take before WAYLAND_DISPLAY (review M6).
-  WAYLAND_SOCKET: '99',
+  WAYLAND_SOCKET: PERSON_SOCKET,
   XDG_SESSION_TYPE: 'wayland',
   DBUS_SESSION_BUS_ADDRESS: PERSON_BUS,
   XDG_RUNTIME_DIR: PERSON_RUNTIME
@@ -78,6 +79,12 @@ const envOf = async (pid: number): Promise<Map<string, string> | null> => {
     if (i > 0) out.set(kv.slice(0, i), kv.slice(i + 1))
   }
   return out
+}
+
+/** A live process's parent pid, from /proc/<pid>/stat (the field after the `)` that ends the name). */
+const parentOf = async (pid: number): Promise<number> => {
+  const stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8').catch(() => '')
+  return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]) || 0
 }
 
 const recordedPids = async (recordFile: string): Promise<number[]> => {
@@ -172,28 +179,55 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
       expect(Number(display.slice(1))).toBeGreaterThanOrEqual(90)
 
       // The app is on the workspace's display, and nothing in its environment points it at the person's
-      // X display or Wayland compositor.
+      // X display, Wayland compositor, session bus or runtime folder.
+      //
+      // Two kinds of process are told apart (CI run 36306874070). The sh the desk started and the
+      // Electron it runs were given the desk's env and nothing else, so the desk's promise is checked on
+      // them exactly: no session bus, no Wayland, the workspace's display and its own runtime folder.
+      // The processes Electron starts after that inherit whatever Electron set in its own env meanwhile
+      // (Chromium or GLib may set a DBUS_SESSION_BUS_ADDRESS of their own, such as a bus autolaunched
+      // for the virtual display), so on them only the person's values are ruled out.
       const running = await fixturePids(udd)
       expect(running.length).toBeGreaterThan(0)
-      let read = 0
-      const runtimeDirs = new Set<string>()
+      const observed: Array<{ pid: number; ppid: number; role: string; env: Record<string, string | null> }> = []
       for (const pid of running) {
         const env = await envOf(pid)
         if (env === null) continue
-        read++
-        expect(env.get('DISPLAY')).toBe(display)
-        expect(env.get('DISPLAY')).not.toBe(PERSON_DISPLAY)
-        expect(env.has('WAYLAND_DISPLAY')).toBe(false)
-        expect(env.has('WAYLAND_SOCKET')).toBe(false)
-        expect(env.get('XDG_SESSION_TYPE')).toBe('x11')
-        expect(env.has('DBUS_SESSION_BUS_ADDRESS')).toBe(false)
-        expect(env.get('XDG_RUNTIME_DIR')).not.toBe(PERSON_RUNTIME)
-        runtimeDirs.add(env.get('XDG_RUNTIME_DIR') ?? '')
+        const ppid = await parentOf(pid)
+        const pick = (k: string): string | null => env.get(k) ?? null
+        observed.push({
+          pid,
+          ppid,
+          role: '',
+          env: Object.fromEntries(['DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'XDG_SESSION_TYPE', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR'].map((k) => [k, pick(k)]))
+        })
       }
-      expect(read).toBeGreaterThan(0)
+      const shPid = observed.find((o) => !running.includes(o.ppid))?.pid
+      for (const o of observed) o.role = o.pid === shPid ? 'sh' : o.ppid === shPid ? 'electron' : 'child'
+      // Printed on every run, so a failure here, or a change in what Chromium sets, shows the values.
+      console.log(`fixture env: ${JSON.stringify(observed)}`)
+      const seen = JSON.stringify(observed, null, 1)
+      expect(observed.length, seen).toBeGreaterThan(0)
+      const roots = observed.filter((o) => o.role !== 'child')
+      expect(roots.map((o) => o.role).sort(), seen).toEqual(['electron', 'sh'])
+      for (const o of roots) {
+        expect(o.env.DISPLAY, seen).toBe(display)
+        expect(o.env.WAYLAND_DISPLAY, seen).toBeNull()
+        expect(o.env.WAYLAND_SOCKET, seen).toBeNull()
+        expect(o.env.XDG_SESSION_TYPE, seen).toBe('x11')
+        expect(o.env.DBUS_SESSION_BUS_ADDRESS, seen).toBeNull()
+      }
+      for (const o of observed) {
+        expect(o.env.DISPLAY, seen).not.toBe(PERSON_DISPLAY)
+        expect(o.env.WAYLAND_DISPLAY, seen).not.toBe(PERSON_WAYLAND)
+        expect(o.env.WAYLAND_SOCKET, seen).not.toBe(PERSON_SOCKET)
+        expect(o.env.DBUS_SESSION_BUS_ADDRESS, seen).not.toBe(PERSON_BUS)
+        expect(o.env.DBUS_SESSION_BUS_ADDRESS ?? '', seen).not.toContain(PERSON_RUNTIME)
+        expect(o.env.XDG_RUNTIME_DIR, seen).not.toBe(PERSON_RUNTIME)
+      }
       // One folder of the desk's own, only this user may open, removed with the desk below.
-      expect(runtimeDirs.size).toBe(1)
-      const runtimeDir = [...runtimeDirs][0]
+      const runtimeDir = roots[0].env.XDG_RUNTIME_DIR ?? ''
+      expect(roots[1].env.XDG_RUNTIME_DIR, seen).toBe(runtimeDir)
       expect(path.basename(runtimeDir)).toMatch(/^astera-xrt-/)
       expect((await fs.stat(runtimeDir)).mode & 0o777).toBe(0o700)
       await vi.waitFor(async () => expect(await recordedPids(h.recordFile)).toHaveLength(2))

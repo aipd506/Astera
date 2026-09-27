@@ -75,12 +75,14 @@ Known limits, beside the spec's:
   tested. A Screen Recording and Accessibility permission mode may come later, as an
   opt-in, to move a window or drive native input (user decision L3a).
 - **Linux:** an app that only speaks Wayland cannot start on Xvfb; Electron apps use X11 through the
-  hint. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The app has
-  no session bus and no secret service: an app that keeps secrets with Electron's `safeStorage` gets its
-  `basic_text` backend there, not the person's keyring, and a file chooser opens as the toolkit's own
-  dialog on the virtual display, never as a portal. Where `dbus-launch` is installed, libdbus may start
-  a bus of its own for the virtual display; that bus is not the person's, and as a daemon it leaves the
-  process group (see Both). A stale X lock file only makes the reservation skip that display number; it
+  hint. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The app starts
+  with no session bus, so none of the person's services reach it, their secret service included: an
+  app that keeps secrets with Electron's `safeStorage` gets its `basic_text` backend there, not the
+  person's keyring, and a file chooser opens as the toolkit's own dialog on the virtual display, never
+  as a portal. Electron, Chromium or libdbus may set up a bus of their own for the virtual display
+  (through `dbus-launch`, where it is installed), and the processes the app starts afterward inherit
+  its address. That bus is never the person's, and a daemon it starts leaves the process group (see
+  Both). A stale X lock file only makes the reservation skip that display number; it
   removes nothing.
 - **Both:** a process that leaves its process group (a `setsid`, a daemon) escapes the group kill, as a
   process that detaches from the tree does on Windows. The command runs as `sh -c`, then a newline, then
