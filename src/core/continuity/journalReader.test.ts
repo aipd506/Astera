@@ -139,7 +139,7 @@ describe('JournalReader on the main thread (stage 3 T1)', () => {
     }
     const took = Date.now() - t0
     expect(isBusyError(caught)).toBe(true)
-    expect(took).toBeLessThan(300 + 150)
+    expect(took).toBeLessThan(2_000) // gave up long before the writer's 5 s; Windows takes ~370 ms for a 250 ms timeout
     expect(r.eventsFor('run_1')).toHaveLength(1)
   }, 15_000)
 })

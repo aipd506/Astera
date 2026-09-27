@@ -347,7 +347,7 @@ describe('runDetail’s journal rows on the main thread (stage 3 T1)', () => {
     } finally {
       lock.release()
     }
-    expect(Date.now() - t0).toBeLessThan(300 + 150)
+    expect(Date.now() - t0).toBeLessThan(2_000) // gave up long before the writer's 5 s; Windows takes ~370 ms for a 250 ms timeout
     expect(t).toEqual({ events: [], busy: true, older: false, capped: false })
     expect(logs.some((l) => /busy/.test(l))).toBe(true)
     expect(j.timeline('run_1', on())).toMatchObject({ busy: false, events: [expect.objectContaining({ kind: 'runtime-lost' })] })
