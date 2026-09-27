@@ -402,7 +402,9 @@ export function RunConfigForm({
         <div className="field">
           <label>{t('run.field.javaHome')}</label>
           {jdks === null ? (
-            <span className="check-note">{t('run.form.jdkLoading')}</span>
+            <span className="check-note">
+              <span className="loading-spinner small" aria-hidden="true" /> {t('run.form.jdkLoading')}
+            </span>
           ) : (
             <div className="row">
               <Select
@@ -505,7 +507,9 @@ export function RunConfigForm({
         <div className="field">
           <label>{t('run.field.interpreter')}</label>
           {pythonInterpreters === null ? (
-            <span className="check-note">{t('run.form.interpreterLoading')}</span>
+            <span className="check-note">
+              <span className="loading-spinner small" aria-hidden="true" /> {t('run.form.interpreterLoading')}
+            </span>
           ) : (
             <div className="row">
               <Select

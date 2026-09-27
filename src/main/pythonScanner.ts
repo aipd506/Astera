@@ -5,81 +5,142 @@ import {
   venvInterpreterPaths,
   pythonBinNames,
   parsePythonVersion,
+  pathPythonCandidates,
   type PythonInterpreter
 } from '../core/run/python'
 
-/** Python interpreter discovery. The pure decisions (candidate paths, output parsing) live in
- *  core/run/python.ts; this is the main-only layer that actually runs fs.access and execFile against
- *  those results — the same split as jdkScanner.ts.
+/** Python interpreter discovery. The pure decisions (candidate paths, output parsing, which `where`
+ *  lines to drop) live in core/run/python.ts; this is the main-only layer that actually runs fs.access
+ *  and execFile against those results — the same split as jdkScanner.ts.
  *
- *  Deliberately not cached, the same call dotnetScanner.ts makes and for the same reason: a venv is
- *  created inside the project *while the app is open* (`python -m venv .venv` in the project terminal
- *  is the ordinary way to start), and a per-project cache that never invalidates meant the new
- *  interpreter could not appear until the app restarted. It ran per project path, so it did not even
- *  answer with the wrong project's venv — it simply went stale with nothing able to refresh it.
- *  The cost of rescanning is a handful of short-lived `--version` probes on a deliberate user action
- *  (opening the run configuration dialog), which is the same bargain dotnetScanner already takes.
- *  jdkScanner keeps its session-wide cache because a JDK is installed outside the app, not made inside
- *  the project the app is looking at. */
+ *  Cached per project, like jdkScanner's cache (a promise, so two opens at once share one scan). It
+ *  was once left uncached on purpose: a venv is created inside the project *while the app is open*
+ *  (`python -m venv .venv` in the project terminal is the ordinary way to start), and a cache that
+ *  never invalidated hid it until a restart. So the cache is keyed on which of the project's venv
+ *  interpreters exist — two fs.access calls, checked on every open — and a venv appearing or going
+ *  away rescans. What stays cached is the expensive part: `where`/`which` and every `--version`
+ *  probe, which on a machine with the Store alias on PATH could hold the dialog for seconds each time
+ *  it opened. */
 
-/** Checks whether one candidate path is a real interpreter — confirms it exists, then reads the
- *  version from `--version`. Returns null (never throws) so a candidate that is not actually installed
- *  just drops out of the list; a machine with no Python must still be able to create a Python run
- *  configuration by typing the interpreter path in by hand. */
-async function verify(candidate: string): Promise<PythonInterpreter | null> {
-  try {
-    await fs.access(candidate)
-  } catch {
-    return null // most scan targets simply are not installed
-  }
-  return new Promise((resolve) => {
-    // No shell:true — candidate paths contain spaces (e.g. a project path or `Program Files`), and
-    // going through a shell would split the unquoted absolute path into tokens (same reasoning as
-    // jdkScanner's verify()).
-    execFile(candidate, ['--version'], { timeout: 5000, windowsHide: true }, (_err, stdout, stderr) => {
-      // Python 3.4+ writes this to stdout; Python 2 wrote it to stderr — combine both like
-      // parseJavaVersion does, so whichever stream it landed on is still found.
-      const version = parsePythonVersion(`${stdout}\n${stderr}`)
-      resolve(version ? { path: candidate, version } : null)
+export interface PythonScannerDeps {
+  platform: NodeJS.Platform
+  /** Resolves when the path exists (fs.access). */
+  access: (p: string) => Promise<void>
+  /** `where`/`which` output for one executable name; '' when it finds nothing. */
+  findOnPath: (name: string) => Promise<string>
+  /** `<exe> --version` stdout+stderr; '' when it fails. */
+  version: (exe: string) => Promise<string>
+}
+
+const liveDeps: PythonScannerDeps = {
+  platform: process.platform,
+  access: (p) => fs.access(p),
+  // where/which are shell built-ins that look a bare name up on PATH, so shell:true is correct for
+  // them — different in kind from the absolute-path execution in `version`.
+  findOnPath: (name) =>
+    new Promise((resolve) => {
+      const finder = process.platform === 'win32' ? 'where' : 'which'
+      execFile(finder, [name], { shell: true, timeout: 5000, windowsHide: true }, (err, stdout) =>
+        resolve(err ? '' : String(stdout))
+      )
+    }),
+  // No shell:true — candidate paths contain spaces (e.g. a project path or `Program Files`), and going
+  // through a shell would split the unquoted absolute path into tokens (same reasoning as jdkScanner's
+  // verify()). Python 3.4+ writes the version to stdout; Python 2 wrote it to stderr — both are passed.
+  version: (exe) =>
+    new Promise((resolve) => {
+      execFile(exe, ['--version'], { timeout: 5000, windowsHide: true }, (_err, stdout, stderr) =>
+        resolve(`${stdout}\n${stderr}`)
+      )
     })
-  })
 }
 
-/** Everything pythonBinNames resolves to on PATH (where/which are shell built-ins that look a bare
- *  name up on PATH, so shell:true is correct for them — different in kind from verify()'s absolute-path
- *  execution). Both names are tried; verify()'s existence check and the dedup below settle which of
- *  them, if any, turn out to be real. */
-function pathPythons(): Promise<string[]> {
-  const finder = process.platform === 'win32' ? 'where' : 'which'
-  return Promise.all(
-    pythonBinNames(process.platform).map(
-      (name) =>
-        new Promise<string[]>((resolve) => {
-          execFile(finder, [name], { shell: true, timeout: 5000, windowsHide: true }, (err, stdout) => {
-            if (err) return resolve([])
-            resolve(
-              stdout
-                .split(/\r\n|\r|\n/)
-                .map((l) => l.trim())
-                .filter(Boolean)
-            )
-          })
-        })
+export interface PythonScanner {
+  /** The detected interpreters for one project: its venv (if any) plus whatever is on PATH, deduped.
+   *  Never rejects — a scan that fails answers what it could confirm (possibly nothing). */
+  list(projectPath: string): Promise<PythonInterpreter[]>
+}
+
+export function createPythonScanner(deps: PythonScannerDeps = liveDeps): PythonScanner {
+  const cache = new Map<string, { venvKey: string; result: Promise<PythonInterpreter[]> }>()
+
+  const exists = (p: string): Promise<boolean> =>
+    deps.access(p).then(
+      () => true,
+      () => false
     )
-  ).then((lists) => lists.flat())
+
+  /** Checks whether one candidate is a real interpreter — it exists, and `--version` names a version.
+   *  Returns null (never throws) so a candidate that is not actually installed just drops out; a
+   *  machine with no Python must still be able to type an interpreter path in by hand. */
+  const verify = async (candidate: string): Promise<PythonInterpreter | null> => {
+    if (!(await exists(candidate))) return null
+    try {
+      const version = parsePythonVersion(await deps.version(candidate))
+      return version ? { path: candidate, version } : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Everything pythonBinNames resolves to on PATH, Store aliases left out (pathPythonCandidates). */
+  const pathPythons = async (): Promise<string[]> => {
+    const lists = await Promise.all(
+      pythonBinNames(deps.platform).map((name) =>
+        deps.findOnPath(name).then(pathPythonCandidates, () => [] as string[])
+      )
+    )
+    return lists.flat()
+  }
+
+  const scan = async (venvs: string[]): Promise<PythonInterpreter[]> => {
+    // Deduped before probing as well as after: `where python.exe` and `where python3.exe` often print
+    // the same file, and each duplicate was one more `--version` run.
+    const seen = new Set<string>()
+    const candidates = [...venvs, ...(await pathPythons())].filter((c) => {
+      const k = foldPathCase(c, deps.platform)
+      if (seen.has(k)) return false
+      seen.add(k)
+      return true
+    })
+    const verified = await Promise.all(candidates.map(verify))
+    const byPath = new Map<string, PythonInterpreter>()
+    for (const py of verified) {
+      if (!py) continue
+      // The same interpreter can turn up twice, once from the venv scan and once via PATH
+      const key = foldPathCase(py.path, deps.platform)
+      if (!byPath.has(key)) byPath.set(key, py)
+    }
+    return [...byPath.values()]
+  }
+
+  const lookup = async (projectPath: string, key: string): Promise<PythonInterpreter[]> => {
+    const venvCandidates = venvInterpreterPaths(projectPath, deps.platform)
+    const present = await Promise.all(venvCandidates.map(exists))
+    const venvs = venvCandidates.filter((_, i) => present[i])
+    const venvKey = venvs.join('\n')
+    const hit = cache.get(key)
+    if (hit && hit.venvKey === venvKey) return hit.result
+    const result = scan(venvs).catch(() => [] as PythonInterpreter[])
+    cache.set(key, { venvKey, result })
+    return result
+  }
+
+  // Two opens at once share one scan without further bookkeeping: the cache holds the scan's promise
+  // and is checked and set with no await in between, so whichever open finishes its venv check second
+  // finds the first one's scan already there.
+  return {
+    list(projectPath) {
+      return lookup(projectPath, foldPathCase(projectPath, deps.platform)).catch(
+        () => [] as PythonInterpreter[]
+      )
+    }
+  }
 }
 
-/** The detected Python interpreters for one project: its venv (if any) plus whatever pythonBinNames
- *  resolves to on PATH. Verified in parallel, deduped by resolved path (case ignored where the filesystem ignores it, foldPathCase —
- *  the same interpreter can turn up twice, once from the venv scan and once via PATH). */
-export async function listPythonInterpreters(projectPath: string): Promise<PythonInterpreter[]> {
-  const candidates = [...venvInterpreterPaths(projectPath, process.platform), ...(await pathPythons())]
-  const verified = await Promise.all(candidates.map(verify))
-  const byPath = new Map<string, PythonInterpreter>()
-  for (const py of verified) {
-    if (!py) continue
-    const key = foldPathCase(py.path, process.platform)
-    if (!byPath.has(key)) byPath.set(key, py)
-  }
-  return [...byPath.values()]
+const scanner = createPythonScanner()
+
+/** The detected Python interpreters for one project (see createPythonScanner). */
+export function listPythonInterpreters(projectPath: string): Promise<PythonInterpreter[]> {
+  return scanner.list(projectPath)
 }
