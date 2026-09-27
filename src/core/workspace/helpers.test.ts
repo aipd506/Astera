@@ -4,9 +4,11 @@ import { clickScript, snapshotScript } from '../agentBrowser/guestScripts'
 import type { DeskWindow } from './protocol'
 import {
   DRAG_CDP_MS,
+  LAYOUT_TRIES,
   NO_CDP,
   PAGE_READY_MS,
   cdpKeyEvents,
+  insideViewport,
   launchEnv,
   parseLaunchSpec,
   pngSize,
@@ -443,6 +445,45 @@ describe('drag and drop inside the page', () => {
     expect(windowPoint({ title: '', offX: 4, offY: 30, dpr: 1.5 }, { x: 10.2, y: 20.4 })).toEqual({ x: 21, y: 76 })
     // A page that reports nonsense is taken as a plain viewport at ratio 1.
     expect(windowPoint({ title: '', offX: -8, offY: -8, dpr: 0 }, { x: 5, y: 6 })).toEqual({ x: 5, y: 6 })
+  })
+
+  it('reads an element again while its centre is outside the viewport, then uses the reading inside it', async () => {
+    const r = rig()
+    await r.h.launch({ command: 'app' })
+    r.cdp.evaluates({ x: -60, y: -116, vw: 0, vh: 0 }, { x: 5, y: 6, vw: 900, vh: 673 })
+    await r.h.dropFiles('#drop', [process.platform === 'win32' ? 'C:\\a.txt' : '/a.txt'])
+    // One more for launch's wait for the page.
+    expect(r.cdp.calls.filter((c) => c.method === 'Runtime.evaluate')).toHaveLength(1 + 2)
+    expect(r.cdp.calls.find((c) => c.params?.type === 'drop')?.params).toMatchObject({ x: 5, y: 6 })
+  })
+
+  it('fails with the numbers, pressing nothing, when the centre never comes inside the viewport (CI run 36312079513)', async () => {
+    vi.useFakeTimers()
+    try {
+      const r = rig()
+      await r.h.launch({ command: 'app' })
+      r.cdp.answers.set('Runtime.evaluate', () => ({ result: { value: { x: -60, y: -116, vw: 0, vh: 0 } } }))
+      const drag = r.h.drag('#src', '#dst').then(
+        () => null,
+        (e: Error) => e.message
+      )
+      await vi.advanceTimersByTimeAsync(LAYOUT_TRIES * 100 + 1_000)
+      expect(await drag).toBe(
+        "drag: #src is outside the page's viewport even after scrolling it into view (its centre is at -60,-116; the viewport is 0x0)"
+      )
+      expect(r.cdp.calls.filter((c) => c.method === 'Runtime.evaluate')).toHaveLength(1 + LAYOUT_TRIES)
+      expect(r.cdp.calls.some((c) => c.method === 'Input.dispatchMouseEvent')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('knows a centre inside the viewport from one outside it', () => {
+    expect(insideViewport({ x: 48, y: 70, vw: 900, vh: 673 })).toBe(true)
+    expect(insideViewport({ x: -60, y: -116, vw: 900, vh: 673 })).toBe(false)
+    expect(insideViewport({ x: 0, y: 0, vw: 0, vh: 0 })).toBe(false)
+    expect(insideViewport({ x: 900, y: 10, vw: 900, vh: 673 })).toBe(false)
+    expect(insideViewport({ x: 1, y: 2 })).toBe(true)
   })
 
   it('a selector that matches nothing is named', async () => {

@@ -263,12 +263,37 @@ async function evaluate(cdp: Cdp, expression: string, at: string): Promise<unkno
 const centerScript = (sel: string): string =>
   `(() => { const el = document.querySelector(${embedJson(sel)}); if (!el) return null; ` +
   `el.scrollIntoView({ block: 'center', inline: 'center' }); const r = el.getBoundingClientRect(); ` +
-  `return { x: r.left + r.width / 2, y: r.top + r.height / 2 } })()`
+  `const vv = window.visualViewport; ` +
+  `return { x: r.left + r.width / 2, y: r.top + r.height / 2, vw: vv ? vv.width : window.innerWidth, vh: vv ? vv.height : window.innerHeight } })()`
 
-async function centerOf(cdp: Cdp, sel: string, at: string): Promise<{ x: number; y: number }> {
-  const r = await evaluate(cdp, centerScript(sel), at)
-  if (!isRecord(r) || typeof r.x !== 'number' || typeof r.y !== 'number') throw new Error(`${at}: nothing matches ${sel}`)
-  return { x: r.x, y: r.y }
+/** How many times centerOf reads again, PAGE_POLL_MS apart, while the centre is not inside the
+ *  viewport: about 5 s. */
+export const LAYOUT_TRIES = 50
+
+/** Whether a centre lies in a viewport of `vw` by `vh` CSS pixels. A reading with no viewport size
+ *  (an older page script) is taken as it is. */
+export function insideViewport(r: { x: number; y: number; vw?: unknown; vh?: unknown }): boolean {
+  if (typeof r.vw !== 'number' || typeof r.vh !== 'number') return true
+  return r.x >= 0 && r.y >= 0 && r.x < r.vw && r.y < r.vh
+}
+
+/** The element's centre in the viewport, after scrolling it into view. Read again while the centre is
+ *  outside the viewport: a page whose viewport is not laid out yet (all of it scrollbars, or no size)
+ *  puts it at negative coordinates, where a press lands on nothing (CI run 36312079513: #src at
+ *  -60,-116). It fails with the numbers rather than press there. */
+async function centerOf(cdp: Cdp, sel: string, at: string, tries = LAYOUT_TRIES): Promise<{ x: number; y: number }> {
+  for (let i = 0; ; i++) {
+    const r = await evaluate(cdp, centerScript(sel), at)
+    if (!isRecord(r) || typeof r.x !== 'number' || typeof r.y !== 'number') throw new Error(`${at}: nothing matches ${sel}`)
+    const c = { x: r.x, y: r.y, vw: r.vw, vh: r.vh }
+    if (insideViewport(c)) return { x: r.x, y: r.y }
+    if (i + 1 >= tries)
+      throw new Error(
+        `${at}: ${sel} is outside the page's viewport even after scrolling it into view ` +
+          `(its centre is at ${Math.round(r.x)},${Math.round(r.y)}; the viewport is ${String(r.vw)}x${String(r.vh)})`
+      )
+    await new Promise((res) => setTimeout(res, PAGE_POLL_MS))
+  }
 }
 
 const waitOf = (opts: unknown): number => {
