@@ -22,7 +22,9 @@ import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react'
 const STATUS_LABEL: Record<WorktreeListItem['status'], MessageKey | null> = {
   ok: null,
   'orphan-dir': 'worktree.status.orphanDir',
-  unreachable: 'worktree.status.unreachable'
+  unreachable: 'worktree.status.unreachable',
+  // git 이 목록을 주지 못했다 — 'git 등록 소실' 로 보이면 사람이 지워도 되는 잔해로 읽는다
+  'git-unchecked': 'worktree.status.gitUnchecked'
 }
 
 /** Sidebar worktree list — only the worktrees this app created (per the registry) */

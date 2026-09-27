@@ -59,9 +59,11 @@ export async function listWithStatus(
       // 되는 잔해로 읽는다
       if (presence.get(w.id) === 'unreachable') return { ...w, status: 'unreachable' as const }
       const rows = rowsByRepo.get(w.repoPath)
-      const registered = rows?.some((r) => isSamePath(r.path, w.path)) ?? false
+      // git 이 목록을 주지 못했다(시간 초과, 출력 한도, 닿지 않는 저장소) — 모른다. orphan-dir 은
+      // "git 등록 소실", 곧 지워도 되는 잔해로 읽히므로 모를 때 붙이면 안 된다
+      if (rows == null) return { ...w, status: 'git-unchecked' as const }
       // 여기 오는 항목은 폴더가 있다(위에서 걸렀다) — 남은 질문은 git 이 아는가 하나다
-      const status: WorktreeStatus = registered ? 'ok' : 'orphan-dir'
+      const status: WorktreeStatus = rows.some((r) => isSamePath(r.path, w.path)) ? 'ok' : 'orphan-dir'
       return { ...w, status }
     })
 }

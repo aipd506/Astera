@@ -734,6 +734,7 @@ export const es: Catalog = {
   // WorktreePanel.tsx — status labels
   'worktree.status.orphanDir': 'Registro de git perdido',
   'worktree.status.unreachable': 'Carpeta no accesible',
+  'worktree.status.gitUnchecked': 'No se pudo comprobar git',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'Eliminar worktree',
   'worktree.remove.body':

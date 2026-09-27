@@ -927,6 +927,7 @@ export const ko = {
   // WorktreePanel.tsx — status labels (STATUS_LABEL; a module-level constant, so translated at render time)
   'worktree.status.orphanDir': 'git 등록 소실',
   'worktree.status.unreachable': '폴더에 닿을 수 없음',
+  'worktree.status.gitUnchecked': 'git 확인 못 함',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'worktree 삭제',
   'worktree.remove.body':

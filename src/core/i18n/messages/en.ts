@@ -792,6 +792,7 @@ export const en: Record<keyof typeof ko, string> = {
   'history.resume.pickFolder': 'Choose folder',
   'worktree.status.orphanDir': 'Git registration lost',
   'worktree.status.unreachable': 'Folder not reachable',
+  'worktree.status.gitUnchecked': 'Could not check Git',
   'worktree.remove.title': 'Delete worktree',
   'worktree.remove.body':
     '{name} ({branch})\n{path}\n\nDelete this worktree? The folder and the branch are deleted together. A branch that has not been merged is kept so its commits are not lost.',

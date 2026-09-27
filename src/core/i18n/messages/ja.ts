@@ -726,6 +726,7 @@ export const ja: Catalog = {
   // WorktreePanel.tsx — status labels
   'worktree.status.orphanDir': 'git 登録が消失',
   'worktree.status.unreachable': 'フォルダーに接続できません',
+  'worktree.status.gitUnchecked': 'git を確認できません',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'worktree の削除',
   'worktree.remove.body':
