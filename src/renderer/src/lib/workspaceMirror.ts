@@ -2,6 +2,9 @@
 // tested without a window. A closed workspace keeps its entry (and last frame) until its tab closes:
 // the person sees "closed" rather than a tab that vanished (agent workspace plan ruling P7).
 import type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary } from '../../../core/host/protocol'
+import { placeTab } from '../../../core/panes/place'
+import { appTab } from '../../../core/panes/tabId'
+import { groupOfTab, removeTab, type PaneNode } from '../../../core/panes/tree'
 
 export interface MirrorEntry {
   sessionId: string
@@ -34,4 +37,30 @@ export function newlyOpened(prev: Mirrors, next: Mirrors): string[] {
   return Object.values(next)
     .filter((m) => m.open && prev[m.sessionId]?.open !== true)
     .map((m) => m.sessionId)
+}
+
+/** Sessions whose workspace is open now: the mirror tabs a freshly built tree must carry. */
+export function openSessionIds(m: Mirrors): string[] {
+  return Object.values(m)
+    .filter((e) => e.open)
+    .map((e) => e.sessionId)
+}
+
+/** Places each session's mirror tab in the background (the openAgentTab rule: the agent's work must not
+ *  take the tab the person is on), each placement building on the previous one's tree, so two
+ *  workspaces that open before a render both keep their tab. A tab already in the tree is left alone. */
+export function placeAppTabs(root: PaneNode | null, sessionIds: string[], activePaneId: string | null): PaneNode | null {
+  let next = root
+  for (const sid of sessionIds) {
+    const id = appTab(sid)
+    if (next && groupOfTab(next, id)) continue
+    next = placeTab(next, id, { activePaneId, background: true }).root
+  }
+  return next
+}
+
+/** The tree without the session's mirror tab: a closed session leaves no mirror behind. */
+export function removeAppTab(root: PaneNode | null, sessionId: string): PaneNode | null {
+  const id = appTab(sessionId)
+  return root && groupOfTab(root, id) ? removeTab(root, id) : root
 }

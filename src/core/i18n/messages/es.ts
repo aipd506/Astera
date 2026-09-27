@@ -974,6 +974,8 @@ export const es: Catalog = {
   'workspace.pane.close': 'Cerrar',
   'workspace.pane.alt': 'La app del agente',
   'workspace.pane.failed': 'No se pudo llegar al espacio de trabajo: {detail}',
+  'workspace.pane.nothingToStop': 'No hay ningún script que detener',
+  'workspace.pane.nothingToClose': 'No hay ningún espacio de trabajo que cerrar',
   // BottomPanel, the rail terminal button
   'terminal.rail.open': 'Terminal',
   'terminal.tab.label': 'Terminal {n}',

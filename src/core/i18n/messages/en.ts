@@ -1021,6 +1021,8 @@ export const en: Record<keyof typeof ko, string> = {
   'workspace.pane.close': 'Close',
   'workspace.pane.alt': "The agent's app",
   'workspace.pane.failed': 'Could not reach the workspace: {detail}',
+  'workspace.pane.nothingToStop': 'There is no script to stop',
+  'workspace.pane.nothingToClose': 'There is no workspace to close',
   'terminal.rail.open': 'Terminal',
   'terminal.tab.label': 'Terminal {n}',
   'terminal.tab.new': 'New terminal',

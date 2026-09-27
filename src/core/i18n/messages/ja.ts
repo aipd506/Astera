@@ -964,6 +964,8 @@ export const ja: Catalog = {
   'workspace.pane.close': '閉じる',
   'workspace.pane.alt': 'エージェントのアプリ画面',
   'workspace.pane.failed': '作業スペースに届きませんでした: {detail}',
+  'workspace.pane.nothingToStop': '中断するスクリプトはありません',
+  'workspace.pane.nothingToClose': '閉じる作業スペースはありません',
   // BottomPanel, the rail terminal button. The Run tab and the terminal tabs share the bottom panel.
   'terminal.rail.open': 'ターミナル',
   'terminal.tab.label': 'ターミナル {n}',

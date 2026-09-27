@@ -1191,6 +1191,8 @@ export const ko = {
   'workspace.pane.close': '닫기',
   'workspace.pane.alt': '에이전트의 앱 화면',
   'workspace.pane.failed': '작업 공간에 전하지 못했습니다: {detail}',
+  'workspace.pane.nothingToStop': '중단할 스크립트가 없습니다',
+  'workspace.pane.nothingToClose': '닫을 작업 공간이 없습니다',
   // BottomPanel, the rail terminal button. The Run tab and the terminal tabs share the bottom panel.
   'terminal.rail.open': '터미널',
   'terminal.tab.label': '터미널 {n}',

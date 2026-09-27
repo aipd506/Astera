@@ -19,7 +19,7 @@ import { invalidateImageCache } from './components/MarkdownPreview'
 import type { EditorState, StateEffect } from '@codemirror/state'
 import type { EditorView } from '@codemirror/view'
 import { EditorStateCache } from './lib/editorStateCache'
-import { applyWorkspaceEvent, mirrorsFromList, newlyOpened, type Mirrors } from './lib/workspaceMirror'
+import { applyWorkspaceEvent, mirrorsFromList, newlyOpened, openSessionIds, placeAppTabs, removeAppTab, type Mirrors } from './lib/workspaceMirror'
 import { FileExplorer, type ExplorerTreeState } from './components/FileExplorer'
 import { JobsView } from './components/JobsView'
 import { jobsStall, jobsStallRecheckInMs } from '../../core/orchestration/jobsView'
@@ -115,7 +115,7 @@ import {
   type PaneDir,
   type PaneNode
 } from '../../core/panes/tree'
-import { appTab, browserTab, fileTab, parseTab, recordTab, sessionTab } from '../../core/panes/tabId'
+import { browserTab, fileTab, parseTab, recordTab, sessionTab } from '../../core/panes/tabId'
 import { placeTab } from '../../core/panes/place'
 import { sessionKindOf } from '../../core/sessions/kind'
 import { displayHostOf, linkDestination, normalizeUrl, previewTargetOf } from '../../core/preview/url'
@@ -967,7 +967,12 @@ export default function App(): React.JSX.Element {
       const wanted = (list.find((s) => s.status === 'running') ?? list[0]).id
       const act = activateTab(root, sessionTab(wanted))
       if (!act) return
-      setLayout(act.root)
+      // This tree is built from scratch, so the mirror tabs a workspace.list that answered first has
+      // already placed go back in (fix round 1: they were wiped). The ref moves now, so a list that
+      // answers after this, before the render, builds on this tree.
+      const withMirrors = placeAppTabs(act.root, openSessionIds(mirrorsRef.current), act.paneId)
+      layoutRef.current = withMirrors
+      setLayout(withMirrors)
       setActivePaneId(act.paneId)
     })
     const offAccounts = window.api.on('accounts:changed', (p) => setAccounts(p.accounts))
@@ -1987,7 +1992,8 @@ export default function App(): React.JSX.Element {
     setSessions(rest)
     const cur = layoutRef.current
     if (cur) {
-      const next = removeTab(cur, sessionTab(id))
+      // The session's mirror tab goes with it (fix round 1): left behind, it would name a gone session.
+      const next = removeAppTab(removeTab(cur, sessionTab(id)), id)
       if (next) {
         // If the active group is gone, focus moves to the first remaining group
         const p = activePaneIdRef.current
@@ -2687,20 +2693,23 @@ export default function App(): React.JSX.Element {
   openAgentTabRef.current = openAgentTab
   const [mirrors, setMirrors] = useState<Mirrors>({})
   const mirrorsRef = useRef<Mirrors>({})
-  /** The Host showed a workspace for a session: its mirror tab, placed once and in the background, the
-   *  openAgentTab rule (the agent's work must not take the tab the person is on). */
-  const openAppTab = (sessionId: string): void => {
-    const id = appTab(sessionId)
-    if (layoutRef.current && groupOfTab(layoutRef.current, id)) return
-    const placed = placeTab(layoutRef.current, id, { activePaneId: activePaneIdRef.current, background: true })
-    setLayout(placed.root)
+  /** The Host showed workspaces for these sessions: their mirror tabs, placed once and in the
+   *  background, the openAgentTab rule (the agent's work must not take the tab the person is on). The
+   *  ref moves with the tree (dropTabFromTree's rule), so two workspaces that open before a render both
+   *  keep their tab (fix round 1: the second placement overwrote the first). */
+  const openAppTabs = (sessionIds: string[]): void => {
+    const root = placeAppTabs(layoutRef.current, sessionIds, activePaneIdRef.current)
+    if (root === layoutRef.current) return
+    layoutRef.current = root
+    setLayout(root)
   }
-  const openAppTabRef = useRef(openAppTab)
-  openAppTabRef.current = openAppTab
+  const openAppTabsRef = useRef(openAppTabs)
+  openAppTabsRef.current = openAppTabs
   const takeMirrors = (next: Mirrors, prev: Mirrors): void => {
     mirrorsRef.current = next
     setMirrors(next)
-    for (const sid of newlyOpened(prev, next)) openAppTabRef.current(sid)
+    const opened = newlyOpened(prev, next)
+    if (opened.length > 0) openAppTabsRef.current(opened)
   }
   const closeAgentTab = (sessionId: string): void => {
     const b = browserTabsRef.current.find((x) => x.agentSessionId === sessionId)
@@ -2878,8 +2887,22 @@ export default function App(): React.JSX.Element {
       <AppMirrorPane
         sessionTitle={s?.title ?? ref.id}
         mirror={mirrors[ref.id] ?? null}
-        onStop={() => void window.api.workspace.stop(ref.id).catch(fail)}
-        onClose={() => void window.api.workspace.close(ref.id).catch(fail)}
+        onStop={() =>
+          void window.api.workspace
+            .stop(ref.id)
+            .then((stopped) => {
+              if (!stopped) toast.info(t('workspace.pane.nothingToStop'))
+            })
+            .catch(fail)
+        }
+        onClose={() =>
+          void window.api.workspace
+            .close(ref.id)
+            .then((closed) => {
+              if (!closed) toast.info(t('workspace.pane.nothingToClose'))
+            })
+            .catch(fail)
+        }
       />
     )
   }
