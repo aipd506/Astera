@@ -4,7 +4,7 @@
 // 도 거기 적혀 있고, 여기서는 프로세스와 그 주변만 다룬다 — 출력에서 값을 꺼내는 일은
 // core/understanding/agentOutput.ts 가 한다.
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { providerOf } from '../../core/providers/meta'
 import { descriptorOf } from '../../core/providers/descriptor'
@@ -13,6 +13,7 @@ import type { ProviderDescriptor } from '../../core/providers/descriptor'
 import type { GeneratorSettings } from '../../core/understanding/generatorSettings'
 import { extractJson, readClaudeOutput, readCodexOutput } from '../../core/understanding/agentOutput'
 import { agentArgs, codexMcpServerNames } from '../../core/understanding/agentArgs'
+import { defaultCwdProbe, type Probe } from '../../core/sessions/pathProbe'
 
 /** 한 번의 생성에 주는 시간.
  *
@@ -42,6 +43,8 @@ interface RunArgs {
   cwd: string
   prompt: string
   log?: (m: string) => void
+  /** Test seam; defaults to the session folder's probe (core/sessions/pathProbe.ts). */
+  probe?: Probe
 }
 
 /** 에이전트를 돌려 **JSON 객체 하나**를 받는다. 스키마 검증은 부르는 쪽(validate.ts)이 한다.
@@ -64,13 +67,20 @@ export async function runAgent(a: RunArgs): Promise<AgentRun> {
   const cmd = wrap(d.cliFile, args)
   const env = { ...process.env, [d.configDirEnv]: a.account.configDir }
 
+  // **없는 작업 디렉터리는 실행 파일 문제처럼 보인다.** win32 에서 존재하지 않는 cwd 로
+  // spawn 하면 오류가 `spawn cmd.exe ENOENT` 로 오는데(실측), 그것을 그대로 사용자에게 보이면
+  // "CLI 가 설치되지 않았다"로 읽힌다. 프로젝트 폴더가 사라진 것은 실제로 일어나는 일이라
+  // (워크트리를 지웠거나 드라이브가 빠졌다) 여기서 갈라 준다.
+  //
+  // **비동기로, 시간 제한을 두고 묻는다**(세션 폴더와 같은 probe). 동기 existsSync 는 끊긴 네트워크
+  // 드라이브 위의 폴더에서 메인 스레드를 20~60초 세웠다. 답하지 않는 폴더에서는 띄우지 않는다 —
+  // 그 cwd 로 spawn 하는 것 자체가 같은 자리에서 멈출 수 있다.
+  const at = await (a.probe ?? defaultCwdProbe)(a.cwd).catch(() => 'timeout' as const)
+  const folderError =
+    at === 'absent' ? `프로젝트 폴더가 없다: ${a.cwd}` : at === 'timeout' ? `프로젝트 폴더에 닿지 않는다(응답 없음): ${a.cwd}` : null
   const out = await new Promise<{ stdout: string; stderr: string } | { error: string }>((resolve) => {
-    // **없는 작업 디렉터리는 실행 파일 문제처럼 보인다.** win32 에서 존재하지 않는 cwd 로
-    // spawn 하면 오류가 `spawn cmd.exe ENOENT` 로 오는데(실측), 그것을 그대로 사용자에게 보이면
-    // "CLI 가 설치되지 않았다"로 읽힌다. 프로젝트 폴더가 사라진 것은 실제로 일어나는 일이라
-    // (워크트리를 지웠거나 드라이브가 빠졌다) 여기서 갈라 준다.
-    if (!existsSync(a.cwd)) {
-      resolve({ error: `프로젝트 폴더가 없다: ${a.cwd}` })
+    if (folderError !== null) {
+      resolve({ error: folderError })
       return
     }
     let child: ReturnType<typeof spawn>

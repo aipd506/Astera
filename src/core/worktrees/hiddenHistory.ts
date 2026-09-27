@@ -3,6 +3,7 @@
 // 여기에 fs 를 두지 않는 이유: core/history 는 디스크를 io 추상화를 통해서만 보고, 그 규율을 이
 // 판정이 우회하면 그 층의 테스트가 실제 디스크에 의존하게 된다.
 import { isPathWithin, isSamePath } from '../files/tree'
+import type { CheckResult, Presence } from './presence'
 
 /**
  * 앱이 만들고 지운 워크트리의 스크래치 프로젝트 경로들 — 히스토리에서 감출 것.
@@ -24,12 +25,15 @@ import { isPathWithin, isSamePath } from '../files/tree'
  * 문자열은 받은 값 그대로다 — 정규화한 값을 주면 hiddenPaths 쪽에서 다시 정규화하는 값과 어긋날
  * 이유를 만든다.
  */
-export function goneWorktreeProjects(
+export async function goneWorktreeProjects(
   projectPaths: readonly string[],
   worktreeRoot: string,
-  exists: (p: string) => boolean
-): string[] {
-  return projectPaths.filter(
-    (p) => isPathWithin(worktreeRoot, p) && !isSamePath(worktreeRoot, p) && !exists(p)
-  )
+  /** Whether the folder is there, asked asynchronously with a time limit (presence.ts). A sync look
+   *  froze the main thread when the root sat on an offline network share. **Only `missing` hides a
+   *  project**: a folder that could not be reached, or whose check was refused or failed, stays. */
+  presence: (p: string) => Promise<Presence | CheckResult>
+): Promise<string[]> {
+  const candidates = projectPaths.filter((p) => isPathWithin(worktreeRoot, p) && !isSamePath(worktreeRoot, p))
+  const answers = await Promise.all(candidates.map((p) => presence(p).catch(() => 'unreachable' as const)))
+  return candidates.filter((_, i) => answers[i] === 'missing')
 }

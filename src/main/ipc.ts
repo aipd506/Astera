@@ -3897,10 +3897,13 @@ export function registerIpc(
   // 판정은 core 의 goneWorktreeProjects 가 한다(루트 밑인가 + 없는가). 후보 목록은
   // knownProjectPaths 가 projectsPage 와 **같은 캐시**에서 주므로 디렉터리를 다시 훑지 않는다.
   ipcMain.handle('history.projectsPage', async (_e, req?: HistoryProjectsPageRequest) => {
-    const gone = goneWorktreeProjects(
+    // 폴더 확인은 비동기다(worktreePresence, core/worktrees/presence.ts). 동기 existsSync 는 끊긴
+    // 네트워크 공유 위의 루트에서 히스토리를 여는 것만으로 메인 스레드를 세웠다. 확인하지 못한
+    // 폴더는 감추지 않는다.
+    const gone = await goneWorktreeProjects(
       await core.history.knownProjectPaths(),
       core.worktrees.getRoot(),
-      existsSync
+      (p) => worktreePresence.refresh(p)
     )
     return core.history.projectsPage(
       gone.length === 0 ? req : { ...req, hiddenPaths: [...(req?.hiddenPaths ?? []), ...gone] }
