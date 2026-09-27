@@ -935,7 +935,14 @@ export interface HostStatus {
 export type HostRuntimeInstallState =
   | { phase: 'idle' }
   | { phase: 'preparing'; slow: boolean; startedAt: number }
-  | { phase: 'failed'; detail: string }
+  | {
+      phase: 'failed'
+      /** Which short, translated sentence the status bar shows: the files could not be copied, the
+       *  install ran past its two-minute deadline, or something else threw. `detail` keeps the raw
+       *  error for the log and the tooltip. */
+      reason: 'copy' | 'timeout' | 'unknown'
+      detail: string
+    }
 
 /** Who drives Jobs, as a Host that announced HOST_FEATURE_DRIVER says it (limits pass L3). The app
  *  keeps the last one it was told on this connection and forgets it when the connection drops; an

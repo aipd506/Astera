@@ -226,7 +226,10 @@ export const es: Catalog = {
   'status.hostPreparingSlow': 'Preparando el Astera Host… sigue en curso ({seconds} s)',
   'status.hostPrepareFailed': 'No se pudo preparar el Astera Host',
   'status.hostPrepareFailedTitle':
-    '{detail} — esta vez el Host se inicia desde el ejecutable de la app, y se vuelve a preparar en el próximo inicio.',
+    '{reason} ({detail}) Esta vez el Host se inicia desde el ejecutable de la app, y se vuelve a preparar en el próximo inicio.',
+  'status.hostPrepareReason.copy': 'No se pudieron copiar los archivos del Host.',
+  'status.hostPrepareReason.timeout': 'La preparación no terminó en dos minutos.',
+  'status.hostPrepareReason.unknown': 'Un error inesperado detuvo la preparación.',
   'settings.slack.save': 'Guardar',
   'settings.slack.saved': 'Guardado',
   'settings.slack.saveFailed': 'No se pudo guardar la configuración de Slack: {detail}',

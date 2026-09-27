@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   asyncRuntimeFs,
   createRuntimeInstaller,
+  INSTALL_TIMEOUT_MS,
   installHostRuntime,
   spawnWhenInstalled,
   type AsyncFs
@@ -267,7 +268,7 @@ describe('createRuntimeInstaller — one install at a time, and what the window 
       log: () => {}
     })
     expect(await inst.ensure()).toBeNull()
-    expect(inst.state()).toEqual({ phase: 'failed', detail: 'the host runtime could not be installed: EBUSY' })
+    expect(inst.state()).toEqual({ phase: 'failed', reason: 'copy', detail: 'the host runtime could not be installed: EBUSY' })
     fail = false
     expect(await inst.ensure()).toBe('rt')
     expect(inst.state()).toEqual({ phase: 'idle' })
@@ -283,7 +284,7 @@ describe('createRuntimeInstaller — one install at a time, and what the window 
       log
     })
     await expect(inst.ensure()).resolves.toBeNull()
-    expect(inst.state()).toMatchObject({ phase: 'failed', detail: expect.stringContaining('EIO') })
+    expect(inst.state()).toMatchObject({ phase: 'failed', reason: 'unknown', detail: expect.stringContaining('EIO') })
     expect(log).toHaveBeenCalledWith(expect.stringContaining('EIO'))
   })
 
@@ -321,7 +322,7 @@ describe('spawnWhenInstalled — no Host is spawned from a runtime still being w
     const d = deferred<{ value: string; failure: string | null }>()
     const inst = createRuntimeInstaller({ run: () => d.promise, onState: () => {}, log: () => {} })
     const spawn = vi.fn()
-    const p = spawnWhenInstalled(inst, spawn)()
+    const p = spawnWhenInstalled(inst, spawn)({ wanted: () => true })
     await Promise.resolve()
     await Promise.resolve()
     expect(spawn).not.toHaveBeenCalled()
@@ -337,7 +338,76 @@ describe('spawnWhenInstalled — no Host is spawned from a runtime still being w
       log: () => {}
     })
     const spawn = vi.fn()
-    await spawnWhenInstalled(inst, spawn)()
+    await spawnWhenInstalled(inst, spawn)({ wanted: () => true })
     expect(spawn).toHaveBeenCalledWith(null)
+  })
+})
+
+// Review of S3-T2, finding 1: the updater's stop() or an app quit can land while the install runs.
+describe('spawnWhenInstalled — a spawn nobody wants any more is not made', () => {
+  it('does not spawn when the client stopped while the install was pending', async () => {
+    const d = deferred<{ value: string; failure: string | null }>()
+    const inst = createRuntimeInstaller({ run: () => d.promise, onState: () => {}, log: () => {} })
+    const spawn = vi.fn()
+    let wanted = true
+    const p = spawnWhenInstalled(inst, spawn)({ wanted: () => wanted })
+    wanted = false // client.stop() lands here
+    d.resolve({ value: 'rt', failure: null })
+    await p
+    expect(spawn).not.toHaveBeenCalled()
+  })
+})
+
+// Review of S3-T2, finding 2: nothing bounded the install, so a hung copy held the connect cycle, the
+// fallback and `hostSessionsTakenBack` — and with it bootOrch — for good.
+describe('createRuntimeInstaller — an install that never finishes', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('is two minutes, as a named constant', () => {
+    expect(INSTALL_TIMEOUT_MS).toBe(120_000)
+  })
+
+  it('resolves the fallback and says it timed out when a copy hangs', async () => {
+    vi.useFakeTimers()
+    const m = shipped()
+    const wrapped = m.wrap()
+    const hanging: AsyncFs = { ...pick(wrapped), cp: () => new Promise<void>(() => {}) }
+    const inst = createRuntimeInstaller({
+      run: async ({ installing }) => {
+        const r = await installHostRuntime({ base: BASE, shippedRoot: SHIPPED_ROOT, appVersion: APP, stamp: '42', fs: hanging, onInstall: installing, log: () => {} })
+        return { value: r.runtime, failure: r.failure }
+      },
+      onState: () => {},
+      log: () => {}
+    })
+    const p = inst.ensure()
+    await vi.advanceTimersByTimeAsync(INSTALL_TIMEOUT_MS)
+    await expect(p).resolves.toBeNull()
+    expect(inst.state()).toMatchObject({ phase: 'failed', reason: 'timeout' })
+    expect(m.has(paths.exePath)).toBe(false)
+  })
+
+  it('shares the hung install rather than starting a second one beside it, and recovers when it lands late', async () => {
+    vi.useFakeTimers()
+    const d = deferred<{ value: string; failure: string | null }>()
+    const run = vi.fn(() => d.promise)
+    const inst = createRuntimeInstaller({ run, onState: () => {}, log: () => {} })
+    const first = inst.ensure()
+    await vi.advanceTimersByTimeAsync(INSTALL_TIMEOUT_MS)
+    expect(await first).toBeNull()
+    // Past its deadline, a caller gets the fallback at once — and no second install races the first
+    // one's staging directory.
+    await expect(inst.ensure()).resolves.toBeNull()
+    await inst.whenSettled()
+    expect(run).toHaveBeenCalledTimes(1)
+    // The late completion is the truth: the runtime is there, and the next check finds it.
+    d.resolve({ value: 'rt', failure: null })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(inst.state()).toEqual({ phase: 'idle' })
+    run.mockImplementation(async () => ({ value: 'rt', failure: null }))
+    await expect(inst.ensure()).resolves.toBe('rt')
+    expect(run).toHaveBeenCalledTimes(2)
   })
 })

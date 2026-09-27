@@ -306,6 +306,85 @@ describe('HostClient', () => {
     await c.stop()
   })
 
+  // Review of S3-T2, finding 1: the install is awaited between the client's own `stopped` check and
+  // the spawn. The updater's stop() — or the app quitting — landing during a slow repair must not end
+  // with a detached Host started behind the update.
+  it('tells spawnHost it is no longer wanted once the client was stopped during the wait', async () => {
+    const addr = addressFor('stop-during-install')
+    let release!: () => void
+    const installed = new Promise<void>((r) => (release = r))
+    const wantedAfter: boolean[] = []
+    let asked = false
+    const c = new HostClient({
+      address: addr.address,
+      appVersion: '9.0.0',
+      attempts: 2,
+      retryMs: 10,
+      spawnHost: async (ctx) => {
+        asked = true
+        await installed
+        wantedAfter.push(ctx.wanted())
+      },
+      log: () => {}
+    })
+    c.start()
+    await waitFor(() => asked)
+    await c.stop()
+    release()
+    await waitFor(() => wantedAfter.length === 1)
+    expect(wantedAfter).toEqual([false])
+    // A stopped client gives no reason: nothing failed, it was asked to stop.
+    expect(c.status().problem).toBeNull()
+  })
+
+  it('tells a superseded cycle its spawn is not wanted when a restart began another', async () => {
+    const addr = addressFor('restart-during-install')
+    const releases: Array<() => void> = []
+    const wanted: boolean[] = []
+    const c = new HostClient({
+      address: addr.address,
+      appVersion: '9.0.0',
+      attempts: 2,
+      retryMs: 10,
+      spawnHost: async (ctx) => {
+        await new Promise<void>((r) => releases.push(r))
+        wanted.push(ctx.wanted())
+      },
+      log: () => {}
+    })
+    c.start()
+    await waitFor(() => releases.length === 1)
+    await c.stop()
+    c.restart()
+    await waitFor(() => releases.length === 2)
+    releases[0]()
+    releases[1]()
+    await waitFor(() => wanted.length === 2)
+    expect(wanted).toEqual([false, true])
+    await c.stop()
+  })
+
+  // Review of S3-T2, minor 3: `ready(ms)` is what reattach and *Restart now* wait on, and both used to
+  // read an install still running as "no Host". Time spent inside an asynchronous spawnHost — the
+  // runtime being installed — does not count against it.
+  it('does not let ready() run out while spawnHost is still installing', async () => {
+    const addr = addressFor('ready-during-install')
+    const c = new HostClient({
+      address: addr.address,
+      appVersion: '9.0.0',
+      retryMs: 10,
+      spawnHost: async () => {
+        await new Promise((r) => setTimeout(r, 300))
+        void serveAt(addr)
+      },
+      log: () => {}
+    })
+    c.start()
+    await c.ready(100)
+    expect(c.status().connected).toBe(true)
+    await c.stop()
+  })
+
   it('reports a rejected asynchronous spawnHost as a problem, not an unhandled rejection', async () => {
     const addr = addressFor('spawn-rejects')
     const c = new HostClient({

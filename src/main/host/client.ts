@@ -10,6 +10,11 @@ import { encodeLine, createLineReader } from '../../host/framing'
 // from src/main.
 import type { HostStatus } from '../../core/types'
 
+/** What `spawnHost` is handed: whether the spawn it is about to make is still wanted. */
+export interface SpawnContext {
+  wanted(): boolean
+}
+
 export interface HostClientDeps {
   address: string
   appVersion: string
@@ -19,8 +24,13 @@ export interface HostClientDeps {
    *  **May be asynchronous, and is awaited** (stage 3 task 2): the app's spawnHost first waits for the
    *  Host runtime to be installed, which after an update can take many seconds. The attempts to reach
    *  the address start counting only once it has resolved — they are for a Host binding after its
-   *  process starts, not for the install before it. A rejection is the same as a throw. */
-  spawnHost(): void | Promise<void>
+   *  process starts, not for the install before it. A rejection is the same as a throw.
+   *
+   *  **`ctx.wanted()` is asked after that wait, before anything is spawned.** It turns false once the
+   *  client was stopped (the updater's stop, or the app quitting) or a restart began another cycle
+   *  while the install ran; spawning then would leave a detached Host behind an update, or two
+   *  Hosts racing for one address. Time spent in here does not count against `ready(ms)` either. */
+  spawnHost(ctx: SpawnContext): void | Promise<void>
   log(m: string): void
   /** The protocol this app speaks. Injected only so a test can be the odd one out. */
   protocol?: number
@@ -112,6 +122,15 @@ const connectOnce = (address: string): Promise<net.Socket> =>
 export class HostClient {
   private socket: net.Socket | null = null
   private stopped = false
+  /** Which `cycle()` is the current one. A cycle still waiting on an asynchronous spawnHost when a
+   *  restart begins another is superseded, and its spawn is no longer wanted. */
+  private cycleGen = 0
+  /** How many asynchronous spawnHost calls are in flight — the runtime being installed. `ready(ms)`
+   *  does not count that time. */
+  private spawning = 0
+  /** `ready()` waits whose time ran out while spawnHost was installing; each restarts its full wait
+   *  once that is over. */
+  private readonly afterSpawn = new Set<() => void>()
   private drops = 0
   private readonly subscribers = new Set<(m: HostMessage) => void>()
   /** The connection to the Host went away. Notified from the socket's own 'close' handler, before a
@@ -324,10 +343,27 @@ export class HostClient {
     return new Promise((resolve) => {
       const done = (): void => {
         clearTimeout(timer)
+        this.afterSpawn.delete(arm)
         this.readyWaiters.delete(done)
         resolve()
       }
-      const timer = setTimeout(done, ms)
+      // **The wait does not run out while spawnHost is still installing the runtime** (review of
+      // stage 3 task 2). A first install after an update can take far longer than `ms`, and a caller
+      // that gave up then would read "no Host" for a Host that was never started yet. The install
+      // has its own deadline (INSTALL_TIMEOUT_MS in runtimeInstall.ts), so this cannot wait forever.
+      const arm = (): void => {
+        this.afterSpawn.delete(arm)
+        timer = setTimeout(expire, ms)
+        timer.unref?.()
+      }
+      const expire = (): void => {
+        if (this.spawning > 0 && !this.stopped) {
+          this.afterSpawn.add(arm)
+          return
+        }
+        done()
+      }
+      let timer = setTimeout(expire, ms)
       timer.unref?.()
       this.readyWaiters.add(done)
     })
@@ -408,6 +444,8 @@ export class HostClient {
 
   private async cycle(): Promise<void> {
     if (this.stopped) return
+    const gen = ++this.cycleGen
+    const wanted = (): boolean => !this.stopped && gen === this.cycleGen
     const attempts = this.deps.attempts ?? DEFAULT_ATTEMPTS
     const retryMs = this.deps.retryMs ?? DEFAULT_RETRY_MS
     let asked = false
@@ -429,12 +467,19 @@ export class HostClient {
         if (!asked && !this.stopped) {
           asked = true
           this.deps.log('no Host at the address — starting one')
+          this.spawning += 1
           try {
-            await this.deps.spawnHost()
+            await this.deps.spawnHost({ wanted })
           } catch (err) {
-            this.fail(`the Host could not be started: ${String(err)}`)
+            if (wanted()) this.fail(`the Host could not be started: ${String(err)}`)
             return
+          } finally {
+            this.spawning -= 1
+            if (this.spawning === 0) for (const a of [...this.afterSpawn]) a()
           }
+          // Stopped, or superseded by a restart, while the runtime was being installed: this cycle is
+          // over, and whatever was wanted of it is now the newer cycle's business.
+          if (!wanted()) return
         }
         await sleep(retryMs)
       }

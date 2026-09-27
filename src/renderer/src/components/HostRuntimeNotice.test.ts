@@ -39,10 +39,20 @@ describe('HostRuntimeNotice — the status bar while the Host runtime is being p
   })
 
   it('reports a failed install, with the reason in the title', () => {
-    const html = render({ state: { phase: 'failed', detail: 'EBUSY node.exe' }, nowMs: 0 })
+    const html = render({ state: { phase: 'failed', reason: 'copy', detail: 'EBUSY node.exe' }, nowMs: 0 })
     expect(html).toContain('status.hostPrepareFailed')
     expect(html).toContain('EBUSY node.exe')
     expect(html).not.toContain('loading-spinner')
+  })
+
+  // Review of S3-T2, minor 4: the raw error is English and technical. The pill and the start of the
+  // title are a short translated sentence chosen by the reason; the raw text stays as the detail.
+  it('says why in a short translated sentence, one per reason, keeping the raw error as the detail', () => {
+    for (const reason of ['copy', 'timeout', 'unknown'] as const) {
+      const html = render({ state: { phase: 'failed', reason, detail: 'EIO: raw' }, nowMs: 0 })
+      expect(html).toContain(`status.hostPrepareReason.${reason}`)
+      expect(html).toContain('EIO: raw')
+    }
   })
 
   it('has every one of its strings in all four languages', () => {

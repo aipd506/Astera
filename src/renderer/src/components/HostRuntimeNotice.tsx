@@ -7,8 +7,17 @@ export const HOST_RUNTIME_NOTICE_KEYS: readonly MessageKey[] = [
   'status.hostPreparing',
   'status.hostPreparingSlow',
   'status.hostPrepareFailed',
-  'status.hostPrepareFailedTitle'
+  'status.hostPrepareFailedTitle',
+  'status.hostPrepareReason.copy',
+  'status.hostPrepareReason.timeout',
+  'status.hostPrepareReason.unknown'
 ]
+
+const REASON_TEXT: Record<'copy' | 'timeout' | 'unknown', MessageKey> = {
+  copy: 'status.hostPrepareReason.copy',
+  timeout: 'status.hostPrepareReason.timeout',
+  unknown: 'status.hostPrepareReason.unknown'
+}
 
 /**
  * The status bar's word on the Host's own runtime being put in place (stage 3 task 2).
@@ -19,7 +28,8 @@ export const HOST_RUNTIME_NOTICE_KEYS: readonly MessageKey[] = [
  * actually writes — then "Preparing the Astera Host…" with the shared spinner, and once it has run past
  * about a second, that it is still working and for how long, so a long scan never reads as a hang.
  *
- * A failure is said in the same amber the other Host notices use, with the reason in the title: the
+ * A failure is said in the same amber the other Host notices use. The title starts with a short
+ * translated sentence chosen by the reason and keeps the raw error after it, as the detail: the
  * Host then runs from the app executable as it always could, and the next start tries again.
  */
 export function HostRuntimeNotice({
@@ -34,7 +44,10 @@ export function HostRuntimeNotice({
   if (!state || state.phase === 'idle') return null
   if (state.phase === 'failed') {
     return (
-      <span className="status-host-runtime failed" title={t('status.hostPrepareFailedTitle', { detail: state.detail })}>
+      <span
+        className="status-host-runtime failed"
+        title={t('status.hostPrepareFailedTitle', { reason: t(REASON_TEXT[state.reason]), detail: state.detail })}
+      >
         {t('status.hostPrepareFailed')}
       </span>
     )

@@ -124,12 +124,28 @@ export async function installHostRuntime(a: {
 /** How long an install may run before the window says it is still working. */
 export const INSTALL_SLOW_MS = 1_000
 
+/**
+ * How long anyone waits for one install before falling back to the app executable (review of stage 3
+ * task 2). Two minutes is far past a first install on a slow disk with an antivirus scanning
+ * `node.exe`, and far short of "forever" — which is what a hung `fs.promises.cp` used to mean: the
+ * connect cycle, the fallback, `hostSessionsTakenBack` and with it `bootOrch` all waited on it.
+ */
+export const INSTALL_TIMEOUT_MS = 120_000
+
 export interface RuntimeInstaller<T> {
   /** The runtime, installing or checking it first. Concurrent callers share the one in flight; a call
    *  after that one settled starts another, which is the check-and-repair before every spawn (design
-   *  F6). Never rejects: a failure is `null` — spawn from the app executable — and the state says why. */
+   *  F6). Never rejects: a failure is `null` — spawn from the app executable — and the state says why.
+   *
+   *  **Bounded by INSTALL_TIMEOUT_MS.** Past it every caller gets `null` and the state is `failed`
+   *  with reason `timeout`, while the install itself is left to finish or fail on its own. It stays
+   *  the one in flight until it does, so no second install is started beside it to fight over the
+   *  same staging directory; when it lands, the state says what it actually came to, and the next
+   *  `ensure()` checks the runtime from scratch. A late completion corrupts nothing: it either renamed
+   *  a whole directory into place or did not. */
   ensure(): Promise<T | null>
-  /** Resolves once no install is in flight. Does not start one. */
+  /** Resolves once no install is in flight, or once the one in flight has run past its deadline. Does
+   *  not start one. */
   whenSettled(): Promise<void>
   state(): HostRuntimeInstallState
 }
@@ -146,12 +162,15 @@ export function createRuntimeInstaller<T>(o: {
   onState(s: HostRuntimeInstallState): void
   log(m: string): void
   slowAfterMs?: number
+  timeoutMs?: number
   now?: () => number
 }): RuntimeInstaller<T> {
   const slowAfterMs = o.slowAfterMs ?? INSTALL_SLOW_MS
+  const timeoutMs = o.timeoutMs ?? INSTALL_TIMEOUT_MS
   const now = o.now ?? Date.now
   let state: HostRuntimeInstallState = { phase: 'idle' }
-  let inflight: Promise<T | null> | null = null
+  /** The install in flight, and the promise that resolves null at its deadline. */
+  let running: { done: Promise<T | null>; deadline: Promise<null> } | null = null
   let slowTimer: ReturnType<typeof setTimeout> | null = null
 
   const set = (s: HostRuntimeInstallState): void => {
@@ -185,29 +204,48 @@ export function createRuntimeInstaller<T>(o: {
     try {
       const r = await o.run({ installing })
       clearSlow()
-      if (r.failure) set({ phase: 'failed', detail: r.failure })
+      if (r.failure) set({ phase: 'failed', reason: 'copy', detail: r.failure })
       else if (state.phase !== 'idle') set({ phase: 'idle' })
       return r.failure ? null : r.value
     } catch (err) {
       clearSlow()
       const detail = `the host runtime could not be prepared: ${String(err)}`
       o.log(`${detail} — the Host runs from the app executable, and the next start tries again`)
-      set({ phase: 'failed', detail })
+      set({ phase: 'failed', reason: 'unknown', detail })
       return null
     }
   }
 
+  const start = (): { done: Promise<T | null>; deadline: Promise<null> } => {
+    const done = once()
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const deadline = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        timer = null
+        clearSlow()
+        const detail = `the host runtime was still being prepared after ${Math.round(timeoutMs / 1000)}s`
+        o.log(`${detail} — the Host runs from the app executable; the install is left to finish on its own`)
+        set({ phase: 'failed', reason: 'timeout', detail })
+        resolve(null)
+      }, timeoutMs)
+      ;(timer as { unref?: () => void }).unref?.()
+    })
+    const r = { done, deadline }
+    // `once()` never rejects, so neither does this.
+    void done.then(() => {
+      if (timer) clearTimeout(timer)
+      if (running === r) running = null
+    })
+    return r
+  }
+
   return {
     ensure: () => {
-      if (inflight) return inflight
-      const p = once().finally(() => {
-        if (inflight === p) inflight = null
-      })
-      inflight = p
-      return p
+      if (!running) running = start()
+      return Promise.race([running.done, running.deadline])
     },
     whenSettled: async () => {
-      if (inflight) await inflight
+      if (running) await Promise.race([running.done, running.deadline])
     },
     state: () => state
   }
@@ -215,9 +253,18 @@ export function createRuntimeInstaller<T>(o: {
 
 /** A `spawnHost` that waits for the install before spawning: nothing is started from a runtime that
  *  is still being written. `spawn` gets null when the runtime is not usable, and then spawns from the
- *  app executable, as before. */
-export function spawnWhenInstalled<T>(installer: RuntimeInstaller<T>, spawn: (runtime: T | null) => void): () => Promise<void> {
-  return async () => {
-    spawn(await installer.ensure())
+ *  app executable, as before.
+ *
+ *  **And nothing is spawned that is no longer wanted** (review of stage 3 task 2): the client may have
+ *  been stopped — the updater's stop, or the app quitting — or restarted into another cycle while the
+ *  install ran, and a spawn then would put a detached Host behind an update. */
+export function spawnWhenInstalled<T>(
+  installer: RuntimeInstaller<T>,
+  spawn: (runtime: T | null) => void
+): (ctx: { wanted(): boolean }) => Promise<void> {
+  return async (ctx) => {
+    const runtime = await installer.ensure()
+    if (!ctx.wanted()) return
+    spawn(runtime)
   }
 }

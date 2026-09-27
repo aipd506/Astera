@@ -5669,6 +5669,15 @@ export function registerIpc(
     // install in flight is shared with every later `spawnHost`, and the window says "Preparing the
     // Astera Host…" while it runs rather than freezing (stage 3 task 2).
     let runtime: InstalledRuntime | null = await runtimeInstaller.ensure()
+    // The app may have started quitting — an update being installed among the reasons — while that
+    // install ran. `will-quit` only learns of the client through `onHostClientReady` at the end of
+    // this function, so a client built from here on would spawn a Host nobody stops, behind the
+    // update (review of stage 3 task 2). Nothing was taken back, and nothing will be.
+    if (quittingForHost) {
+      hostLog('the app is quitting — no Host is started')
+      settleSessionsTakenBack(null)
+      return
+    }
     hostSurvivesUpdate = process.platform !== 'win32' || runtime !== null
     // An update changes the protocol, and the Host from the previous version is still there holding
     // terminals this app cannot speak to. Ask it to leave first. A restart does not come through
@@ -5949,6 +5958,11 @@ export function registerIpc(
     // timeout smaller than that sum can expire mid-handshake — reading a merely slow Host the same as
     // no Host at all, permanently, since nothing re-checks a hello that lands after this has already
     // given up.
+    //
+    // Time spent installing the runtime inside `spawnHost` does not count against it (`ready`'s own
+    // note), and that install is itself bounded by INSTALL_TIMEOUT_MS — so this wait, and the
+    // `bootOrch` wait behind it, stay bounded while a slow first install is not read as "no Host".
+    // `host.replace` below waits through the same `ready()`, so it gets the same treatment.
     const HOST_READY_MS = READY_TIMEOUT_MS
 
     /** One round trip: ask for the list and resolve on the reply, giving up after five seconds so a
