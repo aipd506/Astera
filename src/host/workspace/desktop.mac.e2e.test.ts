@@ -5,13 +5,14 @@
 // reads the hide marker ASTERA_APP_CHROMIUM_FLAGS), the three refusals (windows, windowShot, keys),
 // and that nothing is left once the workspace is closed.
 import { describe, it, expect, afterAll, vi } from 'vitest'
-import { promises as fs, readFileSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { hostWorkerBaseEnv } from '../../core/host/spawn'
 import { connectCdp } from './cdp'
 import { macRefusal } from './deskMac'
+import { electronExe, exists, read2 } from './e2eSupport'
 import { createLaunchResolver } from './launch'
 import { createWorkspaceManager, type WorkspaceEvent, type WorkspaceManager } from './manager'
 import { freePort, killTree, processStartTimes } from './native'
@@ -19,12 +20,8 @@ import { workspaceDeskStarter } from './platformDesk'
 import { execText } from './posixProc'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
-const repo = path.resolve(here, '..', '..', '..')
 const enabled = process.platform === 'darwin' && process.env.ASTERA_DESKTOP_E2E === '1'
 const TITLE = 'Astera workspace fixture'
-
-const electronExe = (): string =>
-  path.join(repo, 'node_modules', 'electron', 'dist', readFileSync(path.join(repo, 'node_modules', 'electron', 'path.txt'), 'utf8').trim())
 
 // A plain command, not a bundle: the desk runs it through `sh -c` with the hide marker in its env, and
 // the command passes the marker's Chromium switches on, as a project's own command would.
@@ -39,19 +36,6 @@ const fixturePids = async (udd: string): Promise<number[]> =>
     .filter((l) => l.includes(udd))
     .map((l) => Number(l.trim().split(/\s+/)[0]))
     .filter((n) => Number.isSafeInteger(n) && n > 0)
-
-const exists = (p: string): Promise<boolean> => fs.stat(p).then(() => true, () => false)
-
-/** One expression evaluated over a fresh CDP client of the fixture's port, then closed. */
-const read2 = async (port: number, expression: string): Promise<unknown> => {
-  const c = await connectCdp(port, 5_000)
-  if (!c) throw new Error(`no page on port ${port}`)
-  try {
-    return ((await c.send('Runtime.evaluate', { expression, returnByValue: true })).result as { value?: unknown }).value
-  } finally {
-    c.close()
-  }
-}
 
 describe.runIf(enabled)('the agent app workspace on a real macOS session', () => {
   let dir = ''

@@ -6,17 +6,19 @@
 // there; and that nothing is left once the workspace is closed or its Xvfb dies: no Xvfb, no fixture,
 // no record.
 //
-// The Host here is given a person's session to stay off: a DISPLAY that names no server and a Wayland
-// one (WAYLAND_DISPLAY, XDG_SESSION_TYPE=wayland). The runner has neither, so without them the check
-// that the app never reaches the person's screen would pass for want of a screen to reach.
+// The Host here is given a person's session to stay off: a DISPLAY that names no server, a Wayland one
+// (WAYLAND_DISPLAY, WAYLAND_SOCKET, XDG_SESSION_TYPE=wayland), a session bus and a runtime folder. The
+// runner has none of them, so without them the check that the app never reaches the person's session
+// would pass for want of a session to reach.
 import { describe, it, expect, afterAll, vi } from 'vitest'
-import { promises as fs, readFileSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { hostWorkerBaseEnv } from '../../core/host/spawn'
 import type { DeskHandle } from '../../core/workspace/helpers'
 import { connectCdp } from './cdp'
+import { electronExe, exists, read2 } from './e2eSupport'
 import { createLaunchResolver } from './launch'
 import { probeLinuxTools, realProbeDeps } from './linuxTools'
 import { createWorkspaceManager, type WorkspaceEvent, type WorkspaceManager } from './manager'
@@ -24,7 +26,6 @@ import { freePort, killTree, processStartTimes } from './native'
 import { workspaceDeskStarter } from './platformDesk'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
-const repo = path.resolve(here, '..', '..', '..')
 const enabled = process.platform === 'linux' && process.env.ASTERA_DESKTOP_E2E === '1'
 const TITLE = 'Astera workspace fixture'
 const NUL = String.fromCharCode(0)
@@ -35,15 +36,20 @@ const TYPED = 'hi 한글 입력'
  *  which exists, so an app that reached either would fail to open rather than appear on a real screen. */
 const PERSON_DISPLAY = ':1999'
 const PERSON_WAYLAND = 'astera-e2e-person-wayland'
+/** The person's session bus and runtime folder (review I1): an app that kept either could reach their
+ *  portals, notifications, tray, `wayland-0` and audio. Neither exists here either. */
+const PERSON_BUS = 'unix:path=/nonexistent/astera-e2e-person/bus'
+const PERSON_RUNTIME = '/nonexistent/astera-e2e-person'
 const hostEnv: Record<string, string | undefined> = {
   ...process.env,
   DISPLAY: PERSON_DISPLAY,
   WAYLAND_DISPLAY: PERSON_WAYLAND,
-  XDG_SESSION_TYPE: 'wayland'
+  // An inherited compositor connection, which libwayland would take before WAYLAND_DISPLAY (review M6).
+  WAYLAND_SOCKET: '99',
+  XDG_SESSION_TYPE: 'wayland',
+  DBUS_SESSION_BUS_ADDRESS: PERSON_BUS,
+  XDG_RUNTIME_DIR: PERSON_RUNTIME
 }
-
-const electronExe = (): string =>
-  path.join(repo, 'node_modules', 'electron', 'dist', readFileSync(path.join(repo, 'node_modules', 'electron', 'path.txt'), 'utf8').trim())
 
 // --no-sandbox: the runner's Electron has no set up SUID sandbox helper, and Ubuntu 24.04 blocks the
 // unprivileged user namespaces Chromium falls back to.
@@ -72,19 +78,6 @@ const envOf = async (pid: number): Promise<Map<string, string> | null> => {
     if (i > 0) out.set(kv.slice(0, i), kv.slice(i + 1))
   }
   return out
-}
-
-const exists = (p: string): Promise<boolean> => fs.stat(p).then(() => true, () => false)
-
-/** One expression evaluated over a fresh CDP client of the fixture's port, then closed. */
-const read2 = async (port: number, expression: string): Promise<unknown> => {
-  const c = await connectCdp(port, 5_000)
-  if (!c) throw new Error(`no page on port ${port}`)
-  try {
-    return ((await c.send('Runtime.evaluate', { expression, returnByValue: true })).result as { value?: unknown }).value
-  } finally {
-    c.close()
-  }
 }
 
 const recordedPids = async (recordFile: string): Promise<number[]> => {
@@ -183,6 +176,7 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
       const running = await fixturePids(udd)
       expect(running.length).toBeGreaterThan(0)
       let read = 0
+      const runtimeDirs = new Set<string>()
       for (const pid of running) {
         const env = await envOf(pid)
         if (env === null) continue
@@ -192,8 +186,16 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
         expect(env.has('WAYLAND_DISPLAY')).toBe(false)
         expect(env.has('WAYLAND_SOCKET')).toBe(false)
         expect(env.get('XDG_SESSION_TYPE')).toBe('x11')
+        expect(env.has('DBUS_SESSION_BUS_ADDRESS')).toBe(false)
+        expect(env.get('XDG_RUNTIME_DIR')).not.toBe(PERSON_RUNTIME)
+        runtimeDirs.add(env.get('XDG_RUNTIME_DIR') ?? '')
       }
       expect(read).toBeGreaterThan(0)
+      // One folder of the desk's own, only this user may open, removed with the desk below.
+      expect(runtimeDirs.size).toBe(1)
+      const runtimeDir = [...runtimeDirs][0]
+      expect(path.basename(runtimeDir)).toMatch(/^astera-xrt-/)
+      expect((await fs.stat(runtimeDir)).mode & 0o777).toBe(0o700)
       await vi.waitFor(async () => expect(await recordedPids(h.recordFile)).toHaveLength(2))
       expect((await recordedPids(h.recordFile))[1]).toBe(xvfb.pid)
       const port = (JSON.parse(firstBody.log[0]) as { port: number }).port
@@ -236,6 +238,7 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
       expect(xvfb.alive()).toBe(false)
       expect(await exists(`/proc/${xvfb.pid}`)).toBe(false)
       expect(await exists(`/tmp/.X11-unix/X${display.slice(1)}`)).toBe(false)
+      expect(await exists(runtimeDir)).toBe(false)
       await vi.waitFor(async () => expect(await fixturePids(udd)).toEqual([]), { timeout: 10_000, interval: 250 })
       expect(await exists(h.recordFile)).toBe(false)
       expect(h.events.filter((e) => e.kind === 'state').at(-1)).toMatchObject({ open: false })
@@ -254,7 +257,11 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
 
       const first = await h.m.run('s-e2e-2', `log(await launch({ command: ${JSON.stringify(commandFor(udd))} }))`)
       expect((first.body as { error?: unknown }).error).toBeUndefined()
-      expect((await fixturePids(udd)).length).toBeGreaterThan(0)
+      const running = await fixturePids(udd)
+      expect(running.length).toBeGreaterThan(0)
+      let runtimeDir = ''
+      for (const pid of running) runtimeDir ||= (await envOf(pid))?.get('XDG_RUNTIME_DIR') ?? ''
+      expect(path.basename(runtimeDir)).toMatch(/^astera-xrt-/)
       const xvfb = h.desks[0]
       const n = (await fs.readFile(`/proc/${xvfb.pid}/cmdline`, 'utf8')).split(NUL).find((a) => /^:\d+$/.test(a))!.slice(1)
       // A SIGKILLed Xvfb leaves its lock and socket; removed after the run.
@@ -264,6 +271,8 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
       await vi.waitFor(() => expect(xvfb.alive()).toBe(false), { timeout: 10_000 })
       await vi.waitFor(async () => expect(await fixturePids(udd)).toEqual([]), { timeout: 20_000, interval: 500 })
       await vi.waitFor(async () => expect(await exists(h.recordFile)).toBe(false))
+      // No close follows a dead Xvfb, so the desk removes its folder when Xvfb exits.
+      await vi.waitFor(async () => expect(await exists(runtimeDir)).toBe(false))
       expect(h.events.filter((e) => e.kind === 'state').at(-1)).toMatchObject({ open: false })
       expect(h.m.list()).toEqual([])
       await h.m.dispose()

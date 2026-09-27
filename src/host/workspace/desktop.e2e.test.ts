@@ -14,7 +14,7 @@
 // The helper starts with the production ready timeout (DESK_READY_MS, 5 s; preflight ruling F3).
 import { describe, it, expect, afterAll, vi } from 'vitest'
 import { execFile } from 'node:child_process'
-import { promises as fs, readFileSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,10 +23,10 @@ import { createLaunchResolver } from './launch'
 import { createWorkspaceManager, type WorkspaceEvent, type WorkspaceManager } from './manager'
 import { spawnPowerShell, startDesktopHelper, writeDeskScript, type DesktopHelper } from './desktopHelper'
 import { connectCdp } from './cdp'
+import { electronExe, exists, read2 } from './e2eSupport'
 import { freePort, killTree, processStartTimes } from './native'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
-const repo = path.resolve(here, '..', '..', '..')
 const enabled = process.platform === 'win32' && process.env.ASTERA_DESKTOP_E2E === '1'
 const TITLE = 'Astera workspace fixture'
 
@@ -113,20 +113,6 @@ const setClipboardText = (text: string | null): Promise<string> =>
       (text === null || text === '' ? '[Windows.Forms.Clipboard]::Clear()' : `[Windows.Forms.Clipboard]::SetDataObject(${psString(text)}, $true, 10, 100)`)
   )
 
-/** One expression evaluated over a fresh CDP client of the fixture's port, then closed. */
-const read2 = async (port: number, expression: string): Promise<unknown> => {
-  const c = await connectCdp(port, 5_000)
-  if (!c) throw new Error(`no page on port ${port}`)
-  try {
-    return ((await c.send('Runtime.evaluate', { expression, returnByValue: true })).result as { value?: unknown }).value
-  } finally {
-    c.close()
-  }
-}
-
-const electronExe = (): string =>
-  path.join(repo, 'node_modules', 'electron', 'dist', readFileSync(path.join(repo, 'node_modules', 'electron', 'path.txt'), 'utf8').trim())
-
 const commandFor = (udd: string): string =>
   `"${electronExe()}" "${path.join(here, 'fixtures', 'app', 'main.cjs')}" --remote-debugging-port=%ASTERA_APP_CDP_PORT% --user-data-dir="${udd}"`
 
@@ -181,8 +167,6 @@ const recordedPids = async (recordFile: string): Promise<number[]> => {
   const record = JSON.parse(await fs.readFile(recordFile, 'utf8')) as { workspaces: Array<{ pids: Array<{ pid: number }> }> }
   return record.workspaces[0].pids.map((p) => p.pid)
 }
-
-const exists = (p: string): Promise<boolean> => fs.stat(p).then(() => true, () => false)
 
 describe.runIf(enabled)('the agent app workspace on a real desktop', () => {
   let dir = ''

@@ -30,7 +30,16 @@ drop.addEventListener('drop', (e) => { e.preventDefault(); note({ kind: 'files',
 const hidden = Boolean(process.env.ASTERA_APP_CHROMIUM_FLAGS)
 
 app.whenReady().then(() => {
-  const w = new BrowserWindow({ width: 900, height: 700, title: 'Astera workspace fixture', show: !hidden })
+  // paintWhenInitiallyHidden and no background throttling: said outright, so a window that is never
+  // shown still paints and CDP's Page.captureScreenshot (screenshot() and every frame) does not stall.
+  const w = new BrowserWindow({
+    width: 900,
+    height: 700,
+    title: 'Astera workspace fixture',
+    show: !hidden,
+    paintWhenInitiallyHidden: true,
+    webPreferences: { backgroundThrottling: false }
+  })
   w.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(HTML))
 })
 app.on('window-all-closed', () => app.quit())
