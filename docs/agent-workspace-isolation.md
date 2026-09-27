@@ -1,11 +1,105 @@
-# Agent workspace isolation — design brief
+# Agent workspace isolation, design brief
 
-Status: **scope decided, mechanism measured, design not written yet.** This is the brief a next
-session starts from: the problem, what was measured, the candidate shapes, and what is still open.
+Status: **shipped for Windows** (2026-09-27). The design is
+[docs/superpowers/specs/2026-09-27-agent-workspace-isolation-design.md](superpowers/specs/2026-09-27-agent-workspace-isolation-design.md);
+what shipped is summarised under "Shipped" below. macOS and Linux are the next step (W7). The rest of
+this brief is the problem and the measurements the design stands on, kept as they were written.
 
-Written 2026-09-08 after the explorer clipboard work (develop `5ac2116`) forced the question, and
-updated the same day with the scope decisions and a spike that measured an isolated desktop
-directly.
+## Shipped (Windows, 2026-09-27)
+
+An agent session runs `astera app js --file check.js`. The Host answers it whether or not the Astera
+app is open. The first `launch()` in a session creates a Windows desktop object nobody switches to,
+starts the project's app there (a Run configuration or a command), and connects to the app's debugging
+port. The script drives the page over CDP (`snapshot`, `click`, `fill`, `press`, `paste`, `drag`,
+`dropFiles`, `screenshot`) and the native windows through the desktop helper (`windows`, `windowShot`,
+`keys`). The person's screen, foreground window and pointer are never touched; the clipboard is shared.
+
+- **Where it lives.** `src/core/workspace/` (the JSON line protocol, the idle and leftover rules, the
+  script runner, and the helpers over the `Cdp` and `Desk` ports, none of it Windows specific) and
+  `src/host/workspace/` (the PowerShell desktop helper with its embedded C#, the CDP client, and
+  `WorkspaceManager`). The app shows a mirror tab per session (`AppMirrorPane`), in the agent's violet,
+  with the running helper, a Stop and a Close.
+- **What the agent is told.** `resources/skills/app-guide.md`, printed by `astera app help`, and the
+  `astera-app` skill, installed while **Agent app workspace** is on in Settings.
+- **Lifecycle.** One desktop per session, cleaned up on `close()`, on Close in the tab, when the
+  session ends, after 10 minutes without a script, and when the Host leaves. A Host that starts after
+  one that died ends the recorded processes whose start time still matches
+  (`<profile>/orch/workspaces.json`). Ending the helper does not by itself end the apps on its desktop
+  (measured); the manager's own cleanup and the next Host's leftover sweep end them by pid and start
+  time.
+- **How it is tested.** Unit tests with fake ports for every helper and rule; a real Host server and
+  orch for `app js` with no app attached and for the mirror events; and a real desktop e2e
+  (`src/host/workspace/desktop.e2e.test.ts`, run with `ASTERA_DESKTOP_E2E=1` on a signed in Windows
+  desktop) that launches an Electron fixture, drives it, and checks that the foreground window is the
+  same before and after and that nothing is left running.
+
+Rulings the implementation plan made where the spec was silent, adjusted below where the real desktop
+changed one of them:
+
+- **P1. The script deadline and the launch wait.** The script stays at 60 s. `launch()` waits
+  `min(waitMs, time left in the script minus 2 s)` for the debugging port, so a port that never opens is
+  reported by `launch` with the `--remote-debugging-port` hint rather than as `at: "timeout"`. It then
+  waits up to 10 s more (`PAGE_READY_MS`) for the page to finish parsing past `about:blank`, and still
+  succeeds if the page never settles by then, since the page helpers speak for themselves after that.
+- **P2. Where `app js` is answered.** Above the command layer and below the request receipt line beside
+  `requests-show`, because the CLI mints a request id for every call and a command above the line refuses
+  one. A retried id replays the recorded result instead of launching twice.
+- **P3. Its own setting.** `agentAppEnabled` in `app-settings.json`, labelled **Agent app workspace
+  (experimental)** under Settings, Agents, off by default. It gates the `astera-app` skill and `app js`
+  alike, and the Host reads it on every `app js`, so it works with the app closed.
+- **P4. The session's folder.** Captures go to the folder every session is granted (`preview/shots`),
+  named `app-<uuid>.png`, and are trimmed the way the agent browser's are.
+- **P5. Embedded as a string.** The desktop helper script is a constant in the Host, ASCII only, written
+  to `<profile>/host/desk-<hash>.ps1` at first use (rewritten only when it differs) and run with
+  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File`, because an encoded command
+  would pass the command line limit.
+- **P6. The app's opt in.** The Host pushes workspace events only to an app whose hello yields
+  `workspace`, and captures frames only while one is attached.
+- **P7. The mirror tab.** One workbench tab per session, placed in the background on the first event that
+  opens a workspace, drawn only while the workspace is active. A workspace that closes leaves the tab
+  showing closed until the person closes it.
+- **P8. When the session ends.** A session ends, for its workspace, 5 s after its last pty or line process
+  exits, because a roll reopens the same session id.
+- **P9. Driving an app is not browsing the web.** `click` follows links, since the page is the app under
+  test, and `press` sends trusted CDP key events rather than the agent browser's synthetic ones.
+- **P10. No interactive desktop.** `app js` is refused, before any process starts, on a platform other
+  than Windows, over SSH (the Host's own environment says so), and in a non-interactive session (a window
+  station that is not visible; the helper says so). **Adjusted:** the desktop helper cannot attach
+  PowerShell's own thread to the desktop, since that fails with `ERROR_BUSY` (measured); it attaches a
+  fresh thread for each window, capture or key request instead (`OnDesk`), and replies with whichever
+  message is innermost. The spec left "its own thread" open as an implementation detail; this costs one
+  thread per request, which is cheap.
+- **P11. What is recorded for leftovers.** `workspaces.json` holds, per workspace, the launched root pid
+  and the helper pid, each with its creation time. At Host start, and by `relaunch()` for the app it ends,
+  a recorded pid is only ended when the live process's creation time is still within 2 s of the recorded
+  one; a malformed file kills nothing. **Adjusted:** ending the helper does not by itself end the apps on
+  its desktop (measured), so this same pid and start time check, run by the manager's own cleanup and by
+  the next Host's leftover sweep, is what ends them, not the helper's own exit.
+- **P12. Frames.** JPEG, at most 960 px wide, about one a second while a script runs and an app yields
+  `workspace`, plus one capture after each helper that changes the screen, coalesced while one is in
+  flight; only the latest frame is kept.
+
+Two more limits, found only once a real desktop and a real helper were driven (Task 3, Task 10):
+
+- **Every desk request times out at 15 s.** A launch, a capture, a windows list or a key press that gets
+  no answer in that time ends the helper, since a hung window must not block every later call.
+- **A process that detaches from the launched tree can escape cleanup.** The manager and the leftover
+  sweep both walk the tree by pid and start time; a process that forks off and reparents itself is not
+  found that way.
+
+Known limits, beside the spec's:
+
+- **The clipboard is shared**, so `paste()` reads what the person copied, and your app can overwrite
+  what they copied.
+- **Dragging out of the app to Explorer or another app is impossible.** This desktop has no real
+  pointer, so an OS level drag never starts; `dropFiles()` proves the drop side only.
+- **A closed mirror tab reappears when the Host reconnects while that workspace is still open.** The
+  Close in the app ends the tab, not the workspace; a workspace the Host still holds is shown again once
+  the app reconnects.
+- An Electron app that is not started with a debugging port gets the native helpers only.
+  `snapshot().url` is empty for an address that is not http or https (a `file:` or custom scheme page).
+
+**Next steps.** Linux (Xvfb) and macOS (a background launch driven over CDP) come next.
 
 ## The problem
 
@@ -156,16 +250,13 @@ logon session, and is out of scope for the shape above.
    Host reports: captures or a marker that an agent is driving an app out of sight. The agent browser
    stays as it is, in the app, and still does not work with the app closed.
 
-## Still open
+## Decided since (2026-09-27)
 
-- **Who drives.** A scripted API in the agent-browser style, or a CDP endpoint the skill drives
-  directly. The agent browser's own history argues for the scripted API, because its guardrails all
-  turned out to be load-bearing: a busy tab, a stop, a bounded script.
-- **Visibility.** The agent browser shows a violet frame and a pointer while it works. The
-  equivalent for a desktop the person cannot see is undecided: a tab that mirrors `PrintWindow`
-  captures, a status pill, or nothing.
-- **Lifecycle.** The desktop object dies when its last process exits (measured). Who creates it,
-  when, and what happens to a stranded instance is undesigned.
+- **Who drives.** Decided (W3): a scripted API in the agent browser's style, `astera app js`.
+- **Visibility.** Decided (W4): a mirror tab per session, with the latest capture in a violet frame,
+  the running helper, a Stop and a Close.
+- **Lifecycle.** Decided (W5): one desktop per session, created at the first `launch()`, cleaned up
+  when the session ends, on `close()`, or after 10 minutes without a script.
 
 ## Suggested next step
 

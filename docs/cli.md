@@ -435,7 +435,8 @@ the profile it resolved, which is how to check.
 
 Two more variables exist inside sessions Astera starts: `ASTERA_CLI` is the absolute path to this
 command, and `ASTERA_SKILLS` is the folder `astera help` reads its guide from. Outside a session
-`astera help` and `astera browser help` read the guides that ship with the installed Astera instead.
+`astera help`, `astera browser help` and `astera app help` read the guides that ship with the
+installed Astera instead.
 
 ## Command reference
 
@@ -680,13 +681,14 @@ folder as given, and a Job made from a subfolder then lists only what that subfo
 else about them. `--agent claude` or `--agent codex` narrows it to one vendor.
 
 **`skills` manages the agent skills Astera installs into each account**: the files that tell an agent
-session about `astera`, and about the features switched on in the app. There are four.
-`astera-orchestration` is always on. `astera-task`, `astera-browser` and `astera-handoff` follow
-**Work unit tracking**, **Agent browser** and the **Smart Resume** resume strategy in Settings. The app
-installs them itself at launch and when a setting is turned on; these two commands are for checking,
-and for the times it has not yet done so. `--account <accountId>` narrows either to one account, and
-an id that is not in `accounts list` is a 4. A damaged `accounts.json` or `app-settings.json` is a 6,
-and the message says to open Astera, which repairs it. Repairing `app-settings.json` keeps the
+session about `astera`, and about the features switched on in the app. There are five.
+`astera-orchestration` is always on. `astera-task`, `astera-browser`, `astera-handoff` and `astera-app`
+follow **Work unit tracking**, **Agent browser**, the **Smart Resume** resume strategy and **Agent app
+workspace** in Settings. The app installs them itself at launch and when a setting is turned on; these
+two commands are for checking, and for the times it has not yet done so. `--account <accountId>`
+narrows either to one account, and an id that is not in `accounts list` is a 4. A damaged
+`accounts.json` or `app-settings.json` is a 6, and the message says to open Astera, which repairs it.
+Repairing `app-settings.json` keeps the
 damaged copy as `app-settings.json.bak` and writes every setting back at its default, with one
 exception: permission prompts are turned on ("Run agents without permission checks" is off), because
 the damaged file may have had them on. Astera tells you when it opens. Neither command writes to either file. A
@@ -1107,8 +1109,8 @@ nothing.)
 The rest simply cannot act twice, so the id does nothing and nothing is refused over it: `version`
 answers from the binary, because saying that the two builds differ is exactly what that command is
 for; a read the state file can answer is answered from the file when no Host is running; a worker's
-report that cannot be delivered is written to the queue; and `help`, `agent-context` and `browser
-help` only print what is already in this binary.
+report that cannot be delivered is written to the queue; and `help`, `agent-context`, `browser
+help` and `app help` only print what is already in this binary.
 
 **`requests show` asks what became of an id, and its three answers all exit 0**, because not finding
 a receipt is an answer rather than a failure. `completed` means this Host ran the request, and
@@ -1132,6 +1134,14 @@ not part of this surface and are not described here. `astera help` documents the
 (`run-create --auto`, `task-create`, `accounts`, `run-configs`), and the old names keep working for
 the agents that use them. `run-configs list` differs in one way: it names its Job, where `run-configs`
 reads the latest run's.
+
+`astera app js` and `astera app help` are session commands as well. An agent session uses them to
+launch, drive and photograph the project's own app on a Windows desktop the person never sees, while
+the person keeps their screen and pointer; `astera app help` documents them, and `astera agent-context`
+lists them with `"public": false`. The Host answers `app js` whether or not Astera is open. It needs
+**Agent app workspace** switched on in Settings and refuses, with the reason, on another platform or
+where there is no interactive desktop (an SSH session, a service). The clipboard is shared with the
+person.
 
 ## Output
 
