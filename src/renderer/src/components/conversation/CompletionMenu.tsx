@@ -25,6 +25,9 @@ export interface CompletionMenuProps {
   /** A line under the rows saying the list is still being built (the `@` index's first walk). With it
    *  the menu is drawn even with no rows yet, so a slow walk reads as work under way, not as nothing. */
   status?: string;
+  /** Whether the status line is work under way (a spinner beside it). False for a line that only
+   *  says something, such as the file list being unavailable. Defaults to true. */
+  statusBusy?: boolean;
 }
 
 /** The list `/` and `@` open, drawn in the banner slot so it sits directly above the composer with no
@@ -35,6 +38,7 @@ export function CompletionMenu({
   onPick,
   onHover,
   status,
+  statusBusy = true,
 }: CompletionMenuProps): ReactNode {
   const activeRef = useRef<HTMLButtonElement | null>(null);
 
@@ -81,7 +85,7 @@ export function CompletionMenu({
           role="status"
           className="text-muted-foreground flex items-center gap-2 px-3 py-1.5 text-xs"
         >
-          <span className="loading-spinner small" aria-hidden="true" />
+          {statusBusy && <span className="loading-spinner small" aria-hidden="true" />}
           {status}
         </div>
       )}

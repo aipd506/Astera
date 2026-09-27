@@ -7003,6 +7003,8 @@ export function registerIpc(
       ? await fileIndex.lookup(session.cwd, query, CONVERSATION_FILE_MATCHES)
       : { paths: [], indexing: false }
     const files = found.paths
+    // A walk that failed or ran out of time (a dead share): the menu stops asking and says so
+    const unavailable = found.unavailable === true ? { unavailable: true as const } : {}
     // codex asks for a skill by mentioning it, the same way it mentions a file, so both belong in
     // the one list — skills first, being far fewer and named rather than found.
     let account: { provider?: string; configDir: string } | null = null
@@ -7011,7 +7013,7 @@ export function registerIpc(
     } catch {
       account = null
     }
-    if (account?.provider !== 'codex') return { paths: files, indexing: found.indexing }
+    if (account?.provider !== 'codex') return { paths: files, indexing: found.indexing, ...unavailable }
     const skills = filterFilePaths(
       await listCodexMentions(account.configDir),
       query,
@@ -7019,7 +7021,8 @@ export function registerIpc(
     )
     return {
       paths: [...skills, ...files].slice(0, CONVERSATION_FILE_MATCHES),
-      indexing: found.indexing
+      indexing: found.indexing,
+      ...unavailable
     }
   })
   ipcMain.handle('conversation.commands', async (_e, sessionId: string) => {

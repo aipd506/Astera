@@ -52,6 +52,7 @@ import { useI18n } from "../../i18n/I18nProvider";
 import type { ConvPart, ConvTurn } from "../../../../core/history/convTypes";
 import type { RollStateEvent, SchedStateEvent } from "../../../../core/types";
 import { chatBannerFor, composerLockedFor } from "./paneTransport";
+import { pollFileIndex } from "../../lib/fileIndexPoll";
 import { SessionStateBanners, stateBannerHeight } from "../SessionStateBanners";
 
 export interface ConversationPaneProps {
@@ -433,6 +434,7 @@ export function ConversationPane({
   const [fileMatches, setFileMatches] = useState<readonly string[]>([]);
   /** The project's first `@` walk is still under way — the menu says so instead of sitting empty. */
   const [fileIndexing, setFileIndexing] = useState(false);
+  const [fileUnavailable, setFileUnavailable] = useState(false);
   const [slashActive, setSlashActive] = useState(0);
   /** What this session's CLI says it can run. Asked once per session — see conversation.models. */
   const [models, setModels] = useState<readonly ModelDescriptor[]>([]);
@@ -841,39 +843,38 @@ export function ConversationPane({
   // once and keeps the list (main/fileIndex.ts), so this is an in-memory filter and a round trip.
   // While the first walk of a large project (or a slow share) is under way, main answers with what it
   // has found so far and `indexing`; this asks again shortly, so the menu fills in as the walk goes.
+  // It stops asking once the walk failed or ran out of time (a dead share: `unavailable`), and says so
+  // (lib/fileIndexPoll.ts).
   useEffect(() => {
     if (fileQuery === null) {
       setFileMatches([]);
       setFileIndexing(false);
+      setFileUnavailable(false);
       return;
     }
     const generation = generationRef.current;
-    let cancelled = false;
-    let retry: ReturnType<typeof setTimeout> | null = null;
-    const ask = (): void => {
-      void window.api.conversation
-        .files(sessionId, fileQuery)
-        .then(({ paths, indexing }) => {
-          if (cancelled || generationRef.current !== generation) return;
-          setFileMatches(paths);
-          setFileIndexing(indexing);
-          if (indexing) retry = setTimeout(ask, FILE_INDEX_POLL_MS);
-        })
-        .catch(() => {
-          if (!cancelled) setFileIndexing(false);
-        });
-    };
-    ask();
-    return () => {
-      cancelled = true;
-      if (retry !== null) clearTimeout(retry);
-    };
+    const stop = pollFileIndex(
+      () => window.api.conversation.files(sessionId, fileQuery),
+      ({ paths, indexing, unavailable }) => {
+        if (generationRef.current !== generation) {
+          stop();
+          return;
+        }
+        setFileMatches(paths);
+        setFileIndexing(indexing);
+        setFileUnavailable(unavailable);
+      },
+      () => setFileIndexing(false),
+      { pollMs: FILE_INDEX_POLL_MS }
+    );
+    return stop;
   }, [sessionId, fileQuery]);
 
   const rows: CompletionRow[] =
     fileToken === null ? [] : fileMatches.map((p) => ({ key: p, label: p }));
   const slashOpen = rows.length > 0;
   const fileIndexingShown = fileToken !== null && fileIndexing;
+  const fileUnavailableShown = fileToken !== null && fileUnavailable;
   const slashOpenRef = useRef(slashOpen);
   slashOpenRef.current = slashOpen;
   const rowsRef = useRef(rows);
@@ -1344,7 +1345,14 @@ export function ConversationPane({
       active={Math.min(slashActive, Math.max(rows.length - 1, 0))}
       onPick={takeRow}
       onHover={setSlashActive}
-      status={fileIndexingShown ? t("conversation.indexingFiles") : undefined}
+      status={
+        fileIndexingShown
+          ? t("conversation.indexingFiles")
+          : fileUnavailableShown
+            ? t("conversation.filesUnavailable")
+            : undefined
+      }
+      statusBusy={fileIndexingShown}
     />
   );
   /** What the banner slot is for, in the order paneTransport.ts sets out. */
@@ -1380,7 +1388,7 @@ export function ConversationPane({
     <ChatNotice text={t("chat.notice.checking")} />
   ) : chatBanner.kind === "endsWithApp" ? (
     <ChatNotice text={t("chat.notice.endsWithApp")} />
-  ) : slashOpen || fileIndexingShown ? (
+  ) : slashOpen || fileIndexingShown || fileUnavailableShown ? (
     completionMenu
   ) : null;
 

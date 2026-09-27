@@ -1827,8 +1827,10 @@ export type RendererApi = CoreApi & {
     /** Project files matching what follows an `@`, best first, already capped. Root-relative with
      *  forward slashes. Empty for a session with no project, or one whose folder cannot be read.
      *  `indexing` is true while the project's first walk is still under way (main/fileIndex.ts
-     *  lookup): `paths` is then what it has found so far, and the pane asks again shortly. */
-    files(sessionId: string, query: string): Promise<{ paths: string[]; indexing: boolean }>
+     *  lookup): `paths` is then what it has found so far, and the pane asks again shortly.
+     *  `unavailable` (set only when true) means the walk failed or ran out of time, a dead share say:
+     *  there is no list to wait for, and the pane stops asking and says so. */
+    files(sessionId: string, query: string): Promise<{ paths: string[]; indexing: boolean; unavailable?: true }>
   }
   /** A chat session's own IPC surface, the counterpart of `conversation` above for sessions whose kind
    *  is 'chat'. Every method takes a session id and is a no-op (or null) for an id the chat manager
