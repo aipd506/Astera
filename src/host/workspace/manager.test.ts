@@ -239,10 +239,14 @@ describe('Linux and macOS', () => {
     const { m, file, settle } = await rig({ platform: 'darwin', startDesk })
     expect((await m.run('s1', "await launch({ command: 'app' })")).status).toBe(200)
     await settle()
-    expect(await file()).toEqual({
-      version: 1,
-      workspaces: [{ sessionId: 's1', desktop: expect.stringMatching(/^mac-bg-astera-ws-/), pids: [{ pid: 501, startedAt: 3_000 }] }]
-    })
+    // The launch record is a second write after the desktop's own; on a loaded CI runner it can land after
+    // settle() (macOS CI saw `pids: []`), so wait for it rather than read once.
+    await vi.waitFor(async () =>
+      expect(await file()).toEqual({
+        version: 1,
+        workspaces: [{ sessionId: 's1', desktop: expect.stringMatching(/^mac-bg-astera-ws-/), pids: [{ pid: 501, startedAt: 3_000 }] }]
+      })
+    )
   })
 
   it('hands the platform to the helpers, so the launch hint names the port the POSIX way (R12)', async () => {
