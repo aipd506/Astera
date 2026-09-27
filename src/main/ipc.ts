@@ -48,6 +48,7 @@ import { hostSpeaksProcs, hostSpeaksPing, hostSpeaksSpawn, hostSpeaksDispatch, h
 import { askHostCoordinatorIdle } from './host/coordinatorIdle'
 import { createBlockSync } from './host/blockSync'
 import { createHostDriverView, type HostDriverView } from './host/hostDriver'
+import { createHostWorkspaceView, type HostWorkspaceView } from './host/hostWorkspace'
 import { createOfflineRolls } from './host/offlineRolls'
 import type { BlockRegistry } from '../core/rolling/blockRegistry'
 import { createHostRollView, installHostRollExit, orchHoldsSession, hostForced, announcesAdopted } from './host/hostRollView'
@@ -1041,6 +1042,7 @@ export function registerIpc(
   let hostClient: HostClient | null = null
   /** Who drives Jobs, as the Host last said it (limits L3). Null until `startHostClient` builds it. */
   let hostDriverView: HostDriverView | null = null
+  let hostWorkspaceView: HostWorkspaceView | null = null
   /** Takes back the one pty a Host roll respawned into (`takeSessionsBack` with its id). Null until
    *  `startHostClient` has built the sweep queue, and then for good: nothing is pushed before then. */
   let takeBackRolledPty: ((ptyId: string) => Promise<unknown>) | null = null
@@ -5746,6 +5748,20 @@ export function registerIpc(
     client.onMessage((m) => driverView.pushed(m))
     client.onStatusChange((s) => driverView.status(s))
 
+    // The agent app workspace mirror (agent workspace design): a Host that announced `workspace` pushes
+    // its events to this app, which yields `workspace` in its hello. After each handshake the view asks
+    // for the live ones. None of these callbacks throws (hostWorkspace.ts).
+    const workspaceView = createHostWorkspaceView({
+      status: () => client.status(),
+      call: orchCall,
+      changed: (e) => send('workspace:event', e),
+      log: hostLog
+    })
+    hostWorkspaceView = workspaceView
+    client.onMessage((m) => workspaceView.pushed(m))
+    client.onConnect(() => void workspaceView.connected())
+    client.onStatusChange((s) => workspaceView.status(s))
+
     // S6 D4: the block records this app's coordinators found go to a Host that speaks `blocks`, whole
     // after each handshake, and the Host's come back as `blocks` pushes. Sends nothing to an older Host.
     // Neither callback throws (blockSync.ts).
@@ -6781,6 +6797,17 @@ export function registerIpc(
   ipcMain.handle('host.status', () => hostClient?.status() ?? noHostStatus)
   // Limits L3: the window reads it once at mount; changes arrive on 'host:driver'.
   ipcMain.handle('host.driver', () => hostDriverView?.current() ?? null)
+  // The mirror tab reads the live workspaces once at mount; changes arrive on 'workspace:event'. Stop and
+  // Close go to the Host (workspace-stop, workspace-close).
+  ipcMain.handle('workspace.list', () => hostWorkspaceView?.current() ?? [])
+  ipcMain.handle('workspace.stop', async (_e, sessionId: unknown) => {
+    if (typeof sessionId !== 'string' || sessionId === '') throw new Error(`INVALID_SESSION_ID: ${String(sessionId)}`)
+    return (await hostWorkspaceView?.stop(sessionId)) ?? false
+  })
+  ipcMain.handle('workspace.close', async (_e, sessionId: unknown) => {
+    if (typeof sessionId !== 'string' || sessionId === '') throw new Error(`INVALID_SESSION_ID: ${String(sessionId)}`)
+    return (await hostWorkspaceView?.close(sessionId)) ?? false
+  })
   // How many of the running sessions would still be running after this app quits — the window-close
   // confirmation's question (App.tsx's closeWindow, then `quitConfirmBody`).
   //

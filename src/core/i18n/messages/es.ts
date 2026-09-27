@@ -962,6 +962,18 @@ export const es: Catalog = {
   'preview.agent.stop': 'Detener el script del agente',
   'preview.agent.stopped': 'Script del agente detenido',
   'preview.agent.inUse': 'El agente está usando tu computadora  ·  Esc para cancelar',
+  // Pestaña espejo del espacio de trabajo de apps del agente
+  'workspace.tab.tag': 'App',
+  'workspace.tab.running': 'El agente está manejando su app en un escritorio oculto',
+  'workspace.pane.title': 'App de {session}',
+  'workspace.pane.running': 'En curso: {helper}',
+  'workspace.pane.idle': 'En espera (la app sigue abierta)',
+  'workspace.pane.closed': 'Cerrado',
+  'workspace.pane.waiting': 'Esperando la primera imagen',
+  'workspace.pane.stop': 'Detener',
+  'workspace.pane.close': 'Cerrar',
+  'workspace.pane.alt': 'La app del agente',
+  'workspace.pane.failed': 'No se pudo llegar al espacio de trabajo: {detail}',
   // BottomPanel, the rail terminal button
   'terminal.rail.open': 'Terminal',
   'terminal.tab.label': 'Terminal {n}',

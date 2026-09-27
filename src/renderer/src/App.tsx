@@ -11,6 +11,7 @@ import { HistoryBrowser } from './components/HistoryBrowser'
 import { Select } from './components/Select'
 import { type BrowserTab, type FileTab, type RecordTab } from './components/WorkbenchTabs'
 import { BrowserPane, type BrowserStatePatch } from './components/BrowserPane'
+import { AppMirrorPane } from './components/AppMirrorPane'
 import type { AgentPointerState } from './components/agentOverlay'
 import { FileEditor } from './components/FileEditor'
 import { MarkdownSplit } from './components/MarkdownSplit'
@@ -18,6 +19,7 @@ import { invalidateImageCache } from './components/MarkdownPreview'
 import type { EditorState, StateEffect } from '@codemirror/state'
 import type { EditorView } from '@codemirror/view'
 import { EditorStateCache } from './lib/editorStateCache'
+import { applyWorkspaceEvent, mirrorsFromList, newlyOpened, type Mirrors } from './lib/workspaceMirror'
 import { FileExplorer, type ExplorerTreeState } from './components/FileExplorer'
 import { JobsView } from './components/JobsView'
 import { jobsStall, jobsStallRecheckInMs } from '../../core/orchestration/jobsView'
@@ -113,7 +115,7 @@ import {
   type PaneDir,
   type PaneNode
 } from '../../core/panes/tree'
-import { browserTab, fileTab, parseTab, recordTab, sessionTab } from '../../core/panes/tabId'
+import { appTab, browserTab, fileTab, parseTab, recordTab, sessionTab } from '../../core/panes/tabId'
 import { placeTab } from '../../core/panes/place'
 import { sessionKindOf } from '../../core/sessions/kind'
 import { displayHostOf, linkDestination, normalizeUrl, previewTargetOf } from '../../core/preview/url'
@@ -809,7 +811,7 @@ export default function App(): React.JSX.Element {
   // 탭 트리에서 파생시킨다 — activeFileId 와 같은 이유다: 따로 상태를 두면 다른 페인의 탭을
   // 누르는 순간 트리와 갈라진다
   closableTabIdRef.current =
-    activeTab?.kind === 'file' || activeTab?.kind === 'record' || activeTab?.kind === 'browser' ? activeTabId : null
+    activeTab?.kind === 'file' || activeTab?.kind === 'record' || activeTab?.kind === 'browser' || activeTab?.kind === 'app' ? activeTabId : null
   /** The close function itself. `closeWorkbenchTab` is recreated every render and its body reads
    *  render-time values (via closeFileTab), so a key listener registered once that called a captured
    *  stale closure would act on outdated tabs — same place, same reason as selectWorkbenchTabRef. */
@@ -1780,6 +1782,14 @@ export default function App(): React.JSX.Element {
       dropTabFromTree(tabId)
       return
     }
+    if (ref.kind === 'app') {
+      // A picture, not a process: dropping the tab is the whole close. The workspace itself is closed
+      // only by the pane's Close button (workspace-close). The mirror entry stays, so the next frame of
+      // a workspace that is still open does not put the tab back: only a workspace that opens again
+      // does (newlyOpened reads a transition, not a presence).
+      dropTabFromTree(tabId)
+      return
+    }
     closeSession(ref.id)
   }
   // Ctrl+W 가 이 함수를 타도록 — 위 selectWorkbenchTabRef 와 같은 자리, 같은 이유다
@@ -2372,7 +2382,9 @@ export default function App(): React.JSX.Element {
         : activeTab?.kind === 'browser'
           ? // A browser tab names its project the same way a file tab does
             browserTabs.find((t) => t.id === activeTabId)?.projectRoot
-          : sessions.find((s) => s.id === activeTab?.id)?.cwd) ?? null
+          : activeTab?.kind === 'app' || activeTab?.kind === 'session'
+            ? sessions.find((s) => s.id === activeTab.id)?.cwd
+            : undefined) ?? null
 
   /** 탭이 하나도 없을 때의 현재 프로젝트. 마운트에서 한 번 복원하고, 그 뒤로는 활성 탭이 갱신한다.
    *  영속 규칙은 lib/stickyProject.ts 에 있다(렌더러에 테스트가 없어 App.tsx 안에서는 확인할 수 없다). */
@@ -2673,6 +2685,23 @@ export default function App(): React.JSX.Element {
   }
   const openAgentTabRef = useRef(openAgentTab)
   openAgentTabRef.current = openAgentTab
+  const [mirrors, setMirrors] = useState<Mirrors>({})
+  const mirrorsRef = useRef<Mirrors>({})
+  /** The Host showed a workspace for a session: its mirror tab, placed once and in the background, the
+   *  openAgentTab rule (the agent's work must not take the tab the person is on). */
+  const openAppTab = (sessionId: string): void => {
+    const id = appTab(sessionId)
+    if (layoutRef.current && groupOfTab(layoutRef.current, id)) return
+    const placed = placeTab(layoutRef.current, id, { activePaneId: activePaneIdRef.current, background: true })
+    setLayout(placed.root)
+  }
+  const openAppTabRef = useRef(openAppTab)
+  openAppTabRef.current = openAppTab
+  const takeMirrors = (next: Mirrors, prev: Mirrors): void => {
+    mirrorsRef.current = next
+    setMirrors(next)
+    for (const sid of newlyOpened(prev, next)) openAppTabRef.current(sid)
+  }
   const closeAgentTab = (sessionId: string): void => {
     const b = browserTabsRef.current.find((x) => x.agentSessionId === sessionId)
     if (b) closeWorkbenchTab(b.id)
@@ -2834,6 +2863,31 @@ export default function App(): React.JSX.Element {
         onRegenerate={() => regenerateRecord(rec.projectRoot, rec.recordId)}
       />
     )
+  }
+
+  /** An app mirror tab's body (AppMirrorPane). The session's title names it; Stop and Close go to the
+   *  Host through main. */
+  const renderApp = (appTabId: string): React.ReactNode => {
+    const ref = parseTab(appTabId)
+    if (ref?.kind !== 'app') return null
+    const s = sessions.find((x) => x.id === ref.id)
+    const fail = (err: unknown): void => {
+      toast.error(t('workspace.pane.failed', { detail: err instanceof Error ? err.message : String(err) }))
+    }
+    return (
+      <AppMirrorPane
+        sessionTitle={s?.title ?? ref.id}
+        mirror={mirrors[ref.id] ?? null}
+        onStop={() => void window.api.workspace.stop(ref.id).catch(fail)}
+        onClose={() => void window.api.workspace.close(ref.id).catch(fail)}
+      />
+    )
+  }
+  const appTabInfo = (sessionId: string): { title: string; running: boolean; open: boolean } | null => {
+    const s = sessions.find((x) => x.id === sessionId)
+    const m = mirrors[sessionId]
+    if (!s && !m) return null
+    return { title: s?.title ?? sessionId, running: m?.running === true, open: m?.open === true }
   }
 
   /** A browser tab's body. `serverPending` is derived from this project's runs — the tab's run is
@@ -3233,6 +3287,11 @@ export default function App(): React.JSX.Element {
   // The agent browser: main asks for a session's tab, asks it closed, and reports whether a script is
   // running in it — see CoreEvents' preview:agentTab / preview:agentTabClose / preview:agentBusy.
   useEffect(() => window.api.on('preview:agentTab', ({ sessionId, cwd, url }) => openAgentTabRef.current(sessionId, cwd, url)), [])
+  // The agent app workspaces (agent workspace design): the live ones once at mount, then every change.
+  useEffect(() => {
+    void window.api.workspace.list().then((list) => takeMirrors({ ...mirrorsRef.current, ...mirrorsFromList(list) }, mirrorsRef.current))
+  }, [])
+  useEffect(() => window.api.on('workspace:event', (e) => takeMirrors(applyWorkspaceEvent(mirrorsRef.current, e), mirrorsRef.current)), [])
   useEffect(() => window.api.on('preview:agentTabClose', ({ sessionId }) => closeAgentTabRef.current(sessionId)), [])
   useEffect(() => window.api.on('preview:agentBusy', ({ sessionId, busy }) => {
     setAgentBusy((prev) => (busy ? { ...prev, [sessionId]: true } : (({ [sessionId]: _b, ...rest }) => rest)(prev)))
@@ -4070,6 +4129,8 @@ export default function App(): React.JSX.Element {
                 renderEditor={renderEditor}
                 renderRecord={renderRecord}
                 renderBrowser={renderBrowser}
+                appTabInfo={appTabInfo}
+                renderApp={renderApp}
                 rollStates={rollStates}
                 schedStates={schedStates}
                 busy={busy}

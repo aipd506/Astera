@@ -51,6 +51,7 @@ export type { ConvTurn } from './history/convTypes'
 // the renderer typecheck every Node global, which is the guard this note stands to protect.
 import type { CheckResult, GateKind, MessageType, Outcome, RepairReason, TaskStatus } from './orchestration/types'
 import type { CompletionDetail } from './orchestration/completion'
+import type { WorkspaceEvent, WorkspaceSummary } from './host/protocol'
 export type { CompletionDetail, CompletionCheckDetail } from './orchestration/completion'
 export type { MessageType, TaskStatus } from './orchestration/types'
 
@@ -749,6 +750,10 @@ export interface CoreEvents {
    *  connection that went, or a Host too old to say. The Jobs sidebar reads it with the Host status to
    *  say why nothing moves (jobsStall). `host.driver` answers the same value for a window that mounts later. */
   'host:driver': HostDriverReport | null
+  /** An agent app workspace changed, as the Host said it (agent workspace design): a state, with
+   *  `open: false` when its desktop is gone, or the latest frame. `workspace.list` answers the live ones
+   *  for a window that mounts later. */
+  'workspace:event': WorkspaceEvent
 
   /** How It Works 의 저장 파일이 바뀌었다. **실린 값은 프로젝트 키이고, 받는 쪽은 그것을 쓰지
    *  않는다** — main 은 그 키를 원 저장소로 접어 두는데(설계 D1) 렌더러는 그 접기를 모른다.
@@ -1684,6 +1689,14 @@ export type RendererApi = CoreApi & {
      *  Never rejects, and never blocks the caller for longer than the one round trip's own deadline.
      *  The Info tab reads it beside `status()` and draws the row without waiting for it. */
     holdings(): Promise<HostHoldings | null>
+  }
+  /** The agent app workspaces the Host runs (agent workspace design). */
+  workspace: {
+    list(): Promise<WorkspaceSummary[]>
+    /** The mirror's Stop: ends the running script, leaves the app running. */
+    stop(sessionId: string): Promise<boolean>
+    /** The mirror's Close: kills the app and closes its desktop. */
+    close(sessionId: string): Promise<boolean>
   }
   /** The conversation view's IPC surface (main/conversation.ts). `open` and `more` fail soft: null
    *  means the session has no transcript path yet, or the file could not be read — never an error,

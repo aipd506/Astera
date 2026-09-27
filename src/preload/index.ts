@@ -47,6 +47,7 @@ const EVENT_CHANNELS = [
   'orch:state',
   'orch:host',
   'host:driver',
+  'workspace:event',
   'understanding:changed',
   'sessionTasks:changed',
   'sessionTasks:goalIgnored',
@@ -329,6 +330,11 @@ const api = {
     replace: invoke('host.replace'),
     driver: invoke('host.driver'),
     holdings: invoke('host.holdings')
+  },
+  workspace: {
+    list: invoke('workspace.list'),
+    stop: invoke('workspace.stop'),
+    close: invoke('workspace.close')
   },
   conversation: {
     open: invoke('conversation.open'),

@@ -952,6 +952,18 @@ export const ja: Catalog = {
   'preview.agent.stop': 'エージェントのスクリプトを中断',
   'preview.agent.stopped': 'エージェントのスクリプトを中断しました',
   'preview.agent.inUse': 'エージェントがコンピューターを使用中です  ·  Esc でキャンセル',
+  // エージェントアプリ作業スペースのミラータブ
+  'workspace.tab.tag': 'アプリ',
+  'workspace.tab.running': 'エージェントが見えないデスクトップでアプリを操作しています',
+  'workspace.pane.title': '{session} のアプリ',
+  'workspace.pane.running': '実行中: {helper}',
+  'workspace.pane.idle': '待機中（アプリは起動したままです）',
+  'workspace.pane.closed': '閉じました',
+  'workspace.pane.waiting': '最初の画面を待っています',
+  'workspace.pane.stop': '停止',
+  'workspace.pane.close': '閉じる',
+  'workspace.pane.alt': 'エージェントのアプリ画面',
+  'workspace.pane.failed': '作業スペースに届きませんでした: {detail}',
   // BottomPanel, the rail terminal button. The Run tab and the terminal tabs share the bottom panel.
   'terminal.rail.open': 'ターミナル',
   'terminal.tab.label': 'ターミナル {n}',

@@ -1179,6 +1179,18 @@ export const ko = {
   'preview.agent.stop': '에이전트 스크립트 중단',
   'preview.agent.stopped': '에이전트 스크립트를 중단했습니다',
   'preview.agent.inUse': '에이전트가 컴퓨터를 사용 중입니다  ·  Esc로 취소',
+  // 에이전트 앱 작업 공간 미러 탭
+  'workspace.tab.tag': '앱',
+  'workspace.tab.running': '에이전트가 보이지 않는 데스크톱에서 앱을 조작하고 있습니다',
+  'workspace.pane.title': '{session} 의 앱',
+  'workspace.pane.running': '실행 중: {helper}',
+  'workspace.pane.idle': '대기 중 (앱은 떠 있습니다)',
+  'workspace.pane.closed': '닫혔습니다',
+  'workspace.pane.waiting': '첫 화면을 기다리는 중',
+  'workspace.pane.stop': '중단',
+  'workspace.pane.close': '닫기',
+  'workspace.pane.alt': '에이전트의 앱 화면',
+  'workspace.pane.failed': '작업 공간에 전하지 못했습니다: {detail}',
   // BottomPanel, the rail terminal button. The Run tab and the terminal tabs share the bottom panel.
   'terminal.rail.open': '터미널',
   'terminal.tab.label': '터미널 {n}',

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { browserTab, recordTab, fileTab, parseTab, sessionTab } from './tabId'
+import { appTab, browserTab, recordTab, fileTab, parseTab, sessionTab } from './tabId'
 
 describe('tabId', () => {
   it('세션 탭 id를 만들고 되읽는다', () => {
@@ -44,5 +44,11 @@ describe('tabId', () => {
   // 콜론으로 시작하는 문자열은 종류가 빈 문자열이므로 탭 id가 아니다
   it('콜론으로 시작하면 null', () => {
     expect(parseTab(':sess-1')).toBeNull()
+  })
+
+  it('an app mirror tab is one per session, by session id', () => {
+    expect(appTab('s-1')).toBe('app:s-1')
+    expect(parseTab('app:s-1')).toEqual({ kind: 'app', id: 's-1' })
+    expect(parseTab('app:')).toBeNull()
   })
 })
