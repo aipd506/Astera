@@ -222,6 +222,29 @@ const waitOf = (opts: unknown): number => {
   return Math.max(0, Math.min(opts.waitMs, CDP_WAIT_MS))
 }
 
+const NO_SUCH_HELPER: readonly [string, string] = ['no helper named ', ': run help() for the list']
+
+/** Everything `help()` can answer, worked out ahead: the whole guide, each `## name(...)` section by
+ *  its name, and the two halves of the answer for any other name. The Host's worker runner
+ *  (src/host/workspace/scriptWorker.ts) answers `help()` from this inside the worker, so it stays
+ *  synchronous there; every value is a string or a Map, which a worker's workerData clones. */
+export interface HelpTexts {
+  all: string
+  sections: Map<string, string>
+  unknown: readonly [string, string]
+}
+
+export function helpTexts(guide: string): HelpTexts {
+  const sections = new Map<string, string>()
+  for (const line of guide.split('\n')) {
+    if (!line.startsWith('## ')) continue
+    const name = line.slice(3).split('(')[0].trim()
+    const text = sections.has(name) ? null : section(guide, name)
+    if (text !== null) sections.set(name, text)
+  }
+  return { all: guide, sections, unknown: NO_SUCH_HELPER }
+}
+
 export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<string, unknown> {
   const needCdp = (): Cdp => {
     if (!deps.state.launched) throw new Error(NOTHING_LAUNCHED)
@@ -418,7 +441,7 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
     help(name?: unknown): string {
       ctx.at = 'help'
       if (name === undefined) return deps.guide
-      return section(deps.guide, String(name)) ?? `no helper named ${String(name)}: run help() for the list`
+      return section(deps.guide, String(name)) ?? `${NO_SUCH_HELPER[0]}${String(name)}${NO_SUCH_HELPER[1]}`
     }
   }
 }

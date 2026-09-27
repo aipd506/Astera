@@ -55,7 +55,9 @@ export class ScriptSlots {
   }
 }
 
-/** Runs one script. `stop` is the mirror's Stop and the manager's cleanup: it ends the script with
+/** Runs one script on this thread. The Host no longer calls this: it runs each `app js` script in a
+ *  worker it can terminate (src/host/workspace/scriptWorker.ts), which keeps this contract.
+ *  `stop` is the mirror's Stop and the manager's cleanup: it ends the script with
  *  `at: "stopped"` (spec, Mirror tab). Every way out aborts the gate, so a body that outlived the race
  *  cannot keep driving the app. */
 export async function runWorkspaceScript(a: {

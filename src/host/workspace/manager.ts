@@ -9,7 +9,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { SCRIPT_TIMEOUT_MS } from '../../core/agentBrowser/script'
 import { evictionPlan } from '../../core/preview/pick/shots'
-import { ScriptSlots, runWorkspaceScript } from '../../core/workspace/script'
+import { ScriptSlots } from '../../core/workspace/script'
 import { workspaceHelpers, type AppState, type Cdp, type Desk, type HelperDeps, type LaunchSpec, type ResolvedLaunch } from '../../core/workspace/helpers'
 import {
   idleExpired,
@@ -21,6 +21,7 @@ import {
   type WorkspaceRecord
 } from '../../core/workspace/lifecycle'
 import type { DesktopHelper } from './desktopHelper'
+import { runScriptInWorker } from './scriptWorker'
 import type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary } from '../../core/host/protocol'
 export type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary }
 
@@ -447,8 +448,10 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
         void captureFrame(e).catch(() => undefined)
       })
       try {
-        const result = await runWorkspaceScript({
+        // In a worker of its own, so a busy loop cannot freeze the Host (scriptWorker.ts).
+        const result = await runScriptInWorker({
           script,
+          guide: d.guide(),
           stop: ac.signal,
           timeoutMs,
           onHelper: (name) => {
