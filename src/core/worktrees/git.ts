@@ -1,6 +1,6 @@
 import { execFile, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
-import type { BranchRef } from '../types'
+import type { BranchRef, RepoProbe } from '../types'
 import { treeKillCommand } from '../run/kill'
 import { cancelledError } from './cancel'
 
@@ -164,6 +164,41 @@ export function git(
 export async function repoRoot(dir: string): Promise<string | null> {
   const r = await git(['rev-parse', '--show-toplevel'], { cwd: dir })
   return r.ok && r.stdout ? path.resolve(r.stdout) : null
+}
+
+/** Deadline for the new-session dialog's repository check. The dialog holds Start while it runs, and on
+ *  a UNC share or `\wsl$` path git can sit for the full 30 s default — a dead button with nothing to
+ *  say. Five seconds is far past any local answer; past it, the answer is "unknown", not "no". */
+export const REPO_PROBE_TIMEOUT_MS = 5_000
+
+/**
+ * `repoRoot` for a person waiting on it: `repo` with the root, `none` when git answered that this is not
+ * a repository, and `unknown` when git did not answer in time (or could not be asked). The caller must
+ * not read `unknown` as `none` — the folder may well be a repository on a slow share.
+ *
+ * Answers at the deadline even when git itself will not die (git's own kill waits for the exit), and
+ * never rejects.
+ */
+export async function probeRepoRoot(
+  dir: string,
+  run: typeof git = git,
+  timeoutMs: number = REPO_PROBE_TIMEOUT_MS
+): Promise<RepoProbe> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const deadline = new Promise<RepoProbe>((resolve) => {
+    timer = setTimeout(() => resolve({ kind: 'unknown' }), timeoutMs)
+  })
+  const asked = (async (): Promise<RepoProbe> => {
+    const r = await run(['rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs })
+    if (r.ok && r.stdout) return { kind: 'repo', root: path.resolve(r.stdout) }
+    // git ran and said no. No exit code means it never answered (deadline, spawn failure): unknown.
+    return r.exitCode !== undefined ? { kind: 'none' } : { kind: 'unknown' }
+  })().catch((): RepoProbe => ({ kind: 'unknown' }))
+  try {
+    return await Promise.race([asked, deadline])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 /** The absolute path of that directory's real git directory. In a linked worktree it returns

@@ -5,6 +5,7 @@ import type {
   ScheduleConfig,
   SessionKind,
   Provider,
+  RepoProbe,
   WorktreeCreateProgress
 } from '../../../core/types'
 import type { UnattendedPermission } from '../../../core/chat/types'
@@ -14,7 +15,12 @@ import { isSlackReady } from '../../../core/slack/ready'
 import { useChatAvailability } from '../hooks/useChatAvailability'
 import { useAccountStatus } from '../hooks/useAccountStatus'
 import { branchPickerState, orderBranchesForPicker } from '../../../core/worktrees/base'
-import { isWaitingReason, startBlockedBy, type StartBlocked } from '../../../core/sessions/startBlocked'
+import {
+  isWaitingReason,
+  startBlockedBy,
+  worktreeOption,
+  type StartBlocked
+} from '../../../core/sessions/startBlocked'
 import type { MessageKey } from '../../../core/i18n'
 import { toast } from '../lib/toast'
 import { trackWorktreeCreate } from '../lib/worktreeCreate'
@@ -105,7 +111,13 @@ export function NewSessionDialog({
   // has actually failed with something to say (a passing check, one that hasn't run yet for this
   // folder, or one that died silently inside its own timeout all leave nothing to show)
   const [cliError, setCliError] = useState<{ claude?: string; codex?: string }>({})
-  const [repoRoot, setRepoRoot] = useState<string | null>(null) // result of the git repo check
+  // Result of the git repo check (probeRepoRoot). `unknown` is git not answering within its short
+  // deadline — a UNC or \wsl$ folder — which leaves Start open and holds back only the worktree option.
+  const [repoProbe, setRepoProbe] = useState<RepoProbe | null>(null)
+  const repoRoot = repoProbe?.kind === 'repo' ? repoProbe.root : null
+  // Whether the per-folder CLI check below is still running. It does not gate Start (see that effect),
+  // but on a slow share it can take its full 10 s, and a line saying so beats silence.
+  const [checkingCli, setCheckingCli] = useState(false)
   const [resolvingRepo, setResolvingRepo] = useState(false) // blocks start while the check runs — stops a spawn with the previous repoRoot
   const [useWorktree, setUseWorktree] = useState(false)
   const [wtName, setWtName] = useState('')
@@ -206,6 +218,7 @@ export function NewSessionDialog({
   useEffect(() => {
     if (!cwd) return
     let cancelled = false
+    setCheckingCli(true)
     void window.api.system
       .checkCli(cwd)
       .then((c) => {
@@ -213,8 +226,15 @@ export function NewSessionDialog({
         setCliOk({ claude: c.claude.ok, codex: c.codex.ok })
         setCliError({ claude: c.claude.error, codex: c.codex.error })
       })
+      .catch(() => {
+        /* An IPC failure says nothing about the CLI — keep the previous answer, just stop "checking" */
+      })
+      .finally(() => {
+        if (!cancelled) setCheckingCli(false)
+      })
     return () => {
       cancelled = true
+      setCheckingCli(false)
     }
   }, [cwd])
 
@@ -228,17 +248,19 @@ export function NewSessionDialog({
     setBranches(null)
     setBranchesUnavailable(false)
     void (async () => {
-      let root: string | null
+      let probe: RepoProbe
       try {
-        root = await window.api.worktrees.isGitRepo(cwd)
+        probe = await window.api.worktrees.isGitRepo(cwd)
       } catch {
-        // An IPC failure is treated as "not a git repo" as well — it only hides the worktree option, it does not block starting a normal session
-        root = null
+        // An IPC failure is "could not check", not "not a repo" — Start stays open, the worktree option waits
+        probe = { kind: 'unknown' }
       } finally {
         if (!cancelled) setResolvingRepo(false)
       }
       if (cancelled) return
-      setRepoRoot(root)
+      setRepoProbe(probe)
+      if (probe.kind !== 'repo') setUseWorktree(false)
+      const root = probe.kind === 'repo' ? probe.root : null
       const id = await window.api.projects.getDefaultAccount(root ?? cwd)
       if (cancelled || !id || touched.current || !accounts.some((a) => a.id === id)) return
       setAccountIds((prev) => (prev.includes(id) ? prev : [id, ...prev.slice(1)]))
@@ -335,6 +357,7 @@ export function NewSessionDialog({
 
   const rollChecked = multi ? true : rollMode
 
+  const wtOption = worktreeOption(repoProbe)
   const withWorktree = !!repoRoot && useWorktree
 
   const start = async (): Promise<void> => {
@@ -496,7 +519,16 @@ export function NewSessionDialog({
             <button onClick={() => void pick()}>{t('session.new.pickFolder')}</button>
           </div>
         </div>
-        {repoRoot && (
+        {wtOption === 'unknown' && (
+          <>
+            <label className="row check-small">
+              <input type="checkbox" checked={false} disabled />
+              {t('session.new.useWorktree')}
+            </label>
+            <span className="modal-hint">{t('session.new.worktreeRepoUnknown')}</span>
+          </>
+        )}
+        {wtOption === 'available' && (
           <>
             <label className="row check-small">
               <input
@@ -711,6 +743,14 @@ export function NewSessionDialog({
           <p className="modal-hint start-blocked">
             {isWaitingReason(blocked) && <span className="loading-spinner small" aria-hidden="true" />}
             {t(BLOCKED_KEY[blocked])}
+          </p>
+        )}
+        {/* The per-folder CLI check does not hold Start, but on a slow share it can run for its full
+            10 s — say it is running rather than leave the warning above to appear out of nowhere. */}
+        {checkingCli && !starting && (
+          <p className="modal-hint start-blocked">
+            <span className="loading-spinner small" aria-hidden="true" />
+            {t('session.new.checkingCli')}
           </p>
         )}
       </div>

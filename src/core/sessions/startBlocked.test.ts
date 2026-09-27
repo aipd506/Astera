@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isWaitingReason, startBlockedBy, type StartBlocked } from './startBlocked'
+import { isWaitingReason, startBlockedBy, worktreeOption, type StartBlocked } from './startBlocked'
 
 const ok = {
   cwd: 'D:/p', starting: false, resolvingRepo: false,
@@ -41,5 +41,19 @@ describe('isWaitingReason', () => {
     expect(isWaitingReason('checking-folder')).toBe(true)
     const actionable: StartBlocked[] = ['no-cwd', 'no-account', 'cli-missing', 'no-schedule']
     for (const r of actionable) expect(isWaitingReason(r)).toBe(false)
+  })
+})
+
+// 저장소 검사가 기한에 걸려 "모름" 이면 시작은 막지 않되 worktree 는 고를 수 없고, 왜인지 말한다
+describe('worktreeOption', () => {
+  it('repo 면 고를 수 있다', () => {
+    expect(worktreeOption({ kind: 'repo', root: 'D:/r' })).toBe('available')
+  })
+  it('unknown 이면 보이되 막히고 안내가 붙는다', () => {
+    expect(worktreeOption({ kind: 'unknown' })).toBe('unknown')
+  })
+  it('저장소가 아니거나 아직 모르면 숨긴다', () => {
+    expect(worktreeOption({ kind: 'none' })).toBe('hidden')
+    expect(worktreeOption(null)).toBe('hidden')
   })
 })

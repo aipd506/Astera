@@ -608,6 +608,8 @@ export const ja: Catalog = {
   'session.new.worktreeNoBase':
     'このリポジトリには基準にできるブランチがないため worktree を作成できません。コミットを1つ作成してから再試行してください。',
   'session.new.worktreeBranchesUnavailable': 'ブランチ一覧を確認できませんでした（git が応答しません）。基準ブランチは自動で決まります。',
+  'session.new.worktreeRepoUnknown': 'このフォルダが git リポジトリか確認できませんでした（git が時間内に応答しません — ネットワークや WSL のパスは遅いことがあります）。ここでセッションは開始できますが、worktree に分離しては開始できません。',
+  'session.new.checkingCli': 'このフォルダで CLI を確認しています…',
   'pr.create.branchesUnavailable': 'ブランチ一覧を確認できませんでした（git が応答しません）。',
   'session.new.worktreeBaseRef': '基準ブランチ',
   'session.new.worktreeBaseCurrent': '(現在のブランチ)',
@@ -632,7 +634,7 @@ export const ja: Catalog = {
   'session.new.blocked.noAccount': 'アカウントを選んでください',
   'session.new.blocked.cliMissing': 'このアカウントの CLI が見つかりません',
   'session.new.blocked.noSchedule': '予約時刻を決めてください',
-  'session.new.blocked.checkingFolder': 'プロジェクトフォルダを確認しています',
+  'session.new.blocked.checkingFolder': 'リポジトリを確認しています…',
   'session.new.starting': 'セッションを開始しています…',
   'session.new.startingWorktree': 'worktree を作成しています…',
   'session.new.stage.fetch': 'ベースブランチを取得しています…',

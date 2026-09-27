@@ -614,6 +614,8 @@ export const es: Catalog = {
   'session.new.worktreeNoBase':
     'Este repositorio no tiene ninguna rama que sirva de base, así que no se puede crear el worktree. Cree un commit y vuelva a intentarlo.',
   'session.new.worktreeBranchesUnavailable': 'No se pudo comprobar la lista de ramas (git no respondió). La rama base se detectará automáticamente.',
+  'session.new.worktreeRepoUnknown': 'No se pudo comprobar si esta carpeta es un repositorio git (git no respondió a tiempo; una ruta de red o de WSL puede ser lenta). Puedes iniciar una sesión aquí, pero no en un worktree aparte.',
+  'session.new.checkingCli': 'Comprobando la CLI en esta carpeta…',
   'pr.create.branchesUnavailable': 'No se pudo comprobar la lista de ramas (git no respondió).',
   'session.new.worktreeBaseRef': 'Rama base',
   'session.new.worktreeBaseCurrent': '(rama actual)',
@@ -638,7 +640,7 @@ export const es: Catalog = {
   'session.new.blocked.noAccount': 'Elige una cuenta',
   'session.new.blocked.cliMissing': 'No se encontró la CLI de esta cuenta',
   'session.new.blocked.noSchedule': 'Fija una hora programada',
-  'session.new.blocked.checkingFolder': 'Comprobando la carpeta del proyecto',
+  'session.new.blocked.checkingFolder': 'Comprobando el repositorio…',
   'session.new.starting': 'Iniciando la sesión…',
   'session.new.startingWorktree': 'Creando el worktree…',
   'session.new.stage.fetch': 'Obteniendo la rama base…',

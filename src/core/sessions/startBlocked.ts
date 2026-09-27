@@ -1,3 +1,5 @@
+import type { RepoProbe } from '../types'
+
 // Why the new-session dialog's start button is dead. The button had five conditions and said nothing
 // about any of them; two of them resolve asynchronously (the git check on the chosen folder, and the
 // default-account preselect that runs after it), so a person who had filled everything in met a dead
@@ -52,4 +54,16 @@ export function startBlockedBy(a: {
  *  is a judgement about the reasons, and the renderer has no test environment. */
 export function isWaitingReason(r: StartBlocked): boolean {
   return r === 'checking-folder'
+}
+
+/** What the dialog does with the worktree option for this repository check. `hidden` for a folder that
+ *  is not a repository (or not checked yet), exactly as before; `available` with a root; `unknown` when
+ *  git did not answer in time — the checkbox is shown disabled with a hint saying why, so the person
+ *  knows the option exists and that the slow check, not the folder, is what is holding it back. */
+export type WorktreeOption = 'available' | 'unknown' | 'hidden'
+
+export function worktreeOption(probe: RepoProbe | null): WorktreeOption {
+  if (probe === null) return 'hidden'
+  if (probe.kind === 'repo') return 'available'
+  return probe.kind === 'unknown' ? 'unknown' : 'hidden'
 }

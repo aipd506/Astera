@@ -60,6 +60,11 @@ export type { MessageType, TaskStatus } from './orchestration/types'
 // Provider from types can stay as they are.
 export type { Provider } from './providers/meta'
 
+/** The new-session dialog's repository check (core/worktrees/git.ts probeRepoRoot). `unknown` is git
+ *  not answering in time — a slow share, not a verdict — so Start stays open and only the worktree
+ *  option, which needs the root, is held back. */
+export type RepoProbe = { kind: 'repo'; root: string } | { kind: 'none' } | { kind: 'unknown' }
+
 export interface Account {
   id: string
   label: string
@@ -1017,7 +1022,8 @@ export interface CoreApi {
      *  check", which the picker must not show as an empty list. */
     listBranches(repoPath: string): Promise<{ branches: BranchRef[] | null; detected: string | null }>
     remove(id: string, opts?: { force?: boolean }): Promise<WorktreeRemoveResult>
-    isGitRepo(dir: string): Promise<string | null> // returns the repo root, or null
+    /** The repository check behind the new-session dialog (probeRepoRoot: short deadline, `unknown` on timeout). */
+    isGitRepo(dir: string): Promise<RepoProbe>
     getRoot(): Promise<string>
     setRoot(root: string | null): Promise<void>
     /** Branch push state for one repository, one git call per distinct base, keyed base then

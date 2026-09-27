@@ -786,6 +786,8 @@ export const ko = {
   'session.new.useWorktree': 'worktree로 분리해서 시작',
   'session.new.worktreeNoBase': '이 저장소에는 기준으로 삼을 브랜치가 없어 worktree 를 만들 수 없습니다. 커밋을 하나 만든 뒤 다시 시도하세요.',
   'session.new.worktreeBranchesUnavailable': '브랜치 목록을 확인하지 못했습니다(git 이 응답하지 않음). 기준 브랜치는 자동으로 정합니다.',
+  'session.new.worktreeRepoUnknown': '이 폴더가 git 저장소인지 확인하지 못했습니다(git 이 제때 응답하지 않음 — 네트워크·WSL 경로는 느릴 수 있습니다). 여기서 세션은 시작할 수 있지만 worktree 로 분리해서는 시작할 수 없습니다.',
+  'session.new.checkingCli': '이 폴더에서 CLI 를 확인하는 중…',
   'pr.create.branchesUnavailable': '브랜치 목록을 확인하지 못했습니다(git 이 응답하지 않음).',
   'session.new.worktreeBaseRef': '기준 브랜치',
   'session.new.worktreeBaseCurrent': '(현재 브랜치)',
@@ -841,7 +843,7 @@ export const ko = {
   'session.new.blocked.noAccount': '계정을 고르세요',
   'session.new.blocked.cliMissing': '이 계정의 CLI 를 찾지 못했습니다',
   'session.new.blocked.noSchedule': '예약 시각을 정하세요',
-  'session.new.blocked.checkingFolder': '프로젝트 폴더를 확인하는 중입니다',
+  'session.new.blocked.checkingFolder': '저장소를 확인하는 중…',
   // Waiting text between pressing Start and the tab opening. Splitting off a worktree chains fetch, worktree add and
   // the include copy, taking several seconds, so what is in progress is announced separately.
   'session.new.starting': '세션을 시작하는 중…',
