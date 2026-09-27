@@ -20,6 +20,7 @@ describe('workspaceDeskStarter', () => {
       exists: async () => false,
       makeRuntimeDir: async () => '/tmp/astera-xrt-1',
       removeDir: async () => {},
+      writeFile: async () => {},
       startTime: async () => 5,
       killGroup: async () => {},
       sleep: async () => {},

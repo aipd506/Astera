@@ -46,6 +46,9 @@ const KEYBOARD_TEXT = /^[\x20-\x7e\n\t]$/
 export const REMAP_DELAY_MS = 100
 /** Characters per run at REMAP_DELAY_MS: about 10 s, inside DESK_REQUEST_MS. */
 export const REMAP_CHUNK = 100
+/** How long Chromium is given to read a keyboard map the desk uploaded, before the typing that needs
+ *  it and again after it, before the map goes back (bindKeysyms). */
+export const KEYMAP_SETTLE_MS = 300
 /** Moves between the press and the target in a real pointer drag (pressArgs). */
 export const DRAG_STEPS = 5
 /** The pause after each move, in seconds, as xdotool's `sleep` takes it. */
@@ -84,6 +87,8 @@ export interface LinuxDeskDeps {
   makeRuntimeDir(): Promise<string>
   /** Removes a folder and what is in it; a folder already gone is no error. */
   removeDir(p: string): Promise<void>
+  /** Writes a text file (UTF-8), replacing one that is there. */
+  writeFile(p: string, text: string): Promise<void>
   /** A live pid's start time in epoch ms from /proc, or null when it is gone. */
   startTime(pid: number): Promise<number | null>
   killGroup(pid: number): Promise<void>
@@ -140,6 +145,55 @@ export function typeRuns(text: string): string[][] {
   const head = keyboard ? ['type', '--'] : ['type', '--delay', String(REMAP_DELAY_MS), '--']
   const out: string[][] = []
   for (let i = 0; i < chars.length; i += size) out.push([...head, chars.slice(i, i + size).join('')])
+  return out
+}
+
+/** What the keyboard has no key for: every character of `text` that is not KEYBOARD_TEXT, once each,
+ *  in order. */
+export function specialChars(text: string): string[] {
+  return [...new Set(Array.from(text).filter((ch) => !KEYBOARD_TEXT.test(ch)))]
+}
+
+/** The keycode names an `xkbcomp -xkb` dump defines in xkb_keycodes and binds nothing to in
+ *  xkb_symbols: keys this keyboard has and never types with, free to bind. */
+export function freeKeycodes(xkb: string): string[] {
+  const kc = xkb.indexOf('xkb_keycodes')
+  const types = xkb.indexOf('xkb_types', kc)
+  const sym = xkb.indexOf('xkb_symbols')
+  if (kc < 0 || types < 0 || sym < 0) return []
+  const names = [...xkb.slice(kc, types).matchAll(/^\s*<([A-Za-z0-9_+-]+)>\s*=\s*\d+\s*;/gm)].map((m) => m[1])
+  const used = new Set([...xkb.slice(sym).matchAll(/\bkey\s+<([A-Za-z0-9_+-]+)>/g)].map((m) => m[1]))
+  return names.filter((n) => !used.has(n))
+}
+
+/** The dump with each character bound, at its first level, to the free keycode next to it, as its
+ *  Unicode keysym: the lines go at the end of xkb_symbols. The dump itself when there is no
+ *  xkb_symbols to add to. */
+export function withKeysyms(xkb: string, bind: Array<{ keycode: string; ch: string }>): string {
+  const sym = xkb.indexOf('xkb_symbols')
+  const end = sym < 0 ? -1 : xkb.indexOf('\n};', sym)
+  if (end < 0) return xkb
+  const lines = bind.map((b) => `    key <${b.keycode}> { [ U${(b.ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')} ] };`)
+  return `${xkb.slice(0, end)}\n${lines.join('\n')}${xkb.slice(end)}`
+}
+
+/** `text` in pieces of at most TYPE_CHUNK characters, each with at most `free` characters the
+ *  keyboard has no key for, never splitting a surrogate pair. */
+export function keymapPieces(text: string, free: number): string[] {
+  const out: string[] = []
+  let piece: string[] = []
+  let special = new Set<string>()
+  for (const ch of Array.from(text)) {
+    const extra = !KEYBOARD_TEXT.test(ch) && !special.has(ch)
+    if (piece.length === TYPE_CHUNK || (extra && special.size === free)) {
+      out.push(piece.join(''))
+      piece = []
+      special = new Set()
+    }
+    if (!KEYBOARD_TEXT.test(ch)) special.add(ch)
+    piece.push(ch)
+  }
+  if (piece.length > 0) out.push(piece.join(''))
   return out
 }
 
@@ -363,6 +417,40 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
       return out
     }
 
+    /** Types text that has characters the keyboard has no key for with those characters bound to
+     *  free keys first, for the whole of each piece, then the map put back: xdotool then finds every
+     *  character on a key and binds nothing while it types, so there is no binding for Chromium to read
+     *  late (REMAP_DELAY_MS). On Xvfb in ubuntu:24.04 at 2 CPUs, 90 of 90 typings came out whole this
+     *  way, at the default delay. False, having typed nothing, when the map cannot be read or has no
+     *  free key; the caller then types the slow way. */
+    const typeBound = async (id: string, text: string): Promise<boolean> => {
+      let original: string
+      try {
+        original = (await d.run('xkbcomp', ['-w', '0', '-xkb', `:${display}`, '-'], env)).toString('utf8')
+      } catch (err) {
+        d.log(`desktop ${name}: the keyboard map could not be read (${messageOf(err)}); typing slowly instead`)
+        return false
+      }
+      const free = freeKeycodes(original)
+      if (free.length === 0) return false
+      const file = path.posix.join(runtimeDir, 'keymap.xkb')
+      const upload = async (xkb: string): Promise<void> => {
+        await d.writeFile(file, xkb)
+        await d.run('xkbcomp', ['-w', '0', file, `:${display}`], env)
+      }
+      try {
+        for (const piece of keymapPieces(text, free.length)) {
+          await upload(withKeysyms(original, specialChars(piece).map((ch, i) => ({ keycode: free[i], ch }))))
+          await d.sleep(KEYMAP_SETTLE_MS)
+          await xdotool(['windowfocus', id, 'type', '--', piece])
+          await d.sleep(KEYMAP_SETTLE_MS)
+        }
+      } finally {
+        await upload(original).catch((err: unknown) => d.log(`desktop ${name}: the keyboard map could not be put back: ${messageOf(err)}`))
+      }
+      return true
+    }
+
     const park = ['mousemove', String(PARKED_POINTER.x), String(PARKED_POINTER.y)]
     let lastPressAt = -Infinity
     /** drag()'s fallback (DeskPointer, helpers.ts): real X input on this display, which only this
@@ -372,6 +460,11 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
         const w = pickWindow(await windows(), o.title || undefined)
         if (!w) throw noWindow(o.title)
         const g = parseGeometry((await xdotool(['getwindowgeometry', '--shell', String(w.hwnd)])).toString('utf8'))
+        // A point off the window would press on whatever lies under it, or on nothing (CI run
+        // 36312079513 pressed at 450,101, above the window at 510,190).
+        for (const pt of [o.from, o.to])
+          if (!(pt.x >= 0 && pt.y >= 0 && pt.x < g.width && pt.y < g.height))
+            throw new Error(`the point ${pt.x},${pt.y} is outside the ${g.width}x${g.height} window "${w.title}", so the display's pointer was not pressed`)
         const wait = lastPressAt + PRESS_GAP_MS - d.now()
         if (wait > 0) await d.sleep(wait)
         lastPressAt = d.now()
@@ -457,7 +550,9 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
           if (!sym) throw new Error(`unknown key ${o.key}`)
           await xdotool(['windowfocus', id, 'key', '--clearmodifiers', sym])
         }
-        if (o.text !== undefined) for (const run of typeRuns(o.text)) await xdotool(['windowfocus', id, ...run])
+        if (o.text === undefined) return
+        if (specialChars(o.text).length === 0 || !(await typeBound(id, o.text)))
+          for (const run of typeRuns(o.text)) await xdotool(['windowfocus', id, ...run])
       },
       close: async () => {
         for (const [p, at] of [...launched]) await kill(p, at).catch((err) => d.log(`desktop ${name}: pid ${p} could not be ended: ${messageOf(err)}`))
@@ -495,6 +590,7 @@ export function realLinuxDeskDeps(a: { hostEnv: Record<string, string | undefine
       return dir
     },
     removeDir: (p) => fs.rm(p, { recursive: true, force: true }),
+    writeFile: (p, text) => fs.writeFile(p, text, 'utf8'),
     startTime: async (pid) => (await linuxStartTimes([pid], procFs)).get(pid) ?? null,
     killGroup: (pid) => killGroup(pid),
     sleep: (ms, signal) =>

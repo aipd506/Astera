@@ -6,6 +6,7 @@ import { NAMED_KEYS } from '../../core/workspace/helpers'
 import { DESK_CLOSE_MS, DESK_READY_MS, type DeskWindow } from '../../core/workspace/protocol'
 import {
   DRAG_STEPS,
+  KEYMAP_SETTLE_MS,
   PARKED_POINTER,
   PRESS_GAP_MS,
   REMAP_CHUNK,
@@ -14,13 +15,17 @@ import {
   XDOTOOL_KEYS,
   createLinuxDesks,
   displayEnv,
+  freeKeycodes,
   imageSize,
+  keymapPieces,
   parseGeometry,
   pickWindow,
   pressArgs,
   realLinuxDeskDeps,
+  specialChars,
   typeRuns,
   utf8Env,
+  withKeysyms,
   type LinuxDeskDeps
 } from './deskLinux'
 import type { SpawnedProc } from './posixProc'
@@ -80,6 +85,7 @@ const rig = (plan: Mode[] = []) => {
   /** Private runtime folders made and not yet removed, and every one ever made. */
   const dirs = new Set<string>()
   const made: string[] = []
+  const written: Array<{ path: string; text: string }> = []
   let clock = 1_000_000
   let nextPid = 700
   let xvfbs = 0
@@ -147,6 +153,9 @@ const rig = (plan: Mode[] = []) => {
     removeDir: async (p) => {
       dirs.delete(p)
     },
+    writeFile: async (p, text) => {
+      written.push({ path: p, text })
+    },
     startTime: async (pid) => starts.get(pid) ?? null,
     killGroup: async (pid) => {
       groupsKilled.push(pid)
@@ -173,7 +182,7 @@ const rig = (plan: Mode[] = []) => {
   const xdo = (fn: (args: string[]) => Buffer | Error | undefined): void => {
     answers.push((file, args) => (file === 'xdotool' ? fn(args) : undefined))
   }
-  return { deps, desks: createLinuxDesks(deps), files, procs, runs, starts, groupsKilled, log, sleeps, answers, xdo, dirs, made }
+  return { deps, desks: createLinuxDesks(deps), files, procs, runs, starts, groupsKilled, log, sleeps, answers, xdo, dirs, made, written }
 }
 
 /** Three windows: a Hangul titled one with a pid, one with no _NET_WM_PID, and one that closes
@@ -279,6 +288,88 @@ describe('the Linux desk: the pointer', () => {
   })
 })
 
+/** A small `xkbcomp -xkb` dump: four keycodes, two with symbols. */
+const DUMP = [
+  'xkb_keymap {',
+  'xkb_keycodes "evdev" {',
+  '    minimum = 8;',
+  '    <AE01> = 10;',
+  '    <AC01> = 38;',
+  '    <I120> = 120;',
+  '    <FK13> = 191;',
+  '    alias <LatA> = <AC01>;',
+  '};',
+  'xkb_types "complete" {',
+  '};',
+  'xkb_symbols "pc+us" {',
+  '    key <AE01> { [ 1, exclam ] };',
+  '    key <AC01> { [ a, A ] };',
+  '};',
+  'xkb_geometry "pc(pc105)" {',
+  '};',
+  '};',
+  ''
+].join('\n')
+
+describe('the Linux desk: typing with the needed characters bound first', () => {
+  it('finds the keycodes nothing is bound to, and binds characters to them as Unicode keysyms', () => {
+    expect(freeKeycodes(DUMP)).toEqual(['I120', 'FK13'])
+    expect(freeKeycodes('nonsense')).toEqual([])
+    const bound = withKeysyms(DUMP, [
+      { keycode: 'I120', ch: '한' },
+      { keycode: 'FK13', ch: 'é' }
+    ])
+    expect(bound).toContain('    key <AC01> { [ a, A ] };\n    key <I120> { [ UD55C ] };\n    key <FK13> { [ U00E9 ] };\n};\nxkb_geometry')
+    expect(withKeysyms('no symbols here', [{ keycode: 'I120', ch: 'x' }])).toBe('no symbols here')
+    expect(specialChars('hi 한글 한\n')).toEqual(['한', '글'])
+  })
+
+  it('cuts text into pieces with no more new characters than there are free keys', () => {
+    expect(keymapPieces('ab한글c국어', 2)).toEqual(['ab한글c', '국어'])
+    expect(keymapPieces('한한한한', 1)).toEqual(['한한한한'])
+    expect(keymapPieces('a'.repeat(TYPE_CHUNK + 1), 5).map((p) => p.length)).toEqual([TYPE_CHUNK, 1])
+    expect(keymapPieces('', 3)).toEqual([])
+  })
+
+  it('binds, waits, types at the default delay, waits, and puts the map back', async () => {
+    const r = rig()
+    threeWindows(r)
+    r.answers.unshift((file, args) => (file === 'xkbcomp' && args.includes('-xkb') ? Buffer.from(DUMP) : undefined))
+    const desk = await r.desks.start('a')
+    await desk.keys({ title: 'astera', text: 'hi 한글' })
+    const steps = r.runs.filter((x) => x.file === 'xkbcomp' || x.args[2] === 'type').map((x) => [x.file, ...x.args])
+    const file = '/tmp/astera-xrt-1/keymap.xkb'
+    expect(steps).toEqual([
+      ['xkbcomp', '-w', '0', '-xkb', ':90', '-'],
+      ['xkbcomp', '-w', '0', file, ':90'],
+      ['xdotool', 'windowfocus', '41', 'type', '--', 'hi 한글'],
+      ['xkbcomp', '-w', '0', file, ':90']
+    ])
+    expect(r.written.map((w) => w.path)).toEqual([file, file])
+    expect(r.written[0].text).toContain('key <I120> { [ UD55C ] };\n    key <FK13> { [ UAE00 ] };')
+    expect(r.written[1].text).toBe(DUMP)
+    expect(r.sleeps.filter((x) => x.ms === KEYMAP_SETTLE_MS)).toHaveLength(2)
+  })
+
+  it('puts the map back when typing fails, and types the slow way when the map cannot be read', async () => {
+    const r = rig()
+    threeWindows(r)
+    r.answers.unshift((file, args) => (file === 'xkbcomp' && args.includes('-xkb') ? Buffer.from(DUMP) : undefined))
+    r.answers.unshift((file, args) => (file === 'xdotool' && args[2] === 'type' ? new Error('BadWindow') : undefined))
+    const desk = await r.desks.start('a')
+    await expect(desk.keys({ title: 'astera', text: '한' })).rejects.toThrow('BadWindow')
+    expect(r.written.at(-1)!.text).toBe(DUMP)
+
+    const s = rig()
+    threeWindows(s)
+    s.answers.unshift((file) => (file === 'xkbcomp' ? new Error('xkbcomp: not found') : undefined))
+    const slow = await s.desks.start('a')
+    await slow.keys({ title: 'astera', text: '한' })
+    expect(s.runs.filter((x) => x.args[2] === 'type').map((x) => x.args)).toEqual([['windowfocus', '41', 'type', '--delay', '100', '--', '한']])
+    expect(s.log.some((l) => l.includes('the keyboard map could not be read (xkbcomp: not found); typing slowly instead'))).toBe(true)
+  })
+})
+
 describe("the Linux desk: drag()'s real pointer", () => {
   it('presses at the window origin plus the page point, moves in steps to the target, and lets go back in the corner', async () => {
     const r = rig()
@@ -307,6 +398,13 @@ describe("the Linux desk: drag()'s real pointer", () => {
     await desk.pointer!.press({ title: '', from: { x: 1, y: 1 }, to: { x: 50, y: 50 } })
     expect(r.sleeps.slice(before).map((s) => s.ms)).toEqual([PRESS_GAP_MS])
     await expect(desk.pointer!.press({ title: 'nothing like it', from: { x: 1, y: 1 }, to: { x: 2, y: 2 } })).rejects.toThrow('no window titled "nothing like it"')
+    // CI run 36312079513: a page point above the window is refused, and nothing is pressed.
+    const presses = r.runs.filter((x) => x.args.includes('mousedown')).length
+    await expect(desk.pointer!.press({ title: '', from: { x: -60, y: -89 }, to: { x: 50, y: 50 } })).rejects.toThrow(
+      'the point -60,-89 is outside the 900x700 window "Astera 픽스처 창", so the display\'s pointer was not pressed'
+    )
+    await expect(desk.pointer!.press({ title: '', from: { x: 1, y: 1 }, to: { x: 900, y: 5 } })).rejects.toThrow('the point 900,5 is outside')
+    expect(r.runs.filter((x) => x.args.includes('mousedown'))).toHaveLength(presses)
   })
 
   it('gives xdotool a UTF-8 locale when the Host has none, and keeps one it has', async () => {
