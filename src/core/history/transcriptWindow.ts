@@ -156,10 +156,11 @@ export const HEAVY_LINE_CHARS = 256 * 1024
 export const PARSE_LINE_CHARS_MAX = 4 * 1024 * 1024
 
 /** A JSON string whose whole value is a long base64 run: an image's `source.data`, or the copy of it
- *  Claude Code keeps in `toolUseResult.file.base64`. Neither is ever text a parser here reads — the
- *  text of a turn is in `text` blocks and tool output. The lookbehind keeps an escaped quote inside a
- *  longer string from being taken for the start of one. */
-const INLINE_BASE64 = /(?<!\\)"[A-Za-z0-9+/=]{4096,}"/g
+ *  Claude Code keeps in `toolUseResult.file.base64` — or the same run behind a `data:<type>;base64,`
+ *  prefix, which is how codex records a pasted image (`input_image.image_url`). None of these is ever
+ *  text a parser here reads — the text of a turn is in `text` blocks and tool output. The lookbehind
+ *  keeps an escaped quote inside a longer string from being taken for the start of one. */
+const INLINE_BASE64 = /(?<!\\)"(?:data:[A-Za-z0-9.+-]+\/[A-Za-z0-9.+-]+;base64,)?[A-Za-z0-9+/=]{4096,}"/g
 
 /** JSON.parse for one transcript line, without paying for its images. A line over HEAVY_LINE_CHARS has
  *  its base64 string values emptied first — a regex pass over the raw text is far cheaper than
