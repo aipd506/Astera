@@ -737,6 +737,9 @@ export interface CoreEvents {
   'session:busy': { sessionId: string; busy: boolean } // session working/idle — the spinner dot on the tab
   'session:schedState': SchedStateEvent // schedule banner
   'history:updated': { total: number }
+  /** Rollout heads the codex index does not know yet, being read (core/history/scanProgress.ts).
+   *  `active: false` closes it. Only a scan of 20 files or more is reported. */
+  'history:scan': { active: boolean; done: number; total: number }
   'accounts:changed': { accounts: Account[] }
   // The unregistered history sources were re-scanned (fires after an account is added or removed)
   'accounts:ghostsChanged': { accounts: Account[] }

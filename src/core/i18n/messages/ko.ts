@@ -953,6 +953,7 @@ export const ko = {
   'history.panel.title': '히스토리',
   'history.panel.empty': '기록 없음',
   'history.loading': '불러오는 중…',
+  'history.scan.codex': 'Codex 기록을 훑는 중… {done}/{total}',
   'history.filter.deletedSuffix': ' (삭제됨)',
   'session.resume.originAccount': '원래 계정',
   'session.resume.originDeleted': '삭제된 계정',

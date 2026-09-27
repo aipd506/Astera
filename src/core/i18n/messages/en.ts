@@ -819,6 +819,7 @@ export const en: Record<keyof typeof ko, string> = {
   'history.panel.title': 'History',
   'history.panel.empty': 'No history',
   'history.loading': 'Loading…',
+  'history.scan.codex': 'Scanning Codex history… {done}/{total}',
   'history.filter.deletedSuffix': ' (deleted)',
   'session.resume.originAccount': 'Original account',
   'session.resume.originDeleted': 'Deleted account',

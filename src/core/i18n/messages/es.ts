@@ -762,6 +762,7 @@ export const es: Catalog = {
   'history.panel.title': 'Historial',
   'history.panel.empty': 'Sin registros',
   'history.loading': 'Cargando…',
+  'history.scan.codex': 'Analizando el historial de Codex… {done}/{total}',
   'history.filter.deletedSuffix': ' (eliminada)',
   // HistoryBrowser.tsx — account filter labels
   'session.resume.originAccount': 'Cuenta original',

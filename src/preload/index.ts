@@ -27,6 +27,7 @@ const EVENT_CHANNELS = [
   'session:busy',
   'session:schedState',
   'history:updated',
+  'history:scan',
   'accounts:changed',
   'accounts:ghostsChanged',
   'files:changed',

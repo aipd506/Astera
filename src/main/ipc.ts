@@ -1799,6 +1799,8 @@ export function registerIpc(
     send('history:updated', { total: 0 })
     workUnitCollector.onTranscriptChanged()
   }
+  // "Scanning Codex history… N/M" while the rollout index reads heads it does not know yet
+  core.history.onScanProgress = (e) => send('history:scan', e)
   // Accounts go out exactly as stored. There is no default-account flag to decorate: the default is decided
   // per provider from the list plus login state, and the renderer already holds both (useAccountStatus), so
   // it derives that itself with core/accounts/defaultAccount.ts.

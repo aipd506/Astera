@@ -753,6 +753,7 @@ export const ja: Catalog = {
   'history.panel.title': '履歴',
   'history.panel.empty': '記録なし',
   'history.loading': '読み込み中…',
+  'history.scan.codex': 'Codex の履歴をスキャンしています… {done}/{total}',
   'history.filter.deletedSuffix': ' (削除済み)',
   'session.resume.originAccount': '元のアカウント',
   'session.resume.originDeleted': '削除されたアカウント',
