@@ -72,9 +72,9 @@ const codexGoal = (status: string, objective = 'rpg 게임을 만들어줘'): st
 interface Fake {
   git: CollectorGit & {
     ref: GitRef
-    files: string[]
+    files: string[] | null
     ancestor: boolean | null
-    range: { commits: string[]; changedFiles: string[]; authors?: string[] }
+    range: { commits: string[]; changedFiles: string[]; authors?: string[] } | null
   }
   sessions: CollectorSession[]
   clock: number
@@ -322,6 +322,57 @@ describe('WorkUnitCollector — 선언으로 여닫는다', () => {
 
     expect(store.get(projectPath)!.units).toHaveLength(0) // sawWrite alone does not save it
     expect(closed).toHaveLength(0)
+  })
+
+  // git 이 답하지 못한 것(null)은 "바뀐 파일이 없다"가 아니다. 쓰기 증거가 있는 Unit 을 git 이 매달린
+  // 순간에 완료했다고 지우면, 실제로 한 일이 기록 없이 사라진다.
+  it('완료 순간 git 이 답하지 못하면(null) 쓰기 증거가 있는 Unit 을 지우지 않고 기록한다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    await collector.startTask('s1', '버그를 고쳐줘')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null // status 가 시간 초과 — 모른다
+
+    const result = await collector.completeTask('s1', { source: 'agent' })
+    expect(result.ok).toBe(true)
+    expect(store.get(projectPath)!.units).toHaveLength(1)
+    expect(store.get(projectPath)!.units[0].status).toBe('completed')
+    expect(closed).toHaveLength(1)
+  })
+
+  it('git 이 답하지 못해도(null) 쓰기 증거가 없는 Unit 은 그대로 지운다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+
+    await collector.startTask('s1', '설명해줘')
+    fake.git.files = null
+    await collector.completeTask('s1', { source: 'agent' })
+    expect(store.get(projectPath)!.units).toHaveLength(0)
+  })
+
+  it('completeTaskById 도 git 이 답하지 못하면(null) 쓰기 증거가 있는 Unit 을 기록한다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    const started = await collector.startTask('s1', '고쳐줘')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null
+    const id = (started as { id: string }).id
+    const r = await collector.completeTaskById(projectPath, id)
+    expect(r).toEqual({ ok: true, recorded: true })
+    expect(store.get(projectPath)!.units).toHaveLength(1)
+    expect(closed).toHaveLength(1)
   })
 
   it('completeTaskById 는 중단된 것도 닫는다', async () => {
@@ -817,6 +868,43 @@ describe('WorkUnitCollector — beginGitOperation/endGitOperation', () => {
   // threading 되는지는 이 자리 말고는 볼 데가 없다(gitProbe.test.ts 는 readRange 자신만 본다).
   // 그리고 **커밋과 같은 조건으로 버리는지**를 함께 본다: `git log before..after` 에서 온 값이라
   // fast-forward 밖에서는 커밋과 마찬가지로 뜻이 없다(EG §6·§7).
+  // 범위를 읽지 못했을 때(null) 빈 목록만 남기면 큰 pull 이 "아무 것도 안 바뀐 이동"으로 기록된다.
+  // 기록은 남기되 모른다는 표지를 단다.
+  it('범위를 읽지 못한 외부 변경은 rangeUnknown 표지를 달고 기록된다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+
+    collector.onGitChanged() // 기준선
+    await collector.flush()
+
+    fake.git.range = null
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+
+    const state = store.get(projectPath)!
+    expect(state.externalGitChanges).toHaveLength(1)
+    expect(state.externalGitChanges[0].rangeUnknown).toBe(true)
+    expect(state.externalGitChanges[0].commits).toEqual([])
+    expect(state.externalGitChanges[0].changedFiles).toEqual([])
+  })
+
+  it('범위를 읽은 외부 변경에는 rangeUnknown 이 없다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    collector.onGitChanged()
+    await collector.flush()
+    fake.git.range = { commits: ['c1'], changedFiles: ['a.txt'] }
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges[0].rangeUnknown).toBeUndefined()
+  })
+
   it('fast-forward 의 author 는 저장되고, 브랜치 전환의 author 는 버려진다', async () => {
     const fake = makeFake()
     fake.sessions = [session()]

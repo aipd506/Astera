@@ -73,20 +73,24 @@ export interface CollectorSession {
 export interface CollectorGit {
   readRef(repoPath: string): Promise<GitRef>
   isAncestor(repoPath: string, before: string | null, after: string | null): Promise<boolean | null>
-  /** 작업 트리에서 지금 바뀌어 있는 파일들 (저장소 루트 기준 상대 경로, git 이 찍은 그대로) */
-  changedFiles(repoPath: string): Promise<string[]>
+  /** 작업 트리에서 지금 바뀌어 있는 파일들 (저장소 루트 기준 상대 경로, git 이 찍은 그대로).
+   *  **null 은 git 이 답하지 못했다는 뜻이다(모름)** — 빈 목록(깨끗하다)과 다르게 다룬다. */
+  changedFiles(repoPath: string): Promise<string[] | null>
   /** before..after 구간의 커밋과 그 구간에서 바뀐 파일들 (gitProbe.ts 의 readRange). **두 HEAD 가
    *  다른 전이에서 부른다.** 돌려받은 셋의 쓰임은 다르다 — 커밋 목록과 author 목록은
    *  fast-forward 에서만 쓰고(그 밖에는 범위를 신뢰할 수 없다, ExternalGitChange.commits 주석),
    *  파일 목록은 두 트리의 비교라 어느 전이에서나 쓴다(gitRound 의 주석).
    *
    *  `authors` 가 선택인 것은 **구현이 그것 없이도 계약을 지키기 때문이다** — 이름은 표시용이고
-   *  (EG §7) 판정에 쓰이지 않는다. 실제 구현(gitProbe.readRange)은 늘 준다. */
+   *  (EG §7) 판정에 쓰이지 않는다. 실제 구현(gitProbe.readRange)은 늘 준다.
+   *
+   *  **null 은 git 이 범위를 읽지 못했다는 뜻이다(모름)** — 외부 변경은 그래도 기록하되
+   *  `rangeUnknown` 표지를 달아 빈 목록이 "바뀐 것 없음"으로 읽히지 않게 한다. */
   readRange(
     repoPath: string,
     before: string,
     after: string
-  ): Promise<{ commits: string[]; changedFiles: string[]; authors?: string[] }>
+  ): Promise<{ commits: string[]; changedFiles: string[]; authors?: string[] } | null>
 }
 
 export interface CollectorDeps {
@@ -417,6 +421,12 @@ export class WorkUnitCollector {
       interruptedId = open.id
     }
     const head = (await this.refOf(s.projectPath)).head
+    // 기준선을 git 이 답하지 못했으면(null) 빈 기준선으로 연다. 이것은 "깨끗했다"고 믿는 것이
+    // 아니라 **덜 가리는 쪽**을 고른 것이다: 기준선은 관찰에서 빼는 목록이라, 모를 때 비워 두면
+    // 열리기 전부터 더럽던 파일이 이 Unit 의 관찰에 더 들어갈 수는 있어도 실제 변경이 가려지지는
+    // 않는다. 질문만 한 Unit 이 그 때문에 기록되는 일은 finish 의 sawWrite 조건이 막는다.
+    const baseline = await this.changedFiles(s.projectPath)
+    if (baseline === null) this.log(`baseline unknown ${s.projectPath}: git did not answer, opening with none`)
     state.units.push(
       startedTask({
         id: randomUUID(),
@@ -425,7 +435,7 @@ export class WorkUnitCollector {
         objective,
         at,
         startHead: head,
-        baselineDirtyFiles: await this.changedFiles(s.projectPath)
+        baselineDirtyFiles: baseline ?? []
       })
     )
     const id = state.units[state.units.length - 1].id
@@ -460,8 +470,11 @@ export class WorkUnitCollector {
     const state = this.stateOf(s.projectPath)
     const open = state.units.find((u) => u.sessionId === sessionId && u.status === 'active')
     if (!open) return { ok: false as const, reason: 'NO_ACTIVE_TASK' }
-    this.observe(state, s.projectPath, await this.changedFiles(s.projectPath))
-    this.finish(state, open, completedTask(open, { ...input, at: this.nowIso() }), s.projectPath)
+    const live = await this.changedFiles(s.projectPath)
+    this.observe(state, s.projectPath, live)
+    this.finish(state, open, completedTask(open, { ...input, at: this.nowIso() }), s.projectPath, {
+      gitUnknown: live === null
+    })
     await this.persist(s.projectPath, state)
     this.deps.onTasksChanged?.(s.projectPath)
     return { ok: true as const, id: open.id }
@@ -490,12 +503,16 @@ export class WorkUnitCollector {
       if (!state || !u) return { ok: false as const, reason: `unknown task: ${unitId}` }
       if (u.status !== 'active' && u.status !== 'interrupted')
         return { ok: false as const, reason: `task is ${u.status}` }
-      if (this.running) this.observe(state, projectPath, await this.changedFiles(projectPath))
+      // Only an open (active) unit takes this live read into its window — see observe — so only
+      // then does "git did not answer" say anything about what this unit changed.
+      const live = this.running ? await this.changedFiles(projectPath) : undefined
+      if (live !== undefined) this.observe(state, projectPath, live)
       const recorded = this.finish(
         state,
         u,
         completedTask(u, { source: 'user', at: this.nowIso() }),
-        projectPath
+        projectPath,
+        { gitUnknown: live === null && isOpen(u.status) }
       )
       await this.persist(projectPath, state)
       this.deps.onTasksChanged?.(projectPath)
@@ -1440,10 +1457,13 @@ export class WorkUnitCollector {
       // 같으면(브랜치만 갈아탔다) 견줄 트리가 하나뿐이라 묻지 않는다 — 답이 늘 빈 목록이다.
       // Astera 자신의 동작으로 판정된 경우는 이 블록에 들어오지 않으므로, 버려질 range 를 위해
       // git 을 더 부르지 않는다.
-      const range =
+      // null: git could not read the range. The change is still recorded — the HEAD did move — but
+      // with rangeUnknown, so its empty lists are not read as "nothing changed".
+      const read =
         before.head && after.head && before.head !== after.head
           ? await this.deps.git.readRange(projectPath, before.head, after.head)
           : { commits: [], changedFiles: [] }
+      const range = read ?? { commits: [], changedFiles: [] }
       const change: ExternalGitChange = {
         id: randomUUID(),
         projectPath,
@@ -1455,6 +1475,7 @@ export class WorkUnitCollector {
         // 범위를 믿을 수 없는 전이에서 이름만 믿을 이유가 없다 (EG §6·§7)
         authors: type === 'fast-forward' ? (range.authors ?? []) : [],
         changedFiles: range.changedFiles,
+        ...(read === null ? { rangeUnknown: true as const } : {}),
         detectedAt: this.nowIso()
       }
       state.externalGitChanges.push(change)
@@ -1561,10 +1582,15 @@ export class WorkUnitCollector {
     state: WorkUnitState,
     unit: SessionWorkUnit,
     next: SessionWorkUnit,
-    projectPath: string
+    projectPath: string,
+    /** The live read taken just before this close could not be answered by git. Then an empty
+     *  observed list is "could not check", not "nothing changed", and a unit with write evidence is
+     *  kept rather than dropped. */
+    opts: { gitUnknown?: boolean } = {}
   ): boolean {
     const i = state.units.indexOf(unit)
-    if (next.status === 'completed' && (!next.sawWrite || next.git.observedChangedFiles.length === 0)) {
+    const nothingChanged = next.git.observedChangedFiles.length === 0 && opts.gitUnknown !== true
+    if (next.status === 'completed' && (!next.sawWrite || nothingChanged)) {
       if (i >= 0) state.units.splice(i, 1)
       return false
     }
@@ -1595,8 +1621,10 @@ export class WorkUnitCollector {
    *  what a later 완료 (`finish`, Critical 1's second guard) judges the unit by. A fourth path that
    *  interrupts a unit without this same live look first can freeze it holding zero observed files
    *  despite real, already-made edits sitting right there in the working tree. */
-  private observe(state: WorkUnitState, projectPath: string, files: string[]): boolean {
-    if (files.length === 0) return false
+  private observe(state: WorkUnitState, projectPath: string, files: string[] | null): boolean {
+    // null: git did not answer. Nothing is added — and nothing is concluded either; callers that
+    // judge "nothing changed" (finish) are told separately.
+    if (files === null || files.length === 0) return false
     let changed = false
     for (const u of state.units) {
       if (u.projectPath !== projectPath || !isOpen(u.status)) continue
@@ -1615,12 +1643,16 @@ export class WorkUnitCollector {
     return changed
   }
 
-  private async changedFiles(projectPath: string): Promise<string[]> {
+  /** The working tree's changed files, or **null when git could not answer** (an error, a timeout, an
+   *  output limit, or a throw). Never [] for a failure — [] is a clean tree. */
+  private async changedFiles(projectPath: string): Promise<string[] | null> {
     try {
-      return await this.deps.git.changedFiles(projectPath)
+      const files = await this.deps.git.changedFiles(projectPath)
+      if (files === null) this.log(`changed files unknown ${projectPath}: git did not answer`)
+      return files
     } catch (e) {
       this.log(`changed files failed ${projectPath}: ${String(e)}`)
-      return []
+      return null
     }
   }
 

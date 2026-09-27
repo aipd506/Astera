@@ -57,13 +57,17 @@ export async function isAncestorOf(
  *
  * (이 함수는 한동안 collector.ts 에 있었다 — 그때는 이 파일을 고칠 수 없다는 제약이 있어서였다.
  * 지금은 그 제약이 없어 제자리로 옮긴다: git 에 말을 거는 일이 두 파일에 나뉘어 있을 이유가 없다.)
+ *
+ * **실패하면 null(모름)이다 — 빈 목록이 아니다.** 저장소가 아니거나, 5초 안에 답하지 못했거나, 출력
+ * 한도에 걸린 것을 []로 주면 깨끗한 작업 트리와 구별되지 않고, 수집기는 그것을 "바뀐 것 없음"으로
+ * 읽어 쓰기 증거가 있는 Unit 을 지운다. 여전히 던지지는 않는다(감시 고리 안에서 불린다).
  */
-export async function readChangedFiles(repoPath: string): Promise<string[]> {
+export async function readChangedFiles(repoPath: string): Promise<string[] | null> {
   const r = await git(
     ['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all'],
     { cwd: repoPath, timeoutMs: WATCH_ROUND_TIMEOUT_MS, trim: false }
   )
-  if (!r.ok) return [] // 저장소가 아니거나 git 이 실패했다 — 관찰된 변경이 없는 것으로 본다
+  if (!r.ok) return null // 저장소가 아니거나 git 이 실패했다 — 모른다. 변경이 없다는 뜻이 아니다
   return parsePorcelainZ(r.stdout).map((e) => e.relPath)
 }
 
@@ -91,8 +95,9 @@ export async function readChangedFiles(repoPath: string): Promise<string[]> {
  * 그대로 저장돼 사람이 읽을 수 없는 경로가 남는다 — 한글이 흔한 이 코드베이스에서는 드문 일이
  * 아니다.
  *
- * 실패하면(저장소가 아니다, 커밋을 못 찾는다) 셋 다 빈 목록이다 — **절대 던지지 않는다.** 감시
- * 고리(gitWatcher) 안에서 불린다.
+ * 실패하면(저장소가 아니다, 커밋을 못 찾는다, 시간 초과, 출력 한도) **null(모름)** 이다 — 빈 목록이
+ * 아니다. 빈 목록은 "그 구간에 바뀐 것이 없다"는 답이고, 큰 pull 뒤에 한도를 넘어 실패한 것을 그렇게
+ * 적으면 거짓 기록이 된다. **절대 던지지 않는다.** 감시 고리(gitWatcher) 안에서 불린다.
  *
  * **author 도 따로 묻는다 — 형식 문자열에 붙이지 않는다.** `--pretty=format:%H%x00%an` 하나로
  * 받으면 스트림이 `해시\0이름\0해시\0이름` 이 되어 **자리로 짝을 맞춰야** 하고, 그러면 이름이 빈
@@ -107,7 +112,7 @@ export async function readRange(
   repoPath: string,
   before: string,
   after: string
-): Promise<{ commits: string[]; changedFiles: string[]; authors: string[]; subjects: string[] }> {
+): Promise<{ commits: string[]; changedFiles: string[]; authors: string[]; subjects: string[] } | null> {
   const range = `${before}..${after}`
   const opts = { cwd: repoPath, timeoutMs: WATCH_ROUND_TIMEOUT_MS, trim: false }
   // 파일 쪽은 `git diff before..after --name-only` 다 — 커밋마다의 `--name-only` 목록을 합집합으로
@@ -125,7 +130,7 @@ export async function readRange(
     // authors is: a hash tells the agent nothing, so it needs its own query.
     git(['log', '--pretty=format:%s', '-z', range], opts)
   ])
-  if (!log.ok || !diff.ok) return { commits: [], changedFiles: [], authors: [], subjects: [] }
+  if (!log.ok || !diff.ok) return null
 
   const split = (s: string): string[] => s.split('\0').filter((t) => t !== '')
   // author 만 실패했다면 나머지 둘은 그대로 준다 — 이름은 표시용이고(EG §7), 커밋과 파일이

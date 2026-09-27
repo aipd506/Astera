@@ -4553,7 +4553,9 @@ export function registerIpc(
     now: () => new Date().toISOString(),
     // Commit subjects in the unit's range — material for the write-up. readRange is the same reader
     // the collector uses for git provenance, so there is no second way to ask this question.
-    readCommits: async (root, from, to) => (from && to ? (await readRange(root, from, to)).subjects : []),
+    // A range git could not read (null) gives no material — the record is still written, just without
+    // commit subjects, which is what the pipeline already does when this reader throws.
+    readCommits: async (root, from, to) => (from && to ? ((await readRange(root, from, to))?.subjects ?? []) : []),
     // 배경 재생성이 끝났다고 화면에 알린다. **접힌 키를 그대로 실어 보낸다** — 렌더러는 그 접기를
     // 모르므로(워크트리 세션이면 원 저장소의 키다) 값을 비교하지 않고 다시 읽기만 한다.
     // 그쪽 주석이 그 이유를 적고 있다.

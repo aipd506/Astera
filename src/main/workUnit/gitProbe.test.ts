@@ -4,7 +4,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { makeRepo, tempDir, gitSync } from '../../core/worktrees/testRepo'
 import { classifyTransition } from '../../core/git/transition'
-import { readGitRef, isAncestorOf, readRange } from './gitProbe'
+import { readGitRef, isAncestorOf, readRange, readChangedFiles } from './gitProbe'
 
 const run = (repo: string, args: string[]): void => {
   gitSync(repo, args)
@@ -115,7 +115,7 @@ describe('readRange', () => {
     run(repo, ['commit', '-m', 'third'])
     const after = headHash(repo)
 
-    const range = await readRange(repo, before, after)
+    const range = (await readRange(repo, before, after))!
     // git log 는 최신 커밋을 먼저 낸다
     expect(range.commits).toEqual([after, mid])
     expect(range.changedFiles.sort()).toEqual(['g.txt', 'has space/한글.txt'])
@@ -145,19 +145,27 @@ describe('readRange', () => {
     const after = headHash(repo)
     expect(after).toHaveLength(64) // SHA-256 해시 — 40자 hex 모양 판정이 있었다면 여기서 깨졌을 것이다
 
-    const range = await readRange(repo, before, after)
+    const range = (await readRange(repo, before, after))!
     expect(range.commits).toEqual([after])
     expect(range.changedFiles).toEqual(['g.txt'])
   })
 
-  it('git 저장소가 아닌 디렉터리 → 던지지 않고 빈 목록', async () => {
+  // 모른다는 것은 비었다는 것이 아니다. 실패(저장소가 아니다, 시간 초과, 출력 한도)를 빈 목록으로
+  // 주면 큰 pull 뒤의 기록이 "아무 것도 안 바뀌었다"로 남는다 — null 이 그 둘을 가른다.
+  it('git 저장소가 아닌 디렉터리 → 던지지 않고 null(모름) — 빈 목록이 아니다', async () => {
     const notRepo = await tempDir('astera-gitprobe-range-notrepo-')
-    await expect(readRange(notRepo, MISSING_HASH, MISSING_HASH)).resolves.toEqual({
-      commits: [],
-      changedFiles: [],
-      authors: [],
-      subjects: []
-    })
+    await expect(readRange(notRepo, MISSING_HASH, MISSING_HASH)).resolves.toBeNull()
+  })
+
+  it('저장소에 없는 커밋이 끼면 null(모름)이다', async () => {
+    const repo = await makeRepo()
+    await expect(readRange(repo, MISSING_HASH, headHash(repo))).resolves.toBeNull()
+  })
+
+  it('두 HEAD 가 같은 구간은 null 이 아니라 빈 목록이다', async () => {
+    const repo = await makeRepo()
+    const h = headHash(repo)
+    await expect(readRange(repo, h, h)).resolves.toEqual({ commits: [], changedFiles: [], authors: [], subjects: [] })
   })
 
   // EG §6 이 pull 에서 수집할 것으로 `Authors` 를 적었고 §40 이 "author metadata" 를 필수 단위
@@ -180,10 +188,30 @@ describe('readRange', () => {
     await commitAs('Alice A', 'c.txt')
     const after = headHash(repo)
 
-    const range = await readRange(repo, before, after)
+    const range = (await readRange(repo, before, after))!
     expect(range.commits).toHaveLength(3)
     expect(range.authors).toEqual(['Alice A', 'Bob  B'])
     // 이 구간을 연 커밋의 author('Test User', makeRepo 가 심었다)는 before 자신이라 범위 밖이다
     expect(range.authors).not.toContain('Test User')
+  })
+})
+
+describe('readChangedFiles', () => {
+  it('바뀐 파일을 준다', async () => {
+    const repo = await makeRepo()
+    await fs.writeFile(path.join(repo, 'n.txt'), 'n', 'utf8')
+    expect(await readChangedFiles(repo)).toEqual(['n.txt'])
+  })
+
+  it('깨끗한 작업 트리는 빈 목록이다', async () => {
+    const repo = await makeRepo()
+    expect(await readChangedFiles(repo)).toEqual([])
+  })
+
+  // git 이 답하지 못했을 때 []를 주면 깨끗한 작업 트리와 구별되지 않는다 — 수집기가 그것을 "바뀐 것
+  // 없음"으로 읽고 Unit 을 지운다.
+  it('git 이 실패하면 빈 목록이 아니라 null(모름)이다', async () => {
+    const notRepo = await tempDir('astera-gitprobe-changed-notrepo-')
+    expect(await readChangedFiles(notRepo)).toBeNull()
   })
 })
