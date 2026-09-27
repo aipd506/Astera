@@ -101,6 +101,28 @@ export interface HostServerDeps {
   /** Whether a pid names a live process; defaults to `pidLives` (core/host/pidFile.ts). What
    *  `lastAppPid` probes with, injectable so a test's made-up pid is not judged by this machine. */
   pidLives?(pid: number): boolean
+  /** The clock and timer the `orch-state` throttle runs on; `monotonicClock` when left out. **Monotonic
+   *  on purpose** (review of T4): the wall clock steps back on an NTP correction or a resume from sleep,
+   *  and a gap measured on it held a push for as long as the step. Injectable so a test can move time
+   *  and fire the trailing push itself instead of waiting out real milliseconds. */
+  stateClock?: StateClock
+}
+
+/** What the `orch-state` throttle measures gaps with and waits on. `after` returns its cancel. */
+export interface StateClock {
+  now(): number
+  after(ms: number, fn: () => void): () => void
+}
+
+/** `performance.now()`, which never steps back, and an unref'd timer: a held push is not a reason to
+ *  keep the Host up. */
+export const monotonicClock: StateClock = {
+  now: () => performance.now(),
+  after: (ms, fn) => {
+    const t = setTimeout(fn, ms)
+    t.unref?.()
+    return () => clearTimeout(t)
+  }
 }
 
 export interface HostServer {
@@ -286,13 +308,14 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
    * `line` is encoded when it is sent, not when it is held, so a push that is replaced was never
    * serialised at all.
    */
-  const stateLanes = new Map<net.Socket, { held: (() => string) | null; lastAt: number; timer: ReturnType<typeof setTimeout> | null }>()
+  const clock = deps.stateClock ?? monotonicClock
+  const stateLanes = new Map<net.Socket, { held: (() => string) | null; lastAt: number; cancel: (() => void) | null }>()
   const readsLatest = (s: net.Socket): boolean =>
     roles.get(s) === 'cli' || (roles.get(s) === 'app' && (yields.get(s)?.has(HOST_YIELD_ORCH_STATE_LATEST) ?? false))
-  const laneOf = (s: net.Socket): { held: (() => string) | null; lastAt: number; timer: ReturnType<typeof setTimeout> | null } => {
+  const laneOf = (s: net.Socket): { held: (() => string) | null; lastAt: number; cancel: (() => void) | null } => {
     let lane = stateLanes.get(s)
     if (!lane) {
-      lane = { held: null, lastAt: -Infinity, timer: null }
+      lane = { held: null, lastAt: -Infinity, cancel: null }
       stateLanes.set(s, lane)
     }
     return lane
@@ -301,20 +324,20 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
   const flushState = (s: net.Socket): void => {
     const lane = stateLanes.get(s)
     if (!lane) return
-    if (lane.timer) clearTimeout(lane.timer)
-    lane.timer = null
+    lane.cancel?.()
+    lane.cancel = null
     const held = lane.held
     if (!held) return
     lane.held = null
-    lane.lastAt = Date.now()
+    lane.lastAt = clock.now()
     if (!s.destroyed) s.write(held())
   }
   /** Forgets what is held for `s` without sending it — the sender of a `state-put` holds newer. */
   const dropState = (s: net.Socket): void => {
     const lane = stateLanes.get(s)
     if (!lane) return
-    if (lane.timer) clearTimeout(lane.timer)
-    lane.timer = null
+    lane.cancel?.()
+    lane.cancel = null
     lane.held = null
   }
   /** One `orch-state` for one socket: at once, or held as the newest until the gap has passed. */
@@ -325,25 +348,29 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
       return
     }
     const lane = laneOf(s)
-    const since = Date.now() - lane.lastAt
-    if (!lane.timer && since >= ORCH_STATE_PUSH_MS) {
+    const now = clock.now()
+    const since = now - lane.lastAt
+    if (!lane.cancel && since >= ORCH_STATE_PUSH_MS) {
       lane.held = null
-      lane.lastAt = Date.now()
+      lane.lastAt = now
       s.write(line())
       return
     }
     lane.held = line
-    if (lane.timer) return
-    // Caught: a timer's throw is uncaught, and it would end the Host with every pty it holds.
-    lane.timer = setTimeout(() => {
+    if (lane.cancel) return
+    // **Clamped to the gap, whatever the clock says** (review of T4). The clock is monotonic, so
+    // `since` should never be negative; if it ever were, a wait of `gap - since` would hold this push
+    // for as long as the clock jumped, and a quiet app would show a stale state all that time.
+    const wait = Math.min(ORCH_STATE_PUSH_MS, Math.max(0, ORCH_STATE_PUSH_MS - since))
+    lane.cancel = clock.after(wait, () => {
+      lane.cancel = null
+      // Caught: a timer's throw is uncaught, and it would end the Host with every pty it holds.
       try {
         flushState(s)
       } catch (err) {
         deps.log.write(`a held orch-state push failed: ${String(err)}`)
       }
-    }, Math.max(0, ORCH_STATE_PUSH_MS - since))
-    // A held push is not a reason to keep the Host up.
-    lane.timer.unref?.()
+    })
   }
   /** Every message to a socket goes through here, so nothing overtakes a held `orch-state`. */
   const writeTo = (s: net.Socket, m: HostMessage, line: () => string): void => {

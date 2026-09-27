@@ -38,6 +38,7 @@ const server = async (
     onAppsChanged?: HostServerDeps['onAppsChanged']
     onAppGreeted?: HostServerDeps['onAppGreeted']
     pidLives?: HostServerDeps['pidLives']
+    stateClock?: HostServerDeps['stateClock']
   } = {}
 ): Promise<{
   s: HostServer
@@ -70,6 +71,7 @@ const server = async (
     // Every pid lives unless a test says otherwise: the tests' made-up pids must not be forgotten by a
     // real probe of whatever this machine runs under them.
     pidLives: over.pidLives ?? ((): boolean => true),
+    stateClock: over.stateClock,
     log: { write: (m) => logs.push(m), close: () => {} }
   })
   open.push(s)
@@ -113,11 +115,18 @@ const messageChannel = (sock: net.Socket): { send(m: ClientMessage): void; next(
           resolve(queue.shift())
           return
         }
-        const timer = setTimeout(() => resolve(undefined), waitMs)
-        waiters.push((v) => {
+        // A waiter that timed out leaves the queue: left in, it would swallow the next message and the
+        // caller who asks for it after the timeout would never see it.
+        const waiter = (v: unknown): void => {
           clearTimeout(timer)
           resolve(v)
-        })
+        }
+        const timer = setTimeout(() => {
+          const i = waiters.indexOf(waiter)
+          if (i >= 0) waiters.splice(i, 1)
+          resolve(undefined)
+        }, waitMs)
+        waiters.push(waiter)
       })
   }
 }
@@ -1152,9 +1161,44 @@ describe('onAppGreeted', () => {
 // Stage 3 T4: the whole state goes out on every commit, and it grows. A client that reads it as "the
 // latest" (HOST_YIELD_ORCH_STATE_LATEST) gets at most one push per ORCH_STATE_PUSH_MS, always the
 // newest, and never a held push behind a message that follows it.
+//
+// The clock and the trailing timer are injected (`stateClock`), so nothing here waits out a real
+// 100 ms: a trailing push goes out when the test fires it. The only real waits are the short ones that
+// check nothing more arrived.
 describe('orch-state pushes to a client that reads the latest', () => {
+  const QUIET_MS = 60
   const st = (version: number): HostMessage => ({ t: 'orch-state', state: emptyState(), version })
-  const versionOf = (m: unknown): number | undefined => (m as { t?: string; version?: number } | undefined)?.t === 'orch-state' ? (m as { version: number }).version : undefined
+  const versionOf = (m: unknown): number | undefined =>
+    (m as { t?: string } | undefined)?.t === 'orch-state' ? (m as { version: number }).version : undefined
+  /** A monotonic clock the test moves, and the trailing timers the server asked for. */
+  const fakeClock = (): {
+    clock: NonNullable<HostServerDeps['stateClock']>
+    at: { now: number }
+    timers: Array<{ ms: number; fn: () => void; cancelled: boolean }>
+    live(): number
+    fire(): void
+  } => {
+    const at = { now: 1_000_000 }
+    const timers: Array<{ ms: number; fn: () => void; cancelled: boolean }> = []
+    return {
+      at,
+      timers,
+      clock: {
+        now: () => at.now,
+        after: (ms, fn) => {
+          const t = { ms, fn, cancelled: false }
+          timers.push(t)
+          return () => {
+            t.cancelled = true
+          }
+        }
+      },
+      live: () => timers.filter((t) => !t.cancelled).length,
+      fire: () => {
+        for (const t of timers.splice(0)) if (!t.cancelled) t.fn()
+      }
+    }
+  }
   const connectAs = async (
     address: string,
     hello: { role?: 'app' | 'cli'; yields?: string[] }
@@ -1166,59 +1210,142 @@ describe('orch-state pushes to a client that reads the latest', () => {
     await ch.next()
     return { sock, ch }
   }
+  const latest = { role: 'app' as const, yields: [HOST_YIELD_ORCH_STATE_LATEST] }
+  /** An orch whose every call is a state-put from the caller: it pushes `version` to the others. */
+  const putOrch = (version: number): HostServerDeps['orch'] => ({
+    call: async ({ from }) => {
+      from?.toOthers(st(version))
+      return { status: 200, body: { ok: true, version } }
+    }
+  })
 
   it('sends the first at once and then only the newest of a burst, to an app and to a CLI', async () => {
-    const h = await server()
-    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock })
+    const app = await connectAs(h.address, latest)
     const cli = await connectAs(h.address, { role: 'cli' })
     for (let v = 1; v <= 5; v++) h.s.broadcast(st(v))
-    for (const c of [app, cli]) {
-      expect(versionOf(await c.ch.next())).toBe(1)
-      expect(versionOf(await c.ch.next(ORCH_STATE_PUSH_MS * 10))).toBe(5)
-      expect(await c.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    for (const x of [app, cli]) expect(versionOf(await x.ch.next())).toBe(1)
+    for (const x of [app, cli]) expect(await x.ch.next(QUIET_MS)).toBeUndefined()
+    // One trailing timer per socket, each no longer than the gap.
+    expect(c.live()).toBe(2)
+    for (const t of c.timers) expect(t.ms).toBeLessThanOrEqual(ORCH_STATE_PUSH_MS)
+    c.at.now += ORCH_STATE_PUSH_MS
+    c.fire()
+    for (const x of [app, cli]) {
+      expect(versionOf(await x.ch.next())).toBe(5)
+      expect(await x.ch.next(QUIET_MS)).toBeUndefined()
     }
     app.sock.end()
     cli.sock.end()
   })
 
-  it('still pushes every commit to an app that does not read the latest', async () => {
+  // Review of T4 (Important): with the wall clock, a step back (an NTP correction, a resume from sleep)
+  // made `now - lastAt` negative and the trailing push was scheduled for the size of the jump, so a
+  // quiet app showed a stale state for minutes. The clock is monotonic now, and the wait is clamped to
+  // the gap whatever the clock says.
+  it('never waits longer than the gap for the trailing push, even when the clock steps back', async () => {
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock })
+    const app = await connectAs(h.address, latest)
+    h.s.broadcast(st(1))
+    expect(versionOf(await app.ch.next())).toBe(1)
+    c.at.now -= 10 * 60_000
+    h.s.broadcast(st(2))
+    expect(c.timers).toHaveLength(1)
+    expect(c.timers[0].ms).toBeGreaterThanOrEqual(0)
+    expect(c.timers[0].ms).toBeLessThanOrEqual(ORCH_STATE_PUSH_MS)
+    c.fire()
+    expect(versionOf(await app.ch.next())).toBe(2)
+    app.sock.end()
+  })
+
+  it('reads a monotonic clock by default, not the wall clock', async () => {
     const h = await server()
+    const app = await connectAs(h.address, latest)
+    h.s.broadcast(st(1))
+    // The wall clock steps back ten minutes: read, it would put the trailing push ten minutes away.
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(Date.now() - 10 * 60_000)
+    try {
+      h.s.broadcast(st(2))
+      expect(versionOf(await app.ch.next())).toBe(1)
+      expect(versionOf(await app.ch.next(ORCH_STATE_PUSH_MS * 20))).toBe(2)
+    } finally {
+      spy.mockRestore()
+    }
+    app.sock.end()
+  })
+
+  it('still pushes every commit to an app that does not read the latest', async () => {
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock })
     const older = await connectAs(h.address, { role: 'app', yields: ['journal'] })
     for (let v = 1; v <= 3; v++) h.s.broadcast(st(v))
     for (let v = 1; v <= 3; v++) expect(versionOf(await older.ch.next())).toBe(v)
+    expect(c.timers).toHaveLength(0)
     older.sock.end()
   })
 
   it('sends a held push before any other message, and not a second time after', async () => {
-    const h = await server()
-    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock })
+    const app = await connectAs(h.address, latest)
     h.s.broadcast(st(1))
     h.s.broadcast(st(2))
     h.s.broadcast({ t: 'pty-exit', id: 'p1', exitCode: 0 })
     expect(versionOf(await app.ch.next())).toBe(1)
     expect(versionOf(await app.ch.next())).toBe(2)
     expect(await app.ch.next()).toEqual({ t: 'pty-exit', id: 'p1', exitCode: 0 })
-    expect(await app.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    // The flush cancelled the trailing timer: firing whatever is left sends nothing.
+    expect(c.live()).toBe(0)
+    c.fire()
+    expect(await app.ch.next(QUIET_MS)).toBeUndefined()
+    app.sock.end()
+  })
+
+  // An `orch-act` is read against the mirror (the app looks up the Dispatch the Host just opened), so
+  // the state that commit left goes out ahead of it.
+  it('sends a held push before an orch-act to the app', async () => {
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock })
+    const app = await connectAs(h.address, latest)
+    h.s.broadcast(st(1))
+    h.s.broadcast(st(2))
+    const acted = h.s.act('spawn', ['x'])
+    expect(versionOf(await app.ch.next())).toBe(1)
+    expect(versionOf(await app.ch.next())).toBe(2)
+    const ask = (await app.ch.next()) as { t: string; call: string; act: string }
+    expect(ask).toMatchObject({ t: 'orch-act', act: 'spawn' })
+    app.ch.send({ t: 'orch-acted', call: ask.call, ok: true, value: 'done' } as ClientMessage)
+    await expect(acted).resolves.toBe('done')
+    expect(c.live()).toBe(0)
+    c.fire()
+    expect(await app.ch.next(QUIET_MS)).toBeUndefined()
     app.sock.end()
   })
 
   it('lets terminal output pass a held push', async () => {
-    const h = await server()
-    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock })
+    const app = await connectAs(h.address, latest)
     h.s.broadcast(st(1))
     h.s.broadcast(st(2))
     h.s.broadcast({ t: 'pty-data', id: 'p1', data: 'out' })
     expect(versionOf(await app.ch.next())).toBe(1)
     expect(await app.ch.next()).toEqual({ t: 'pty-data', id: 'p1', data: 'out' })
-    expect(versionOf(await app.ch.next(ORCH_STATE_PUSH_MS * 10))).toBe(2)
+    expect(await app.ch.next(QUIET_MS)).toBeUndefined()
+    c.fire()
+    expect(versionOf(await app.ch.next())).toBe(2)
     app.sock.end()
   })
 
   // A caller that awaits its own mutation reads its mirror when the reply lands: the state that
   // mutation left must be there by then, held or not.
   it('sends the state a call committed before that call’s reply', async () => {
+    const c = fakeClock()
     let s!: HostServer
     const h = await server({
+      stateClock: c.clock,
       orch: {
         call: async () => {
           s.broadcast(st(2))
@@ -1227,40 +1354,60 @@ describe('orch-state pushes to a client that reads the latest', () => {
       }
     })
     s = h.s
-    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    const app = await connectAs(h.address, latest)
     h.s.broadcast(st(1))
     expect(versionOf(await app.ch.next())).toBe(1)
     app.ch.send({ t: 'orch-call', call: 'c1', cmd: 'tasks-update', args: {}, session: '' } as ClientMessage)
     expect(versionOf(await app.ch.next())).toBe(2)
     expect(await app.ch.next()).toMatchObject({ t: 'orch-result', call: 'c1', status: 200 })
-    expect(await app.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    c.fire()
+    expect(await app.ch.next(QUIET_MS)).toBeUndefined()
     app.sock.end()
   })
 
   // `state-put` pushes to the others only: the sender already holds that state, and a push of an older
   // one arriving after its own write would put its mirror back (orch.ts, statePut). So what was held
-  // for the sender is dropped, and the others get the newest.
-  it('drops what was held for the sender of a state-put, and sends the others the newest', async () => {
-    const h = await server({
-      orch: {
-        call: async ({ from }) => {
-          from?.toOthers(st(3))
-          return { status: 200, body: { ok: true, version: 3 } }
-        }
-      }
-    })
-    const a = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
-    const b = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+  // for the sender is dropped, its trailing timer with it, and the others get the newest.
+  it('drops what was held for the sender of a state-put, timer and all, and sends the others the newest', async () => {
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock, orch: putOrch(3) })
+    const a = await connectAs(h.address, latest)
+    const b = await connectAs(h.address, latest)
     h.s.broadcast(st(1))
     h.s.broadcast(st(2))
     expect(versionOf(await a.ch.next())).toBe(1)
     expect(versionOf(await b.ch.next())).toBe(1)
+    expect(c.live()).toBe(2)
     a.ch.send({ t: 'orch-call', call: 'put', cmd: 'state-put', args: {}, session: '' } as ClientMessage)
     expect(await a.ch.next()).toMatchObject({ t: 'orch-result', call: 'put', status: 200 })
-    expect(await a.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
-    expect(versionOf(await b.ch.next(ORCH_STATE_PUSH_MS * 10))).toBe(3)
-    expect(await b.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    // a's timer is gone; b's is still waiting, now holding 3.
+    expect(c.live()).toBe(1)
+    c.fire()
+    expect(await a.ch.next(QUIET_MS)).toBeUndefined()
+    expect(versionOf(await b.ch.next())).toBe(3)
+    expect(await b.ch.next(QUIET_MS)).toBeUndefined()
     a.sock.end()
     b.sock.end()
+  })
+
+  // After a drop the next push is judged by the gap as usual: held when it comes within it, and sent by
+  // a trailing timer of its own.
+  it('holds a push that comes after a drop and sends it on a fresh trailing timer', async () => {
+    const c = fakeClock()
+    const h = await server({ stateClock: c.clock, orch: putOrch(3) })
+    const a = await connectAs(h.address, latest)
+    h.s.broadcast(st(1))
+    h.s.broadcast(st(2))
+    expect(versionOf(await a.ch.next())).toBe(1)
+    a.ch.send({ t: 'orch-call', call: 'put', cmd: 'state-put', args: {}, session: '' } as ClientMessage)
+    expect(await a.ch.next()).toMatchObject({ t: 'orch-result', call: 'put' })
+    expect(c.live()).toBe(0)
+    h.s.broadcast(st(4))
+    expect(await a.ch.next(QUIET_MS)).toBeUndefined()
+    expect(c.live()).toBe(1)
+    c.fire()
+    expect(versionOf(await a.ch.next())).toBe(4)
+    expect(await a.ch.next(QUIET_MS)).toBeUndefined()
+    a.sock.end()
   })
 })
