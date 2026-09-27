@@ -1344,6 +1344,7 @@ export const ko = {
   'jobs.run.mergeConfirmBody': '워커가 워크트리에 커밋한 일을 프로젝트 폴더로 합칩니다 (워크트리 {count}개).\n\n프로젝트 폴더의 현재 브랜치에 커밋으로 추가됩니다.',
   'jobs.run.mergeNothing': '합칠 것이 남아 있지 않습니다 — 워크트리 폴더가 이미 사라졌습니다',
   'jobs.run.mergeUncommitted': '커밋되지 않은 변경 {count}개는 합쳐지지 않았습니다 — 워크트리에 그대로 있고, 폴더를 지우면 사라집니다',
+  'jobs.run.mergeUncommittedUnknown': '워크트리 {count}개의 커밋되지 않은 변경을 확인하지 못했습니다 — 폴더를 지우기 전에 직접 확인하세요',
   'jobs.run.mergeFailed': '합치지 못했습니다: {reason}',
   'jobs.run.notStarted': '실행 대기',
   'jobs.run.notStartedHint': '아직 실행하지 않았습니다 — 상세 창에서 실행을 누르면 시작합니다',

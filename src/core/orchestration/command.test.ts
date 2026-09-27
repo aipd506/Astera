@@ -4145,6 +4145,28 @@ describe('run-merge', () => {
     expect((r.body as { uncommitted?: number }).uncommitted).toBe(3)
   })
 
+  // 상태를 읽지 못한 워크트리는 "0개"가 아니다 — 경로를 그대로 올려 화면이 "확인하지 못했다"고 말하게 한다
+  it('커밋되지 않은 변경을 확인하지 못한 워크트리를 그대로 올린다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    const blind = Object.assign(deps, {
+      mergeWorktrees: async (_c: string, p: string[]) => ({
+        ok: true as const,
+        merged: p,
+        uncommitted: 0,
+        unchecked: p
+      })
+    })
+    const r = await call(blind, 'run-merge', { run: runId })
+    expect(r.status).toBe(200)
+    expect((r.body as { uncommittedUnchecked?: string[] }).uncommittedUnchecked).toEqual(['D:/wt/a'])
+  })
+
+  it('모두 확인했으면 uncommittedUnchecked 는 없다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    const r = await call(deps, 'run-merge', { run: runId })
+    expect((r.body as { uncommittedUnchecked?: string[] }).uncommittedUnchecked).toBeUndefined()
+  })
+
   it('합쳐도 Run 은 남는다 — 이 명령은 지우지 않는다', async () => {
     const { deps, runId } = await withFinishedWorktree()
     await call(deps, 'run-merge', { run: runId })

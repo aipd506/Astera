@@ -1068,6 +1068,7 @@ export const es: Catalog = {
   'jobs.run.mergeConfirmBody': 'Integra en la carpeta del proyecto lo que los trabajadores confirmaron en sus árboles de trabajo ({count} árbol(es) de trabajo).\n\nLas confirmaciones se añaden a la rama actual de la carpeta del proyecto.',
   'jobs.run.mergeNothing': 'No queda nada que fusionar: las carpetas de los árboles de trabajo ya no existen',
   'jobs.run.mergeUncommitted': '{count} cambio(s) sin confirmar no se fusionaron: siguen en el árbol de trabajo y se pierden si se elimina la carpeta',
+  'jobs.run.mergeUncommittedUnknown': 'No se pudieron comprobar los cambios sin confirmar en {count} árbol(es) de trabajo: revíselos antes de eliminar las carpetas',
   'jobs.run.mergeFailed': 'No se pudo fusionar: {reason}',
   'jobs.run.notStarted': 'Sin iniciar',
   'jobs.run.notStartedHint': 'Aún no se ha iniciado — pulsa Ejecutar en la ventana de detalle para empezar',

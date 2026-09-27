@@ -559,6 +559,14 @@ export function RunDetail({
           : 0
       if (typeof uncommitted === 'number' && uncommitted > 0)
         toast.error(t('jobs.run.mergeUncommitted', { count: uncommitted }))
+      // git status did not answer for these worktrees — their uncommitted changes are unknown, not 0,
+      // and the same folder-deletion risk applies, so this is said just as loudly.
+      const unchecked =
+        typeof reply.body === 'object' && reply.body !== null && 'uncommittedUnchecked' in reply.body
+          ? (reply.body as { uncommittedUnchecked: unknown }).uncommittedUnchecked
+          : undefined
+      if (Array.isArray(unchecked) && unchecked.length > 0)
+        toast.error(t('jobs.run.mergeUncommittedUnknown', { count: unchecked.length }))
     } catch {
       toast.error(t('jobs.run.mergeFailed', { reason: '' }))
     } finally {

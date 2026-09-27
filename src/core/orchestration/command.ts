@@ -233,7 +233,16 @@ export interface OrchServerDeps {
   mergeWorktrees?(
     runCwd: string,
     paths: string[]
-  ): Promise<{ ok: true; merged: string[]; uncommitted: number } | { ok: false; reason: string }>
+  ): Promise<
+    | {
+        ok: true
+        merged: string[]
+        uncommitted: number
+        /** Worktrees whose uncommitted changes could not be checked (git status failed) — unknown, not 0. */
+        unchecked?: string[]
+      }
+    | { ok: false; reason: string }
+  >
   /** 이 경로들의 워크트리를 폴더째 지운다 — `run-delete --remove-worktrees` 가 부른다. 그 안에서
    *  도는 세션을 닫는 일까지 배선이 한다(removeWorktree 의 isPathInUse 가 그러지 않으면 거절한다).
    *  실패한 경로는 돌려준다 — 삭제를 막지는 않지만 응답에 실어 사람이 알 수 있게 한다. */
@@ -2190,7 +2199,12 @@ export async function handleCommand(
       // **커밋되지 않은 변경의 수를 함께 올린다.** git 은 커밋만 옮기므로 그 변경은 합쳐지지 않았고
       // 그 폴더에만 있다 — 폴더를 지우면 사라진다. 병합이 성공했다는 말만 돌려주면 사람은 그것을
       // "일이 다 옮겨졌다" 로 읽고 폴더를 지운다.
-      return okBody({ merged: merged.merged, uncommitted: merged.uncommitted })
+      // 상태를 읽지 못한 워크트리는 0 에 섞지 않고 따로 올린다 — "확인하지 못했다"는 "없다"가 아니다.
+      return okBody({
+        merged: merged.merged,
+        uncommitted: merged.uncommitted,
+        ...(merged.unchecked && merged.unchecked.length > 0 ? { uncommittedUnchecked: merged.unchecked } : {})
+      })
     }
     // 계획의 회차를 하나 더 만들고 **`jobs run` 이 한 회차를 시작하는 그대로 시작한다**(U1, F65).
     // 부르는 것은 예약의 발화(core/orchestration/exec/dispatchLoop.ts 의 fireTick: 앱의 타이머와,

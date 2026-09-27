@@ -82,7 +82,14 @@ export type Integration =
    *  그 변경은 병합되지 않았고 그 폴더에만 있다 — 폴더를 지우면 사라진다. 워커에게 커밋 의무를
    *  주기는 하지만(coordinator 의 commitObligation) 지켰는지 확인하는 곳은 없어서, 이 수가
    *  사람에게 그 사실이 닿는 유일한 자리다. */
-  | { kind: 'merged'; uncommitted: number }
+  | {
+      kind: 'merged'
+      uncommitted: number
+      /** Source worktrees whose `git status` could not be read (error, timeout, output limit). Their
+       *  uncommitted changes are **unknown**, not 0 — so the person is told "could not check" for
+       *  them rather than nothing. Absent when every status was read. */
+      unchecked?: string[]
+    }
   | { kind: 'human'; reason: string }
   | { kind: 'agent'; reason: string; worktrees: { path: string; branch: string | null }[] }
 
@@ -288,9 +295,18 @@ export async function integrateWorktrees(
   // `--porcelain` 의 기본값을 쓴다: 추적되지 않는 파일도 센다. 워커가 새 파일을 만들고 add 하지
   // 않은 것이 정확히 이 경고가 잡아야 하는 경우이고, 커밋 의무의 `git add -A` 도 그것을 담는다.
   // 무시되는 파일(빌드 산출물, node_modules)은 기본적으로 빠진다.
+  //
+  // **읽지 못한 status 는 0 이 아니다.** 실패·시간 초과·출력 한도로 답이 없으면 그 워크트리를
+  // `unchecked` 에 담아 "확인하지 못했다"로 올린다. 병합은 막지 않는다 — 원본 워크트리의 변경은
+  // 원래도 병합을 막지 않았고(경고만 한다), 막는 것은 합칠 폴더(위 2)뿐이다.
   let uncommitted = 0
+  const unchecked: string[] = []
   for (const target of targets) {
     const dirty = await (ctx.git ?? realGit)(['status', '--porcelain'], { cwd: target.path })
+    if (!dirty.ok) {
+      unchecked.push(target.path)
+      ctx.log(`merge: could not check uncommitted changes in ${target.path} — git status failed: ${dirty.stderr}`)
+    }
     const n = dirty.ok && dirty.stdout !== '' ? dirty.stdout.split('\n').length : 0
     if (n > 0) ctx.log(`merge: ${target.path} has ${n} uncommitted change(s) — not merged`)
     uncommitted += n
@@ -384,7 +400,7 @@ export async function integrateWorktrees(
     // 프로세스 밑의 폴더는 지우지 않는다. 그때 그 워크트리는 남고 이유는 로그에 남는다.
     if (reap) await ctx.reap(target.path)
   }
-  return { kind: 'merged', uncommitted }
+  return { kind: 'merged', uncommitted, ...(unchecked.length > 0 ? { unchecked } : {}) }
 }
 
 export interface ReapContext {
@@ -503,7 +519,7 @@ export function worktreeDeps(ctx: {
       if (alive.length === 0) return { ok: true, merged: [], uncommitted: 0 }
       const r = await ctx.integrate(runCwd, alive, { reap: false })
       return r.kind === 'merged'
-        ? { ok: true, merged: alive, uncommitted: r.uncommitted }
+        ? { ok: true, merged: alive, uncommitted: r.uncommitted, ...(r.unchecked ? { unchecked: r.unchecked } : {}) }
         : { ok: false, reason: r.reason }
     },
     // `run-delete --remove-worktrees` 가 부른다. 순차로 지운다 — reapWorktree 가 세션을 닫고

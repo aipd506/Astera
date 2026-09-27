@@ -264,7 +264,9 @@ function formatUpdate(input: TabResumeInput): string | null {
   if (!input.git) return null
   const parts: string[] = []
   const changed = input.git.changed
-  if (changed.length === 0) parts.push('There are no uncommitted changes right now.')
+  // changedUnknown: status did not answer — an empty list is then "unknown", never "clean"
+  if (input.git.changedUnknown) parts.push('Could not check for uncommitted changes right now (git status did not answer).')
+  else if (changed.length === 0) parts.push('There are no uncommitted changes right now.')
   else {
     const shown = changed.slice(0, UPDATE_FILES_MAX)
     const more = changed.length - shown.length

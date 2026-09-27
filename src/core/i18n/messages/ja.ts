@@ -1055,6 +1055,7 @@ export const ja: Catalog = {
   'jobs.run.mergeConfirmBody': 'ワーカーがワークツリーにコミットした作業をプロジェクトフォルダーに取り込みます (ワークツリー {count} 個)。\n\nプロジェクトフォルダーの現在のブランチにコミットとして追加されます。',
   'jobs.run.mergeNothing': 'マージするものが残っていません — ワークツリーのフォルダーはすでにありません',
   'jobs.run.mergeUncommitted': 'コミットされていない変更 {count} 件はマージされていません — ワークツリーに残っており、フォルダーを削除すると失われます',
+  'jobs.run.mergeUncommittedUnknown': 'ワークツリー {count} 件のコミットされていない変更を確認できませんでした — フォルダーを削除する前にご自身で確認してください',
   'jobs.run.mergeFailed': 'マージできませんでした: {reason}',
   'jobs.run.notStarted': '実行待ち',
   'jobs.run.notStartedHint': 'まだ実行していません — 詳細ウィンドウで実行を押すと開始します',

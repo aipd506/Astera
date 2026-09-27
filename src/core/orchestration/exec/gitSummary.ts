@@ -66,8 +66,9 @@ function changedPaths(shortStatus: string): string[] {
  * 쪽(Task 4)은 그 null 을 "이 절은 비운다"로만 받아들이고 재개 자체를 막지 않는다.
  *
  * `rev-parse HEAD` 가 성공한 뒤로는(= 유효한 저장소가 확인된 뒤로는) 나머지 세 번의 호출은 필드
- * 단위로만 실패를 흡수한다 — branch/diffstat 은 그 필드만 null, changed 는 빈 배열(타입이
- * `string[]` 이라 "모른다"를 표현할 자리가 없다; 실패와 "변경 없음"이 같은 값으로 접힌다).
+ * 단위로만 실패를 흡수한다 — branch/diffstat 은 그 필드만 null, changed 는 빈 배열에
+ * `changedUnknown: true` 를 붙인다. 표지 없이 빈 배열만 두면 실패와 "변경 없음"이 같은 값으로 접혀
+ * 브리핑이 "커밋되지 않은 변경이 없다"고 단정한다.
  * 절대 던지지 않는다. (exit 실패인데 stdout에 내용이 남는 경우를 실제 git으로 안정적으로
  * 재현할 수 없어서, 이 가드가 실제로 지키는지는 gitSummary.test.ts가 git을 주입해 고정한다.)
  */
@@ -96,6 +97,7 @@ export async function readGitSummary(
     // 로컬 브랜치가 아니면(detached HEAD) 성공해도 빈 문자열이 온다 — 그 경우도 null.
     branch: branch.ok && branch.stdout !== '' ? branch.stdout : null,
     changed: status.ok ? changedPaths(status.stdout) : [],
+    ...(status.ok ? {} : { changedUnknown: true as const }),
     // 변경이 없을 때도 빈 문자열로 성공한다 — diff 본문은 절대 담기지 않는다(--stat 은 요약 줄뿐).
     diffstat: diffstat.ok && diffstat.stdout !== '' ? diffstat.stdout : null
   }

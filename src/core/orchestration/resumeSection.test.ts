@@ -168,6 +168,17 @@ describe('formatResumeNote', () => {
     expect(out).toContain('no uncommitted changes')
   })
 
+  // A status read that failed is not a clean worktree: the note must say it could not check.
+  it('says it could not check uncommitted changes when the status read failed', () => {
+    const out = formatResumeNote({
+      ...base,
+      worktreeMoved: false,
+      git: { branch: 'main', head: 'def456', changed: [], changedUnknown: true, diffstat: null }
+    })!
+    expect(out).not.toContain('no uncommitted changes')
+    expect(out).toContain('Could not check for uncommitted changes')
+  })
+
   it('caps a long changed-file list and reports the remainder as a count', () => {
     const changed = Array.from({ length: 45 }, (_, i) => `src/f${i}.ts`)
     const out = formatResumeNote({

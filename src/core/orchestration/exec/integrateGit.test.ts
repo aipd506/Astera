@@ -178,6 +178,26 @@ describe('integrateWorktrees — the rules of the one automatic writer into a re
     expect(at(begin)).toBe(at(merge) - 1)
     expect(at(end)).toBeGreaterThan(at(merge))
   })
+  // A source worktree whose status cannot be read is not "0 uncommitted": it is reported by path, and
+  // the merge still goes ahead (a dirty source never blocked it either — only the target does).
+  it('reports a source worktree whose status cannot be read, instead of counting it as clean', async () => {
+    const a = await worked('a')
+    await fs.writeFile(path.join(a, 'left.txt'), 'uncommitted')
+    const blind: typeof git = (args, opts) =>
+      args[0] === 'status' && args.length === 2 && opts?.cwd === a
+        ? Promise.resolve({ ok: false, stdout: '', stderr: 'timed out' })
+        : git(args, opts)
+    const r = await integrateWorktrees(repo, [a], {}, ctx({ git: blind }))
+    expect(r).toEqual({ kind: 'merged', uncommitted: 0, unchecked: [a] })
+    expect(logs.some((l) => l.includes('could not check uncommitted changes') && l.includes(a))).toBe(true)
+  })
+
+  it('leaves unchecked out when every source status was read', async () => {
+    const a = await worked('a')
+    const r = await integrateWorktrees(repo, [a], {}, ctx())
+    expect(r).toEqual({ kind: 'merged', uncommitted: 0 })
+  })
+
   // A write killed part-way leaves the folder mid-merge — the adapter's 30 s default was that kill.
   // merge, merge --abort and the merge-tree probe (it writes tree objects) all get the long write
   // ceiling. Mutation check: drop timeoutMs from any of them; red.
@@ -331,6 +351,21 @@ describe('worktreeDeps', () => {
     expect(calls).toEqual([])   // no git runs over an empty list (it would still check the folder)
     expect(logs.join('\n')).toMatch(/skipping 1 removed worktree/)
   })
+  it('mergeWorktrees passes on the worktrees whose status could not be checked', async () => {
+    const d = worktreeDeps({
+      integrate: async () => ({ kind: 'merged', uncommitted: 0, unchecked: ['D:/wt/a'] }),
+      reap: async () => true,
+      log: () => {},
+      exists: () => true
+    })
+    expect(await d.mergeWorktrees('D:/p', ['D:/wt/a'])).toEqual({
+      ok: true,
+      merged: ['D:/wt/a'],
+      uncommitted: 0,
+      unchecked: ['D:/wt/a']
+    })
+  })
+
   it('mergeWorktrees merges without reaping and turns a refusal into a reason', async () => {
     const calls: unknown[] = []
     const d = worktreeDeps({ integrate: async (into, paths, opts) => { calls.push([into, paths, opts]); return { kind: 'human', reason: 'dirty' } }, reap: async () => true, log: () => {}, exists: () => true })

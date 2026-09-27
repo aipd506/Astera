@@ -20,6 +20,9 @@ export interface GitSummary {
   branch: string | null
   head: string | null
   changed: string[]
+  /** git status could not be read (error, timeout, output limit): `changed` is empty because it is
+   *  unknown, not because the worktree is clean. Absent when status answered. */
+  changedUnknown?: true
   diffstat: string | null
 }
 

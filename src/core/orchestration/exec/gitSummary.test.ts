@@ -191,15 +191,23 @@ describe('필드 단위 실패 흡수 (rev-parse HEAD 성공 뒤)', () => {
     expect(summary?.diffstat).toBeNull()
   })
 
-  it('status 조회가 exit 실패(부분 stdout 포함)여도 changed는 빈 배열, 나머지는 정상', async () => {
+  // 실패한 status 를 빈 배열로만 남기면 브리핑이 "커밋되지 않은 변경이 없다"고 단정한다 —
+  // changedUnknown 이 그 빈 배열을 "모른다"로 표시한다.
+  it('status 조회가 exit 실패(부분 stdout 포함)면 changed는 비고 changedUnknown 이 켜진다, 나머지는 정상', async () => {
     const summary = await readGitSummary('/fake/cwd', {
       git: fakeGit({ '-c core.quotepath=false status --short': { ok: false, stdout: 'partial', stderr: 'boom' } })
     })
 
     expect(summary?.changed).toEqual([])
+    expect(summary?.changedUnknown).toBe(true)
     expect(summary?.head).toBe('abc123')
     expect(summary?.branch).toBe('main')
     expect(summary?.diffstat).toBeNull()
+  })
+
+  it('status 가 답했으면 changedUnknown 은 없다', async () => {
+    const summary = await readGitSummary('/fake/cwd', { git: fakeGit({}) })
+    expect(summary?.changedUnknown).toBeUndefined()
   })
 
   it('diffstat 조회가 exit 실패(부분 stdout 포함)여도 diffstat만 null, 나머지는 정상', async () => {
