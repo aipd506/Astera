@@ -1,9 +1,84 @@
 # Agent workspace isolation, design brief
 
-Status: **shipped for Windows** (2026-09-27). The design is
-[docs/superpowers/specs/2026-09-27-agent-workspace-isolation-design.md](superpowers/specs/2026-09-27-agent-workspace-isolation-design.md);
-what shipped is summarised under "Shipped" below. macOS and Linux are the next step (W7). The rest of
-this brief is the problem and the measurements the design stands on, kept as they were written.
+Status: **shipped for Windows, Linux and macOS** (2026-09-27). The designs are
+[docs/superpowers/specs/2026-09-27-agent-workspace-isolation-design.md](superpowers/specs/2026-09-27-agent-workspace-isolation-design.md)
+and, for the other two platforms,
+[docs/superpowers/specs/2026-09-27-agent-workspace-linux-macos-design.md](superpowers/specs/2026-09-27-agent-workspace-linux-macos-design.md);
+what shipped is summarised under the two "Shipped" sections below. The rest of this brief is the
+problem and the measurements the design stands on, kept as they were written.
+
+## Shipped (Linux and macOS, 2026-09-27)
+
+The script API, `WorkspaceManager`, the mirror tab and every lifecycle rule are the Windows ones. Only
+the `Desk` changes, chosen per platform by `workspaceDeskStarter` (`src/host/workspace/platformDesk.ts`),
+and the Host announces `workspace` on all three.
+
+- **Linux** (`src/host/workspace/deskLinux.ts`). Each workspace gets its own Xvfb display, from `:90`
+  up, at 1920x1080. The app starts through `sh` in a process group of its own, with `DISPLAY` set,
+  `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` removed, and `XDG_SESSION_TYPE=x11`, `GDK_BACKEND=x11`,
+  `QT_QPA_PLATFORM=xcb`, `SDL_VIDEODRIVER=x11` and `ELECTRON_OZONE_PLATFORM_HINT=x11` set (a newer
+  Electron no longer reads that last hint alone, so Chromium, GTK, Qt and SDL are each pointed at X11
+  directly). `windows()` and `keys()` use xdotool, `windowShot()` and the frames without CDP use
+  ImageMagick's `import`. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
+  `app js` is refused, with the install line for the distribution, when Xvfb, xdotool or `import` is
+  missing.
+- **macOS** (`src/host/workspace/deskMac.ts`). Nothing is created. The app starts in the person's
+  session in the background, in a process group of its own: an app bundle is opened with `open -g -j -n`
+  and a tag (`--astera-desk=<name>-<seq>`) unique to that launch in its arguments, found afterward with
+  `ps`; a plain command runs through `sh` instead. Both get `ASTERA_APP_CHROMIUM_FLAGS`, holding the
+  switches that keep a page nobody sees rendering, so a project's app can read it and start with
+  `show: false`. The window is never moved, so it may sit behind the person's own (user decision L3b).
+  Only the page is driven. `windows()`, `windowShot()` and `keys()` are refused with the reason, and
+  `app js` is refused over SSH.
+- **Kill and leftovers** (`src/host/workspace/posixProc.ts`). A start time is read from `/proc` on
+  Linux and from `ps -o lstart=` on macOS, the same way when a launch is recorded and when it is
+  checked, with the same 2 s tolerance. A match ends the process group with `SIGTERM`, then `SIGKILL`
+  after 2 s. `workspaces.json` records the Xvfb pid as the helper on Linux, and only the launched app on
+  macOS.
+- **How it is tested.** Each Desk is unit tested with injected processes and files on every platform.
+  The real e2e (`desktop.linux.e2e.test.ts`, `desktop.mac.e2e.test.ts`) runs in CI on the ubuntu and
+  macos jobs with `ASTERA_DESKTOP_E2E=1`, after the ubuntu job installs `xvfb xdotool imagemagick`.
+
+Rulings the plan made where the Linux and macOS spec was silent:
+
+- **L-R1. Linux keys focus the window and use XTEST.** `xdotool --window` sends synthetic events, which
+  Chromium ignores. The display is the workspace's own, so focusing on it takes nothing from anyone.
+- **L-R2. `windowShot()` with no title photographs the largest titled window**, as on Windows, and the
+  whole display only when no window has a title.
+- **L-R3. `className` is empty on Linux.** `hwnd` is the X window id.
+- **L-R4. Display numbers are reserved inside the Host**, so two workspaces starting at once get two
+  displays; an Xvfb that exits before it is ready (another Host took the number) is retried on the next
+  one, three times at most.
+- **L-R5. macOS never moves a window.** That needs Accessibility, which is not asked for. An app that
+  reads `ASTERA_APP_CHROMIUM_FLAGS` can keep its window hidden; the e2e fixture does.
+- **L-R6. A macOS app bundle** is found by a tag (`--astera-desk=<name>-<seq>`) unique to that launch,
+  added to its arguments and matched afterward with `ps` among the processes that started since `open`
+  ran, never by path and time alone (an earlier instance, or the person's own, could match that). It
+  sees only what reaches it after its path, not the launch environment.
+- **L-R7. The Linux tool check runs on every `app js`**, so a tool installed while the Host runs counts
+  at once. A check that fails is logged and refuses nothing.
+- **L-R8. The feature is announced on all three platforms**, tools or not; the refusal explains, and
+  checks the platform and SSH first, the setting next, and the Linux tools last, so a Host with the
+  workspace off never names tools to install for a feature it would refuse anyway.
+
+Known limits, beside the spec's:
+
+- **macOS:** a Dock icon can appear while the app runs, and native windows, dialogs and keys cannot be
+  driven. A plain command's window can show unless the app keeps it hidden, and an app that ignores the
+  hide marker and shows its window anyway can come to the front. A bundle run through App Translocation
+  (macOS's own quarantine of a bundle opened from certain folders) is not found, since its path at launch
+  is not the one on disk. A Screen Recording and Accessibility permission mode may come later, as an
+  opt-in, to move a window or drive native input (user decision L3a).
+- **Linux:** an app that only speaks Wayland cannot start on Xvfb; Electron apps use X11 through the
+  hint. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The desk keeps
+  `DBUS_SESSION_BUS_ADDRESS`, so notifications and tray icons from the launched app can still appear on
+  the person's own desktop. A stale X lock file only makes the reservation skip that display number; it
+  removes nothing.
+- **Both:** a process that leaves its process group (a `setsid`, a daemon) escapes the group kill, as a
+  process that detaches from the tree does on Windows. The command runs as `sh -c`, then a newline, then
+  `wait`, so a child put in the background is still there to end; a command ending in a backslash, one
+  with an unclosed heredoc, or one that calls `exit` defeats that `wait`, and such a child may not be
+  cleaned up.
 
 ## Shipped (Windows, 2026-09-27)
 
@@ -62,13 +137,14 @@ changed one of them:
   exits, because a roll reopens the same session id.
 - **P9. Driving an app is not browsing the web.** `click` follows links, since the page is the app under
   test, and `press` sends trusted CDP key events rather than the agent browser's synthetic ones.
-- **P10. No interactive desktop.** `app js` is refused, before any process starts, on a platform other
-  than Windows, over SSH (the Host's own environment says so), and in a non-interactive session (a window
-  station that is not visible; the helper says so). **Adjusted:** the desktop helper cannot attach
-  PowerShell's own thread to the desktop, since that fails with `ERROR_BUSY` (measured); it attaches a
-  fresh thread for each window, capture or key request instead (`OnDesk`), and replies with whichever
-  message is innermost. The spec left "its own thread" open as an implementation detail; this costs one
-  thread per request, which is cheap.
+- **P10. No interactive desktop.** `app js` is refused, before any process starts, on a platform the
+  workspace does not run on, over SSH on Windows and macOS (the Host's own environment says so), and in
+  a non-interactive session (a window station that is not visible; the helper says so). **Adjusted:**
+  the desktop helper cannot attach PowerShell's own thread to the desktop, since that fails with
+  `ERROR_BUSY` (measured); it attaches a fresh thread for each window, capture or key request
+  instead (`OnDesk`), and replies with whichever message is innermost. The spec left "its own thread"
+  open as an implementation detail; this costs one thread per request, which is cheap. Linux refuses
+  only for a missing tool (the Linux and macOS section above).
 - **P11. What is recorded for leftovers.** `workspaces.json` holds, per workspace, the launched root pid
   and the helper pid, each with its creation time. At Host start, and by `relaunch()` for the app it ends,
   a recorded pid is only ended when the live process's creation time is still within 2 s of the recorded
@@ -113,7 +189,7 @@ Known limits, beside the spec's:
 - An Electron app that is not started with a debugging port gets the native helpers only.
   `snapshot().url` is empty for an address that is not http or https (a `file:` or custom scheme page).
 
-**Next steps.** Linux (Xvfb) and macOS (a background launch driven over CDP) come next.
+**Linux and macOS** shipped next, in the section above.
 
 ## The problem
 

@@ -4,11 +4,13 @@ This document, which `astera app help` prints, is the single source of truth. `h
 a script prints one section of it.
 
 `astera app js` reads a JavaScript script from stdin (or `--file path.js`) and runs it against **this
-session's own desktop**: a Windows desktop the person never sees and never switches to. The first
-`launch()` creates it; your app's windows open there and nowhere else. The person keeps their screen,
-their foreground window and their pointer the whole time. The Astera app, when it is open, shows them
-a picture of your app in a tab with a violet frame and the helper you are running; they can stop your
-script or close the desktop from there. It works the same when the Astera app is closed.
+session's own desktop**, which the person never sees. On Windows it is a desktop object nobody switches
+to. On Linux it is a virtual display (Xvfb) of its own, so it also works over SSH and on a server. On
+macOS the app runs in the background in the person's session and only its page can be driven. The
+first `launch()` creates it; your app's windows open there and nowhere else. The person keeps their
+screen, their foreground window and their pointer the whole time. The Astera app, when it is open,
+shows them a picture of your app in a tab with a violet frame and the helper you are running; they can
+stop your script or close the desktop from there. It works the same when the Astera app is closed.
 
 ## Rules
 
@@ -18,15 +20,24 @@ script or close the desktop from there. It works the same when the Astera app is
   `windowShot()`, and act with the helpers below. If a helper fails, report what it said and stop.
 - **The app must open a debugging port.** `launch()` gives the command `ASTERA_APP_CDP_PORT`, a free
   port, in its environment. Electron has to be started with
-  `--remote-debugging-port=%ASTERA_APP_CDP_PORT%` (on the command line, in the npm script, or with
+  `--remote-debugging-port=%ASTERA_APP_CDP_PORT%` on Windows (the command runs in cmd) or
+  `--remote-debugging-port=$ASTERA_APP_CDP_PORT` on Linux and macOS (the command runs in sh), on the
+  command line, in the npm script, or with
   `app.commandLine.appendSwitch('remote-debugging-port', process.env.ASTERA_APP_CDP_PORT)` in the main
-  process). Without it `launch()` fails with that hint, the app keeps running, and only `windows()`,
-  `windowShot()` and `keys()` work; the page helpers throw `no CDP connection`.
-- **The clipboard is shared.** `paste()` pastes what the person copied, and your app can overwrite
-  what they copied. Say so before you rely on it.
-- **What cannot be done here.** Dragging out of the app into Explorer or another app needs a real
+  process. Without it `launch()` fails with that hint and the app keeps running. On Windows and Linux
+  only `windows()`, `windowShot()` and `keys()` work then; the page helpers throw `no CDP connection`.
+- **On macOS, pass `$ASTERA_APP_CHROMIUM_FLAGS` too.** It holds the Chromium switches that keep a page
+  nobody sees rendering. `windows()`, `windowShot()` and `keys()` throw `not available on macOS`, since
+  the app runs in the background and only its page can be driven. Use `screenshot()` to see it. A Dock
+  icon can appear while it runs, and a plain command's window can show unless the app keeps it hidden
+  (it may when `ASTERA_APP_CHROMIUM_FLAGS` is set). An app bundle (`/Applications/My App.app --flag`) is
+  opened in the background; it sees only what reaches it after its path, not the environment.
+- **The clipboard.** On Windows and macOS it is the person's: `paste()` pastes what they copied, and
+  your app can overwrite what they copied. Say so before you rely on it. On Linux it is the virtual
+  display's own, so `paste()` pastes only what your app itself copied.
+- **What cannot be done here.** Dragging out of the app into a file manager or another app needs a real
   mouse, which this desktop does not have. `dropFiles()` proves your app handles a drop; it does not
-  prove Explorer would start the drag. There is no real pointer, no foreground window and no
+  prove a file manager would start the drag. There is no real pointer, no foreground window and no
   desktop wide screenshot on this desktop.
 - **`log(value)` is the only output.** There is no `console`. A thrown error ends the script; what was
   logged before it is kept, and the report names the helper that was running (`error.at`).
@@ -120,22 +131,24 @@ Drags one element onto another inside the page, as HTML drag and drop. Throws wh
 start a drag.
 
 ## dropFiles(selector, paths)
-Drops files (absolute paths) onto an element, as the app would receive them from Explorer.
+Drops files (absolute paths) onto an element, as the app would receive them from a file manager.
 
 ## screenshot()
 The page as a PNG. Resolves with `{ path, width, height }`; the path opens without a permission prompt.
 
 ## windowShot(title?)
 A native window or dialog on this desktop as a PNG, by part of its title, or the largest window when
-no title is given. Resolves with `{ path, width, height, title }`.
+no title is given. Resolves with `{ path, width, height, title }`. Not available on macOS: it throws
+there.
 
 ## windows()
 The windows showing on this desktop: `{ title, className, pid, width, height }` each. Use it to find a
-native dialog's title.
+native dialog's title. `className` is empty on Linux. Not available on macOS: it throws there.
 
 ## keys(title, textOrKey)
 Types text, or presses one of the key names `press()` knows, into the window whose title contains
-`title`. It reaches native dialogs that the page helpers cannot.
+`title`. It reaches native dialogs that the page helpers cannot. Not available on macOS: it throws
+there.
 
 ## help(name?)
 This guide, or one section of it.

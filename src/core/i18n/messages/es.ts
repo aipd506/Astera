@@ -44,8 +44,8 @@ export const es: Catalog = {
   // Espacio de trabajo de apps del agente
   'settings.agentApp.label': 'Espacio de trabajo de apps del agente (experimental)',
   'settings.agentApp.hint':
-    'Activado, un agente puede abrir la app de este proyecto en un escritorio de Windows que usted no ve, manejarla y fotografiarla. ' +
-    'Nunca toma su pantalla ni su puntero, pero comparte su portapapeles. Instala la habilidad astera-app en todas las cuentas. ' +
+    'Activado, un agente puede abrir la app de este proyecto donde usted no la ve (un escritorio oculto en Windows, una pantalla virtual en Linux, en segundo plano en macOS), manejarla y fotografiarla. ' +
+    'Nunca toma su pantalla ni su puntero. En Windows y macOS comparte su portapapeles. Instala la habilidad astera-app en todas las cuentas. ' +
     'No afecta a las sesiones ya abiertas; sí a las nuevas.',
   'settings.agentApp.saveFailed': 'No se pudo guardar el ajuste del espacio de trabajo de apps del agente: {detail}',
   // Generación de explicaciones (How It Works)

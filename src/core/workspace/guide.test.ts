@@ -43,4 +43,17 @@ describe('app-guide.md', () => {
     for (const file of ['app-guide.md', 'app-stub.md'])
       for (const line of prose(read(file))) expect(line, `${file}: ${line}`).not.toMatch(/\S\s[—–-]\s\S/)
   })
+
+  it('tells each platform how to pass the port, and what macOS and Linux do differently', () => {
+    const guide = read('app-guide.md')
+    expect(guide).toContain('%ASTERA_APP_CDP_PORT%')
+    expect(guide).toContain('$ASTERA_APP_CDP_PORT')
+    expect(guide).toContain('$ASTERA_APP_CHROMIUM_FLAGS')
+    expect(guide).toContain('not available on macOS')
+    expect(guide).toContain('`className` is empty on Linux')
+    expect(guide).not.toContain('a Windows desktop the person never sees')
+    const stub = read('app-stub.md')
+    expect(stub).not.toContain('on a Windows desktop the person never sees')
+    expect(stub).toContain('$ASTERA_APP_CDP_PORT')
+  })
 })

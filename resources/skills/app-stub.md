@@ -1,6 +1,6 @@
 ---
 name: astera-app
-description: Launch, drive and photograph this project's own desktop app (an Electron app first) on a Windows desktop the person never sees. Use when the person asks to run the app and check that it works, click through a flow, check a native dialog or a drop of files, and you would otherwise take their screen, pointer or keyboard. Not for web pages in a browser (use astera-browser) and not for the open web.
+description: Launch, drive and photograph this project's own desktop app (an Electron app first) where the person never sees it (a hidden desktop on Windows, a virtual display on Linux, the background on macOS). Use when the person asks to run the app and check that it works, click through a flow, check a native dialog or a drop of files, and you would otherwise take their screen, pointer or keyboard. Not for web pages in a browser (use astera-browser) and not for the open web.
 ---
 
 <!-- managed by Astera — the app owns this file. Local edits are overwritten on the next launch.
@@ -30,8 +30,9 @@ version.
    log(await screenshot())
    log(await consoleErrors())
    ```
-   The app must pass `--remote-debugging-port=%ASTERA_APP_CDP_PORT%` to Electron, or only the native
-   helpers work; the guide says how.
+   The app must pass `--remote-debugging-port=%ASTERA_APP_CDP_PORT%` to Electron on Windows, or
+   `--remote-debugging-port=$ASTERA_APP_CDP_PORT` on Linux and macOS, or only the native helpers work
+   (and on macOS none do); the guide says how.
 
    If this answers `{"error":"agent app workspace is off"}`, the setting is off. Tell the person where
    it is (Settings, **Agent app workspace**) and stop rather than launching the app on their screen.

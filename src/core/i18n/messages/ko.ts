@@ -68,8 +68,8 @@ export const ko = {
   // 에이전트 앱 작업 공간
   'settings.agentApp.label': '에이전트 앱 작업 공간 (실험)',
   'settings.agentApp.hint':
-    '켜면 에이전트가 이 프로젝트의 앱을 사람이 보지 않는 Windows 데스크톱에서 띄우고 조작하고 찍을 수 있습니다. ' +
-    '화면과 포인터는 건드리지 않지만 클립보드는 함께 씁니다. 모든 계정에 astera-app 스킬을 설치합니다. ' +
+    '켜면 에이전트가 이 프로젝트의 앱을 사람이 보지 않는 곳(Windows 는 숨은 데스크톱, Linux 는 가상 디스플레이, macOS 는 백그라운드)에서 띄우고 조작하고 찍을 수 있습니다. ' +
+    '화면과 포인터는 건드리지 않습니다. Windows 와 macOS 에서는 클립보드를 함께 씁니다. 모든 계정에 astera-app 스킬을 설치합니다. ' +
     '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다.',
   'settings.agentApp.saveFailed': '에이전트 앱 작업 공간 설정을 저장하지 못했습니다: {detail}',
   // 설명 생성 (How It Works)

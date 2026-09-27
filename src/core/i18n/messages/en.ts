@@ -66,8 +66,8 @@ export const en: Record<keyof typeof ko, string> = {
   // Agent app workspace
   'settings.agentApp.label': 'Agent app workspace (experimental)',
   'settings.agentApp.hint':
-    'On, an agent can launch this project’s app on a Windows desktop you never see, drive it and photograph it. ' +
-    'It never takes your screen or pointer, but it shares your clipboard. Installs the astera-app skill for every account. ' +
+    'On, an agent can launch this project’s app where you never see it (a hidden desktop on Windows, a virtual display on Linux, the background on macOS), drive it and photograph it. ' +
+    'It never takes your screen or pointer. On Windows and macOS it shares your clipboard. Installs the astera-app skill for every account. ' +
     'Sessions already open are not affected; new sessions are.',
   'settings.agentApp.saveFailed': 'Could not save the agent app workspace setting: {detail}',
   // Explanation generation (How It Works)
