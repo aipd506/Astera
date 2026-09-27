@@ -22,6 +22,7 @@ import type { Account, SessionInfo } from '../core/types'
 import type { HostChats } from './hostChats'
 import type { HostRolling } from './rolling'
 import type { HostSpawner } from './spawner'
+import { checkCwd, type ProbeResult } from '../core/sessions/pathProbe'
 
 export function createHostSessionStarter(d: {
   /** Null for a Host started without the agent CLI paths: it starts no session. */
@@ -34,7 +35,9 @@ export function createHostSessionStarter(d: {
   /** Whether Astera's setting runs agents without permission checks, read now. Rejects on a damaged
    *  settings file, which may have said manual, so it is never read as the bypass. */
   bypass(): Promise<boolean>
-  exists(p: string): boolean
+  /** The session folder, probed off the Host's one thread and within the probe limit
+   *  (core/sessions/pathProbe.ts); `timeout` refuses it as not reachable. */
+  probeCwd(p: string): Promise<ProbeResult>
   /** Tells the apps that take chat sessions back about a new chat proc. Never throws. */
   announceProc(procId: string): void
   /** The Host's session rows, `sessions list`'s. */
@@ -77,7 +80,7 @@ export function createHostSessionStarter(d: {
       const found = accounts.find((a) => a.id === o.accountId)
       if (!found) throw new Error(`unknown account: ${o.accountId}`)
       account = found
-      if (!d.exists(o.cwd)) throw new Error(`CWD_MISSING: ${o.cwd} does not exist`)
+      await checkCwd(o.cwd, d.probeCwd, `CWD_MISSING: ${o.cwd} does not exist`)
       bypass = await d.bypass()
     } catch (err) {
       throw err instanceof Error ? refusedBeforeActing(err) : err

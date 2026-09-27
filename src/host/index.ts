@@ -5,6 +5,7 @@
 // Everything it needs arrives in the environment, because it has no `app.getPath('userData')` to ask.
 import childProcess from 'node:child_process'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { defaultProbe } from '../core/sessions/pathProbe'
 import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -479,7 +480,7 @@ async function main(): Promise<void> {
       rolling: rollingWiring?.rolling ?? null,
       readAccounts: () => readAccountEntries(path.join(profileDir, 'accounts.json')),
       bypass: async () => (await readAgentPermissionMode(path.join(profileDir, 'app-settings.json'))) === 'yolo',
-      exists: existsSync,
+      probeCwd: defaultProbe,
       announceProc: (procId) => announceChatProc(server, procId, (m) => log.write(m)),
       list: () => hostSessions.listSessions(),
       log: (m) => log.write(m)

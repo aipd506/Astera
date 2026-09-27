@@ -3,7 +3,9 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { Account } from '../types'
 import { PTY_LOST_SIGHT_EXIT_CODE, type PtyFactory, type PtyLike, type PtySpawnOptions } from './pty'
-import { SessionManager, prependToPath } from './manager'
+import { SessionManager, prependToPath, type SpawnChecks } from './manager'
+import { createGitBashResolver } from './gitBash'
+import { PROBE_TIMEOUT_MS, createProber } from './pathProbe'
 import { buildClaudeCommand, buildCodexCommand } from './commands'
 import { makeDescriptors } from '../providers/descriptor'
 import { absPath, foldsCaseHere } from '../testPaths'
@@ -1096,5 +1098,90 @@ describe('SessionManager', () => {
       expect(manager.runningAppOwned()).toEqual([])
       expect(manager.runningOutlivingApp()).toEqual([])
     })
+  })
+})
+
+describe('SessionManager.prepare — the spawn path never waits on a sync probe', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function withChecks(checks: Partial<SpawnChecks>) {
+    const spawned: { file: string; opts: PtySpawnOptions }[] = []
+    const factory: PtyFactory = (file, _args, opts) => {
+      spawned.push({ file, opts })
+      return new FakePty()
+    }
+    const full: SpawnChecks = {
+      cwd: async () => 'present',
+      gitBash: createGitBashResolver(async () => 'absent'),
+      platform: process.platform,
+      now: Date.now,
+      ...checks
+    }
+    const manager = new SessionManager(factory, makeDescriptors('win32'), 100, 20, 'C:\\Users\\tester', undefined, [], { PATH: 'C:\\a' }, full)
+    return { manager, spawned }
+  }
+
+  it('a folder whose probe never answers fails at 1.5 s with "folder not reachable", and nothing is spawned', async () => {
+    vi.useFakeTimers()
+    const cwd = '\\\\offline-server\\share\\proj'
+    const { manager, spawned } = withChecks({ cwd: createProber({ access: () => new Promise<void>(() => {}), log: () => {} }) })
+    const outcome = manager.prepare({ account, cwd }).then(
+      () => 'resolved',
+      (e: Error) => e.message
+    )
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS - 1)
+    let settled = false
+    void outcome.then(() => (settled = true))
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await outcome).toBe(`CWD_UNREACHABLE: folder not reachable: ${cwd}`)
+    expect(spawned).toHaveLength(0)
+  })
+
+  it('a folder that is not there is still CWD_MISSING', async () => {
+    const { manager } = withChecks({ cwd: async () => 'absent' })
+    await expect(manager.prepare({ account, cwd: 'Z:\\gone' })).rejects.toThrow('CWD_MISSING: Z:\\gone')
+  })
+
+  it('after prepare, spawn trusts the checked folder and the cached Git Bash — no sync probe on either', async () => {
+    let resolves = 0
+    const gitBash = createGitBashResolver(async (p) => {
+      resolves++
+      return p === 'C:\\Program Files\\Git\\bin\\bash.exe' ? 'present' : 'absent'
+    })
+    // Neither path exists on this disk: a sync existsSync on either would refuse or find nothing.
+    const cwd = 'Z:\\prepared\\but\\not\\on\\this\\disk'
+    const { manager, spawned } = withChecks({ gitBash, platform: 'win32' })
+    await manager.prepare({ account, cwd })
+    const before = resolves
+    manager.spawn({ account, cwd })
+    expect(spawned[0].opts.cwd).toBe(cwd)
+    expect(spawned[0].opts.env.CLAUDE_CODE_GIT_BASH_PATH).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+    expect(resolves).toBe(before)
+  })
+
+  it('a second prepare on the same PATH does not probe for Git Bash again', async () => {
+    let resolves = 0
+    const gitBash = createGitBashResolver(async () => {
+      resolves++
+      return 'absent'
+    })
+    const { manager } = withChecks({ gitBash, platform: 'win32' })
+    await manager.prepare({ account, cwd: 'C:\\one' })
+    const first = resolves
+    await manager.prepare({ account, cwd: 'C:\\two' })
+    expect(resolves).toBe(first)
+  })
+
+  it('a folder checked long ago is not trusted without a new check', async () => {
+    let t = 0
+    const { manager } = withChecks({ now: () => t })
+    const cwd = 'Z:\\prepared\\but\\not\\on\\this\\disk'
+    await manager.prepare({ account, cwd })
+    t += 10 * 60_000
+    expect(() => manager.spawn({ account, cwd })).toThrow(/CWD_MISSING/)
   })
 })

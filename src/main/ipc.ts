@@ -2063,6 +2063,10 @@ export function registerIpc(
     // orchEnv is decided in this one place — the user path (sessions.spawn) and the coordinator path
     // (OrchCoordinator.spawnSession) both go through this function, so passing it per call site would
     // give us two copies.
+    // The folder and, on win32, Git Bash are looked for first, off this thread and within the probe
+    // limit (core/sessions/pathProbe.ts): an offline drive refuses the spawn in about 1.5 s instead of
+    // freezing every window for as long as the SMB redirector takes to give up.
+    await core.sessions.prepare({ account, cwd: opts.cwd })
     const info = core.sessions.spawn({
       ...opts,
       account,

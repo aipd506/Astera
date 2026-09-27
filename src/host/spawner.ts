@@ -38,6 +38,7 @@ import { findRollout as findRolloutOnDisk } from '../core/rolling/codexLocate'
 import { descriptorOf, makeDescriptors } from '../core/providers/descriptor'
 import { providerOf } from '../core/providers/meta'
 import { SessionManager } from '../core/sessions/manager'
+import { checkCwd } from '../core/sessions/pathProbe'
 import { defaultSessionTitle } from '../core/sessions/title'
 import type { PtyFactory, PtyLike } from '../core/sessions/pty'
 import { StatusLineManager, resolveNodePath } from '../core/sessions/statusline'
@@ -435,6 +436,11 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
         throw err
       }
     }
+    // The folder and, on win32, Git Bash, looked for off this thread and within the probe limit
+    // (core/sessions/pathProbe.ts), where sessions.spawn used to look for them synchronously — the same
+    // place in the order, so the refusals before it (settings, account) still come first. The Host has
+    // one thread: a sync check on an offline drive would stop every pty it holds. No process (A36).
+    await sessions.prepare({ account, cwd: o.cwd })
     const rollProviders = o.rollAccountIds.map((rid) => providerOf(accounts.find((x) => x.id === rid) ?? account))
     const opensBefore = opens
     let info: ReturnType<SessionManager['spawn']>
@@ -478,7 +484,9 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
     const accounts = await readAccounts(accountsPath) // RepairNeeded on a damaged file (A10)
     accountIn(accounts, account.id)
     preparedAccounts = accounts
-    if (!existsSync(cwd)) throw new Error(`CWD_MISSING: ${cwd}`)
+    // CWD_MISSING, or CWD_UNREACHABLE for a folder that did not answer in time; also finds the Git Bash
+    // the synchronous rollSpawn below will use, so that spawn looks at nothing on disk.
+    await sessions.prepare({ account, cwd })
     preparedBypass = await bypassFromSettings() // RepairNeeded on a damaged settings file (A10)
     await preTrustWorkspace({ account, cwd, homeDir, descriptors, log })
     await ensured()
@@ -670,7 +678,7 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
       try {
         const accounts = await readAccounts(accountsPath)
         accountIn(accounts, o.accountId)
-        if (!existsSync(o.cwd)) throw new Error(`CWD_MISSING: ${o.cwd} does not exist`)
+        await checkCwd(o.cwd, undefined, `CWD_MISSING: ${o.cwd} does not exist`)
         const info = await spawnSession(
           {
             accountId: o.accountId,

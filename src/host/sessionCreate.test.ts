@@ -32,7 +32,7 @@ const rig = (over: Partial<Parameters<typeof createHostSessionStarter>[0]> = {})
     rolling,
     readAccounts: async () => [ACCOUNT],
     bypass: async () => false,
-    exists: () => true,
+    probeCwd: async () => 'present' as const,
     announceProc: (p) => announced.push(p),
     list: async () => rows,
     log: () => {},
@@ -78,7 +78,8 @@ describe('createHostSessionStarter — sessions create, by the spawn paths the H
   it('refusals before a chat spawn start nothing and are tagged so no receipt is kept', async () => {
     for (const over of [
       { readAccounts: async () => [] },
-      { exists: () => false },
+      { probeCwd: async () => 'absent' as const },
+      { probeCwd: async () => 'timeout' as const },
       {
         bypass: async () => {
           throw new Error('app-settings.json is damaged; open Astera to repair it')
@@ -91,6 +92,13 @@ describe('createHostSessionStarter — sessions create, by the spawn paths the H
       expect(wasRefusedBeforeActing(err)).toBe(true)
       expect(h.chats.spawn).not.toHaveBeenCalled()
     }
+  })
+
+  it('a chat folder that does not answer in time is refused as not reachable, not as missing', async () => {
+    const h = rig({ probeCwd: async () => 'timeout' as const })
+    const err = await h.start({ kind: 'chat', accountId: 'acc_c', cwd: 'Z:/offline', rollAccountIds: [] }).catch((e: unknown) => e)
+    expect(String(err)).toContain('CWD_UNREACHABLE: folder not reachable: Z:/offline')
+    expect(h.chats.spawn).not.toHaveBeenCalled()
   })
 
   it('a Host with no spawner starts nothing', async () => {

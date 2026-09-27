@@ -935,6 +935,10 @@ app.whenReady().then(async () => {
             })
           )
         : core!.sessions.spawn(opts),
+    // What the synchronous respawn above would otherwise look for on disk (the folder, and Git Bash on
+    // win32), looked for before the kill and without blocking this thread: an offline drive fails the
+    // roll here, where it is rescheduled, instead of freezing every window at the spawn.
+    prepareSpawn: (account, cwd) => core!.sessions.prepare({ account, cwd }),
     // What the roll above carries: the model the person picked, read off the session being rolled
     // before it is killed. Terminal chains never reach this — the manager only knows chat sessions.
     chosenModelOf: (id) => core!.chat.chosenModelOf(id),
@@ -1031,6 +1035,10 @@ app.whenReady().then(async () => {
             })
           )
         : core!.sessions.spawn(opts),
+    // What the synchronous respawn above would otherwise look for on disk (the folder, and Git Bash on
+    // win32), looked for before the kill and without blocking this thread: an offline drive fails the
+    // roll here, where it is rescheduled, instead of freezing every window at the spawn.
+    prepareSpawn: (account, cwd) => core!.sessions.prepare({ account, cwd }),
     // design F5 fix round 1 (Important 3): claudeCoordinator.ts's own dep, same contract.
     bypassedOf: (id) => core!.chat.bypassedOf(id),
     kill: (id) => (core!.chat.has(id) ? core!.chat.kill(id) : core!.sessions.kill(id)),
