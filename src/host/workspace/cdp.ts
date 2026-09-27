@@ -79,7 +79,7 @@ export function openCdpSession(ws: WebSocketLike, openMs: number = OPEN_MS): Pro
     let nextId = 1
     let closed = false
     const pending = new Map<number, { resolve(v: Record<string, unknown>): void; reject(e: Error): void }>()
-    const waiters = new Map<string, Array<(p: Record<string, unknown>) => void>>()
+    const waiters = new Map<string, Array<{ resolve(p: Record<string, unknown>): void; reject(e: Error): void; timer: ReturnType<typeof setTimeout> }>>()
     const errors: string[] = []
     const fail = (why: string): void => {
       if (closed) return
@@ -87,6 +87,13 @@ export function openCdpSession(ws: WebSocketLike, openMs: number = OPEN_MS): Pro
       for (const [id, p] of pending) {
         pending.delete(id)
         p.reject(new Error(why))
+      }
+      for (const [method, list] of waiters) {
+        waiters.delete(method)
+        for (const w of list) {
+          clearTimeout(w.timer)
+          w.reject(new Error(why))
+        }
       }
     }
     const opened = setTimeout(() => {
@@ -114,15 +121,19 @@ export function openCdpSession(ws: WebSocketLike, openMs: number = OPEN_MS): Pro
         }),
       waitEvent: (method, timeoutMs) =>
         new Promise((res, rej) => {
-          const got = (p: Record<string, unknown>): void => {
-            clearTimeout(timer)
-            res(p)
-          }
           const timer = setTimeout(() => {
-            waiters.set(method, (waiters.get(method) ?? []).filter((f) => f !== got))
+            waiters.set(method, (waiters.get(method) ?? []).filter((w) => w.timer !== timer))
             rej(new Error(`${method} did not arrive within ${timeoutMs} ms`))
           }, timeoutMs)
-          waiters.set(method, [...(waiters.get(method) ?? []), got])
+          const w = {
+            resolve: (p: Record<string, unknown>): void => {
+              clearTimeout(timer)
+              res(p)
+            },
+            reject: rej,
+            timer
+          }
+          waiters.set(method, [...(waiters.get(method) ?? []), w])
         }),
       consoleErrors: () => [...errors],
       close: () => {
@@ -162,7 +173,7 @@ export function openCdpSession(ws: WebSocketLike, openMs: number = OPEN_MS): Pro
       const list = waiters.get(m.method)
       if (list && list.length > 0) {
         waiters.delete(m.method)
-        for (const f of list) f(params)
+        for (const w of list) w.resolve(params)
       }
       const text = consoleErrorOf(m.method, params)
       if (text !== null) {

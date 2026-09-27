@@ -84,6 +84,13 @@ describe('openCdpSession', () => {
     await expect(cdp.send('Runtime.evaluate', {})).rejects.toThrow(NO_CDP)
   })
 
+  it('a socket that closes rejects an in-flight waitEvent at once, with NO_CDP', async () => {
+    const { ws, cdp } = await opened()
+    const waiting = cdp.waitEvent('Input.dragIntercepted', 5_000)
+    ws.fire('close')
+    await expect(waiting).rejects.toThrow(NO_CDP)
+  })
+
   it('a socket that never opens is a rejection', async () => {
     const ws = new FakeSocket()
     const p = openCdpSession(ws, 10)
