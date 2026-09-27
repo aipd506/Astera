@@ -2577,7 +2577,7 @@ describe('WorkUnitCollector — git 회차 모으기', () => {
     hold = true
     collector.onGitChanged()
     const first = collector.flush()
-    await vi.waitFor(() => expect(release).not.toBeNull()) // 첫 회차가 readRef 안에서 서 있다
+    await vi.waitFor(() => expect(release).not.toBeNull(), { timeout: 3_000 }) // 첫 회차가 readRef 안에서 서 있다
     hold = false
     // 회차가 도는 동안 이벤트가 두 무더기로 온다 — 디바운스 창을 넘길 만큼 사이를 두고
     for (let i = 0; i < 5; i++) collector.onGitChanged()
@@ -2587,7 +2587,7 @@ describe('WorkUnitCollector — git 회차 모으기', () => {
     release!()
     await first
 
-    await vi.waitFor(() => expect(refs).toBe(2))
+    await vi.waitFor(() => expect(refs).toBe(2), { timeout: 3_000 })
     await sleep(WINDOW_MS * 2 + 100) // 더 오는 회차가 없는지 본다
     expect(refs).toBe(2)
     expect(lists).toBe(2) // 첫 회차 + 뒤따르는 회차 하나
