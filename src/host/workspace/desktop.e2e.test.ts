@@ -252,9 +252,23 @@ describe.runIf(enabled)('the agent app workspace on a real desktop', () => {
         pastedFrom = plain ? marker : 'denied' in clip ? '' : (clip.text ?? '')
       } finally {
         if (plain) {
-          const now = await clipboardState().catch(() => null)
-          if (now && 'text' in now && now.text === marker) await setClipboardText('text' in clip ? clip.text : null)
-          else console.log('the clipboard changed during the paste step; the new content is kept')
+          // Right after a paste the clipboard can be held for a moment by another program (Windows'
+          // clipboard history, the fixture), and a read can come back with CRLF line ends. So the
+          // read is retried for a few seconds and compared with its line ends normalised; without
+          // this the person's text was left replaced by the marker (seen on a real desktop).
+          const lf = (s: string): string => s.replace(/\r\n/g, '\n')
+          let now: ClipboardState | null = null
+          for (let i = 0; i < 10; i++) {
+            now = await clipboardState().catch(() => null)
+            if (now && 'text' in now) break
+            await new Promise((r) => setTimeout(r, 300))
+          }
+          if (now && 'text' in now && now.text !== null && lf(now.text) === lf(marker))
+            await setClipboardText('text' in clip ? clip.text : null)
+          else
+            console.log(
+              `the clipboard was not restored: ${now === null ? 'it could not be read' : 'denied' in now ? `it could not be opened (${now.denied})` : 'it no longer holds the marker, so the new content is kept'}`
+            )
         }
       }
       const body = second.body as { log: string[]; error?: unknown }
