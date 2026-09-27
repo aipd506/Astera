@@ -30,7 +30,9 @@ stop your script or close the desktop from there. It works the same when the Ast
   nobody sees rendering. `windows()`, `windowShot()` and `keys()` throw `not available on macOS`, since
   the app runs in the background and only its page can be driven. Use `screenshot()` to see it. A Dock
   icon can appear while it runs, and a plain command's window can show unless the app keeps it hidden
-  (it may when `ASTERA_APP_CHROMIUM_FLAGS` is set). An app bundle (`/Applications/My App.app --flag`) is
+  (it may when `ASTERA_APP_CHROMIUM_FLAGS` is set). An app that hides itself should also create that
+  window with `paintWhenInitiallyHidden: true` and `webPreferences: { backgroundThrottling: false }`,
+  so a page nobody sees still paints and `screenshot()` does not wait. An app bundle (`/Applications/My App.app --flag`) is
   opened in the background; it sees only what reaches it after its path, not the environment.
 - **The clipboard.** On Windows and macOS it is the person's: `paste()` pastes what they copied, and
   your app can overwrite what they copied. Say so before you rely on it. On Linux it is the virtual

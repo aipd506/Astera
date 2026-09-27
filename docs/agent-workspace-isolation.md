@@ -18,7 +18,11 @@ and the Host announces `workspace` on all three.
   `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` removed, and `XDG_SESSION_TYPE=x11`, `GDK_BACKEND=x11`,
   `QT_QPA_PLATFORM=xcb`, `SDL_VIDEODRIVER=x11` and `ELECTRON_OZONE_PLATFORM_HINT=x11` set (a newer
   Electron no longer reads that last hint alone, so Chromium, GTK, Qt and SDL are each pointed at X11
-  directly). `windows()` and `keys()` use xdotool, `windowShot()` and the frames without CDP use
+  directly). `DBUS_SESSION_BUS_ADDRESS` is removed too, and `XDG_RUNTIME_DIR` points at a folder of
+  the desk's own (`astera-xrt-` and a random suffix under the temp folder, mode 0700), removed when the
+  desk closes or its Xvfb exits. The person's session bus, portals, notifications, tray, `wayland-0` and
+  audio sockets all live on that bus or in their runtime folder, so the app reaches none of them. The
+  tools the desk runs get the same environment. `windows()` and `keys()` use xdotool, `windowShot()` and the frames without CDP use
   ImageMagick's `import`. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
   `app js` is refused, with the install line for the distribution, when Xvfb, xdotool or `import` is
   missing.
@@ -65,19 +69,24 @@ Known limits, beside the spec's:
 
 - **macOS:** a Dock icon can appear while the app runs, and native windows, dialogs and keys cannot be
   driven. A plain command's window can show unless the app keeps it hidden, and an app that ignores the
-  hide marker and shows its window anyway can come to the front. A bundle run through App Translocation
-  (macOS's own quarantine of a bundle opened from certain folders) is not found, since its path at launch
-  is not the one on disk. A Screen Recording and Accessibility permission mode may come later, as an
+  hide marker and shows its window anyway can come to the front. A bundle is found by the tag in its
+  arguments, not by its path, so a bundle that App Translocation (macOS's own quarantine of a bundle
+  opened from certain folders) runs from another path should still be found; that case has not been
+  tested. A Screen Recording and Accessibility permission mode may come later, as an
   opt-in, to move a window or drive native input (user decision L3a).
 - **Linux:** an app that only speaks Wayland cannot start on Xvfb; Electron apps use X11 through the
-  hint. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The desk keeps
-  `DBUS_SESSION_BUS_ADDRESS`, so notifications and tray icons from the launched app can still appear on
-  the person's own desktop. A stale X lock file only makes the reservation skip that display number; it
+  hint. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The app has
+  no session bus and no secret service: an app that keeps secrets with Electron's `safeStorage` gets its
+  `basic_text` backend there, not the person's keyring, and a file chooser opens as the toolkit's own
+  dialog on the virtual display, never as a portal. Where `dbus-launch` is installed, libdbus may start
+  a bus of its own for the virtual display; that bus is not the person's, and as a daemon it leaves the
+  process group (see Both). A stale X lock file only makes the reservation skip that display number; it
   removes nothing.
 - **Both:** a process that leaves its process group (a `setsid`, a daemon) escapes the group kill, as a
   process that detaches from the tree does on Windows. The command runs as `sh -c`, then a newline, then
-  `wait`, so a child put in the background is still there to end; a command ending in a backslash, one
-  with an unclosed heredoc, or one that calls `exit` defeats that `wait`, and such a child may not be
+  `wait`, so a child put in the background is still there to end. A blank line sits between them, so a
+  command ending in a backslash continues onto that empty line and still reaches `wait`. A command with
+  an unclosed heredoc, or one that calls `exit`, defeats that `wait`, and such a child may not be
   cleaned up.
 
 ## Shipped (Windows, 2026-09-27)
