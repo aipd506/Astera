@@ -8,7 +8,7 @@
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import type { DeskHandle } from '../../core/workspace/helpers'
+import type { DeskHandle, DeskPointer } from '../../core/workspace/helpers'
 import { START_TIME_TOLERANCE_MS } from '../../core/workspace/lifecycle'
 import { DESK_CLOSE_MS, DESK_READY_MS, type DeskLaunched, type DeskShot, type DeskWindow } from '../../core/workspace/protocol'
 import { execText, killGroup, linuxStartTimes, realLinuxProcFs, runTool, spawnDetached, type RunTool, type SpawnDetached, type SpawnedProc } from './posixProc'
@@ -46,6 +46,13 @@ const KEYBOARD_TEXT = /^[\x20-\x7e\n\t]$/
 export const REMAP_DELAY_MS = 100
 /** Characters per run at REMAP_DELAY_MS: about 10 s, inside DESK_REQUEST_MS. */
 export const REMAP_CHUNK = 100
+/** Moves between the press and the target in a real pointer drag (pressArgs). */
+export const DRAG_STEPS = 5
+/** The pause after each move, in seconds, as xdotool's `sleep` takes it. */
+const DRAG_STEP_S = '0.05'
+/** Chromium counts a press this soon after the last one, at the same place, as a double click, and a
+ *  double click starts no drag: a second real drag waits out the rest of this after the first. */
+export const PRESS_GAP_MS = 700
 /** The fd Xvfb reports its display number on once it accepts connections (-displayfd). */
 const READY_FD = 3
 
@@ -137,10 +144,26 @@ export function typeRuns(text: string): string[][] {
 }
 
 /** `xdotool getwindowgeometry --shell`: WINDOW=, X=, Y=, WIDTH=, HEIGHT=, SCREEN= lines. */
-export function parseGeometry(text: string): { width: number; height: number } {
-  const w = /^WIDTH=(\d+)$/m.exec(text)
-  const h = /^HEIGHT=(\d+)$/m.exec(text)
-  return { width: w ? Number(w[1]) : 0, height: h ? Number(h[1]) : 0 }
+export function parseGeometry(text: string): { x: number; y: number; width: number; height: number } {
+  const num = (k: string): number => Number(new RegExp(`^${k}=(-?\\d+)$`, 'm').exec(text)?.[1] ?? 0)
+  return { x: num('X'), y: num('Y'), width: num('WIDTH'), height: num('HEIGHT') }
+}
+
+/** The env xdotool runs with: `env` with a UTF-8 locale. `xdotool type` decodes its text through the
+ *  locale and refuses anything but ASCII under the C locale ("Invalid multi-byte sequence"), which is
+ *  what a Host started with no LANG or LC_* gets. A UTF-8 locale the Host already has is kept. */
+export function utf8Env(env: Record<string, string>): Record<string, string> {
+  const locale = env.LC_ALL || env.LC_CTYPE || env.LANG || ''
+  return /utf-?8/i.test(locale) ? env : { ...env, LC_ALL: 'C.UTF-8' }
+}
+
+/** One `xdotool` run that presses at `from` and moves in DRAG_STEPS steps to `to`, both in screen
+ *  pixels, with a pause after each so Chromium sees every move as its own event. */
+export function pressArgs(from: { x: number; y: number }, to: { x: number; y: number }): string[] {
+  const at = (x: number, y: number): string[] => ['mousemove', String(Math.round(x)), String(Math.round(y)), 'sleep', DRAG_STEP_S]
+  const out = [...at(from.x, from.y), 'mousedown', '1', 'sleep', DRAG_STEP_S]
+  for (let i = 1; i <= DRAG_STEPS; i++) out.push(...at(from.x + ((to.x - from.x) * i) / DRAG_STEPS, from.y + ((to.y - from.y) * i) / DRAG_STEPS))
+  return out
 }
 
 /** Width and height of a PNG (its IHDR) or a JPEG (its first SOF marker); zeros for anything else. */
@@ -301,7 +324,8 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
     const live = (): void => {
       if (st.dead !== null) throw new Error(`the virtual display ended (${st.dead})`)
     }
-    const xdotool = (args: string[]): Promise<Buffer> => d.run('xdotool', args, env)
+    const xdoEnv = utf8Env(env)
+    const xdotool = (args: string[]): Promise<Buffer> => d.run('xdotool', args, xdoEnv)
     const line = (b: Buffer): string => b.toString('utf8').replace(/\n$/, '')
     // Before anything is launched, so no window is ever mapped under it (PARKED_POINTER). A desk
     // whose pointer could not be moved still works; only drag() may then be cut short.
@@ -337,6 +361,28 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
         if (w) out.push({ hwnd: Number(id), title: w[0], className: '', pid: w[2], width: w[1].width, height: w[1].height, visible: true })
       }
       return out
+    }
+
+    const park = ['mousemove', String(PARKED_POINTER.x), String(PARKED_POINTER.y)]
+    let lastPressAt = -Infinity
+    /** drag()'s fallback (DeskPointer, helpers.ts): real X input on this display, which only this
+     *  workspace uses. The window's origin comes from xdotool, the points in it from the page. */
+    const pointer: DeskPointer = {
+      press: async (o) => {
+        const w = pickWindow(await windows(), o.title || undefined)
+        if (!w) throw noWindow(o.title)
+        const g = parseGeometry((await xdotool(['getwindowgeometry', '--shell', String(w.hwnd)])).toString('utf8'))
+        const wait = lastPressAt + PRESS_GAP_MS - d.now()
+        if (wait > 0) await d.sleep(wait)
+        lastPressAt = d.now()
+        const from = { x: g.x + o.from.x, y: g.y + o.from.y }
+        const to = { x: g.x + o.to.x, y: g.y + o.to.y }
+        d.log(`desktop ${name}: dragging with the display's pointer from ${from.x},${from.y} to ${to.x},${to.y} (window ${w.hwnd} at ${g.x},${g.y})`)
+        await xdotool(pressArgs(from, to))
+      },
+      release: async () => {
+        await xdotool(['mouseup', '1', ...park])
+      }
     }
 
     const kill = async (p: number, at: number): Promise<void> => {
@@ -399,6 +445,7 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
         if (size.width === 0) throw new Error(`import returned no ${o.format} image`)
         return { data: bytes.toString('base64'), width: size.width, height: size.height, title: w?.title ?? '' }
       },
+      pointer,
       keys: async (o) => {
         const w = pickWindow(await windows(), o.title)
         if (!w) throw noWindow(o.title)

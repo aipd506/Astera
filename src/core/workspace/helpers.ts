@@ -34,9 +34,46 @@ export interface Desk {
   windows(): Promise<DeskWindow[]>
   shot(a: { title?: string; format: 'png' | 'jpeg'; maxWidth?: number }): Promise<DeskShot>
   keys(a: { title: string; text?: string; key?: string }): Promise<void>
+  /** Real pointer input on a display that is the workspace's own (Linux's Xvfb). Absent on Windows and
+   *  macOS, where the pointer is the person's: drag() stays on CDP there. */
+  pointer?: DeskPointer
   /** Closes the desktop and ends the helper. */
   close(): Promise<void>
 }
+
+/** A point in device pixels from the top left of a window. */
+export interface WindowPoint {
+  x: number
+  y: number
+}
+
+export interface DeskPointer {
+  /** Moves the pointer to `from` in the window titled `title` (the largest titled window when it is
+   *  empty), presses the left button, and moves in steps to `to`, leaving the button down. */
+  press(a: { title: string; from: WindowPoint; to: WindowPoint }): Promise<void>
+  /** Lets the button go and puts the pointer back out of the way. Safe when nothing is pressed. */
+  release(): Promise<void>
+}
+
+/** Where the page sits in its window, from the page itself: `offX` and `offY` are the CSS pixels of
+ *  window frame and menu bar before the viewport (outer size less inner size, all of it taken as
+ *  left and top, which is where Electron puts its menu bar), `dpr` the page's devicePixelRatio. */
+export interface PagePlace {
+  title: string
+  offX: number
+  offY: number
+  dpr: number
+}
+
+/** A viewport point (CSS pixels, as getBoundingClientRect gives it) as a point in its window's
+ *  device pixels. */
+export function windowPoint(place: PagePlace, p: { x: number; y: number }): WindowPoint {
+  const dpr = Number.isFinite(place.dpr) && place.dpr > 0 ? place.dpr : 1
+  return { x: Math.round((Math.max(0, place.offX) + p.x) * dpr), y: Math.round((Math.max(0, place.offY) + p.y) * dpr) }
+}
+
+const PLACE_SCRIPT =
+  '({ title: document.title, offX: window.outerWidth - window.innerWidth, offY: window.outerHeight - window.innerHeight, dpr: window.devicePixelRatio })'
 
 /** A desktop the manager holds: the Desk and the process that keeps it alive, when there is one.
  *  Windows: the PowerShell helper (DesktopHelper); Linux: Xvfb; macOS: none, since the app runs in the
@@ -106,6 +143,9 @@ export const NO_CDP = 'no CDP connection'
 const NOTHING_LAUNCHED = 'nothing launched: call launch() first'
 const CTRL = 2
 const DRAG_START_MS = 5_000
+/** How long a desk with its own pointer (Linux) waits for the CDP press to start a drag before it
+ *  drags with that pointer instead (drag()). */
+export const DRAG_CDP_MS = 2_000
 /** How long `launch` waits, after the port answers, for the page to finish parsing. A page that has
  *  not settled by then is handed over as it is: the page helpers speak for themselves. */
 export const PAGE_READY_MS = 10_000
@@ -399,21 +439,44 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
       const cdp = needCdp()
       const from = await centerOf(cdp, String(fromSel), 'drag')
       const to = await centerOf(cdp, String(toSel), 'drag')
-      await cdp.send('Input.setInterceptDrags', { enabled: true })
-      try {
-        await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 })
-        // Armed before the move and settled into a value at once, so its timeout can never be an
-        // unhandled rejection (R3).
-        const intercepted = cdp.waitEvent('Input.dragIntercepted', DRAG_START_MS).then(
+      // A desk with a pointer of its own (Linux) falls back to it when the CDP press starts no drag.
+      const real = deps.deskIfOpen()?.pointer
+      // Armed before the move and settled into a value at once, so its timeout can never be an
+      // unhandled rejection (R3).
+      const intercept = (ms: number): Promise<{ ok: true; e: Record<string, unknown> } | { ok: false }> =>
+        cdp.waitEvent('Input.dragIntercepted', ms).then(
           (e) => ({ ok: true as const, e }),
           () => ({ ok: false as const })
         )
+      const release = (): Promise<unknown> =>
+        cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 }).catch(() => undefined)
+      let pressed = false
+      await cdp.send('Input.setInterceptDrags', { enabled: true })
+      try {
+        await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 })
+        const intercepted = intercept(real ? DRAG_CDP_MS : DRAG_START_MS)
         await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: to.x, y: to.y, button: 'left', buttons: 1 })
-        const got = await intercepted
+        let got = await intercepted
+        if (!got.ok && real) {
+          // The CDP press was ended before the move reached the page (on Xvfb, by any pointer event X
+          // sends the window; CI run 36310700864). The same drag with the display's own pointer: real
+          // X input, on a display nobody else uses.
+          await release()
+          const place = await evaluate(cdp, PLACE_SCRIPT, 'drag')
+          const p: PagePlace = isRecord(place)
+            ? { title: String(place.title ?? ''), offX: Number(place.offX) || 0, offY: Number(place.offY) || 0, dpr: Number(place.dpr) || 1 }
+            : { title: '', offX: 0, offY: 0, dpr: 1 }
+          const again = intercept(DRAG_START_MS)
+          pressed = true
+          await real.press({ title: p.title, from: windowPoint(p, from), to: windowPoint(p, to) })
+          got = await again
+        }
         if (!got.ok) throw new Error(`drag: ${String(fromSel)} did not start a drag (is it draggable?)`)
         await dragEvents(cdp, to.x, to.y, got.e.data)
       } finally {
-        await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 }).catch(() => undefined)
+        // The CDP press was already let go before the real one.
+        if (pressed) await real?.release().catch(() => undefined)
+        else await release()
         await cdp.send('Input.setInterceptDrags', { enabled: false }).catch(() => undefined)
       }
       deps.changed()

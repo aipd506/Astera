@@ -3,17 +3,21 @@ import type { RunContext } from '../agentBrowser/scriptRunner'
 import { clickScript, snapshotScript } from '../agentBrowser/guestScripts'
 import type { DeskWindow } from './protocol'
 import {
+  DRAG_CDP_MS,
   NO_CDP,
   PAGE_READY_MS,
   cdpKeyEvents,
   launchEnv,
   parseLaunchSpec,
   pngSize,
+  windowPoint,
   workspaceHelpers,
   type AppState,
   type Cdp,
   type Desk,
-  type HelperDeps
+  type DeskPointer,
+  type HelperDeps,
+  type WindowPoint
 } from './helpers'
 
 const png = (w: number, h: number): string => {
@@ -37,7 +41,7 @@ class FakeCdp implements Cdp {
     const a = this.answers.get(method)
     return a ? a(params) : {}
   }
-  async waitEvent(method: string): Promise<Record<string, unknown>> {
+  async waitEvent(method: string, _timeoutMs?: number): Promise<Record<string, unknown>> {
     const e = this.events.get(method)
     if (!e) throw new Error(`${method} did not arrive`)
     return e
@@ -60,6 +64,7 @@ const WINDOWS: DeskWindow[] = [
 ]
 
 class FakeDesk implements Desk {
+  pointer?: DeskPointer
   name = 'astera-ws-test'
   launches: Array<{ command: string; cwd: string; env: Record<string, string> }> = []
   kills: Array<[number, number]> = []
@@ -367,6 +372,77 @@ describe('drag and drop inside the page', () => {
     r.cdp.evaluates({ x: 1, y: 1 }, { x: 2, y: 2 })
     await expect(r.h.drag('#plain', '#column')).rejects.toThrow('drag: #plain did not start a drag')
     expect(r.cdp.calls.some((c) => c.params?.type === 'mouseReleased')).toBe(true)
+  })
+
+  /** A desk with a pointer of its own (Linux), and a CDP whose first drag wait gets nothing: the CDP
+   *  press was ended before its move. `realStarts` says whether the real press starts the drag. */
+  const fallbackRig = (realStarts: boolean) => {
+    const r = rig()
+    const data = { items: [{ mimeType: 'text/plain', data: 'card-1' }], dragOperationsMask: 1 }
+    const presses: Array<{ title: string; from: WindowPoint; to: WindowPoint }> = []
+    let releases = 0
+    let waits = 0
+    const pointer: DeskPointer = {
+      press: async (a) => {
+        presses.push(a)
+      },
+      release: async () => {
+        releases++
+      }
+    }
+    r.desk.pointer = pointer
+    r.cdp.waitEvent = async (method: string, ms?: number) => {
+      r.cdp.calls.push({ method: `wait:${method}`, params: { ms } })
+      waits++
+      if (waits === 1) throw new Error('timed out')
+      // The second wait is armed before the real press and settles after it.
+      await vi.waitFor(() => expect(presses).toHaveLength(1))
+      if (!realStarts) throw new Error('timed out')
+      return { data }
+    }
+    return { r, data, presses, releases: () => releases }
+  }
+
+  it('on a desk with its own pointer, drags with it when the CDP press starts no drag, then drops and lets go', async () => {
+    const f = fallbackRig(true)
+    await f.r.h.launch({ command: 'app' })
+    f.r.cdp.evaluates({ x: 10, y: 20 }, { x: 300, y: 400 }, { title: 'Fixture', offX: 0, offY: 28, dpr: 2 })
+    await f.r.h.drag('#card', '#column')
+    expect(f.presses).toEqual([{ title: 'Fixture', from: { x: 20, y: 96 }, to: { x: 600, y: 856 } }])
+    expect(f.releases()).toBe(1)
+    const seq = f.r.cdp.calls
+      .filter((c) => c.method !== 'Runtime.evaluate')
+      .map((c) => `${c.method}:${String(c.params?.type ?? c.params?.enabled ?? c.params?.ms)}`)
+    expect(seq).toEqual([
+      'Input.setInterceptDrags:true',
+      'Input.dispatchMouseEvent:mousePressed',
+      `wait:Input.dragIntercepted:${DRAG_CDP_MS}`,
+      'Input.dispatchMouseEvent:mouseMoved',
+      'Input.dispatchMouseEvent:mouseReleased',
+      'wait:Input.dragIntercepted:5000',
+      'Input.dispatchDragEvent:dragEnter',
+      'Input.dispatchDragEvent:dragOver',
+      'Input.dispatchDragEvent:drop',
+      'Input.setInterceptDrags:false'
+    ])
+    expect(f.r.cdp.calls.find((c) => c.params?.type === 'drop')?.params).toMatchObject({ x: 300, y: 400, data: f.data })
+  })
+
+  it('names a source neither press starts a drag from, and still lets the real button go', async () => {
+    const f = fallbackRig(false)
+    await f.r.h.launch({ command: 'app' })
+    f.r.cdp.evaluates({ x: 1, y: 1 }, { x: 2, y: 2 }, { title: '', offX: 0, offY: 0, dpr: 1 })
+    await expect(f.r.h.drag('#plain', '#column')).rejects.toThrow('drag: #plain did not start a drag (is it draggable?)')
+    expect(f.presses).toEqual([{ title: '', from: { x: 1, y: 1 }, to: { x: 2, y: 2 } }])
+    expect(f.releases()).toBe(1)
+    expect(f.r.cdp.calls.at(-1)).toMatchObject({ method: 'Input.setInterceptDrags', params: { enabled: false } })
+  })
+
+  it('turns viewport points into window device pixels: the frame and menu bar before the viewport, times the pixel ratio', () => {
+    expect(windowPoint({ title: '', offX: 0, offY: 28, dpr: 1 }, { x: 48, y: 70 })).toEqual({ x: 48, y: 98 })
+    expect(windowPoint({ title: '', offX: 4, offY: 30, dpr: 1.5 }, { x: 10.2, y: 20.4 })).toEqual({ x: 21, y: 76 })
+    // A page that reports nonsense is taken as a plain viewport at ratio 1.
+    expect(windowPoint({ title: '', offX: -8, offY: -8, dpr: 0 }, { x: 5, y: 6 })).toEqual({ x: 5, y: 6 })
   })
 
   it('a selector that matches nothing is named', async () => {

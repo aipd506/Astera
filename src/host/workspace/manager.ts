@@ -369,6 +369,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     windows: () => desk.windows(),
     shot: (a) => desk.shot(a),
     keys: (a) => desk.keys(a),
+    ...(desk.pointer ? { pointer: desk.pointer } : {}),
     close: () => desk.close()
   })
 

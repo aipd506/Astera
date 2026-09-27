@@ -5,7 +5,9 @@ import path from 'node:path'
 import { NAMED_KEYS } from '../../core/workspace/helpers'
 import { DESK_CLOSE_MS, DESK_READY_MS, type DeskWindow } from '../../core/workspace/protocol'
 import {
+  DRAG_STEPS,
   PARKED_POINTER,
+  PRESS_GAP_MS,
   REMAP_CHUNK,
   REMAP_DELAY_MS,
   TYPE_CHUNK,
@@ -15,8 +17,10 @@ import {
   imageSize,
   parseGeometry,
   pickWindow,
+  pressArgs,
   realLinuxDeskDeps,
   typeRuns,
+  utf8Env,
   type LinuxDeskDeps
 } from './deskLinux'
 import type { SpawnedProc } from './posixProc'
@@ -272,6 +276,53 @@ describe('the Linux desk: the pointer', () => {
     const desk = await r.desks.start('a')
     expect(desk.alive()).toBe(true)
     expect(r.log.some((l) => l.includes("desktop a: the pointer could not be moved out of the way: Can't open display"))).toBe(true)
+  })
+})
+
+describe("the Linux desk: drag()'s real pointer", () => {
+  it('presses at the window origin plus the page point, moves in steps to the target, and lets go back in the corner', async () => {
+    const r = rig()
+    threeWindows(r)
+    r.xdo((args) => (args[0] === 'getwindowgeometry' ? Buffer.from('WINDOW=41\nX=510\nY=190\nWIDTH=900\nHEIGHT=700\nSCREEN=0\n') : undefined))
+    r.answers.reverse()
+    const desk = await r.desks.start('a')
+    await desk.pointer!.press({ title: '픽스처', from: { x: 48, y: 98 }, to: { x: 108, y: 158 } })
+    const press = r.runs.at(-1)!
+    expect(press.file).toBe('xdotool')
+    expect(press.args).toEqual(pressArgs({ x: 558, y: 288 }, { x: 618, y: 348 }))
+    expect(press.args.slice(0, 7)).toEqual(['mousemove', '558', '288', 'sleep', '0.05', 'mousedown', '1'])
+    expect(press.args.slice(-5)).toEqual(['mousemove', '618', '348', 'sleep', '0.05'])
+    expect(press.args.filter((a) => a === 'mousemove')).toHaveLength(1 + DRAG_STEPS)
+    expect(r.log.some((l) => l.includes("dragging with the display's pointer from 558,288 to 618,348 (window 41 at 510,190)"))).toBe(true)
+    await desk.pointer!.release()
+    expect(r.runs.at(-1)!.args).toEqual(['mouseup', '1', 'mousemove', '1919', '1079'])
+  })
+
+  it('waits out a double click before pressing again, and names a window that is not there', async () => {
+    const r = rig()
+    threeWindows(r)
+    const desk = await r.desks.start('a')
+    await desk.pointer!.press({ title: '', from: { x: 1, y: 1 }, to: { x: 50, y: 50 } })
+    const before = r.sleeps.length
+    await desk.pointer!.press({ title: '', from: { x: 1, y: 1 }, to: { x: 50, y: 50 } })
+    expect(r.sleeps.slice(before).map((s) => s.ms)).toEqual([PRESS_GAP_MS])
+    await expect(desk.pointer!.press({ title: 'nothing like it', from: { x: 1, y: 1 }, to: { x: 2, y: 2 } })).rejects.toThrow('no window titled "nothing like it"')
+  })
+
+  it('gives xdotool a UTF-8 locale when the Host has none, and keeps one it has', async () => {
+    expect(utf8Env({ PATH: '/bin' })).toEqual({ PATH: '/bin', LC_ALL: 'C.UTF-8' })
+    expect(utf8Env({ LANG: 'C', LC_ALL: 'POSIX' })).toMatchObject({ LC_ALL: 'C.UTF-8' })
+    expect(utf8Env({ LANG: 'ko_KR.UTF-8' })).toEqual({ LANG: 'ko_KR.UTF-8' })
+    expect(utf8Env({ LC_CTYPE: 'en_US.utf8' })).toEqual({ LC_CTYPE: 'en_US.utf8' })
+    const r = rig()
+    threeWindows(r)
+    const desk = await r.desks.start('a')
+    await desk.keys({ title: 'astera', text: '한글' })
+    const typed = r.runs.find((x) => x.args[2] === 'type')!
+    expect(typed.env.LC_ALL).toBe('C.UTF-8')
+    // The app itself is not given it: only the tool that decodes the text.
+    await desk.launch({ command: 'app', cwd: '/p', env: {} })
+    expect(r.procs.at(-1)!.env.LC_ALL).toBeUndefined()
   })
 })
 
@@ -552,8 +603,9 @@ describe('the Linux desk: pure parts', () => {
   })
 
   it('reads geometry, and image sizes from PNG and JPEG headers', () => {
-    expect(parseGeometry('WINDOW=1\nX=0\nY=0\nWIDTH=640\nHEIGHT=480\nSCREEN=0\n')).toEqual({ width: 640, height: 480 })
-    expect(parseGeometry('nonsense')).toEqual({ width: 0, height: 0 })
+    expect(parseGeometry('WINDOW=1\nX=0\nY=0\nWIDTH=640\nHEIGHT=480\nSCREEN=0\n')).toEqual({ x: 0, y: 0, width: 640, height: 480 })
+    expect(parseGeometry('WINDOW=1\nX=510\nY=-4\nWIDTH=900\nHEIGHT=700\n')).toEqual({ x: 510, y: -4, width: 900, height: 700 })
+    expect(parseGeometry('nonsense')).toEqual({ x: 0, y: 0, width: 0, height: 0 })
     expect(imageSize(png(3, 4))).toEqual({ width: 3, height: 4 })
     expect(imageSize(jpeg(960, 540))).toEqual({ width: 960, height: 540 })
     expect(imageSize(Buffer.from('not an image'))).toEqual({ width: 0, height: 0 })
