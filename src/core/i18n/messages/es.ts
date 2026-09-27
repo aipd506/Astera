@@ -122,6 +122,8 @@ export const es: Catalog = {
     'git no rastrea esta carpeta, así que no se puede saber si hay cambios sin confirmar.',
   'worktree.error.gitAddFailed': 'No se pudo crear el worktree de git.',
   'worktree.error.gitRemoveFailed': 'No se pudo eliminar el worktree de git.',
+  'worktree.error.unreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se eliminó nada. Vuelve a intentarlo cuando sea accesible.',
+  'worktree.error.rootUnreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
     'La sesión «{title}» está en ejecución y usa este worktree. Cierre primero esa sesión.',

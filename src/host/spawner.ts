@@ -15,7 +15,7 @@ import { comparablePath } from '../core/files/tree'
 import { randomUUID } from 'node:crypto'
 import type { HostMessage, PtyEntry } from '../core/host/protocol'
 import { hostCliPaths, hostWorkerBaseEnv } from '../core/host/spawn'
-import type { OrchServerDeps } from '../core/orchestration/command'
+import { keptBecause, keptPhrase, type OrchServerDeps } from '../core/orchestration/command'
 import type { OrchState } from '../core/orchestration/state'
 import { OrchCoordinator, type CoordinatorDeps, type PromptWriteEvent } from '../core/orchestration/exec/coordinator'
 import { WorkerTails } from '../core/orchestration/exec/tail'
@@ -615,12 +615,18 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
    *  Never throws: the start's own failure is what the command answers, and this is only cleanup. */
   const discardFork = async (forked: string): Promise<boolean> => {
     try {
-      const { failed } = await d.worktrees.removeWorktrees([forked])
-      if (failed.length === 0) {
+      const r = await d.worktrees.removeWorktrees([forked])
+      if (r.failed.length === 0) {
         log(`worker-start: the spawn failed, so removed the fresh worktree ${forked}`)
         return true
       }
-      log(`worker-start: the fresh worktree ${forked} of a failed spawn is still in use — left in place`)
+      // A folder kept for a reason (uncommitted changes, or it could not be checked) is not in use.
+      const kept = keptBecause(r, forked)
+      log(
+        kept !== null
+          ? `worker-start: the fresh worktree ${forked} of a failed spawn ${keptPhrase(kept)} — left in place`
+          : `worker-start: the fresh worktree ${forked} of a failed spawn is still in use — left in place`
+      )
     } catch (err) {
       log(`worker-start: the fresh worktree ${forked} of a failed spawn could not be removed — left in place: ${String(err)}`)
     }

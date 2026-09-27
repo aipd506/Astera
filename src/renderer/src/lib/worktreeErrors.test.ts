@@ -103,3 +103,17 @@ describe('isOrphanUnverifiable', () => {
     expect(isOrphanUnverifiable('DIRTY: 3')).toBe(false)
   })
 })
+
+// 닿지 않는 폴더(끊긴 네트워크 드라이브)는 원문 대신 번역된 문장으로 보인다
+describe('worktreeErrorMessage, unreachable folders', () => {
+  it('WORKTREE_UNREACHABLE 는 삭제용 키로 간다', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: WORKTREE_UNREACHABLE: folder not reachable, nothing was removed (Z:\wt\a)")
+    ).toEqual({ key: 'worktree.error.unreachable' })
+  })
+  it('WORKTREE_ROOT_UNREACHABLE 는 생성용 키로 간다', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.create': Error: WORKTREE_ROOT_UNREACHABLE: folder not reachable: Z:\wt")
+    ).toEqual({ key: 'worktree.error.rootUnreachable' })
+  })
+})

@@ -4,7 +4,7 @@
 // control plane design §5) — S2 made startWorker local (HOST_LOCAL), and this file changed while
 // `handleCommand` did not.
 import type { CheckWaits } from '../core/orchestration/checkWaits'
-import type { OrchAccount, OrchRunConfig, OrchServerDeps } from '../core/orchestration/command'
+import { keptBecause, keptPhrase, type OrchAccount, type OrchRunConfig, type OrchServerDeps } from '../core/orchestration/command'
 import type { JobEvent, Provider } from '../core/types'
 import type { OrchState } from '../core/orchestration/state'
 import { AppUnreachable, leftNothingBehind, wasRefusedBeforeActing } from '../core/host/orchProtocol'
@@ -966,8 +966,14 @@ export function hostOrchDeps(a: {
         ? (paths) => local.removeWorktrees(paths)
         : (forward('removeWorktrees', false) as NonNullable<OrchServerDeps['removeWorktrees']>)
     try {
-      const { failed } = await remove([path])
-      const inUse = failed.length > 0
+      const r = await remove([path])
+      // A folder kept for a reason (uncommitted changes, or it could not be checked) is not in use.
+      const kept = keptBecause(r, path)
+      if (kept !== null) {
+        a.log(`orphaned run worktree ${path} ${keptPhrase(kept)} — left in place`)
+        return { removed: false, inUse: false }
+      }
+      const inUse = r.failed.length > 0
       if (inUse) a.log(`orphaned run worktree ${path} is still in use — left in place`)
       else if (madeHere.delete(path)) a.withdrawEffect?.()
       return { removed: !inUse, inUse }

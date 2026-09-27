@@ -16,6 +16,9 @@ const MESSAGES: Array<[string, MessageKey]> = [
   ['ORPHAN_UNPROVEN', 'worktree.error.orphanUnproven'],
   // ORPHAN_UNVERIFIABLE is routed to the force-removal reconfirmation, so it is detected by isOrphanUnverifiable() alongside dirtyCount
   ['ORPHAN_UNVERIFIABLE', 'worktree.error.orphanUnverifiable'],
+  // A folder or root that did not answer in time (an offline network drive). Nothing was created or removed.
+  ['WORKTREE_ROOT_UNREACHABLE', 'worktree.error.rootUnreachable'],
+  ['WORKTREE_UNREACHABLE', 'worktree.error.unreachable'],
   ['GIT_ADD_FAILED', 'worktree.error.gitAddFailed'],
   ['GIT_REMOVE_FAILED', 'worktree.error.gitRemoveFailed'],
   // Not a worktree code but a session rolling constraint (sessions/manager.ts) — App.tsx's spawn catch

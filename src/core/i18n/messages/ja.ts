@@ -121,6 +121,8 @@ export const ja: Catalog = {
     'git がこのフォルダを追跡していないため、未コミットの変更の有無を確認できません。',
   'worktree.error.gitAddFailed': 'git worktree の作成に失敗しました。',
   'worktree.error.gitRemoveFailed': 'git worktree の削除に失敗しました。',
+  'worktree.error.unreachable': 'worktree のフォルダーに到達できないか確認できなかったため、何も削除していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
+  'worktree.error.rootUnreachable': 'worktree のフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
     '実行中のセッション「{title}」がこの worktree を使用中です。先にセッションを閉じてください。',

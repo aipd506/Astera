@@ -2285,6 +2285,31 @@ describe('Host-local spawn (S2)', () => {
     expect(worktrees.makeRunWorktree).toHaveBeenCalledTimes(1)
     expect(spawned).toEqual([])
   })
+  // Review minor: a folder kept because it could not be checked (an offline drive, a status git could
+  // not read) is not "still in use". The note and the log say which it was.
+  it('says a fresh run worktree kept as unchecked could not be removed, not that it is in use', async () => {
+    const jobId = await coordinatorJob()
+    await fs.writeFile(path.join(dir, 'app-settings.json'), '{ not json')
+    const runWt = path.join(dir, 'wt-run')
+    const worktrees = { fork: vi.fn(), makeRunWorktree: vi.fn(async () => runWt), mergeWorktrees: vi.fn(), removeWorktrees: vi.fn(async (p: string[]) => ({ failed: p, uncommitted: 0, unchecked: p })) }
+    const { orch } = await realSpawner(worktrees)
+    const first = await orch.call({ cmd: 'run-start', args: { run: jobId }, sessionId: 'sesA', request: 'req-rs' })
+    expect(first.status).toBe(409)
+    const error = (first.body as { error: string }).error
+    expect(error).toMatch(/could not be removed and was left behind/)
+    expect(error).not.toMatch(/still in use/)
+    expect(logs.join('\n')).toMatch(/could not be checked/)
+  })
+  it('logs a failed fork kept as unchecked as not checked, not as in use', async () => {
+    const { taskId } = await seed()
+    const forkedDir = path.join(dir, 'wt-u'); await fs.mkdir(forkedDir)
+    const worktrees = { fork: vi.fn(async () => forkedDir), makeRunWorktree: vi.fn(), mergeWorktrees: vi.fn(), removeWorktrees: vi.fn(async (p: string[]) => ({ failed: p, uncommitted: 0, unchecked: p })) }
+    const { orch } = await realSpawner(worktrees, () => true)
+    await orch.call({ cmd: 'worker-start', args: { ...worker(taskId, 'new'), name: 'n' }, sessionId: 'sesA', request: 'req-u' })
+    const text = logs.join('\n')
+    expect(text).toMatch(/could not be checked/)
+    expect(text).not.toMatch(/of a failed spawn is still in use/)
+  })
   it('removes the fork of a keyed --worktree new worker whose spawn failed, answers the same error, and keeps no receipt', async () => {
     const { taskId } = await seed()
     const forkedDir = path.join(dir, 'wt-a'); await fs.mkdir(forkedDir)

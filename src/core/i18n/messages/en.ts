@@ -131,6 +131,8 @@ export const en: Record<keyof typeof ko, string> = {
   'worktree.error.orphanUnverifiable': 'git does not track this folder, so uncommitted changes cannot be checked.',
   'worktree.error.gitAddFailed': 'Failed to create the git worktree.',
   'worktree.error.gitRemoveFailed': 'Failed to remove the git worktree.',
+  'worktree.error.unreachable': 'The worktree folder could not be reached or checked (an offline network drive?), so nothing was removed. Try again once it is reachable.',
+  'worktree.error.rootUnreachable': 'The worktree folder could not be reached or checked (an offline network drive?), so no worktree was created. Try again once it is reachable.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session': 'Session “{title}” is running and using this worktree. Close the session first.',
   'worktree.inUse.run': 'Process “{name}” is running and using this worktree. Stop it first.',

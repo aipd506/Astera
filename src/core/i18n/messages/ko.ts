@@ -138,6 +138,8 @@ export const ko = {
   'worktree.error.orphanUnverifiable': 'git이 이 폴더를 추적하지 않아 미커밋 변경 여부를 확인할 수 없습니다.',
   'worktree.error.gitAddFailed': 'git worktree 생성에 실패했습니다.',
   'worktree.error.gitRemoveFailed': 'git worktree 제거에 실패했습니다.',
+  'worktree.error.unreachable': '워크트리 폴더에 닿지 못했거나 확인하지 못해 아무것도 지우지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
+  'worktree.error.rootUnreachable': '워크트리 폴더에 닿지 못했거나 확인하지 못해 워크트리를 만들지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session': "실행 중 세션 '{title}'이(가) 이 worktree를 사용 중입니다. 세션을 먼저 닫으세요.",
   'worktree.inUse.run': "실행 중 프로세스 '{name}'이(가) 이 worktree를 사용 중입니다. 실행을 먼저 중지하세요.",
