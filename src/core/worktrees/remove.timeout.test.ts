@@ -12,7 +12,7 @@ vi.mock('./git', async (importOriginal) => {
 
 import { git, GIT_WRITE_TIMEOUT_MS } from './git'
 import { removeWorktree } from './remove'
-import { createWorktree } from './create'
+import { createWorktree, rollbackAdd } from './create'
 import { WorktreeRegistry } from './registry'
 import { makeRepo, tempDir } from './testRepo'
 
@@ -45,5 +45,16 @@ describe('removeWorktree, write deadlines', () => {
     const deletes = callsOf((a) => a[0] === 'branch' && (a[1] === '-d' || a[1] === '-D'))
     expect(deletes.length).toBeGreaterThan(0)
     expect(deletes.every((t) => t === GIT_WRITE_TIMEOUT_MS)).toBe(true)
+  })
+})
+
+describe('rollbackAdd, write deadline', () => {
+  // Re-review minor: the rollback's remove is a write too, and gets the same long ceiling.
+  it('worktree remove --force --force runs with the long write timeout', async () => {
+    const wt = path.join(reg.getRoot(), 'rb')
+    await git(['worktree', 'add', '-b', 'Test-User/rb', wt, 'main'], { cwd: repo })
+    vi.mocked(git).mockClear()
+    expect(await rollbackAdd(repo, wt, 'Test-User/rb')).toEqual([])
+    expect(callsOf((a) => a[0] === 'worktree' && a[1] === 'remove')).toEqual([GIT_WRITE_TIMEOUT_MS])
   })
 })

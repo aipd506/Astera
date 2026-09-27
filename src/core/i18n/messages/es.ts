@@ -131,6 +131,8 @@ export const es: Catalog = {
   'worktree.error.gitRemoveFailed': 'No se pudo eliminar el worktree de git.',
   'worktree.error.unreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se eliminó nada. Vuelve a intentarlo cuando sea accesible.',
   'worktree.error.linksUnverified': 'No se pudieron comprobar y quitar todos los enlaces de la carpeta del worktree, así que no se eliminó nada. Eliminarla de todos modos podría borrar archivos de fuera a través de una unión (junction). Vuelve a intentarlo o quita los enlaces a mano.',
+  'worktree.error.locked': 'El worktree está bloqueado (git worktree lock), así que no se eliminó nada. Desbloquéalo primero o elimínalo forzando.',
+  'worktree.error.hasSubmodules': 'El worktree tiene submódulos, que git solo elimina forzando, así que no se eliminó nada. Elimínalo forzando.',
   'worktree.error.rootUnreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':

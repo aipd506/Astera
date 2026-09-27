@@ -22,6 +22,9 @@ const MESSAGES: Array<[string, MessageKey]> = [
   // The links inside the folder could not all be taken out before git removes it (a junction would carry
   // the removal outside the folder). Nothing was removed.
   ['LINKS_UNVERIFIED', 'worktree.error.linksUnverified'],
+  // Refused without force before the link walk: git would refuse a locked worktree, or one with submodules
+  ['WORKTREE_LOCKED', 'worktree.error.locked'],
+  ['HAS_SUBMODULES', 'worktree.error.hasSubmodules'],
   ['GIT_ADD_FAILED', 'worktree.error.gitAddFailed'],
   ['GIT_REMOVE_FAILED', 'worktree.error.gitRemoveFailed'],
   // The person pressed Cancel and everything the creation made was taken back

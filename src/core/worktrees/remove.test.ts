@@ -387,3 +387,42 @@ describe('removeWorktree without force, with a tracked symlink', () => {
     expect(existsSync(info.path)).toBe(false)
   })
 })
+
+// Re-review minor: without force, a locked worktree or one with submodules is refused by git anyway.
+// It is refused before the link walk, so its node_modules links are not taken out for nothing.
+describe('removeWorktree without force, refused before the link walk', () => {
+  const walkSpy = () => {
+    const walked: string[] = []
+    const detach = async (root: string) => {
+      walked.push(root)
+      return { ok: true as const, unlinked: 0 }
+    }
+    return { walked, detach }
+  }
+
+  it('a locked worktree: WORKTREE_LOCKED, no walk, nothing removed', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'locked', registry: reg })
+    gitIn(repo, ['worktree', 'lock', info.path])
+    const { walked, detach } = walkSpy()
+    await expect(removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse, detach })).rejects.toThrow(
+      /WORKTREE_LOCKED/
+    )
+    expect(walked).toEqual([])
+    expect(existsSync(path.join(info.path, 'f.txt'))).toBe(true)
+    expect(reg.get(info.id)).not.toBeNull()
+  })
+
+  it('a worktree with a submodule: HAS_SUBMODULES, no walk, nothing removed', async () => {
+    const sub = await makeRepo('astera-wt-rm-sub-')
+    gitIn(repo, ['-c', 'protocol.file.allow=always', 'submodule', 'add', sub, 'sub'])
+    gitIn(repo, ['commit', '-m', 'add submodule'])
+    const { info } = await createWorktree({ repoPath: repo, name: 'withsub', registry: reg })
+    const { walked, detach } = walkSpy()
+    await expect(removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse, detach })).rejects.toThrow(
+      /HAS_SUBMODULES/
+    )
+    expect(walked).toEqual([])
+    expect(existsSync(path.join(info.path, 'f.txt'))).toBe(true)
+    expect(reg.get(info.id)).not.toBeNull()
+  })
+})

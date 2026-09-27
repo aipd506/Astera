@@ -145,3 +145,15 @@ describe('worktreeErrorMessage, links not verified', () => {
     ).toEqual({ key: 'worktree.error.linksUnverified' })
   })
 })
+
+// Re-review minor: a locked worktree, or one with submodules, is refused before the link walk
+describe('worktreeErrorMessage, refused before the link walk', () => {
+  it('WORKTREE_LOCKED and HAS_SUBMODULES go to their own keys', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: WORKTREE_LOCKED: the worktree is locked (git worktree lock), nothing was removed (C:\wt\a)")
+    ).toEqual({ key: 'worktree.error.locked' })
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: HAS_SUBMODULES: the worktree has submodules, remove it with force (C:\wt\a)")
+    ).toEqual({ key: 'worktree.error.hasSubmodules' })
+  })
+})

@@ -13,27 +13,33 @@ import type { WorktreeStore } from './registry'
 import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
 import { detachLinks, type DetachResult } from './detachLinks'
 
-/** The paths git tracks as symlinks in this worktree (mode 120000), relative with `/`, case folded
- *  where the file system folds it. null when git could not say. */
-async function trackedLinks(worktreePath: string): Promise<Set<string> | null> {
+/** What the index says about this worktree: the paths git tracks as symlinks (mode 120000), relative
+ *  with `/`, case folded where the file system folds it, and whether it has any submodule (a 160000
+ *  entry). null when git could not say. */
+async function trackedIndex(worktreePath: string): Promise<{ links: Set<string>; submodules: boolean } | null> {
   const r = await git(['ls-files', '-s', '-z'], { cwd: worktreePath, trim: false })
   if (!r.ok) return null
   const fold = process.platform === 'win32' || process.platform === 'darwin'
-  const out = new Set<string>()
+  const links = new Set<string>()
+  let submodules = false
   for (const rec of r.stdout.split('\0')) {
     const tab = rec.indexOf('\t')
-    if (tab < 0 || !rec.startsWith('120000 ')) continue
+    if (tab < 0) continue
+    if (rec.startsWith('160000 ')) submodules = true
+    if (!rec.startsWith('120000 ')) continue
     const p = rec.slice(tab + 1)
-    out.add(fold ? p.toLowerCase() : p)
+    links.add(fold ? p.toLowerCase() : p)
   }
-  return out
+  return { links, submodules }
 }
 
 /** Takes the links out of a worktree before `git worktree remove` runs on it (detachLinks.ts): Git for
  *  Windows' remove deletes through a junction, into the folder outside it points at. Without force,
  *  git's own tracked symlinks are spared: git never follows them, and removing one would make the
- *  worktree dirty and the removal refused, leaving it damaged. Throws LINKS_UNVERIFIED when the walk
- *  could not finish; nothing is removed then. */
+ *  worktree dirty and the removal refused, leaving it damaged. Also without force, a worktree with
+ *  submodules is refused first (HAS_SUBMODULES): git refuses to remove one without force, and taking
+ *  its links out beforehand would only have cost its node_modules links. Throws LINKS_UNVERIFIED when
+ *  the walk could not finish; nothing is removed then. */
 async function detachBeforeRemove(
   worktreePath: string,
   force: boolean,
@@ -41,11 +47,13 @@ async function detachBeforeRemove(
 ): Promise<void> {
   let keep: ((rel: string) => boolean) | undefined
   if (!force) {
-    const tracked = await trackedLinks(worktreePath)
+    const tracked = await trackedIndex(worktreePath)
     if (!tracked)
       throw new Error(`LINKS_UNVERIFIED: git could not list the tracked files, nothing was removed (${worktreePath})`)
+    if (tracked.submodules)
+      throw new Error(`HAS_SUBMODULES: the worktree has submodules, remove it with force (${worktreePath})`)
     const fold = process.platform === 'win32' || process.platform === 'darwin'
-    keep = (rel) => tracked.has(fold ? rel.toLowerCase() : rel)
+    keep = (rel) => tracked.links.has(fold ? rel.toLowerCase() : rel)
   }
   const r = await detach(worktreePath, keep ? { keep } : {})
   if (!r.ok)
@@ -225,6 +233,10 @@ export async function removeWorktree(args: {
     // Force or not, the folder is asked about first: before git removes it, its links are taken out
     // (detachBeforeRemove — git would delete through a junction into the folder it points at), and
     // that walk is not run on a folder that did not answer. Unreachable throws; nothing is removed.
+    // A locked worktree is refused by git without force; refused here first, before the link walk
+    // would have taken its node_modules links out for nothing.
+    if (!args.force && row.locked)
+      throw new Error(`WORKTREE_LOCKED: the worktree is locked (git worktree lock), nothing was removed (${info.path})`)
     if ((await folderState(info.path, presence)) === 'present') {
       if (!args.force) {
         const { clean, changedCount } = await isCleanWorktree(info.path)

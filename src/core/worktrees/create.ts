@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto'
 import type { WorktreeCreateProgress, WorktreeInfo } from '../types'
 import { comparablePath, isPathWithin, isSamePath } from '../files/tree'
 import {
-  git, repoRoot, gitUserName, detectBaseRef, toFullRef, fetchBaseRef, localBranchExists, listGitWorktrees
+  git, repoRoot, gitUserName, detectBaseRef, toFullRef, fetchBaseRef, localBranchExists, listGitWorktrees,
+  GIT_WRITE_TIMEOUT_MS
 } from './git'
 import { cancelledError, throwIfCancelled } from './cancel'
 import {
@@ -118,7 +119,9 @@ export async function rollbackAdd(
   if (owned) {
     const at = await rfs.exists(wtPath)
     if (at === 'unknown' || (at === 'yes' && !(await rfs.detachLinks(wtPath)))) kept = true
-    else await git(['worktree', 'remove', '--force', '--force', wtPath], { cwd: repo })
+    // A write: never cut short at the read default (GIT_WRITE_TIMEOUT_MS) — a remove killed part-way
+    // leaves the folder half deleted with git's record of it still in place
+    else await git(['worktree', 'remove', '--force', '--force', wtPath], { cwd: repo, timeoutMs: GIT_WRITE_TIMEOUT_MS })
   }
   if (!kept && (!entry || owned)) {
     if ((await rfs.exists(wtPath)) === 'yes') {

@@ -130,6 +130,8 @@ export const ja: Catalog = {
   'worktree.error.gitRemoveFailed': 'git worktree の削除に失敗しました。',
   'worktree.error.unreachable': 'worktree のフォルダーに到達できないか確認できなかったため、何も削除していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   'worktree.error.linksUnverified': 'worktree フォルダー内のリンクをすべて確認して取り除けなかったため、何も削除していません。このまま削除するとジャンクションを通じてフォルダーの外のファイルまで削除される可能性があります。再試行するか、リンクを手動で削除してください。',
+  'worktree.error.locked': 'worktree がロックされているため (git worktree lock)、何も削除していません。先にロックを解除するか、強制的に削除してください。',
+  'worktree.error.hasSubmodules': 'worktree にサブモジュールがあるため、何も削除していません。git はサブモジュールのある worktree を強制的にしか削除しません。強制的に削除してください。',
   'worktree.error.rootUnreachable': 'worktree のフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':

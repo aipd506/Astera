@@ -140,6 +140,8 @@ export const en: Record<keyof typeof ko, string> = {
   'worktree.error.gitRemoveFailed': 'Failed to remove the git worktree.',
   'worktree.error.unreachable': 'The worktree folder could not be reached or checked (an offline network drive?), so nothing was removed. Try again once it is reachable.',
   'worktree.error.linksUnverified': 'The links inside the worktree folder could not all be checked and taken out, so nothing was removed. Removing it anyway could delete files outside it through a junction. Try again, or remove the links by hand.',
+  'worktree.error.locked': 'The worktree is locked (git worktree lock), so nothing was removed. Unlock it first, or remove it with force.',
+  'worktree.error.hasSubmodules': 'The worktree has submodules, which git removes only with force, so nothing was removed. Remove it with force.',
   'worktree.error.rootUnreachable': 'The worktree folder could not be reached or checked (an offline network drive?), so no worktree was created. Try again once it is reachable.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session': 'Session “{title}” is running and using this worktree. Close the session first.',
