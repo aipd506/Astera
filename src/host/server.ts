@@ -11,6 +11,8 @@ import {
   HOST_FEATURE_PING,
   HOST_FEATURE_ORCH,
   HOST_FEATURE_REQUESTS,
+  HOST_YIELD_ORCH_STATE_LATEST,
+  ORCH_STATE_PUSH_MS,
   type ClientMessage,
   type HostMessage
 } from '../core/host/protocol'
@@ -264,6 +266,97 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
    *  Set when the number is handed out and deleted in `gone`. */
   const socketByNo = new Map<number, net.Socket>()
   let socketSeq = 0
+  /**
+   * **The `orch-state` push held for each client that reads the latest** (stage 3 T4).
+   *
+   * Every commit pushes the whole state, and it grows with every Run the file keeps; a burst of
+   * commits — a worker's report, the dispatch it frees, the next Task's start — sent it whole each
+   * time, and the app parsed and folded each one on its main thread. A client that says it reads
+   * `orch-state` as "the latest" (HOST_YIELD_ORCH_STATE_LATEST, and every CLI, which reads none of
+   * them) is sent the first push at once and after that at most one per ORCH_STATE_PUSH_MS, always
+   * the newest. What is skipped is only ever a state a newer one replaces: each push carries the
+   * whole state and its version, so the mirror that takes the newest takes everything.
+   *
+   * **A held push never falls behind anything that follows it** (`writeTo`): before any other
+   * message to that socket, the held push goes first. A reply to a call whose commit is held, an
+   * `orch-act` about a Dispatch just opened, a `pty-opened` for the worker it started — each is read
+   * against the mirror, and each still finds its state there. Only terminal output (`pty-data`,
+   * `proc-line`) passes it: it is bytes for a screen, and flushing on it would push on every line.
+   *
+   * `line` is encoded when it is sent, not when it is held, so a push that is replaced was never
+   * serialised at all.
+   */
+  const stateLanes = new Map<net.Socket, { held: (() => string) | null; lastAt: number; timer: ReturnType<typeof setTimeout> | null }>()
+  const readsLatest = (s: net.Socket): boolean =>
+    roles.get(s) === 'cli' || (roles.get(s) === 'app' && (yields.get(s)?.has(HOST_YIELD_ORCH_STATE_LATEST) ?? false))
+  const laneOf = (s: net.Socket): { held: (() => string) | null; lastAt: number; timer: ReturnType<typeof setTimeout> | null } => {
+    let lane = stateLanes.get(s)
+    if (!lane) {
+      lane = { held: null, lastAt: -Infinity, timer: null }
+      stateLanes.set(s, lane)
+    }
+    return lane
+  }
+  /** Sends what is held for `s`, if anything, now. */
+  const flushState = (s: net.Socket): void => {
+    const lane = stateLanes.get(s)
+    if (!lane) return
+    if (lane.timer) clearTimeout(lane.timer)
+    lane.timer = null
+    const held = lane.held
+    if (!held) return
+    lane.held = null
+    lane.lastAt = Date.now()
+    if (!s.destroyed) s.write(held())
+  }
+  /** Forgets what is held for `s` without sending it — the sender of a `state-put` holds newer. */
+  const dropState = (s: net.Socket): void => {
+    const lane = stateLanes.get(s)
+    if (!lane) return
+    if (lane.timer) clearTimeout(lane.timer)
+    lane.timer = null
+    lane.held = null
+  }
+  /** One `orch-state` for one socket: at once, or held as the newest until the gap has passed. */
+  const pushState = (s: net.Socket, line: () => string): void => {
+    if (s.destroyed) return
+    if (!readsLatest(s)) {
+      s.write(line())
+      return
+    }
+    const lane = laneOf(s)
+    const since = Date.now() - lane.lastAt
+    if (!lane.timer && since >= ORCH_STATE_PUSH_MS) {
+      lane.held = null
+      lane.lastAt = Date.now()
+      s.write(line())
+      return
+    }
+    lane.held = line
+    if (lane.timer) return
+    // Caught: a timer's throw is uncaught, and it would end the Host with every pty it holds.
+    lane.timer = setTimeout(() => {
+      try {
+        flushState(s)
+      } catch (err) {
+        deps.log.write(`a held orch-state push failed: ${String(err)}`)
+      }
+    }, Math.max(0, ORCH_STATE_PUSH_MS - since))
+    // A held push is not a reason to keep the Host up.
+    lane.timer.unref?.()
+  }
+  /** Every message to a socket goes through here, so nothing overtakes a held `orch-state`. */
+  const writeTo = (s: net.Socket, m: HostMessage, line: () => string): void => {
+    if (s.destroyed) return
+    if (m.t === 'orch-state') return pushState(s, line)
+    if (m.t !== 'pty-data' && m.t !== 'proc-line') flushState(s)
+    s.write(line())
+  }
+  /** `encodeLine` once, on first use, for a message that may go to several sockets or to none. */
+  const lazyLine = (m: HostMessage): (() => string) => {
+    let line: string | null = null
+    return () => (line ??= encodeLine(m))
+  }
   /** The `orch-act`s that have gone out and not been answered, by call id. The socket is kept with
    *  each one so that a disconnect can refuse exactly the questions it left unanswered. */
   const pendingActs = new Map<
@@ -345,9 +438,7 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
       if (helloTimer) clearTimeout(helloTimer)
       helloTimer = null
     }
-    const send = (m: HostMessage): void => {
-      if (!socket.destroyed) socket.write(encodeLine(m))
-    }
+    const send = (m: HostMessage): void => writeTo(socket, m, lazyLine(m))
     const read = createLineReader({
       onMessage: (v) => {
         const m = v as ClientMessage
@@ -447,8 +538,10 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
           const from: OrchCaller = {
             role: outwardRole(socket),
             toOthers: (msg) => {
-              const line = encodeLine(msg)
-              for (const s of greetedSockets) if (s !== socket && !s.destroyed) s.write(line)
+              const line = lazyLine(msg)
+              // The sender holds this state already; anything older held for it would put it back.
+              if (msg.t === 'orch-state') dropState(socket)
+              for (const s of greetedSockets) if (s !== socket && !s.destroyed) writeTo(s, msg, line)
             }
           }
           void deps.orch
@@ -505,6 +598,8 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
       const role = outwardRole(socket)
       roles.delete(socket)
       yields.delete(socket)
+      dropState(socket)
+      stateLanes.delete(socket)
       if (wasGreeted && wasApp) tellAppsChanged()
       // Whatever this socket was asked and never answered is refused now. Left in the map it would
       // be a promise nothing can ever settle, and the CLI call waiting behind it would hang for as
@@ -624,14 +719,15 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
             reject(r.fromApp === true ? new Error(r.error ?? `${name} failed`) : new AppUnreachable(r.error ?? `${name} failed`))
           }
         })
-        sock.write(encodeLine({ t: 'orch-act', call, act: name, args }))
+        const ask: HostMessage = { t: 'orch-act', call, act: name, args }
+        writeTo(sock, ask, lazyLine(ask))
       }),
     broadcast: (m, to) => {
-      const line = encodeLine(m)
+      const line = lazyLine(m)
       for (const s of greetedSockets) {
         if (s.destroyed) continue
         if (to && !to(yields.get(s) ?? new Set<string>())) continue
-        s.write(line)
+        writeTo(s, m, line)
       }
     },
     stopAccepting: () => {
@@ -650,6 +746,8 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
         // it does not wait: a peer that has already ended its side may not have been reaped yet, and
         // a close that hangs on it is worse than a connection dropped a moment early.
         for (const s of sockets) s.destroy()
+        for (const s of [...stateLanes.keys()]) dropState(s)
+        stateLanes.clear()
         sockets.clear()
         greetedSockets.clear()
         roles.clear()

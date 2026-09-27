@@ -7,7 +7,8 @@ import { hostAddress } from './address'
 import { encodeLine, createLineReader } from './framing'
 import { startHostServer, ADDRESS_TAKEN, UNSAFE_ADDRESS_DIR, type HostServer, type HostServerDeps } from './server'
 import { createHostOrch } from './orch'
-import { HOST_PROTOCOL, type ClientMessage } from '../core/host/protocol'
+import { HOST_PROTOCOL, HOST_YIELD_ORCH_STATE_LATEST, ORCH_STATE_PUSH_MS, type ClientMessage, type HostMessage } from '../core/host/protocol'
+import { emptyState } from '../core/orchestration/state'
 import { versionOnlyOrchCall, AppUnreachable } from '../core/host/orchProtocol'
 import { HOST_UNRESPONSIVE_MS } from '../core/host/unresponsive'
 
@@ -1145,5 +1146,121 @@ describe('onAppGreeted', () => {
     expect(h.logs.join(' ')).toMatch(/greet boom/)
     expect(h.s.hasApp()).toBe(true)
     app.sock.end()
+  })
+})
+
+// Stage 3 T4: the whole state goes out on every commit, and it grows. A client that reads it as "the
+// latest" (HOST_YIELD_ORCH_STATE_LATEST) gets at most one push per ORCH_STATE_PUSH_MS, always the
+// newest, and never a held push behind a message that follows it.
+describe('orch-state pushes to a client that reads the latest', () => {
+  const st = (version: number): HostMessage => ({ t: 'orch-state', state: emptyState(), version })
+  const versionOf = (m: unknown): number | undefined => (m as { t?: string; version?: number } | undefined)?.t === 'orch-state' ? (m as { version: number }).version : undefined
+  const connectAs = async (
+    address: string,
+    hello: { role?: 'app' | 'cli'; yields?: string[] }
+  ): Promise<{ sock: net.Socket; ch: ReturnType<typeof messageChannel> }> => {
+    const sock = net.connect(address)
+    await new Promise((r) => sock.once('connect', r))
+    const ch = messageChannel(sock)
+    ch.send({ t: 'hello', protocol: HOST_PROTOCOL, app: '1.0.0', ...hello } as ClientMessage)
+    await ch.next()
+    return { sock, ch }
+  }
+
+  it('sends the first at once and then only the newest of a burst, to an app and to a CLI', async () => {
+    const h = await server()
+    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    const cli = await connectAs(h.address, { role: 'cli' })
+    for (let v = 1; v <= 5; v++) h.s.broadcast(st(v))
+    for (const c of [app, cli]) {
+      expect(versionOf(await c.ch.next())).toBe(1)
+      expect(versionOf(await c.ch.next(ORCH_STATE_PUSH_MS * 10))).toBe(5)
+      expect(await c.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    }
+    app.sock.end()
+    cli.sock.end()
+  })
+
+  it('still pushes every commit to an app that does not read the latest', async () => {
+    const h = await server()
+    const older = await connectAs(h.address, { role: 'app', yields: ['journal'] })
+    for (let v = 1; v <= 3; v++) h.s.broadcast(st(v))
+    for (let v = 1; v <= 3; v++) expect(versionOf(await older.ch.next())).toBe(v)
+    older.sock.end()
+  })
+
+  it('sends a held push before any other message, and not a second time after', async () => {
+    const h = await server()
+    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    h.s.broadcast(st(1))
+    h.s.broadcast(st(2))
+    h.s.broadcast({ t: 'pty-exit', id: 'p1', exitCode: 0 })
+    expect(versionOf(await app.ch.next())).toBe(1)
+    expect(versionOf(await app.ch.next())).toBe(2)
+    expect(await app.ch.next()).toEqual({ t: 'pty-exit', id: 'p1', exitCode: 0 })
+    expect(await app.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    app.sock.end()
+  })
+
+  it('lets terminal output pass a held push', async () => {
+    const h = await server()
+    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    h.s.broadcast(st(1))
+    h.s.broadcast(st(2))
+    h.s.broadcast({ t: 'pty-data', id: 'p1', data: 'out' })
+    expect(versionOf(await app.ch.next())).toBe(1)
+    expect(await app.ch.next()).toEqual({ t: 'pty-data', id: 'p1', data: 'out' })
+    expect(versionOf(await app.ch.next(ORCH_STATE_PUSH_MS * 10))).toBe(2)
+    app.sock.end()
+  })
+
+  // A caller that awaits its own mutation reads its mirror when the reply lands: the state that
+  // mutation left must be there by then, held or not.
+  it('sends the state a call committed before that call’s reply', async () => {
+    let s!: HostServer
+    const h = await server({
+      orch: {
+        call: async () => {
+          s.broadcast(st(2))
+          return { status: 200, body: { ok: true } }
+        }
+      }
+    })
+    s = h.s
+    const app = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    h.s.broadcast(st(1))
+    expect(versionOf(await app.ch.next())).toBe(1)
+    app.ch.send({ t: 'orch-call', call: 'c1', cmd: 'tasks-update', args: {}, session: '' } as ClientMessage)
+    expect(versionOf(await app.ch.next())).toBe(2)
+    expect(await app.ch.next()).toMatchObject({ t: 'orch-result', call: 'c1', status: 200 })
+    expect(await app.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    app.sock.end()
+  })
+
+  // `state-put` pushes to the others only: the sender already holds that state, and a push of an older
+  // one arriving after its own write would put its mirror back (orch.ts, statePut). So what was held
+  // for the sender is dropped, and the others get the newest.
+  it('drops what was held for the sender of a state-put, and sends the others the newest', async () => {
+    const h = await server({
+      orch: {
+        call: async ({ from }) => {
+          from?.toOthers(st(3))
+          return { status: 200, body: { ok: true, version: 3 } }
+        }
+      }
+    })
+    const a = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    const b = await connectAs(h.address, { role: 'app', yields: [HOST_YIELD_ORCH_STATE_LATEST] })
+    h.s.broadcast(st(1))
+    h.s.broadcast(st(2))
+    expect(versionOf(await a.ch.next())).toBe(1)
+    expect(versionOf(await b.ch.next())).toBe(1)
+    a.ch.send({ t: 'orch-call', call: 'put', cmd: 'state-put', args: {}, session: '' } as ClientMessage)
+    expect(await a.ch.next()).toMatchObject({ t: 'orch-result', call: 'put', status: 200 })
+    expect(await a.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    expect(versionOf(await b.ch.next(ORCH_STATE_PUSH_MS * 10))).toBe(3)
+    expect(await b.ch.next(ORCH_STATE_PUSH_MS * 3)).toBeUndefined()
+    a.sock.end()
+    b.sock.end()
   })
 })

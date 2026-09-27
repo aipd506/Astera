@@ -2,7 +2,7 @@
 // `status()`: nothing else in slice 1 depends on the Host being there, and every failure ends here,
 // as a sentence somebody can read, rather than reaching a caller.
 import net from 'node:net'
-import { HOST_PROTOCOL, HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_SLACK, type ClientMessage, type HostMessage } from '../../core/host/protocol'
+import { HOST_PROTOCOL, HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, HOST_YIELD_SLACK, type ClientMessage, type HostMessage } from '../../core/host/protocol'
 import { HOST_UNRESPONSIVE_MS, PING_MS } from '../../core/host/unresponsive'
 import { hostIsOutdated, hostSpeaksPing } from './outdated'
 import { encodeLine, createLineReader } from '../../host/framing'
@@ -585,7 +585,11 @@ export class HostClient {
       role: 'app',
       // Leftovers Task 1 (S6-3): the Host asks whether this pid lives when app.pid could not be written.
       pid: process.pid,
-      yields: [HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, ...(keepsSlack ? [] : [HOST_YIELD_SLACK])]
+      // `orch-state-latest` (stage 3 T4): the `orch-state` handler in ipc.ts swaps the mirror for whatever
+      // arrives, and its commit hook diffs against the last one it took, so a push a newer one replaced
+      // is never missed. The one reader that needs every commit — the app's own journal recorder — is
+      // idle while the Host announces `journal`, and every Host that reads this name does.
+      yields: [HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, ...(keepsSlack ? [] : [HOST_YIELD_SLACK])]
     })
   }
 

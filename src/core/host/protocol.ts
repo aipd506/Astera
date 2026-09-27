@@ -189,6 +189,15 @@ export const HOST_YIELD_JOURNAL = 'journal'
  *  may push `workspace` to it and captures frames only while one such app is attached. An older app
  *  sends none and is pushed nothing. */
 export const HOST_YIELD_WORKSPACE = 'workspace'
+/** `hello.yields` value: this app reads `orch-state` as "the latest state", so the Host may hold a push
+ *  for up to ORCH_STATE_PUSH_MS and send only the newest of several commits (stage 3 T4). The Host
+ *  still sends a held push before any other message to that app except terminal output, so a reply,
+ *  an `orch-act` or a `pty-opened` never arrives ahead of the state it follows. An older app sends
+ *  none and is pushed every commit, as before: it may still diff consecutive pushes for its journal. */
+export const HOST_YIELD_ORCH_STATE_LATEST = 'orch-state-latest'
+/** The shortest gap between two `orch-state` pushes to one client that reads the latest (above): about
+ *  ten a second. The first push after a quiet spell goes out at once. */
+export const ORCH_STATE_PUSH_MS = 100
 
 /** The latest picture of a workspace's app: a scaled JPEG, base64 (plan ruling P12). */
 export interface WorkspaceFrame {
@@ -411,7 +420,9 @@ export type HostMessage =
   | { t: 'orch-act'; call: string; act: string; args: unknown }
   /** The whole orchestration state, pushed after every commit so the app can swap its mirror and
    *  derive its snapshot the way it does today (design §5). The whole state and not a patch because
-   *  deriving a snapshot needs all of it anyway. */
+   *  deriving a snapshot needs all of it anyway. To a client that reads the latest
+   *  (HOST_YIELD_ORCH_STATE_LATEST), at most one per ORCH_STATE_PUSH_MS, the newest, and never behind
+   *  a later message other than terminal output. */
   | {
       t: 'orch-state'
       state: OrchState

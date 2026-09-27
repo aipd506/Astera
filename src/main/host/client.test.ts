@@ -6,7 +6,7 @@ import path from 'node:path'
 import { hostAddress } from '../../host/address'
 import { startHostServer, type HostServer } from '../../host/server'
 import { encodeLine, createLineReader } from '../../host/framing'
-import { HOST_PROTOCOL, HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_SLACK, type HostMessage } from '../../core/host/protocol'
+import { HOST_PROTOCOL, HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, HOST_YIELD_SLACK, type HostMessage } from '../../core/host/protocol'
 import { HostClient } from './client'
 import { hostSpeaksDispatch } from './outdated'
 
@@ -160,7 +160,8 @@ describe('HostClient', () => {
   })
 
   // S4 (§4.2): the app hands the Host dispatch as well, S6 (R3) rolling, and chat takeover its chat
-  // sessions, and the Host journal the journal (only once the app stops writing it, Task 7). An older
+  // sessions, and the Host journal the journal (only once the app stops writing it, Task 7). It reads
+  // `orch-state` as the latest (stage 3 T4), so the Host may skip a push a newer one replaces. An older
   // Host ignores the names (D5).
   it('says it yields dispatch, rolling, chat-takeover and journal as well as worktrees', async () => {
     const addr = addressFor('yields-dispatch')
@@ -168,7 +169,7 @@ describe('HostClient', () => {
     const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await waitFor(() => host.got.some((m) => m.t === 'hello'))
-    expect((host.got.find((m) => m.t === 'hello') as { yields?: string[] }).yields).toEqual([HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_SLACK])
+    expect((host.got.find((m) => m.t === 'hello') as { yields?: string[] }).yields).toEqual([HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, HOST_YIELD_SLACK])
     expect((host.got.find((m) => m.t === 'hello') as { yields?: string[] }).yields).toContain('slack')
     await c.stop()
     await host.close()
