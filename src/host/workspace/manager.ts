@@ -429,14 +429,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   return {
     run: async (sessionId, script) => {
       if (disposed) return { status: 409, body: { error: 'the Host is leaving' } }
-      let linuxTools: LinuxTools | null = null
-      if (d.platform === 'linux' && d.linuxTools)
-        linuxTools = await d.linuxTools().catch((err: unknown) => {
-          d.log(`workspace: the Linux tool check failed (${messageOf(err)}); going on without it`)
-          return null
-        })
-      const refusal = workspaceRefusal({ platform: d.platform, env: d.env, linuxTools })
-      if (refusal) return { status: 409, body: { error: refusal } }
+      // The setting first: a Host with the workspace off always says so, whatever else is missing.
       let on: boolean
       try {
         on = await d.enabled()
@@ -444,6 +437,18 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
         return { status: 409, body: { error: messageOf(err), repair: 'app-settings.json' } }
       }
       if (!on) return { status: 409, body: { error: 'agent app workspace is off' } }
+      let linuxTools: LinuxTools | null = null
+      const probe = d.linuxTools
+      if (d.platform === 'linux' && probe)
+        // Through a resolved promise, so a probe that throws at once is caught like one that rejects.
+        linuxTools = await Promise.resolve()
+          .then(() => probe())
+          .catch((err: unknown) => {
+            d.log(`workspace: the Linux tool check failed (${messageOf(err)}); going on without it`)
+            return null
+          })
+      const refusal = workspaceRefusal({ platform: d.platform, env: d.env, linuxTools })
+      if (refusal) return { status: 409, body: { error: refusal } }
       const cwd = await d.sessionCwd(sessionId).catch(() => null)
       if (cwd === null) return { status: 404, body: { error: 'no such session' } }
       await sweeping

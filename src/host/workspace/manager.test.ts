@@ -204,6 +204,26 @@ describe('Linux and macOS', () => {
     expect(log.some((l) => l.includes('the Linux tool check failed') && l.includes('EACCES'))).toBe(true)
   })
 
+  it('a tool check that throws at once is logged and refuses nothing (R8)', async () => {
+    const log: string[] = []
+    const { m } = await rig({
+      platform: 'linux',
+      log: (x) => log.push(x),
+      linuxTools: () => {
+        throw new Error('EACCES /usr/bin')
+      }
+    })
+    expect((await m.run('s1', "log('ok')")).status).toBe(200)
+    expect(log.some((l) => l.includes('the Linux tool check failed') && l.includes('EACCES'))).toBe(true)
+  })
+
+  it('with the setting off, answers that it is off before checking the Linux tools', async () => {
+    const linuxTools = vi.fn(async () => ({ missing: ['xdotool' as const], installLine: 'sudo apt-get install -y xdotool' }))
+    const { m } = await rig({ platform: 'linux', enabled: async () => false, linuxTools })
+    expect(await m.run('s1', 'log(1)')).toEqual({ status: 409, body: { error: 'agent app workspace is off' } })
+    expect(linuxTools).not.toHaveBeenCalled()
+  })
+
   it('on macOS, refuses over SSH', async () => {
     const { m } = await rig({ platform: 'darwin', env: { SSH_TTY: '/dev/ttys001' } })
     expect(await m.run('s1', 'log(1)')).toMatchObject({ status: 409, body: { error: expect.stringContaining('SSH') } })
