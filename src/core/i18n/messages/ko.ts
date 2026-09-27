@@ -624,6 +624,7 @@ export const ko = {
   'explorer.noActiveSession': '활성 세션이 없습니다',
   // Folder state shown inside the tree (the .fx-note row)
   'explorer.dir.loading': '불러오는 중…',
+  'explorer.dir.reading': '폴더를 읽는 중…',
   'explorer.dir.readFailed': '읽기 실패: {detail}',
   'explorer.dir.empty': '비어 있음',
   'explorer.refresh': '새로고침',

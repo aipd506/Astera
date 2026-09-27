@@ -5,6 +5,7 @@ import { resolveFileIcon, resolveFolderIcon } from '../../../core/files/icons'
 import { FileIcon } from './FileIcon'
 import { ContextMenu, type MenuItem } from './ContextMenu'
 import { LocalHistoryDialog } from './LocalHistoryDialog'
+import { RowLoading, RootReading, ROOT_SLOW_MS } from './ExplorerLoading'
 import { toast } from '../lib/toast'
 import { useFileTree, type Entry, type DirState } from '../hooks/useFileTree'
 import { useExplorerSelection } from '../hooks/useExplorerSelection'
@@ -99,6 +100,18 @@ export function FileExplorer({
   const tree = useFileTree(root, savedTree && savedTree.root === root ? savedTree : null)
   // Destructured to keep the existing identifiers, so extracting useFileTree touched the rest of the code as little as possible
   const { dirs, expanded, dirsRef, loadDir, toggleDir, findEntry, entriesOf } = tree
+
+  // The root's first read on a big folder or a shared drive can take seconds. Past ROOT_SLOW_MS the tree
+  // says it is still reading, instead of sitting blank; below that nothing shows, so a fast folder does
+  // not flash a message for one frame.
+  const rootPending = !!root && !dirs[root]
+  const [rootSlow, setRootSlow] = useState(false)
+  useEffect(() => {
+    setRootSlow(false)
+    if (!rootPending) return
+    const timer = setTimeout(() => setRootSlow(true), ROOT_SLOW_MS)
+    return () => clearTimeout(timer)
+  }, [rootPending, root])
 
   // git status for the tree rows — the hook re-queries on its own when root changes
   const gitStatus = useGitStatus(root)
@@ -544,6 +557,13 @@ export function FileExplorer({
     const createRow = creating ? editRow(depth, editing.isDir) : null
 
     const state = dirs[dirPath]
+    if (!state && dirPath === root)
+      return (
+        <>
+          {createRow}
+          <RootReading slow={rootSlow} />
+        </>
+      )
     if (!state)
       return (
         <>
@@ -649,6 +669,7 @@ export function FileExplorer({
                   <span className="fx-caret">{isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
                   <FileIcon {...resolveFolderIcon(entry.name, isOpen)} />
                   <span className="fx-name">{entry.name}</span>
+                  <RowLoading pending={tree.loading.has(entry.path)} />
                   {gitStatus.folderCount[entry.path] > 0 && (
                     <span
                       className="fx-git-count"

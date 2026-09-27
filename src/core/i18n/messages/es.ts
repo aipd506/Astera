@@ -467,6 +467,7 @@ export const es: Catalog = {
   'explorer.noActiveSession': 'No hay ninguna sesión activa',
   // Folder state shown inside the tree (the .fx-note row)
   'explorer.dir.loading': 'Cargando…',
+  'explorer.dir.reading': 'Leyendo la carpeta…',
   'explorer.dir.readFailed': 'Error al leer: {detail}',
   'explorer.dir.empty': 'Vacío',
   'explorer.refresh': 'Actualizar',

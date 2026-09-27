@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { isSubPath } from '../../../core/files/ops'
 import { flattenVisible } from '../../../core/files/selection'
 import { onFileChanges } from '../lib/fileChanges'
+import { createDirLoadQueue, planBatchReload, type DirLoadQueue } from '../../../core/files/dirReload'
 
 export interface Entry {
   name: string
@@ -20,6 +21,8 @@ export interface DirState {
 export interface FileTree {
   dirs: Record<string, DirState>
   expanded: Set<string>
+  /** Folders whose children are being read right now — the row's inline loading indicator */
+  loading: ReadonlySet<string>
   dirsRef: React.RefObject<Record<string, DirState>>
   loadDir: (dirPath: string) => void
   toggleDir: (dirPath: string) => void
@@ -50,8 +53,14 @@ export function useFileTree(
   const [expanded, setExpanded] = useState<Set<string>>(() => initialTree?.expanded ?? new Set())
   const [dirs, setDirs] = useState<Record<string, DirState>>(() => initialTree?.dirs ?? {})
 
-  const loadDir = (dirPath: string): void => {
-    void window.api.files.list(dirPath).then(
+  const rootRef = useRef(root)
+  rootRef.current = root
+  const [loading, setLoading] = useState<ReadonlySet<string>>(() => new Set())
+
+  // One read of a folder. Only stable setters and refs are used, because the queue below keeps the
+  // first render's copy of this function. Both outcomes are handled, so the promise never rejects.
+  const readDir = (dirPath: string): Promise<void> =>
+    window.api.files.list(dirPath).then(
       (entries) => setDirs((prev) => ({ ...prev, [dirPath]: { entries } })),
       (err) => {
         const msg = err instanceof Error ? err.message : String(err)
@@ -69,7 +78,7 @@ export function useFileTree(
         // on 'loading…', with no way out because a path that is already gone gets no further watcher
         // events and no re-query either. When the root itself is gone, cache the error as it does now
         // so 'Read failed: ENOENT' shows the reason.
-        if (msg.includes('ENOENT') && dirPath !== root) {
+        if (msg.includes('ENOENT') && dirPath !== rootRef.current) {
           setDirs((prev) => {
             if (!(dirPath in prev)) return prev
             const { [dirPath]: _drop, ...rest } = prev
@@ -86,10 +95,17 @@ export function useFileTree(
         setDirs((prev) => ({ ...prev, [dirPath]: { error: msg } }))
       }
     )
-  }
+
+  // Every read goes through one per-folder single flight (core/files/dirReload.ts): a folder is never
+  // read twice at once, and changes that arrive during a read become one more read after it.
+  const queueRef = useRef<DirLoadQueue | null>(null)
+  if (!queueRef.current) queueRef.current = createDirLoadQueue(readDir, setLoading)
+  const loadDir = (dirPath: string): void => queueRef.current!.request(dirPath)
 
   const dirsRef = useRef(dirs)
   dirsRef.current = dirs
+  const expandedRef = useRef(expanded)
+  expandedRef.current = expanded
 
   // Live updates: start watching the root, and on a change re-query only the cached parent folder.
   // On re-entry the preserved cache can be stale, so the root is re-queried once.
@@ -130,9 +146,22 @@ export function useFileTree(
           return changed ? next : prev
         })
       }
-      for (const parent of batch.parents) {
-        if (dirsRef.current[parent]) loadDir(parent) // only refresh cached (expanded) folders — a side effect kept outside the updater
+      // Each changed folder at most once per batch, and only what is on screen: the root and expanded
+      // folders are re-read; a cached but collapsed one is dropped from the cache so expanding it reads
+      // it fresh. Uncached folders are left alone. Side effects stay outside the updaters.
+      const plan = planBatchReload(batch.parents, {
+        root,
+        isCached: (d) => d in dirsRef.current,
+        isExpanded: (d) => expandedRef.current.has(d)
+      })
+      if (plan.evict.length > 0) {
+        setDirs((prev) => {
+          const next = { ...prev }
+          for (const d of plan.evict) delete next[d]
+          return next
+        })
       }
+      for (const dir of plan.reload) loadDir(dir)
     })
     return () => {
       off()
@@ -196,6 +225,7 @@ export function useFileTree(
   return {
     dirs,
     expanded,
+    loading,
     dirsRef,
     loadDir,
     toggleDir,

@@ -536,6 +536,7 @@ export const en: Record<keyof typeof ko, string> = {
   'explorer.title': 'Explorer',
   'explorer.noActiveSession': 'No active session',
   'explorer.dir.loading': 'Loading…',
+  'explorer.dir.reading': 'Reading folder…',
   'explorer.dir.readFailed': 'Read failed: {detail}',
   'explorer.dir.empty': 'Empty',
   'explorer.refresh': 'Refresh',

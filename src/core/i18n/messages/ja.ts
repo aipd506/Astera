@@ -463,6 +463,7 @@ export const ja: Catalog = {
   'explorer.noActiveSession': 'アクティブなセッションがありません',
   // Folder state shown inside the tree (the .fx-note row)
   'explorer.dir.loading': '読み込み中…',
+  'explorer.dir.reading': 'フォルダーを読み込み中…',
   'explorer.dir.readFailed': '読み込みに失敗しました: {detail}',
   'explorer.dir.empty': '空です',
   'explorer.refresh': '更新',
