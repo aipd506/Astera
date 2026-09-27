@@ -30,6 +30,7 @@ const EVENT_CHANNELS = [
   'accounts:ghostsChanged',
   'files:changed',
   'files:changedBatch',
+  'worktree:createProgress',
   'git:changed',
   'cli:install',
   'run:data',
@@ -100,6 +101,7 @@ const api = {
   worktrees: {
     list: invoke('worktrees.list'),
     create: invoke('worktrees.create'),
+    cancelCreate: invoke('worktrees.cancelCreate'),
     listBranches: invoke('worktrees.listBranches'),
     remove: invoke('worktrees.remove'),
     isGitRepo: invoke('worktrees.isGitRepo'),

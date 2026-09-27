@@ -203,6 +203,7 @@ import { readHostMerges, hostMergesPathIn } from '../core/git/hostMerges'
 import { FileWatcher } from './fileWatcher'
 import { GitWatcher } from './gitWatcher'
 import { createWorktree } from '../core/worktrees/create'
+import { createWorktreeOps } from '../core/worktrees/createOps'
 import { listBranches, detectBaseRef } from '../core/worktrees/git'
 import { goneWorktreeProjects } from '../core/worktrees/hiddenHistory'
 import { deleteProjectHistory } from './historyDeletion'
@@ -3950,13 +3951,28 @@ export function registerIpc(
     return null
   }
   ipcMain.handle('worktrees.list', () => listWithStatus(core.worktrees, (p) => worktreePresence.refresh(p)))
-  ipcMain.handle('worktrees.create', (_e, opts: { repoPath: string; name?: string; baseRef?: string }) =>
-    createWorktree({
-      repoPath: opts.repoPath,
-      name: opts.name,
-      baseRef: opts.baseRef,
-      registry: core.worktrees
-    })
+  // Creation the new-session dialog watches: with an opId, the stage and copy progress go to the
+  // renderer (throttled to about 4 a second) and worktrees.cancelCreate can stop it. Without one it is
+  // the plain call it always was. createOps.ts holds the bookkeeping so it is testable without electron.
+  const worktreeCreates = createWorktreeOps({
+    create: createWorktree,
+    send: (ev) => send('worktree:createProgress', ev)
+  })
+  ipcMain.handle(
+    'worktrees.create',
+    (_e, opts: { repoPath: string; name?: string; baseRef?: string; opId?: string }) =>
+      worktreeCreates.create(
+        {
+          repoPath: opts.repoPath,
+          name: opts.name,
+          baseRef: opts.baseRef,
+          registry: core.worktrees
+        },
+        opts.opId
+      )
+  )
+  ipcMain.handle('worktrees.cancelCreate', (_e, opId: unknown) =>
+    typeof opId === 'string' ? worktreeCreates.cancel(opId) : false
   )
   // Base-branch candidates for the new-session worktree picker. detected rides along so the select can
   // preselect what the automatic path would have chosen — a separate IPC would mean a second round trip.

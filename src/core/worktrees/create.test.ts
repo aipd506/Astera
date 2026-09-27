@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { promises as fs, existsSync } from 'node:fs'
 import path from 'node:path'
 import { createWorktree } from './create'
+import type { WorktreeCreateProgress } from '../types'
 import { WorktreeRegistry } from './registry'
 import { git, localBranchExists } from './git'
 import { makeRepo, addOrigin, tempDir } from './testRepo'
@@ -249,3 +250,136 @@ describe('createWorktree, taking back the repo folder', () => {
   }, 20_000)
 })
 
+
+// 진행과 취소. 느린 것은 괜찮지만 멈춘 것처럼 보이면 안 된다 — 어느 단계인지 알리고, 긴 단계는
+// 멈출 수 있어야 한다. 멈추면 이 호출이 만든 것을 되돌린다: 등록된 반쪽 워크트리를 남기지 않는다.
+describe('createWorktree — 진행과 취소', () => {
+  const wtDir = (name: string): string => path.join(root, path.basename(repo), name)
+
+  /** 되돌리기가 끝났는가: 폴더도, 브랜치도, git 의 워크트리 목록 항목도, 레지스트리 항목도 없다. */
+  const expectRolledBack = async (name: string): Promise<void> => {
+    expect(existsSync(wtDir(name))).toBe(false)
+    expect(await localBranchExists(repo, `Test-User/${name}`)).toBe(false)
+    expect(gitIn(repo, ['worktree', 'list', '--porcelain'])).not.toContain(name)
+    expect(reg.list()).toEqual([])
+  }
+
+  const withInclude = async (files: number): Promise<void> => {
+    await fs.writeFile(path.join(repo, '.gitignore'), 'cache/\n', 'utf8')
+    await fs.mkdir(path.join(repo, 'cache'))
+    for (let i = 0; i < files; i++) await fs.writeFile(path.join(repo, 'cache', `c${i}.txt`), 'x'.repeat(10), 'utf8')
+    await fs.writeFile(path.join(repo, '.worktreeinclude'), 'cache\n', 'utf8')
+    gitIn(repo, ['add', '.gitignore', '.worktreeinclude'])
+    gitIn(repo, ['commit', '-m', 'inc'])
+  }
+
+  it('단계를 fetch → checkout → copy-includes 순서로 알리고, 복사는 총량에 닿아 끝난다', async () => {
+    await addOrigin(repo)
+    await withInclude(3)
+    const seen: WorktreeCreateProgress[] = []
+    await createWorktree({ repoPath: repo, name: 'prog', registry: reg, onProgress: (p) => seen.push(p) })
+    const stages = seen.map((p) => p.stage).filter((s, i, a) => i === 0 || a[i - 1] !== s)
+    expect(stages).toEqual(['fetch', 'checkout', 'copy-includes'])
+    expect(seen[seen.length - 1]).toEqual({
+      stage: 'copy-includes', bytesCopied: 30, bytesTotal: 30, filesCopied: 3, filesTotal: 3
+    })
+  })
+
+  it('포함 파일이 없으면 copy-includes 단계는 알리지 않는다', async () => {
+    const seen: string[] = []
+    await createWorktree({ repoPath: repo, name: 'plain', registry: reg, onProgress: (p) => seen.push(p.stage) })
+    expect(seen).toEqual(['fetch', 'checkout'])
+  })
+
+  it('이미 취소된 신호면 아무것도 만들지 않는다', async () => {
+    const ac = new AbortController()
+    ac.abort()
+    await expect(
+      createWorktree({ repoPath: repo, name: 'never', registry: reg, signal: ac.signal })
+    ).rejects.toThrow(/WORKTREE_CANCELLED/)
+    expect(existsSync(path.join(root, path.basename(repo)))).toBe(false)
+    expect(reg.list()).toEqual([])
+  })
+
+  it('fetch 중에 취소하면 걸린 git 을 죽이고 곧바로 끝난다 — 만든 것이 없다', async () => {
+    await addOrigin(repo)
+    // 로컬 원격의 upload-pack 앞에 30초 잠을 끼워 fetch 를 붙잡는다
+    gitIn(repo, ['config', 'remote.origin.uploadpack', 'sleep 30; git-upload-pack'])
+    const ac = new AbortController()
+    const started = Date.now()
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'infetch', registry: reg, signal: ac.signal,
+        onProgress: (p) => { if (p.stage === 'fetch') setTimeout(() => ac.abort(), 500) }
+      })
+    ).rejects.toThrow(/WORKTREE_CANCELLED/)
+    // fetch 의 자체 시간 제한(10초)보다 훨씬 먼저 — git 이 죽었다는 뜻이다
+    expect(Date.now() - started).toBeLessThan(8_000)
+    await expectRolledBack('infetch')
+    expect(existsSync(path.join(root, path.basename(repo)))).toBe(false)
+  }, 30_000)
+
+  it('checkout(worktree add) 중에 취소하면 git 을 죽이고 반쯤 만든 워크트리와 브랜치를 되돌린다', async () => {
+    // post-checkout 훅이 30초 잔다 — worktree add 가 그 안에서 붙잡힌다
+    const hook = path.join(repo, '.git', 'hooks', 'post-checkout')
+    await fs.writeFile(hook, '#!/bin/sh\nsleep 30\n', 'utf8')
+    await fs.chmod(hook, 0o755)
+    const ac = new AbortController()
+    const started = Date.now()
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'inadd', registry: reg, signal: ac.signal,
+        onProgress: (p) => { if (p.stage === 'checkout') setTimeout(() => ac.abort(), 1500) }
+      })
+    ).rejects.toThrow(/WORKTREE_CANCELLED/)
+    expect(Date.now() - started).toBeLessThan(15_000)
+    await expectRolledBack('inadd')
+  }, 40_000)
+
+  it('포함 파일 복사 중에 취소하면 멈추고 워크트리와 브랜치를 되돌린다', async () => {
+    await withInclude(5)
+    const ac = new AbortController()
+    let copiedWhenCancelled = -1
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'incopy', registry: reg, signal: ac.signal,
+        onProgress: (p) => {
+          if (p.stage === 'copy-includes' && p.filesCopied === 2 && !ac.signal.aborted) {
+            copiedWhenCancelled = p.filesCopied
+            ac.abort()
+          }
+        }
+      })
+    ).rejects.toThrow(/WORKTREE_CANCELLED/)
+    expect(copiedWhenCancelled).toBe(2)
+    await expectRolledBack('incopy')
+  })
+
+  it('신호도 진행도 주지 않는 기존 호출은 그대로 동작한다', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'legacy', registry: reg })
+    expect(reg.get(info.id)?.name).toBe('legacy')
+  })
+})
+
+describe('createWorktree — 되돌리기가 끝나지 못할 때', () => {
+  it('남은 것을 이름과 경로로 적은 ROLLBACK_INCOMPLETE 로 끝난다 — 조용히 반쪽을 남기지 않는다', async () => {
+    // 마지막 단계에서 실패시키면서, 본 저장소의 HEAD 를 새 브랜치로 돌려 두어 branch -D 가 거절되게 한다
+    const failing = Object.create(reg) as WorktreeRegistry
+    failing.add = async () => {
+      gitIn(repo, ['symbolic-ref', 'HEAD', 'refs/heads/Test-User/stuck'])
+      throw new Error('DISK_FULL')
+    }
+    const err = await createWorktree({ repoPath: repo, name: 'stuck', registry: failing }).then(
+      () => null,
+      (e: Error) => e
+    )
+    expect(err?.message).toMatch(/^ROLLBACK_INCOMPLETE: /)
+    const note = JSON.parse(/ROLLBACK_INCOMPLETE: (\{.*?\})/.exec(err!.message)![1])
+    expect(note).toEqual({
+      path: path.join(root, path.basename(repo), 'stuck'),
+      branch: 'Test-User/stuck',
+      remains: ['branch']
+    })
+    expect(err?.message).toContain('DISK_FULL')
+  })
+})

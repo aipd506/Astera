@@ -1,11 +1,12 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { WorktreeInfo } from '../types'
-import { isPathWithin } from '../files/tree'
+import type { WorktreeCreateProgress, WorktreeInfo } from '../types'
+import { isPathWithin, isSamePath } from '../files/tree'
 import {
-  git, repoRoot, gitUserName, detectBaseRef, toFullRef, fetchBaseRef, localBranchExists
+  git, repoRoot, gitUserName, detectBaseRef, toFullRef, fetchBaseRef, localBranchExists, listGitWorktrees
 } from './git'
+import { cancelledError, throwIfCancelled } from './cancel'
 import {
   autoName, branchNameFor, candidateName, repoDirName, slugify, worktreePathFor, MAX_SUFFIX_ATTEMPTS
 } from './naming'
@@ -36,6 +37,49 @@ async function defaultMakeDir(p: string): Promise<MakeDirResult> {
   return r === 'present' ? (made ? 'created' : 'present') : r
 }
 
+/** Undoes a `worktree add` this call made: the worktree (a locked, half-made one too — git marks a
+ *  worktree "initializing" until add finishes, hence the second --force), its folder if git left one,
+ *  git's record of it, and the branch. Then it **checks**: what is still there comes back by name, so
+ *  the caller can say so instead of claiming a clean rollback.
+ *
+ *  The folder is removed by hand only when git did not: it is the path this call found free a moment
+ *  ago and git created, inside the worktree root. */
+async function rollbackAdd(repo: string, wtPath: string, branch: string): Promise<string[]> {
+  await git(['worktree', 'remove', '--force', '--force', wtPath], { cwd: repo })
+  const exists = (): Promise<boolean> => fs.lstat(wtPath).then(() => true, () => false)
+  if (await exists()) {
+    try {
+      await fs.rm(wtPath, { recursive: true, force: true, maxRetries: 3 })
+    } catch {
+      // reported below as a folder that remains
+    }
+  }
+  await git(['worktree', 'prune'], { cwd: repo })
+  await git(['branch', '-D', branch], { cwd: repo })
+
+  const remains: string[] = []
+  if (await exists()) remains.push('folder')
+  if (await localBranchExists(repo, branch)) remains.push('branch')
+  try {
+    if ((await listGitWorktrees(repo)).some((w) => isSamePath(w.path, wtPath))) remains.push('git-worktree')
+  } catch {
+    remains.push('unverified')
+  }
+  return remains
+}
+
+/** The error a failed or cancelled creation ends with, once rollbackAdd has run: the original one when
+ *  the rollback is complete, otherwise ROLLBACK_INCOMPLETE naming what is left and where — never a
+ *  silent half-made worktree. */
+function afterRollback(cause: unknown, remains: string[], wtPath: string, branch: string): Error {
+  const err = cause instanceof Error ? cause : new Error(String(cause))
+  if (remains.length === 0) return err
+  return new Error(
+    `ROLLBACK_INCOMPLETE: ${JSON.stringify({ path: wtPath, branch, remains })} — remove it by hand; the rollback ` +
+      `after "${err.message}" did not finish`
+  )
+}
+
 /** Takes back a folder create made itself: only a real, empty directory, never a link or a junction
  *  (lstat), and never a folder with anything in it (rmdir is not recursive). */
 async function removeOwnEmptyDir(d: string): Promise<void> {
@@ -59,7 +103,24 @@ export async function createWorktree(args: {
    *  and the pool that call goes through (the process-wide budget by default). */
   removeDirAccess?: (p: string) => Promise<void>
   cleanupPool?: ProbePool
+  /** Stage and copy progress (fetch → checkout → copy-includes). Optional; a throwing callback is ignored. */
+  onProgress?: (p: WorktreeCreateProgress) => void
+  /** Stops the creation: a running git is killed, the include walk and copy stop, and whatever this call
+   *  made is rolled back before it throws WORKTREE_CANCELLED (or ROLLBACK_INCOMPLETE, naming what is
+   *  left, when the rollback itself could not finish). Once the registry entry is written the creation
+   *  is done and an abort changes nothing. Optional; callers without one behave exactly as before. */
+  signal?: AbortSignal
 }): Promise<{ info: WorktreeInfo; warnings: Message[] }> {
+  const { signal } = args
+  const report = (p: WorktreeCreateProgress): void => {
+    try {
+      args.onProgress?.(p)
+    } catch {
+      // progress is for show; it never breaks the creation
+    }
+  }
+  throwIfCancelled(signal)
+  report({ stage: 'fetch' })
   const repo = await repoRoot(args.repoPath)
   if (!repo) throw new Error(`NOT_GIT_REPO: ${args.repoPath}`)
 
@@ -72,10 +133,11 @@ export async function createWorktree(args: {
   // rendering and the spawn lands on NO_BASE rather than a confusing git error.
   const baseRef = args.baseRef ?? (await detectBaseRef(repo))
   if (!baseRef) throw new Error('NO_BASE: could not find a default branch (origin/HEAD, main or master)')
-  if ((await fetchBaseRef(repo, baseRef)) === 'stale')
+  if ((await fetchBaseRef(repo, baseRef, { signal })) === 'stale')
     warnings.push({ key: 'worktree.create.fetchFailed', params: { baseRef } })
   const fullBase = await toFullRef(repo, baseRef)
   if (!fullBase) throw new Error(`NO_BASE: cannot resolve the ${baseRef} ref`)
+  throwIfCancelled(signal)
 
   // Name-collision avoidance loop: checks the local branch and the path.
   //
@@ -99,6 +161,7 @@ export async function createWorktree(args: {
   let unreachable = false
   try {
     for (let attempt = 1; attempt <= MAX_SUFFIX_ATTEMPTS; attempt++) {
+      throwIfCancelled(signal) // before anything is picked — the finally below takes the repo folder back
       const cand = candidateName(baseSlug, attempt)
       const candBranch = branchNameFor(username, cand)
       const candPath = worktreePathFor(root, repo, cand)
@@ -138,10 +201,15 @@ export async function createWorktree(args: {
   }
   if (!slug) throw new Error(`NAME_EXHAUSTED: no name starting with '${baseSlug}' is available (20 attempts)`)
 
+  throwIfCancelled(signal)
+  report({ stage: 'checkout' })
   const add = await git(['worktree', 'add', '--no-track', '-b', branch, wtPath, fullBase], {
     cwd: repo,
-    timeoutMs: WORKTREE_ADD_TIMEOUT_MS
+    timeoutMs: WORKTREE_ADD_TIMEOUT_MS,
+    signal
   })
+  // Killed part-way: the folder, git's record and the branch may each be there or not. All of it goes.
+  if (add.cancelled) throw afterRollback(cancelledError(), await rollbackAdd(repo, wtPath, branch), wtPath, branch)
   if (!add.ok) throw new Error(`GIT_ADD_FAILED: ${add.stderr || add.stdout}`)
 
   try {
@@ -153,7 +221,14 @@ export async function createWorktree(args: {
       const set = await git(['config', '--local', 'push.autoSetupRemote', 'true'], { cwd: repo })
       if (!set.ok) warnings.push({ key: 'worktree.create.autoSetupRemoteFailed' })
     }
-    warnings.push(...(await copyWorktreeInclude(repo, wtPath)))
+    throwIfCancelled(signal)
+    warnings.push(
+      ...(await copyWorktreeInclude(repo, wtPath, {
+        signal,
+        onProgress: (p) => report({ stage: 'copy-includes', ...p })
+      }))
+    )
+    throwIfCancelled(signal) // the last point a cancel is honoured — after the registry write it is done
 
     const info: WorktreeInfo = {
       id: randomUUID(),
@@ -167,10 +242,8 @@ export async function createWorktree(args: {
     await args.registry.add(info)
     return { info, warnings }
   } catch (err) {
-    // rollback: do not leave behind the worktree and branch that were just created
-    await git(['worktree', 'remove', '--force', wtPath], { cwd: repo })
-    await git(['branch', '-D', branch], { cwd: repo })
-    await git(['worktree', 'prune'], { cwd: repo })
-    throw err
+    // rollback: do not leave behind the worktree and branch that were just created — and say so when
+    // some of it could not be taken back
+    throw afterRollback(err, await rollbackAdd(repo, wtPath, branch), wtPath, branch)
   }
 }

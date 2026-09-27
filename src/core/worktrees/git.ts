@@ -2,6 +2,7 @@ import { execFile, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import type { BranchRef } from '../types'
 import { treeKillCommand } from '../run/kill'
+import { cancelledError } from './cancel'
 
 export interface GitResult {
   ok: boolean
@@ -215,16 +216,23 @@ const FETCH_TIMEOUT_MS = 10_000
  *  FETCH_FAILED and took worktree creation down with it. Unreachable while detectBaseRef was the only
  *  source (it yields origin/* or main/master), but the base-branch picker lets the user choose one.
  *  Checking the remote list rather than refs/remotes/<baseRef> keeps the FETCH_FAILED case intact: a
- *  configured-but-unreachable remote still has to report a network problem, not silently fall back. */
-export async function fetchBaseRef(repo: string, baseRef: string): Promise<'fetched' | 'stale' | 'local'> {
+ *  configured-but-unreachable remote still has to report a network problem, not silently fall back.
+ *
+ *  `signal` kills a fetch in flight; the call then throws WORKTREE_CANCELLED instead of answering. */
+export async function fetchBaseRef(
+  repo: string,
+  baseRef: string,
+  opts: { signal?: AbortSignal } = {}
+): Promise<'fetched' | 'stale' | 'local'> {
   const m = /^([^/]+)\/(.+)$/.exec(baseRef)
   if (!m) return 'local'
   const [, remote, branch] = m
   if (!(await remoteExists(repo, remote))) return 'local'
   const r = await git(
     ['fetch', '--no-tags', remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`],
-    { cwd: repo, timeoutMs: FETCH_TIMEOUT_MS }
+    { cwd: repo, timeoutMs: FETCH_TIMEOUT_MS, signal: opts.signal }
   )
+  if (r.cancelled) throw cancelledError()
   if (r.ok) return 'fetched'
   if (await refExists(repo, `refs/remotes/${baseRef}`)) return 'stale'
   throw new Error(`FETCH_FAILED: could not refresh ${baseRef} from the remote — check the network (${r.stderr})`)

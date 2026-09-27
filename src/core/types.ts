@@ -138,6 +138,27 @@ export interface WorktreeInfo {
   createdAt: string // ISO 8601
 }
 
+/** The stage worktree creation is in (core/worktrees/create.ts): fetching the base, `worktree add`,
+ *  then copying the .worktreeinclude entries (only when there is such a file). */
+export type WorktreeCreateStage = 'fetch' | 'checkout' | 'copy-includes'
+
+/** One progress report from createWorktree. The counts only appear during copy-includes, and only once
+ *  the entries have been measured — before that the stage alone is known. */
+export interface WorktreeCreateProgress {
+  stage: WorktreeCreateStage
+  bytesCopied?: number
+  bytesTotal?: number
+  filesCopied?: number
+  filesTotal?: number
+}
+
+/** main → renderer, for a worktrees.create call that carried an opId. `progress: null` means the
+ *  worktree is made — cancelling is no longer possible, the session is starting. */
+export interface WorktreeCreateEvent {
+  opId: string
+  progress: WorktreeCreateProgress | null
+}
+
 export interface WorktreeListItem extends WorktreeInfo {
   status: WorktreeStatus // result of cross-checking `git worktree list` against directory existence
 }
@@ -679,6 +700,8 @@ export interface CoreEvents {
   'files:changed': { path: string; kind: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir' } // watcher, one event (the older shape — still accepted by the renderer's subscribeFileChanges)
   /** The watcher's events, one message per FILE_CHANGE_BATCH_MS window (core/files/changeBatch.ts). */
   'files:changedBatch': FileChangeBatch
+  /** Stage and copy progress of one worktrees.create, throttled to about 4 a second (core/worktrees/progress.ts). */
+  'worktree:createProgress': WorktreeCreateEvent
   'git:changed': void // index/HEAD changes in the git dir, e.g. a commit from a session terminal — triggers a tree state refresh
   /** One repository's PR snapshot was refreshed (or marked stale by the rate-limit breaker).
    *  The whole snapshot rides along — the renderer replaces, never merges. */
@@ -962,7 +985,13 @@ export interface CoreApi {
       repoPath: string
       name?: string
       baseRef?: string // the branch to fork from, short form. Absent falls back to automatic detection
+      /** Set by a caller that shows progress and offers Cancel: progress arrives on
+       *  'worktree:createProgress' under this id, and cancelCreate(opId) stops it. */
+      opId?: string
     }): Promise<{ info: WorktreeInfo; warnings: Message[] }>
+    /** Stops the creation started with this opId (WORKTREE_CANCELLED, after rolling back what it made).
+     *  false when nothing by that id is running — it finished, or never started. */
+    cancelCreate(opId: string): Promise<boolean>
     /** Base-branch candidates for the picker, newest commit first. `detected` is what the automatic path
      *  would have chosen, so the select can preselect it and leave behaviour unchanged when untouched.
      *  `branches` is null when git could not be asked (error, timeout, output limit) — "could not
