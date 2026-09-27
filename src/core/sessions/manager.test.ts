@@ -5,7 +5,7 @@ import type { Account } from '../types'
 import { PTY_LOST_SIGHT_EXIT_CODE, type PtyFactory, type PtyLike, type PtySpawnOptions } from './pty'
 import { SessionManager, prependToPath, type SpawnChecks } from './manager'
 import { createGitBashResolver } from './gitBash'
-import { PROBE_TIMEOUT_MS, createProber } from './pathProbe'
+import { PROBE_CACHE_TTL_MS, PROBE_CONCURRENCY, PROBE_TIMEOUT_MS, PathKeyedCache, createProbePool, createProber } from './pathProbe'
 import { buildClaudeCommand, buildCodexCommand } from './commands'
 import { makeDescriptors } from '../providers/descriptor'
 import { absPath, foldsCaseHere } from '../testPaths'
@@ -1112,21 +1112,28 @@ describe('SessionManager.prepare — the spawn path never waits on a sync probe'
       spawned.push({ file, opts })
       return new FakePty()
     }
+    // Every sync look at the disk goes through this one function, so counting it proves none ran.
+    const syncExists = vi.fn(() => true)
+    const log = vi.fn()
     const full: SpawnChecks = {
       cwd: async () => 'present',
       gitBash: createGitBashResolver(async () => 'absent'),
       platform: process.platform,
       now: Date.now,
+      syncExists,
+      log,
       ...checks
     }
     const manager = new SessionManager(factory, makeDescriptors('win32'), 100, 20, 'C:\\Users\\tester', undefined, [], { PATH: 'C:\\a' }, full)
-    return { manager, spawned }
+    return { manager, spawned, syncExists: full.syncExists as typeof syncExists, log: full.log as typeof log }
   }
 
   it('a folder whose probe never answers fails at 1.5 s with "folder not reachable", and nothing is spawned', async () => {
     vi.useFakeTimers()
     const cwd = '\\\\offline-server\\share\\proj'
-    const { manager, spawned } = withChecks({ cwd: createProber({ access: () => new Promise<void>(() => {}), log: () => {} }) })
+    const { manager, spawned } = withChecks({
+      cwd: createProber({ access: () => new Promise<void>(() => {}), log: () => {}, pool: createProbePool(), skipQueue: true })
+    })
     const outcome = manager.prepare({ account, cwd }).then(
       () => 'resolved',
       (e: Error) => e.message
@@ -1141,44 +1148,103 @@ describe('SessionManager.prepare — the spawn path never waits on a sync probe'
     expect(spawned).toHaveLength(0)
   })
 
-  it('a folder that is not there is still CWD_MISSING', async () => {
-    const { manager } = withChecks({ cwd: async () => 'absent' })
-    await expect(manager.prepare({ account, cwd: 'Z:\\gone' })).rejects.toThrow('CWD_MISSING: Z:\\gone')
+  it('a local folder is confirmed while four PATH probes hang on an offline drive', async () => {
+    vi.useFakeTimers()
+    const pool = createProbePool(PROBE_CONCURRENCY)
+    const access = (p: string) => (p.startsWith('Z:') ? new Promise<void>(() => {}) : Promise.resolve())
+    const pathProbe = createProber({ access, pool, log: () => {} })
+    const cwdProbe = createProber({ access, pool, log: () => {}, skipQueue: true })
+    const hung = ['Z:\\a\\pwsh.exe', 'Z:\\b\\pwsh.exe', 'Z:\\a\\powershell.exe', 'Z:\\b\\powershell.exe', 'Z:\\c\\cmd.exe'].map((p) =>
+      pathProbe(p)
+    )
+    const { manager } = withChecks({ cwd: cwdProbe, platform: 'linux' })
+    // No time passes: the folder's answer does not wait for a slot.
+    await expect(manager.prepare({ account, cwd: 'C:\\work\\proj' })).resolves.toBeUndefined()
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    await Promise.all(hung)
   })
 
-  it('after prepare, spawn trusts the checked folder and the cached Git Bash — no sync probe on either', async () => {
+  it('a folder that is not there is still CWD_MISSING, in the wording the caller asks for', async () => {
+    const { manager } = withChecks({ cwd: async () => 'absent' })
+    await expect(manager.prepare({ account, cwd: 'Z:\\gone' })).rejects.toThrow('CWD_MISSING: Z:\\gone')
+    await expect(manager.prepare({ account, cwd: 'Z:\\gone', missing: 'CWD_MISSING: Z:\\gone does not exist' })).rejects.toThrow(
+      'CWD_MISSING: Z:\\gone does not exist'
+    )
+  })
+
+  it('after prepare, spawn trusts the checked folder and the Git Bash it found — nothing sync runs, nothing is warned', async () => {
     let resolves = 0
     const gitBash = createGitBashResolver(async (p) => {
       resolves++
       return p === 'C:\\Program Files\\Git\\bin\\bash.exe' ? 'present' : 'absent'
     })
-    // Neither path exists on this disk: a sync existsSync on either would refuse or find nothing.
     const cwd = 'Z:\\prepared\\but\\not\\on\\this\\disk'
-    const { manager, spawned } = withChecks({ gitBash, platform: 'win32' })
+    const { manager, spawned, syncExists, log } = withChecks({ gitBash, platform: 'win32' })
     await manager.prepare({ account, cwd })
     const before = resolves
     manager.spawn({ account, cwd })
     expect(spawned[0].opts.cwd).toBe(cwd)
     expect(spawned[0].opts.env.CLAUDE_CODE_GIT_BASH_PATH).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
     expect(resolves).toBe(before)
+    expect(syncExists).not.toHaveBeenCalled()
+    expect(log).not.toHaveBeenCalled()
   })
 
-  it('a second prepare on the same PATH does not probe for Git Bash again', async () => {
+  it('the Git Bash cache expiring between prepare and spawn does not send spawn back to the sync search', async () => {
+    let t = 0
+    const gitBash = createGitBashResolver(
+      async (p) => (p === 'C:\\Program Files\\Git\\bin\\bash.exe' ? 'present' : 'absent'),
+      new PathKeyedCache(PROBE_CACHE_TTL_MS, () => t)
+    )
+    const { manager, spawned, syncExists, log } = withChecks({ gitBash, platform: 'win32', now: () => t })
+    // The cache entry was made just before the 5-minute mark; prepare reads it at 4:59.999...
+    await gitBash.resolve({ PATH: 'C:\\a' })
+    t = PROBE_CACHE_TTL_MS - 1
+    await manager.prepare({ account, cwd: 'C:\\w' })
+    // ...and by the spawn it has expired.
+    t = PROBE_CACHE_TTL_MS + 1
+    expect(gitBash.peek({ PATH: 'C:\\a' })).toBeUndefined()
+    manager.spawn({ account, cwd: 'C:\\w' })
+    expect(spawned[0].opts.env.CLAUDE_CODE_GIT_BASH_PATH).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+    expect(syncExists).not.toHaveBeenCalled()
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  it('a spawn nobody prepared falls back to the sync checks and says so in the log', () => {
+    const { manager, syncExists, log } = withChecks({ platform: 'win32' })
+    manager.spawn({ account, cwd: 'C:\\unprepared' })
+    expect(syncExists).toHaveBeenCalled()
+    expect(log).toHaveBeenCalled()
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/without prepare/)
+  })
+
+  it('a second prepare of the same folder reuses the first check, and does not probe for Git Bash again', async () => {
     let resolves = 0
+    let cwdProbes = 0
     const gitBash = createGitBashResolver(async () => {
       resolves++
       return 'absent'
     })
-    const { manager } = withChecks({ gitBash, platform: 'win32' })
+    const { manager } = withChecks({
+      gitBash,
+      platform: 'win32',
+      cwd: async () => {
+        cwdProbes++
+        return 'present'
+      }
+    })
     await manager.prepare({ account, cwd: 'C:\\one' })
     const first = resolves
+    await manager.prepare({ account, cwd: 'C:\\one' })
     await manager.prepare({ account, cwd: 'C:\\two' })
     expect(resolves).toBe(first)
+    expect(cwdProbes).toBe(2)
   })
 
   it('a folder checked long ago is not trusted without a new check', async () => {
     let t = 0
-    const { manager } = withChecks({ now: () => t })
+    const { manager, syncExists } = withChecks({ now: () => t })
+    syncExists.mockReturnValue(false)
     const cwd = 'Z:\\prepared\\but\\not\\on\\this\\disk'
     await manager.prepare({ account, cwd })
     t += 10 * 60_000

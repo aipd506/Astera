@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import type { Account, Provider, SessionInfo, ScheduleConfig } from '../types'
 import { defaultSessionTitle, normalizeSessionTitle } from './title'
 import { createGitBashResolver, findGitBash, type GitBashResolver } from './gitBash'
-import { checkCwd, defaultProbe, type Probe } from './pathProbe'
+import { checkCwd, defaultCwdProbe, defaultProbe, probeLog, type Probe } from './pathProbe'
 import {
   descriptorOf,
   makeDescriptors,
@@ -74,18 +74,38 @@ export interface SpawnChecks {
   /** Whether Git Bash is looked for at all — only on win32. */
   platform: NodeJS.Platform
   now: () => number
+  /** The sync look at the disk, used only by a spawn nobody prepared. Injected so a test can prove
+   *  it did not run. */
+  syncExists: (p: string) => boolean
+  /** Where a spawn that had to fall back to the sync checks says so. */
+  log: (m: string) => void
 }
 
 /** One resolver per process, so its cache is shared by every SessionManager in it. */
 let processGitBash: GitBashResolver | null = null
-export function defaultSpawnChecks(): SpawnChecks {
+/** `log` is the owning process's log (the Host's host.log, the app's sessions log); without one, the
+ *  probe log each entry point sets (pathProbe.ts setProbeLog). */
+export function defaultSpawnChecks(log: (m: string) => void = probeLog): SpawnChecks {
   processGitBash ??= createGitBashResolver(defaultProbe)
-  return { cwd: defaultProbe, gitBash: processGitBash, platform: process.platform, now: Date.now }
+  return {
+    cwd: defaultCwdProbe,
+    gitBash: processGitBash,
+    platform: process.platform,
+    now: Date.now,
+    syncExists: existsSync,
+    log
+  }
 }
 
 /** How long a folder `prepare` confirmed is trusted by `spawn` without being looked at again. A
  *  roll prepares before its kill and spawns right after it, so a minute is plenty. */
 const CWD_CONFIRMED_MS = 60_000
+
+/** The PATH value of an env, whatever the key's casing (Windows gives `Path`). */
+function pathValueOf(env: Record<string, string | undefined>): string {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH')
+  return (key ? env[key] : undefined) ?? ''
+}
 
 interface LiveSession {
   info: SessionInfo
@@ -122,6 +142,10 @@ export class SessionManager {
 
   /** Folders `prepare` confirmed, and when. */
   private confirmedCwds = new Map<string, number>()
+  /** The Git Bash `prepare` found, per PATH string, and when — held here, not read back from the
+   *  resolver's cache, so an entry that expires between a prepare and its spawn cannot send the spawn
+   *  to the sync search. Trusted as long as a confirmed folder is. */
+  private preparedGitBash = new Map<string, { bash: string | null; at: number }>()
 
   /**
    * Everything `spawn` would look for on disk, looked for without blocking: the folder, and on win32
@@ -129,12 +153,21 @@ export class SessionManager {
    * awaits this before `spawn`** — a roll does it before its kill, since the spawn after it has no
    * await. Rejects with CWD_MISSING, or CWD_UNREACHABLE when the folder did not answer in time.
    */
-  async prepare(opts: { account: Account; cwd: string }): Promise<void> {
-    await checkCwd(opts.cwd, this.checks.cwd)
-    const now = this.checks.now()
-    for (const [cwd, at] of this.confirmedCwds) if (now - at >= CWD_CONFIRMED_MS) this.confirmedCwds.delete(cwd)
-    this.confirmedCwds.set(opts.cwd, now)
-    if (this.checks.platform === 'win32') await this.checks.gitBash.resolve(this.envFor(opts.account))
+  async prepare(opts: { account: Account; cwd: string; missing?: string }): Promise<void> {
+    // A folder confirmed a moment ago (a Host session create checks it, then spawns) is not probed again.
+    if (!this.cwdConfirmed(opts.cwd)) {
+      await checkCwd(opts.cwd, this.checks.cwd, opts.missing)
+      const now = this.checks.now()
+      for (const [cwd, at] of this.confirmedCwds) if (now - at >= CWD_CONFIRMED_MS) this.confirmedCwds.delete(cwd)
+      this.confirmedCwds.set(opts.cwd, now)
+    }
+    if (this.checks.platform === 'win32') {
+      const env = this.envFor(opts.account)
+      const bash = await this.checks.gitBash.resolve(env)
+      const now = this.checks.now()
+      for (const [k, v] of this.preparedGitBash) if (now - v.at >= CWD_CONFIRMED_MS) this.preparedGitBash.delete(k)
+      this.preparedGitBash.set(pathValueOf(env), { bash, at: now })
+    }
   }
 
   private cwdConfirmed(cwd: string): boolean {
@@ -186,7 +219,10 @@ export class SessionManager {
     // The folder `prepare` just confirmed is not looked at again. The sync check is left only for a
     // caller that did not prepare (tests, and anything added later without it): it is the one that can
     // freeze this thread on an offline drive.
-    if (!this.cwdConfirmed(opts.cwd) && !existsSync(opts.cwd)) throw new Error(`CWD_MISSING: ${opts.cwd}`)
+    if (!this.cwdConfirmed(opts.cwd)) {
+      this.checks.log(`session spawn without prepare: checking the folder synchronously, which can freeze this thread on an offline drive: ${opts.cwd}`)
+      if (!this.checks.syncExists(opts.cwd)) throw new Error(`CWD_MISSING: ${opts.cwd}`)
+    }
     const d = descriptorOf(this.descriptors, opts.account)
     // Mixed-provider rolling is impossible — the transcript formats differ, so the relay cannot work.
     // codex-only and claude-only chains are handled by their own coordinators.
@@ -228,9 +264,14 @@ export class SessionManager {
     // available; without one the statusLine capture never runs and the app never learns this session's
     // provider id or its usage (see findGitBash). The value the user set is never overwritten.
     // What `prepare` found is used as is; only an unprepared spawn falls back to the sync search.
-    if (this.checks.platform === 'win32') {
-      const known = this.checks.gitBash.peek(env)
-      const gitBash = known !== undefined ? known : findGitBash(env, existsSync)
+    if (this.checks.platform === 'win32' && !env.CLAUDE_CODE_GIT_BASH_PATH) {
+      const prepared = this.preparedGitBash.get(pathValueOf(env))
+      let gitBash: string | null
+      if (prepared && this.checks.now() - prepared.at < CWD_CONFIRMED_MS) gitBash = prepared.bash
+      else {
+        this.checks.log('session spawn without prepare: searching for Git Bash synchronously, which can freeze this thread on an offline PATH drive')
+        gitBash = findGitBash(env, this.checks.syncExists)
+      }
       if (gitBash) env.CLAUDE_CODE_GIT_BASH_PATH = gitBash
     }
     if (sl) {

@@ -37,8 +37,7 @@ import { refusedBeforeActing, undoneBeforeFailing } from '../core/host/orchProto
 import { findRollout as findRolloutOnDisk } from '../core/rolling/codexLocate'
 import { descriptorOf, makeDescriptors } from '../core/providers/descriptor'
 import { providerOf } from '../core/providers/meta'
-import { SessionManager } from '../core/sessions/manager'
-import { checkCwd } from '../core/sessions/pathProbe'
+import { SessionManager, defaultSpawnChecks } from '../core/sessions/manager'
 import { defaultSessionTitle } from '../core/sessions/title'
 import type { PtyFactory, PtyLike } from '../core/sessions/pty'
 import { StatusLineManager, resolveNodePath } from '../core/sessions/statusline'
@@ -308,7 +307,9 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
     homeDir,
     (id, account, o) => statusLine.spawnConfig(id, account, o),
     [previewShotsDir(profileDir)],
-    hostWorkerBaseEnv(d.env)
+    hostWorkerBaseEnv(d.env),
+    // The Host's own log: a spawn that had to fall back to a sync check says so in host.log.
+    defaultSpawnChecks(log)
   )
   sessions.onExit = (e) => {
     sessions.forget(e.sessionId)
@@ -677,8 +678,8 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
       const trace: StartTrace = { opened: false, forked: null, settingsRefused: false }
       try {
         const accounts = await readAccounts(accountsPath)
-        accountIn(accounts, o.accountId)
-        await checkCwd(o.cwd, undefined, `CWD_MISSING: ${o.cwd} does not exist`)
+        // The folder is probed once here; spawnSession's own prepare reuses this answer.
+        await sessions.prepare({ account: accountIn(accounts, o.accountId), cwd: o.cwd, missing: `CWD_MISSING: ${o.cwd} does not exist` })
         const info = await spawnSession(
           {
             accountId: o.accountId,

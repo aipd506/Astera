@@ -6,7 +6,8 @@ import { app, net } from 'electron'
 import { AccountRegistry } from '../core/accounts/registry'
 import { PROVIDERS, providerOf } from '../core/providers/meta'
 import { makeDescriptors, descriptorOf, isAmbientDir, type ProviderDescriptor } from '../core/providers/descriptor'
-import { SessionManager } from '../core/sessions/manager'
+import { SessionManager, defaultSpawnChecks } from '../core/sessions/manager'
+import { setProbeLog } from '../core/sessions/pathProbe'
 import { nodePtyFactory } from '../core/sessions/nodePtyFactory'
 import { createPtyRouter } from './host/ptyRouter'
 import { createProcRouter } from './host/procRouter'
@@ -227,6 +228,18 @@ export async function createCore(userDataDir: string, osLocale: string): Promise
       /* a failed log write blocks nothing */
     }
   }
+  // The spawn path's own file, by the same convention: a path probe that timed out (an offline drive
+  // on PATH, or a session folder on one) and a spawn that had to fall back to a sync check are told
+  // here. Set as the probe log too, so the terminal's shell lookup writes to the same place.
+  const sessionsLogFile = path.join(userDataDir, 'sessions.log')
+  const sessionsLog = (m: string): void => {
+    try {
+      appendFileSync(sessionsLogFile, `${new Date().toISOString()} ${m}\n`)
+    } catch {
+      /* a failed log write blocks nothing */
+    }
+  }
+  setProbeLog(sessionsLog)
   // descriptors is injected explicitly — left unspecified, each of them calls makeDescriptors(process.platform)
   // again, so every instance gets its own table (plus two command builders SessionManager never uses).
   const sessions = new SessionManager(
@@ -238,7 +251,9 @@ export async function createCore(userDataDir: string, osLocale: string): Promise
     (id, account, opts) => statusLine.spawnConfig(id, account, opts),
     // A Claude session may read the app's screenshot folder without a prompt — that is where Design
     // Mode writes the crops whose paths it sends. previewShotsDir is the same path capture.ts writes.
-    [previewShotsDir(userDataDir)]
+    [previewShotsDir(userDataDir)],
+    process.env,
+    defaultSpawnChecks(sessionsLog)
   )
   // The chat sessions. It is handed `procRouter.factory` rather than a factory chosen now, for exactly
   // the reason SessionManager is handed `ptyRouter.factory`: which one a spawn reaches is decided at

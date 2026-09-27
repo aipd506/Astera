@@ -5,7 +5,7 @@
 // Everything it needs arrives in the environment, because it has no `app.getPath('userData')` to ask.
 import childProcess from 'node:child_process'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { defaultProbe } from '../core/sessions/pathProbe'
+import { defaultCwdProbe, setProbeLog } from '../core/sessions/pathProbe'
 import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -83,6 +83,8 @@ async function main(): Promise<void> {
     process.exit(2)
   }
   const log = openHostLog({ path: process.env.ASTERA_HOST_LOG ?? path.join(profileDir, 'host', 'host.log') })
+  // Path probes that time out (an offline drive on PATH, or a session folder on one) are told here.
+  setProbeLog((m) => log.write(m))
   // Final review C1, the belt: a rejection nobody handled is logged and never ends the Host (and every
   // session in it). Each path keeps its own catch; this only keeps a miss from being fatal.
   logUnhandledRejections(process, log)
@@ -480,7 +482,7 @@ async function main(): Promise<void> {
       rolling: rollingWiring?.rolling ?? null,
       readAccounts: () => readAccountEntries(path.join(profileDir, 'accounts.json')),
       bypass: async () => (await readAgentPermissionMode(path.join(profileDir, 'app-settings.json'))) === 'yolo',
-      probeCwd: defaultProbe,
+      probeCwd: defaultCwdProbe,
       announceProc: (procId) => announceChatProc(server, procId, (m) => log.write(m)),
       list: () => hostSessions.listSessions(),
       log: (m) => log.write(m)
