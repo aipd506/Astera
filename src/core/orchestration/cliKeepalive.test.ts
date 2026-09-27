@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { HOST_UNRESPONSIVE_MS } from '../host/unresponsive'
-import { KEEPALIVE_MS, elapsedWord, keepaliveLine, waitingCommand } from './cliKeepalive'
+import { KEEPALIVE_MS, SLOW_ANSWER_NOTICE_MS, elapsedWord, keepaliveLine, slowAnswerLine, waitingCommand } from './cliKeepalive'
 
 describe('cliKeepalive — 간격', () => {
   // 두 곳에 적으면 갈라진다. 이 CLI 와 앱이 같은 Host 를 두고 "언제부터 안 답하는 것인가" 를
@@ -60,6 +60,30 @@ describe('cliKeepalive — 한 줄', () => {
     expect(keepaliveLine({ cmd: 'ask', elapsedMs: 45_000, silentMs: KEEPALIVE_MS })).toBe(
       'waiting for ask, 45s so far; the Host has not answered a ping for 15s'
     )
+  })
+
+  // 기다리지 않는 명령의 알림은 "무엇을 기다리나" 가 명령이 아니라 Host 의 답이다.
+  it('기다리지 않는 명령의 알림은 Host 의 답을 기다린다고 말한다', () => {
+    expect(slowAnswerLine({ cmd: 'jobs-list', elapsedMs: 3_000, silentMs: null, pingUnanswered: false })).toBe(
+      'waiting for the Host to answer jobs list, 3s so far'
+    )
+    expect(slowAnswerLine({ cmd: 'status', elapsedMs: 3_000, silentMs: 1_000, pingUnanswered: false })).toBe(
+      'waiting for the Host to answer status, 3s so far; the Host is still working (it answered a ping 1s ago)'
+    )
+  })
+
+  // 알림은 3초에 처음 나오므로 15초 문턱을 기다리지 않는다: 보낸 ping 에 답이 없으면 그것이 곧 사실이다.
+  it('답이 없는 ping 이 있으면 곧바로 답이 없다고 말한다', () => {
+    expect(slowAnswerLine({ cmd: 'status', elapsedMs: 3_000, silentMs: 3_000, pingUnanswered: true })).toBe(
+      'waiting for the Host to answer status, 3s so far; the Host has not answered a ping for 3s'
+    )
+    expect(slowAnswerLine({ cmd: 'status', elapsedMs: 33_000, silentMs: KEEPALIVE_MS, pingUnanswered: false })).toBe(
+      'waiting for the Host to answer status, 33s so far; the Host has not answered a ping for 15s'
+    )
+  })
+
+  it('알림은 3초 뒤에 처음 나온다', () => {
+    expect(SLOW_ANSWER_NOTICE_MS).toBe(3_000)
   })
 
   it('한 시간짜리 기다림도 읽을 수 있다', () => {

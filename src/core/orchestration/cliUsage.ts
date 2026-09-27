@@ -503,6 +503,7 @@ export function rootUsage(): string {
     '',
     'output is JSON. --human prints aligned columns for reading, --quiet prints ids only.',
     'while a wait is on, a line every 15s goes to stderr, never stdout. --no-keepalive stops them.',
+    'any other command whose Host has not answered in 3s says so on stderr the same way.',
     '--verbose says on stderr which Host was reached, its handshake, and how long each call took.',
     'astera --project <path> <command> filters jobs list, runs list and sessions list to that project.',
     // **The one flag here that changes what happens rather than how it is printed.** It was missing,

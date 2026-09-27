@@ -40,8 +40,11 @@ import {
   KEEPALIVE_MS,
   KEEPALIVE_PING_MS,
   MERGE_CLIENT_TIMEOUT_MS,
+  SLOW_ANSWER_NOTICE_MS,
+  SLOW_ANSWER_PING_LEAD_MS,
   keepaliveLine,
   mergeCommand,
+  slowAnswerLine,
   waitingCommand
 } from '../core/orchestration/cliKeepalive'
 import { agentContext, sessionUsage } from '../core/orchestration/cliAgentContext'
@@ -763,8 +766,14 @@ export async function followRun(a: {
  *
  * **stdout is never touched.** It carries one result and one envelope, so a caller needs no filter to
  * remove these; `2>/dev/null` and `--no-keepalive` are both there for a caller that wants stderr
- * empty. Nothing is written for a command that does not wait, because a liveness line on an answer
- * that came back at once is noise that teaches the reader to ignore the line.
+ * empty.
+ *
+ * **A command that does not wait says nothing for `SLOW_ANSWER_NOTICE_MS`**, and only then starts.
+ * An answer that came back at once gets no line, because a liveness line on it is noise that teaches
+ * the reader to ignore the line. One that did not is a Host that is busy or stuck, and a silence of up
+ * to the client deadline there looked exactly like a frozen command. From that notice on it is the
+ * same loop as a wait, with slowAnswerLine's wording. Its ping goes `SLOW_ANSWER_PING_LEAD_MS` ahead
+ * of the notice, so the very first line already tells a busy Host from a silent one.
  *
  * **The ping is what makes the line worth printing.** A bare timer proves this process is alive,
  * which was never in doubt; what a person watching a five-minute silence needs to know is whether the
@@ -788,7 +797,8 @@ export function startKeepalive(a: {
   now?: () => number
   write?: (line: string) => void
 }): { stop: () => void } {
-  if (!a.enabled || !waitingCommand({ cmd: a.cmd, args: a.args })) return { stop: () => {} }
+  if (!a.enabled) return { stop: () => {} }
+  const waiting = waitingCommand({ cmd: a.cmd, args: a.args })
   const now = a.now ?? Date.now
   const write = a.write ?? logToStderr
   const lineMs = a.lineMs ?? KEEPALIVE_MS
@@ -799,6 +809,7 @@ export function startKeepalive(a: {
   // The `hello` that opened this connection arrived a moment ago and is an answer like any other, so
   // the first line has a real number to report rather than a gap that looks like silence.
   let lastAnswerAt = startedAt
+  let lastPingAt: number | null = null
   let lastLineAt = startedAt
   let seq = 0
   const off = canPing
@@ -806,29 +817,77 @@ export function startKeepalive(a: {
         if (m.t === 'pong') lastAnswerAt = now()
       })
     : (): void => {}
-  const timer = setInterval(() => {
-    const at = now()
-    // Half a tick of slack: a timer that fires a hair early must not push the line a whole tick out.
-    if (at - lastLineAt >= lineMs - tickMs / 2) {
-      lastLineAt = at
-      write(
-        keepaliveLine({
-          cmd: a.cmd,
-          elapsedMs: at - startedAt,
-          silentMs: canPing ? at - lastAnswerAt : null
-        })
-      )
-    }
-    if (canPing) a.conn.call({ t: 'ping', seq: ++seq })
-  }, tickMs)
-  // Nothing should be held open by this: the socket already keeps the process alive for exactly as
+  const ping = (): void => {
+    if (!canPing) return
+    lastPingAt = now()
+    a.conn.call({ t: 'ping', seq: ++seq })
+  }
+  const line = (at: number): void => {
+    lastLineAt = at
+    const silentMs = canPing ? at - lastAnswerAt : null
+    write(
+      waiting
+        ? keepaliveLine({ cmd: a.cmd, elapsedMs: at - startedAt, silentMs })
+        : slowAnswerLine({
+            cmd: a.cmd,
+            elapsedMs: at - startedAt,
+            silentMs,
+            pingUnanswered: lastPingAt !== null && lastPingAt > lastAnswerAt
+          })
+    )
+  }
+  const timers: ReturnType<typeof setTimeout>[] = []
+  // Nothing should be held open by these: the socket already keeps the process alive for exactly as
   // long as the call it is reporting on.
-  timer.unref?.()
+  const hold = <T extends ReturnType<typeof setTimeout>>(t: T): void => {
+    t.unref?.()
+    timers.push(t)
+  }
+  const loop = (): void =>
+    hold(
+      setInterval(() => {
+        const at = now()
+        // Half a tick of slack: a timer that fires a hair early must not push the line a whole tick out.
+        if (at - lastLineAt >= lineMs - tickMs / 2) line(at)
+        ping()
+      }, tickMs)
+    )
+  if (waiting) loop()
+  else {
+    hold(setTimeout(ping, SLOW_ANSWER_NOTICE_MS - SLOW_ANSWER_PING_LEAD_MS))
+    hold(
+      setTimeout(() => {
+        line(now())
+        loop()
+      }, SLOW_ANSWER_NOTICE_MS)
+    )
+  }
   return {
     stop: () => {
-      clearInterval(timer)
+      // A cleared timeout and a cleared interval are the same call in node and in the browser.
+      for (const t of timers) clearInterval(t)
+      timers.length = 0
       off()
     }
+  }
+}
+
+/**
+ * Runs `work` with a keepalive on, and turns it off the moment `work` settles, answer or error.
+ *
+ * **Off is a `finally`, and it is here rather than at each call site** so that "always stops" is one
+ * fact in one place. A timer left running after the result would put its line into the output of the
+ * next command typed in the same shell.
+ */
+export async function keepaliveDuring<T>(
+  opts: Parameters<typeof startKeepalive>[0],
+  work: () => Promise<T>
+): Promise<T> {
+  const keepalive = startKeepalive(opts)
+  try {
+    return await work()
+  } finally {
+    keepalive.stop()
   }
 }
 
@@ -1293,30 +1352,28 @@ export async function main(): Promise<void> {
       if (parsed.cmd === 'version') versionWithoutHost()
       fail(carried.error)
     }
-    // **기다리는 명령만, 그리고 stderr 에만**(cliKeepalive.ts). 여기서 시작하고 답이 오면 끄는
-    // 이유는 자리 하나다: 기다림은 이 한 줄이고, 그 밖의 모든 명령은 이 자리를 스쳐 지나간다.
+    // **stderr 에만**(cliKeepalive.ts). 기다리는 명령은 처음부터, 그 밖의 명령은 3초 동안 답이
+    // 없을 때부터 말한다 — 느린 것은 괜찮지만 멈춘 것처럼 보이면 안 된다. Host 로 가는 부름은
+    // 아래 두 자리뿐이고, 둘 다 이것으로 감싼다.
     //
-    // **끄는 것은 `finally` 다.** `callHost` 가 거절하지 않는 것은 저쪽 함수의 성질이지 이 줄의
-    // 성질이 아니고, 결과가 나간 뒤에도 도는 타이머는 같은 셸에서 이어 치는 다음 명령의 출력에
-    // 줄을 섞는다. 언제나 꺼진다는 것이 이 자리에서 보여야 한다.
-    const keepalive = startKeepalive({
-      conn,
-      cmd: parsed.cmd,
-      args,
-      enabled: !parsed.noKeepalive
-    })
+    // **끄는 것은 `keepaliveDuring` 의 `finally` 다.** `callHost` 가 거절하지 않는 것은 저쪽 함수의
+    // 성질이지 이 줄의 성질이 아니고, 결과가 나간 뒤에도 도는 타이머는 같은 셸에서 이어 치는 다음
+    // 명령의 출력에 줄을 섞는다.
+    const keepalive = { conn, cmd: parsed.cmd, args, enabled: !parsed.noKeepalive }
     // **`runs follow` is a loop of calls on this one connection** (followRun). It prints as it goes, and
     // its ending comes back here as the body `runs wait` answers with, so the exit code below is the
     // same code. It carries no request id: it reads, and a receipt is kept only for a call that acted.
     if (parsed.cmd === 'runs-follow') {
-      const followed = await followRun({
-        id: args.id,
-        mode,
-        timeoutMs: typeof args.timeoutMs === 'number' ? args.timeoutMs : DEFAULT_WAIT_TIMEOUT_MS,
-        write: out,
-        call: (callArgs, timeoutMs) =>
-          timedCall(verbose, { conn, cmd: parsed.cmd, args: callArgs, sessionId, timeoutMs })
-      }).finally(() => keepalive.stop())
+      const followed = await keepaliveDuring(keepalive, () =>
+        followRun({
+          id: args.id,
+          mode,
+          timeoutMs: typeof args.timeoutMs === 'number' ? args.timeoutMs : DEFAULT_WAIT_TIMEOUT_MS,
+          write: out,
+          call: (callArgs, timeoutMs) =>
+            timedCall(verbose, { conn, cmd: parsed.cmd, args: callArgs, sessionId, timeoutMs })
+        })
+      )
       conn.close()
       if ('stuck' in followed) fail({ code: SILENT_HOST_CODE, message: followed.stuck })
       if ('unreachable' in followed) fail({ code: 'HOST_NOT_RUNNING', message: followed.unreachable })
@@ -1326,14 +1383,16 @@ export async function main(): Promise<void> {
     // Held rather than passed inline: the retry line below has to carry what this actually sent,
     // and `argsForCall` fills a missing `--cwd` that the typed line does not have (`implicitArgs`).
     const sentArgs = argsForCall({ cmd: parsed.cmd, args, cwd: process.cwd() })
-    const r = await timedCall(verbose, {
-      conn,
-      cmd: parsed.cmd,
-      args: sentArgs,
-      sessionId,
-      request: carried.send,
-      timeoutMs: clientTimeoutMs({ cmd: parsed.cmd, args })
-    }).finally(() => keepalive.stop())
+    const r = await keepaliveDuring(keepalive, () =>
+      timedCall(verbose, {
+        conn,
+        cmd: parsed.cmd,
+        args: sentArgs,
+        sessionId,
+        request: carried.send,
+        timeoutMs: clientTimeoutMs({ cmd: parsed.cmd, args })
+      })
+    )
     conn.close()
     // **시한을 넘긴 것은 닿지 못한 것이 아니다.** 위의 시한은 분 단위이고, 그것을 넘겼다는 것은
     // 연결은 됐는데 저쪽이 멈췄다는 뜻이다 — 보고는 이미 적용됐을 수 있으므로 적어 두지 않는다.

@@ -33,6 +33,7 @@ import {
   renderErr,
   renderOk,
   startKeepalive,
+  keepaliveDuring,
   writePendingReport
 } from './run'
 import { siblingHostError } from './host'
@@ -1407,13 +1408,6 @@ describe('startKeepalive — 기다리는 동안 내는 줄', () => {
     return { conn, keepalive }
   }
 
-  // 기다리지 않는 출력에 살아 있다는 줄이 붙으면 그 줄은 아무것도 뜻하지 않게 된다.
-  it('기다리지 않는 명령에는 아무것도 내지 않는다', () => {
-    const { conn } = start({ cmd: 'jobs-list' })
-    pass(60_000)
-    expect(lines).toEqual([])
-    expect(conn.sent).toEqual([])
-  })
 
   it('--no-keepalive 는 한 줄도 내지 않고 묻지도 않는다', () => {
     const { conn } = start({ cmd: 'runs-wait', enabled: false })
@@ -1462,5 +1456,130 @@ describe('startKeepalive — 기다리는 동안 내는 줄', () => {
     pass(15_000)
     expect(conn.sent).toEqual([])
     expect(lines).toEqual(['waiting for check, 15s so far'])
+  })
+
+  // **느린 것은 괜찮지만 멈춘 것처럼 보이면 안 된다.** 기다리지 않는 명령도 Host 가 바쁘거나 멈추면
+  // 클라이언트 시한(5분 반)까지 아무 말이 없었다. 3초가 지나도 답이 없으면 그때부터 말한다 —
+  // 곧바로 오는 답에는 한 줄도 붙지 않는다.
+  describe('기다리지 않는 명령 — 3초 뒤의 알림', () => {
+    it('3초 전에는 아무것도 내지 않는다', () => {
+      start({ cmd: 'jobs-list' })
+      pass(2_000)
+      expect(lines).toEqual([])
+      // 그리고 3초가 되는 순간 처음 나온다 — 조용했던 것은 켜지지 않아서가 아니다
+      pass(1_000)
+      expect(lines).toHaveLength(1)
+    })
+
+    it('3초에 한 줄, 그 뒤로 15초마다 한 줄 — 걸린 시간과 Host 가 일하는지를 싣는다', () => {
+      start({ cmd: 'jobs-list' })
+      pass(3_000)
+      expect(lines).toEqual([
+        'waiting for the Host to answer jobs list, 3s so far; the Host is still working (it answered a ping 1s ago)'
+      ])
+      pass(14_000)
+      expect(lines).toHaveLength(1)
+      pass(1_000)
+      expect(lines).toHaveLength(2)
+      expect(lines[1]).toBe(
+        'waiting for the Host to answer jobs list, 18s so far; the Host is still working (it answered a ping 5s ago)'
+      )
+      pass(15_000)
+      expect(lines).toHaveLength(3)
+      expect(lines[2]).toContain('33s so far')
+    })
+
+    // 첫 줄이 이미 "바쁜가, 사라졌나" 를 가른다 — 그래서 ping 은 알림보다 1초 먼저 간다.
+    it('ping 에 답하지 않는 Host 는 첫 줄부터 그렇게 말한다', () => {
+      const { conn } = start({ cmd: 'status', answers: false })
+      pass(3_000)
+      expect(conn.sent).toEqual([{ t: 'ping', seq: 1 }])
+      expect(lines).toEqual(['waiting for the Host to answer status, 3s so far; the Host has not answered a ping for 3s'])
+      pass(15_000)
+      expect(lines[1]).toBe('waiting for the Host to answer status, 18s so far; the Host has not answered a ping for 18s')
+    })
+
+    it('ping 을 모르는 Host 에는 묻지 않고, 걸린 시간만 말한다', () => {
+      const { conn } = start({ cmd: 'status', features: ['orch'] })
+      pass(3_000)
+      expect(conn.sent).toEqual([])
+      expect(lines).toEqual(['waiting for the Host to answer status, 3s so far'])
+    })
+
+    it('--no-keepalive 는 이 알림도 끈다', () => {
+      // 켜 두면 같은 시간에 줄이 나온다 — 조용한 것은 이 플래그 때문이다
+      const on = start({ cmd: 'jobs-list' })
+      pass(60_000)
+      expect(lines).not.toEqual([])
+      on.keepalive.stop()
+      const { conn } = start({ cmd: 'jobs-list', enabled: false })
+      pass(60_000)
+      expect(lines).toEqual([])
+      expect(conn.sent).toEqual([])
+    })
+
+    const during = <T,>(cmd: string, work: () => Promise<T>): Promise<T> => {
+      lines.length = 0
+      const conn = fakeConn({ features: ['orch', 'ping'], answers: true })
+      return keepaliveDuring(
+        { conn: conn.conn, cmd, args: {}, enabled: true, tickMs: 5_000, lineMs: 15_000, now, write: (l) => lines.push(l) },
+        work
+      )
+    }
+    const settleAt =
+      (ms: number, fail = false): (() => Promise<string>) =>
+      () =>
+        new Promise((resolve, reject) => setTimeout(() => (fail ? reject(new Error('boom')) : resolve('answer')), ms))
+
+    it('3초 안에 답이 오면 한 줄도 내지 않고, 그 뒤로도 내지 않는다', async () => {
+      const p = during('jobs-list', settleAt(1_000))
+      pass(1_000)
+      await expect(p).resolves.toBe('answer')
+      pass(60_000)
+      expect(lines).toEqual([])
+    })
+
+    // 결과가 나간 뒤에 도는 타이머는 같은 셸에서 이어 치는 다음 명령의 출력에 줄을 섞는다.
+    it('답이 오는 순간 멈추고, 결과 뒤에는 한 줄도 내지 않는다', async () => {
+      const p = during('jobs-list', settleAt(4_000))
+      pass(4_000)
+      await expect(p).resolves.toBe('answer')
+      expect(lines).toHaveLength(1)
+      pass(60_000)
+      expect(lines).toHaveLength(1)
+    })
+
+    it('오류로 끝나도 멈추고, 오류는 그대로 올라간다', async () => {
+      const p = during('jobs-list', settleAt(4_000, true))
+      pass(4_000)
+      await expect(p).rejects.toThrow('boom')
+      expect(lines).toHaveLength(1)
+      pass(60_000)
+      expect(lines).toHaveLength(1)
+    })
+
+    // stdout 은 결과 하나뿐이다 — 알림은 stderr 에만 간다.
+    it('알림은 stderr 로만 가고 stdout 은 건드리지 않는다', async () => {
+      const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+      const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+      try {
+        const conn = fakeConn({ features: ['orch', 'ping'], answers: true })
+        const p = keepaliveDuring(
+          { conn: conn.conn, cmd: 'status', args: {}, enabled: true, tickMs: 5_000, lineMs: 15_000, now },
+          settleAt(20_000)
+        )
+        pass(20_000)
+        await p
+        pass(60_000)
+        expect(outSpy).not.toHaveBeenCalled()
+        expect(errSpy.mock.calls.map((c) => String(c[0]))).toEqual([
+          'astera: waiting for the Host to answer status, 3s so far; the Host is still working (it answered a ping 1s ago)\n',
+          'astera: waiting for the Host to answer status, 18s so far; the Host is still working (it answered a ping 5s ago)\n'
+        ])
+      } finally {
+        outSpy.mockRestore()
+        errSpy.mockRestore()
+      }
+    })
   })
 })

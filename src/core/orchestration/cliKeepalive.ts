@@ -121,3 +121,45 @@ export function keepaliveLine(a: {
   // the number, because from here the honest reading is that this may no longer be a wait at all.
   return `${head}; the Host has not answered a ping for ${elapsedWord(a.silentMs)}`
 }
+
+/**
+ * How long a command that does not wait may go without an answer before it says so on stderr.
+ *
+ * **Slow is acceptable; looking frozen is not.** `status`, `jobs list` and the rest answer in
+ * milliseconds from a healthy Host, so for them a keepalive from the first second would be noise on
+ * every line. But a Host that is busy or wedged holds them for up to the client deadline, five and a
+ * half minutes, and until now that was five and a half minutes of nothing. Three seconds is well past
+ * any answer a healthy Host gives these, and short enough that a person has not yet started to wonder.
+ */
+export const SLOW_ANSWER_NOTICE_MS = 3_000
+
+/**
+ * How long before the first notice its ping goes out, so the notice can already say whether the Host
+ * answered. A pong from a live Host takes milliseconds; a second is room to spare.
+ */
+export const SLOW_ANSWER_PING_LEAD_MS = 1_000
+
+/**
+ * The line a command that does not wait prints once it has waited `SLOW_ANSWER_NOTICE_MS` for its
+ * answer, and every `KEEPALIVE_MS` after that.
+ *
+ * **Same family as keepaliveLine, one difference in the tail.** The first notice comes at three
+ * seconds, long before the fifteen second threshold keepaliveLine judges by, so waiting for that
+ * threshold would make the first line reassure about a Host that has just ignored a ping. A ping
+ * sent and not yet answered (`pingUnanswered`) is therefore the fact itself: the Host did not answer.
+ * An answered one means its event loop is turning, which is what "still working" can honestly claim.
+ */
+export function slowAnswerLine(a: {
+  cmd: string
+  elapsedMs: number
+  /** Time since the Host last answered anything, or `null` when this Host has no heartbeat. */
+  silentMs: number | null
+  /** A ping went out after the last answer and has not come back. */
+  pingUnanswered: boolean
+}): string {
+  const head = `waiting for the Host to answer ${spelledCommand(a.cmd)}, ${elapsedWord(a.elapsedMs)} so far`
+  if (a.silentMs === null) return head
+  if (a.pingUnanswered || a.silentMs >= KEEPALIVE_MS)
+    return `${head}; the Host has not answered a ping for ${elapsedWord(a.silentMs)}`
+  return `${head}; the Host is still working (it answered a ping ${elapsedWord(a.silentMs)} ago)`
+}

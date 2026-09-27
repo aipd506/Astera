@@ -1261,9 +1261,25 @@ the line ends after `so far`.
 `runs follow` prints the same lines while it follows, on stderr as well, so its event lines on stdout
 stay one per event.
 
+**Any other command says so too, once its answer is late.** `status`, `runs get`, `jobs list` and the
+rest answer at once from a healthy Host, so they print nothing while that holds. When the Host is
+busy or stuck, though, they can wait up to the client deadline of five and a half minutes, and a
+silence that long looks frozen. So if no answer has come after 3 seconds, one line goes to stderr,
+and then one every 15 seconds after it:
+
+```text
+astera: waiting for the Host to answer runs get, 3s so far; the Host is still working (it answered a ping 1s ago)
+astera: waiting for the Host to answer status, 3s so far; the Host has not answered a ping for 3s
+```
+
+The command pings the Host a second before the first line, so even that line tells a Host that is
+busy with the call from one that did not answer at all. A Host too old to know the heartbeat gets no
+ping, and the line ends after `so far`. The lines stop the moment the answer or an error arrives, so
+nothing is printed after the result.
+
 **Nothing of this reaches stdout**, which carries one result and nothing else, so there is nothing to
-filter out of a pipeline: `astera runs wait --id "$run" | jq .data` is unaffected. `--no-keepalive`
-turns the lines off for a caller that wants stderr empty; `2>/dev/null` does the same from the shell.
+filter out of a pipeline: `astera runs wait --id "$run" | jq .data` is unaffected, and neither are
+the exit codes. `--no-keepalive` turns both kinds of line off for a caller that wants stderr empty; `2>/dev/null` does the same from the shell.
 `--quiet` does not turn them off, because it decides what stdout carries and this is the other
 channel.
 
