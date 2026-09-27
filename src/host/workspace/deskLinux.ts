@@ -6,6 +6,8 @@
 // Every process and file it touches arrives in `LinuxDeskDeps`, so the tests drive it on any OS;
 // `realLinuxDeskDeps` is the real one.
 import { promises as fs } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import type { DeskHandle } from '../../core/workspace/helpers'
 import { START_TIME_TOLERANCE_MS } from '../../core/workspace/lifecycle'
 import { DESK_CLOSE_MS, DESK_READY_MS, type DeskLaunched, type DeskShot, type DeskWindow } from '../../core/workspace/protocol'
@@ -48,6 +50,10 @@ export interface LinuxDeskDeps {
   spawn: SpawnDetached
   run: RunTool
   exists(p: string): Promise<boolean>
+  /** A fresh folder only this user may open (mode 0700), the desk's own XDG_RUNTIME_DIR. */
+  makeRuntimeDir(): Promise<string>
+  /** Removes a folder and what is in it; a folder already gone is no error. */
+  removeDir(p: string): Promise<void>
   /** A live pid's start time in epoch ms from /proc, or null when it is gone. */
   startTime(pid: number): Promise<number | null>
   killGroup(pid: number): Promise<void>
@@ -71,11 +77,18 @@ const stringEnv = (env: Record<string, string | undefined>): Record<string, stri
  *  selection and GTK could still pick Wayland, where libwayland falls back to `wayland-0`: the person's
  *  own screen. So the session type and GTK's backend say x11 too (preflight ruling F5). Any command can
  *  be launched, not only Electron, so Qt and SDL are pointed at X11 as well, and WAYLAND_SOCKET (an
- *  inherited compositor connection libwayland takes before anything else) goes with WAYLAND_DISPLAY. */
-export function displayEnv(env: Record<string, string | undefined>, display: number): Record<string, string> {
+ *  inherited compositor connection libwayland takes before anything else) goes with WAYLAND_DISPLAY.
+ *
+ *  The person's session bus and runtime folder go too (review I1). Over DBUS_SESSION_BUS_ADDRESS an app
+ *  on Xvfb could still open a portal file chooser, a notification or a tray icon on the person's
+ *  screen, and libdbus and GDBus fall back to `$XDG_RUNTIME_DIR/bus` without it. That folder also holds
+ *  `wayland-0` and the PipeWire and Pulse sockets. So XDG_RUNTIME_DIR is the desk's own empty folder. */
+export function displayEnv(env: Record<string, string | undefined>, display: number, runtimeDir: string): Record<string, string> {
   const out = stringEnv(env)
   delete out.WAYLAND_DISPLAY
   delete out.WAYLAND_SOCKET
+  delete out.DBUS_SESSION_BUS_ADDRESS
+  out.XDG_RUNTIME_DIR = runtimeDir
   out.DISPLAY = `:${display}`
   out.ELECTRON_OZONE_PLATFORM_HINT = 'x11'
   out.XDG_SESSION_TYPE = 'x11'
@@ -219,7 +232,17 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
       throw new Error(`Xvfb :${display} ended before its start time could be read`)
     }
     const startedAt = readAt
-    const env = displayEnv(d.hostEnv, display)
+    // Made after Xvfb is up, so a display that is taken or never ready leaves no folder behind. Its
+    // name is `astera-xrt-` and random under the temp folder: one a crash leaves is empty and harmless.
+    const runtimeDir = await d.makeRuntimeDir().catch((err: unknown) => {
+      proc.kill('SIGKILL')
+      taken.delete(display)
+      throw err
+    })
+    let removing: Promise<void> | null = null
+    const dropRuntimeDir = (): Promise<void> =>
+      (removing ??= d.removeDir(runtimeDir).catch((err: unknown) => d.log(`desktop ${name}: ${runtimeDir} could not be removed: ${messageOf(err)}`)))
+    const env = displayEnv(d.hostEnv, display, runtimeDir)
     const launched = new Map<number, number>()
     const exitCbs: Array<(why: string) => void> = []
     const st = { dead: null as string | null }
@@ -231,6 +254,8 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
       st.dead = why
       taken.delete(display)
       exitedResolve()
+      // An Xvfb that dies by itself gets no close: the manager only ends the recorded app.
+      void dropRuntimeDir()
       for (const cb of exitCbs) {
         try {
           cb(why)
@@ -305,8 +330,9 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
         live()
         // `wait` keeps sh, the group's leader, alive while anything the command put in the background
         // still runs, so the group always has a leader with a real start time to kill by (fix round 1).
-        // A newline, not `;`, so a command ending in a comment still reaches it.
-        const child = d.spawn('sh', ['-c', `${a.command}\nwait`], { env: displayEnv(a.env, display), cwd: a.cwd })
+        // A newline, not `;`, so a command ending in a comment still reaches it, and a blank line, so a
+        // command ending in a backslash continues onto the empty line, not onto `wait` (review M3).
+        const child = d.spawn('sh', ['-c', `${a.command}\n\nwait`], { env: displayEnv(a.env, display, runtimeDir), cwd: a.cwd })
         if (child.pid === undefined) throw new Error(`launch: sh could not start (${child.stderrTail() || 'no reason given'})`)
         const cpid = child.pid
         // From /proc, never the clock. A command gone already (it exited at once) is recorded with 0,
@@ -363,6 +389,7 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
           }
         }
         taken.delete(display)
+        await dropRuntimeDir()
       }
     }
   }
@@ -377,6 +404,13 @@ export function realLinuxDeskDeps(a: { hostEnv: Record<string, string | undefine
     spawn: spawnDetached,
     run: runTool,
     exists: (p) => fs.access(p).then(() => true, () => false),
+    makeRuntimeDir: async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-xrt-'))
+      // mkdtemp already makes it 0700; said again, since XDG requires exactly that.
+      await fs.chmod(dir, 0o700)
+      return dir
+    },
+    removeDir: (p) => fs.rm(p, { recursive: true, force: true }),
     startTime: async (pid) => (await linuxStartTimes([pid], procFs)).get(pid) ?? null,
     killGroup: (pid) => killGroup(pid),
     sleep: (ms, signal) =>

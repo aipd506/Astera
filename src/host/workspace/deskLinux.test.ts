@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest'
+import { promises as fs } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { NAMED_KEYS } from '../../core/workspace/helpers'
 import { DESK_CLOSE_MS, DESK_READY_MS, type DeskWindow } from '../../core/workspace/protocol'
 import { XDOTOOL_KEYS, createLinuxDesks, displayEnv, imageSize, parseGeometry, pickWindow, realLinuxDeskDeps, type LinuxDeskDeps } from './deskLinux'
@@ -56,12 +59,22 @@ const rig = (plan: Mode[] = []) => {
   const log: string[] = []
   const sleeps: Array<{ ms: number; signal?: AbortSignal }> = []
   const answers: Array<(file: string, args: string[]) => Buffer | Error | undefined> = []
+  /** Private runtime folders made and not yet removed, and every one ever made. */
+  const dirs = new Set<string>()
+  const made: string[] = []
   let clock = 1_000_000
   let nextPid = 700
   let xvfbs = 0
   const numberOf = (p: FakeProc): string => p.args[0].slice(1)
   const deps: LinuxDeskDeps = {
-    hostEnv: { PATH: '/usr/bin', HOME: '/home/me', DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0' },
+    hostEnv: {
+      PATH: '/usr/bin',
+      HOME: '/home/me',
+      DISPLAY: ':0',
+      WAYLAND_DISPLAY: 'wayland-0',
+      XDG_RUNTIME_DIR: '/run/user/1000',
+      DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus'
+    },
     spawn: (file, args, o) => {
       const cbs: Array<(why: string) => void> = []
       let ended: string | null = null
@@ -107,6 +120,15 @@ const rig = (plan: Mode[] = []) => {
       return Buffer.alloc(0)
     },
     exists: async (p) => files.has(p),
+    makeRuntimeDir: async () => {
+      const dir = `/tmp/astera-xrt-${made.length + 1}`
+      made.push(dir)
+      dirs.add(dir)
+      return dir
+    },
+    removeDir: async (p) => {
+      dirs.delete(p)
+    },
     startTime: async (pid) => starts.get(pid) ?? null,
     killGroup: async (pid) => {
       groupsKilled.push(pid)
@@ -133,7 +155,7 @@ const rig = (plan: Mode[] = []) => {
   const xdo = (fn: (args: string[]) => Buffer | Error | undefined): void => {
     answers.push((file, args) => (file === 'xdotool' ? fn(args) : undefined))
   }
-  return { deps, desks: createLinuxDesks(deps), files, procs, runs, starts, groupsKilled, log, sleeps, answers, xdo }
+  return { deps, desks: createLinuxDesks(deps), files, procs, runs, starts, groupsKilled, log, sleeps, answers, xdo, dirs, made }
 }
 
 /** Three windows: a Hangul titled one with a pid, one with no _NET_WM_PID, and one that closes
@@ -330,16 +352,25 @@ describe('the Linux desk: launch, kill and close', () => {
     const got = await desk.launch({
       command: 'npm run dev',
       cwd: '/home/me/proj',
-      env: { PATH: '/usr/bin', WAYLAND_DISPLAY: 'wayland-0', DISPLAY: ':0', ASTERA_APP_CDP_PORT: '9333' }
+      env: {
+        PATH: '/usr/bin',
+        WAYLAND_DISPLAY: 'wayland-0',
+        DISPLAY: ':0',
+        ASTERA_APP_CDP_PORT: '9333',
+        XDG_RUNTIME_DIR: '/run/user/1000',
+        DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus'
+      }
     })
     const app = r.procs[1]
     expect(app.file).toBe('sh')
-    expect(app.args).toEqual(['-c', 'npm run dev\nwait'])
+    // A blank line before `wait`, so a command ending in a backslash cannot join it (review M3).
+    expect(app.args).toEqual(['-c', 'npm run dev\n\nwait'])
     expect(app.cwd).toBe('/home/me/proj')
     expect(app.env).toEqual({
       PATH: '/usr/bin',
       DISPLAY: ':90',
       ASTERA_APP_CDP_PORT: '9333',
+      XDG_RUNTIME_DIR: '/tmp/astera-xrt-1',
       ELECTRON_OZONE_PLATFORM_HINT: 'x11',
       XDG_SESSION_TYPE: 'x11',
       GDK_BACKEND: 'x11',
@@ -447,9 +478,11 @@ describe('the Linux desk: windows, shots and keys', () => {
 describe('the Linux desk: pure parts', () => {
   it('points the env at the display and drops Wayland, so an app started from a Wayland desktop cannot reach its screen (ruling F5)', () => {
     const wayland = { WAYLAND_DISPLAY: 'w', WAYLAND_SOCKET: '5', XDG_SESSION_TYPE: 'wayland', GDK_BACKEND: 'wayland', QT_QPA_PLATFORM: 'wayland', SDL_VIDEODRIVER: 'wayland' }
-    expect(displayEnv({ A: '1', DISPLAY: ':0', GONE: undefined, ...wayland }, 93)).toEqual({
+    const person = { XDG_RUNTIME_DIR: '/run/user/1000', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus' }
+    expect(displayEnv({ A: '1', DISPLAY: ':0', GONE: undefined, ...wayland, ...person }, 93, '/tmp/astera-xrt-x')).toEqual({
       A: '1',
       DISPLAY: ':93',
+      XDG_RUNTIME_DIR: '/tmp/astera-xrt-x',
       ELECTRON_OZONE_PLATFORM_HINT: 'x11',
       XDG_SESSION_TYPE: 'x11',
       GDK_BACKEND: 'x11',
@@ -466,8 +499,8 @@ describe('the Linux desk: pure parts', () => {
     const desk = await r.desks.start('a')
     await desk.shot({ format: 'png' })
     expect(r.runs.length).toBeGreaterThan(0)
-    for (const x of r.runs) expect(x.env).toMatchObject({ DISPLAY: ':90', XDG_SESSION_TYPE: 'x11', GDK_BACKEND: 'x11' })
-    expect(r.runs.every((x) => !('WAYLAND_DISPLAY' in x.env))).toBe(true)
+    for (const x of r.runs) expect(x.env).toMatchObject({ DISPLAY: ':90', XDG_SESSION_TYPE: 'x11', GDK_BACKEND: 'x11', XDG_RUNTIME_DIR: '/tmp/astera-xrt-1' })
+    expect(r.runs.every((x) => !('WAYLAND_DISPLAY' in x.env) && !('DBUS_SESSION_BUS_ADDRESS' in x.env))).toBe(true)
   })
 
   it('reads geometry, and image sizes from PNG and JPEG headers', () => {
@@ -488,7 +521,80 @@ describe('the Linux desk: pure parts', () => {
   })
 })
 
+describe('the Linux desk: a private runtime folder (review I1)', () => {
+  it("gives each desk its own runtime folder and no session bus, so the person's portals, notifications, tray, Wayland and audio sockets are out of reach", async () => {
+    const r = rig()
+    const a = await r.desks.start('a')
+    const b = await r.desks.start('b')
+    await a.launch({ command: 'app', cwd: '/p', env: { XDG_RUNTIME_DIR: '/run/user/1000', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus' } })
+    await b.launch({ command: 'app', cwd: '/p', env: {} })
+    expect(r.made).toEqual(['/tmp/astera-xrt-1', '/tmp/astera-xrt-2'])
+    const [, , appA, appB] = r.procs
+    expect(appA.env.XDG_RUNTIME_DIR).toBe('/tmp/astera-xrt-1')
+    expect(appB.env.XDG_RUNTIME_DIR).toBe('/tmp/astera-xrt-2')
+    expect('DBUS_SESSION_BUS_ADDRESS' in appA.env).toBe(false)
+    // Xvfb itself keeps the Host's own env: it opens no bus and needs none of this.
+    expect(r.procs[0].env.XDG_RUNTIME_DIR).toBe('/run/user/1000')
+  })
+
+  it('removes the folder on close', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    expect([...r.dirs]).toEqual(['/tmp/astera-xrt-1'])
+    await desk.close()
+    expect(r.dirs.size).toBe(0)
+  })
+
+  it('removes the folder when Xvfb dies by itself, since no close may follow', async () => {
+    const r = rig()
+    await r.desks.start('a')
+    r.procs[0].exit('exited SIGKILL')
+    await Promise.resolve()
+    expect(r.dirs.size).toBe(0)
+  })
+
+  it('ends that Xvfb, frees the number, and fails when the folder cannot be made', async () => {
+    const r = rig()
+    const real = r.deps.makeRuntimeDir
+    r.deps.makeRuntimeDir = async () => {
+      throw new Error('ENOSPC: no space left on device')
+    }
+    await expect(r.desks.start('a')).rejects.toThrow('ENOSPC')
+    expect(r.procs[0].signals).toEqual(['SIGKILL'])
+    r.deps.makeRuntimeDir = real
+    await r.desks.start('b')
+    expect(r.procs[1].args[0]).toBe(':90')
+  })
+
+  it('still closes, and logs, when the folder cannot be removed', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    r.deps.removeDir = async () => {
+      throw new Error('EBUSY')
+    }
+    await expect(desk.close()).resolves.toBeUndefined()
+    expect(r.procs[0].signals).toEqual(['SIGTERM'])
+    expect(r.log.some((l) => l.includes('/tmp/astera-xrt-1') && l.includes('EBUSY'))).toBe(true)
+  })
+})
+
 describe('the Linux desk: real deps', () => {
+  it('makes a real runtime folder only its owner may open, under the temp folder, and removes it', async () => {
+    const d = realLinuxDeskDeps({ hostEnv: {}, log: () => {} })
+    const dir = await d.makeRuntimeDir()
+    try {
+      expect(path.basename(dir).startsWith('astera-xrt-')).toBe(true)
+      expect(path.dirname(dir)).toBe(path.resolve(os.tmpdir()))
+      const st = await fs.stat(dir)
+      expect(st.isDirectory()).toBe(true)
+      if (process.platform !== 'win32') expect(st.mode & 0o777).toBe(0o700)
+    } finally {
+      await d.removeDir(dir)
+    }
+    await expect(fs.stat(dir)).rejects.toThrow()
+    await expect(d.removeDir(dir)).resolves.toBeUndefined()
+  })
+
   it('ends a real sleep, and clears its timer, when its signal aborts', async () => {
     const d = realLinuxDeskDeps({ hostEnv: {}, log: () => {} })
     const stop = new AbortController()
