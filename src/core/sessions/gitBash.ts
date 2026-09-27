@@ -123,6 +123,9 @@ async function searchGitBash(
 export interface GitBashResolver {
   /** The Git Bash for this env, probed at most once per PATH string while the cache holds it. */
   resolve(env: Record<string, string | undefined>): Promise<string | null>
+  /** `resolve` with whether a timeout went into the answer: a null found that way may be a Git Bash
+   *  the lookup could not reach in time, which a spawn without one has to say in its log. */
+  search(env: Record<string, string | undefined>): Promise<GitBashSearch>
   /** What `resolve` last found for this env's PATH string, if it is still fresh; undefined otherwise. */
   peek(env: Record<string, string | undefined>): string | null | undefined
 }
@@ -141,11 +144,13 @@ export function createGitBashResolver(
   cache: PathKeyedCache<GitBashSearch> = new PathKeyedCache()
 ): GitBashResolver {
   const ttlOf = (r: GitBashSearch): number => (r.timedOut ? PROBE_DEGRADED_TTL_MS : PROBE_CACHE_TTL_MS)
+  const search = (env: Record<string, string | undefined>): Promise<GitBashSearch> =>
+    env.CLAUDE_CODE_GIT_BASH_PATH
+      ? Promise.resolve({ bash: null, timedOut: false })
+      : cache.get(pathValueOf(env), 'gitBash', () => searchGitBash(env, probe), ttlOf)
   return {
-    resolve: async (env) =>
-      env.CLAUDE_CODE_GIT_BASH_PATH
-        ? null
-        : (await cache.get(pathValueOf(env), 'gitBash', () => searchGitBash(env, probe), ttlOf)).bash,
+    resolve: async (env) => (await search(env)).bash,
+    search,
     peek: (env) => (env.CLAUDE_CODE_GIT_BASH_PATH ? null : cache.peek(pathValueOf(env), 'gitBash')?.bash)
   }
 }

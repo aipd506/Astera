@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createProbePool, createProber, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
+import { createProbePool, createProber, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
 import { createPresenceCheck, PresenceCache, type CheckResult, type Presence } from './presence'
 
 const enoent = (): Error => Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
@@ -159,6 +159,49 @@ describe('createPresenceCheck — POSIX parents', () => {
   it('a folder removed from a parent that answers is missing', async () => {
     const check = createPresenceCheck({ access: only('/home', '/home/u', '/home/u/wts'), pool: createProbePool(), log: () => {} })
     expect(await check('/home/u/wts/a')).toBe('missing')
+  })
+})
+
+describe('the worktree slot is outside the PATH cap', () => {
+  // I1: a stuck worktree check used to hold one of the PATH pool's two slots. One dead PATH root then
+  // filled the cap, and the Git Bash install probe on C: was refused, so a session spawned without Git
+  // Bash. The default check has its own slot now.
+  it('a stuck worktree check plus one dead PATH root still leaves a PATH probe on a live drive answered', async () => {
+    vi.useFakeTimers()
+    const check = createPresenceCheck({ access: () => new Promise<void>(() => {}), log: () => {} })
+    void check('\\\\nas1\\s\\wt\\a')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    // The process-wide PATH pool: the prober below uses it by default, as defaultProbe does.
+    const deadPath = createProber({ access: () => new Promise<void>(() => {}), log: () => {} })
+    void deadPath('Z:\\tools\\bash.exe')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    const live = createProber({ access: async () => {}, log: () => {} })
+    const answer = live('C:\\Program Files\\Git\\bin\\bash.exe')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await answer).toBe('present')
+    // Let the stuck calls go, so nothing is left counting in the shared pool.
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+})
+
+describe('an injected access that throws synchronously', () => {
+  // m2: the worktree slot must be released even then, or every later check waits forever.
+  it('releases the worktree slot, so the next check still answers', async () => {
+    let first = true
+    const check = createPresenceCheck({
+      access: (p) => {
+        if (first) {
+          first = false
+          throw Object.assign(new Error('EPERM'), { code: 'EPERM' })
+        }
+        return p ? Promise.resolve() : Promise.reject(new Error('no'))
+      },
+      pool: createProbePool(),
+      log: () => {}
+    })
+    expect(await check('C:\\wt\\a')).toBe('unreachable')
+    const next = await Promise.race([check('C:\\wt\\b'), new Promise((r) => setTimeout(() => r('hung'), 500))])
+    expect(next).toBe('present')
   })
 })
 

@@ -1210,6 +1210,27 @@ describe('SessionManager.prepare — the spawn path never waits on a sync probe'
     expect(log).not.toHaveBeenCalled()
   })
 
+  // Without Git Bash the session's statusLine capture never runs for its whole life, so the app never
+  // learns its usage. When a timeout is why, the owner's log (sessions.log, host.log) must say so,
+  // once per such spawn.
+  it('a spawn that gets no Git Bash because the lookup timed out says so once in the log', async () => {
+    const gitBash = createGitBashResolver(async (p) => (p.startsWith('C:\\Program Files') ? 'timeout' : 'absent'))
+    const { manager, spawned, log } = withChecks({ gitBash, platform: 'win32' })
+    await manager.prepare({ account, cwd: 'C:\\w' })
+    manager.spawn({ account, cwd: 'C:\\w' })
+    expect(spawned[0].opts.env.CLAUDE_CODE_GIT_BASH_PATH).toBeUndefined()
+    const lines = log.mock.calls.map((c) => String(c[0])).filter((m) => /Git Bash/.test(m))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/timed out/)
+  })
+
+  it('a spawn with no Git Bash on a clean lookup (nothing timed out) logs nothing', async () => {
+    const { manager, log } = withChecks({ gitBash: createGitBashResolver(async () => 'absent'), platform: 'win32' })
+    await manager.prepare({ account, cwd: 'C:\\w' })
+    manager.spawn({ account, cwd: 'C:\\w' })
+    expect(log).not.toHaveBeenCalled()
+  })
+
   it('a spawn nobody prepared falls back to the sync checks and says so in the log', () => {
     const { manager, syncExists, log } = withChecks({ platform: 'win32' })
     manager.spawn({ account, cwd: 'C:\\unprepared' })

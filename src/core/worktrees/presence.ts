@@ -8,17 +8,20 @@
 // user the entry.
 //
 // So there are two pieces:
-// - **createPresenceCheck** asks through pathProbe's pool (its thread cap, per-root rule and
-//   timeout). It answers `missing` only when the folder is confirmed gone: ENOENT on the folder while
+// - **createPresenceCheck** asks through a pathProbe pool of its own (the per-root rule, the timeout
+//   and the stuck-call ceiling), **outside the PATH cap**: a stuck worktree call holds its own slot,
+//   never one of the two PATH slots. Otherwise one stuck worktree share plus one dead PATH root filled
+//   the PATH cap, the Git Bash probes on C: were refused, and a session spawned without Git Bash.
+//   The thread budget is 2 PATH + 1 worktree + the session folder's probe. It answers `missing` only when the folder is confirmed gone: ENOENT on the folder while
 //   something that proves the volume is there answers. On Windows that is the drive or share root
 //   (rootOf). On POSIX it is the folder's parent — rootOf there is only the first two segments, and
 //   `/media/u` answers while the USB drive mounted below it is unplugged, as does an empty `nofail`
 //   mountpoint. The price: a worktree whose parent was deleted too shows as `unreachable`, not
 //   `missing`. A timeout or any other error answers `unreachable`.
 //
-//   `refused` means no call was made: the pool refused it (its cap is full of stuck calls), or this
-//   check's own rules did. A caller keeps what it knew. The rules, so dead shares cannot fill the
-//   PATH cap that pathProbe keeps for PATH lookups:
+//   `refused` means no call was made: the pool refused it (an injected pool whose cap is full of stuck
+//   calls), or this check's own rules did. A caller keeps what it knew. The rules, so dead shares hold
+//   at most one thread:
 //   - **At most one worktree call exists at once, stuck ones included** (PRESENCE_CONCURRENCY). A
 //     second check waits for a live call; while the call is stuck, every other check is refused. The
 //     stuck call is let go at PROBE_STUCK_CEILING_MS, as the pool does.
@@ -30,7 +33,7 @@
 //   changes nothing.
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { createProber, PROBE_STUCK_CEILING_MS, rootOf, type ProbePool } from '../sessions/pathProbe'
+import { createProbePool, createProber, PROBE_STUCK_CEILING_MS, rootOf, type ProbePool } from '../sessions/pathProbe'
 
 /** `missing` is the only answer that may make a caller forget a worktree. */
 export type Presence = 'present' | 'missing' | 'unreachable'
@@ -45,7 +48,7 @@ export type PresenceCheck = (p: string) => Promise<CheckResult>
 export const PRESENCE_SWEEP_MS = 60_000
 /** A path nobody has read for this long, and that the sweep was not given, is dropped. */
 export const PRESENCE_EVICT_MS = 10 * 60_000
-/** How many worktree calls may exist at once, stuck ones included — one of the pool's PATH slots. */
+/** How many worktree calls may exist at once, stuck ones included — a slot of their own, outside the PATH cap. */
 export const PRESENCE_CONCURRENCY = 1
 /** How long a root whose call timed out is left alone before it is probed again. */
 export const PRESENCE_RETRY_MS = 5 * 60_000
@@ -54,7 +57,7 @@ export interface PresenceCheckDeps {
   /** Resolves when the path exists, rejects with an errno error otherwise. Defaults to fs.promises.access. */
   access?: (p: string) => Promise<void>
   timeoutMs?: number
-  /** Defaults to pathProbe's process-wide pool, so these calls share its thread cap. */
+  /** Defaults to a pool of this check's own, outside pathProbe's PATH cap (tests inject a shared one). */
   pool?: ProbePool
   log?: (m: string) => void
   now?: () => number
@@ -100,17 +103,23 @@ export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
     access: (p) => {
       const h = holder
       if (h) h.called = true
-      return access(p).then(
-        () => h?.letGo(),
-        (e: unknown) => {
-          if (h) h.code = (e as NodeJS.ErrnoException | null)?.code
-          h?.letGo()
-          throw e
-        }
-      )
+      // Through a promise, so an access that throws synchronously still reaches letGo below and the
+      // worktree slot is released; otherwise every later check would wait on it forever.
+      return Promise.resolve()
+        .then(() => access(p))
+        .then(
+          () => h?.letGo(),
+          (e: unknown) => {
+            if (h) h.code = (e as NodeJS.ErrnoException | null)?.code
+            h?.letGo()
+            throw e
+          }
+        )
     },
     timeoutMs: d.timeoutMs,
-    pool: d.pool,
+    // Its own pool, not the PATH pool: a stuck worktree call must never take one of the two PATH slots
+    // (see the header). The holder above already keeps this pool to one call.
+    pool: d.pool ?? createProbePool(PRESENCE_CONCURRENCY),
     log: d.log
   })
   const attempt = async (p: string): Promise<Attempt> => {
@@ -181,7 +190,7 @@ export function createPresenceCheck(d: PresenceCheckDeps = {}): PresenceCheck {
 }
 
 let defaultCheck: PresenceCheck | null = null
-/** The process-wide check: fs.promises.access through pathProbe's shared pool and probe log. */
+/** The process-wide check: fs.promises.access through its own one-slot pool, and the probe log. */
 export function defaultPresenceCheck(p: string): Promise<CheckResult> {
   defaultCheck ??= createPresenceCheck()
   return defaultCheck(p)

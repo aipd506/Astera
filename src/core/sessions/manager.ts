@@ -145,7 +145,7 @@ export class SessionManager {
   /** The Git Bash `prepare` found, per PATH string, and when — held here, not read back from the
    *  resolver's cache, so an entry that expires between a prepare and its spawn cannot send the spawn
    *  to the sync search. Trusted as long as a confirmed folder is. */
-  private preparedGitBash = new Map<string, { bash: string | null; at: number }>()
+  private preparedGitBash = new Map<string, { bash: string | null; timedOut: boolean; at: number }>()
 
   /**
    * Everything `spawn` would look for on disk, looked for without blocking: the folder, and on win32
@@ -163,10 +163,10 @@ export class SessionManager {
     }
     if (this.checks.platform === 'win32') {
       const env = this.envFor(opts.account)
-      const bash = await this.checks.gitBash.resolve(env)
+      const { bash, timedOut } = await this.checks.gitBash.search(env)
       const now = this.checks.now()
       for (const [k, v] of this.preparedGitBash) if (now - v.at >= CWD_CONFIRMED_MS) this.preparedGitBash.delete(k)
-      this.preparedGitBash.set(pathValueOf(env), { bash, at: now })
+      this.preparedGitBash.set(pathValueOf(env), { bash, timedOut, at: now })
     }
   }
 
@@ -267,8 +267,16 @@ export class SessionManager {
     if (this.checks.platform === 'win32' && !env.CLAUDE_CODE_GIT_BASH_PATH) {
       const prepared = this.preparedGitBash.get(pathValueOf(env))
       let gitBash: string | null
-      if (prepared && this.checks.now() - prepared.at < CWD_CONFIRMED_MS) gitBash = prepared.bash
-      else {
+      if (prepared && this.checks.now() - prepared.at < CWD_CONFIRMED_MS) {
+        gitBash = prepared.bash
+        // Nothing tells the person otherwise: without Git Bash this session's statusLine capture never
+        // runs, for its whole life. When a timeout is why (a dead PATH drive, a full probe pool), the
+        // owner's log (sessions.log, host.log) says so, once for this spawn.
+        if (gitBash === null && prepared.timedOut)
+          this.checks.log(
+            `session ${id} spawned without Git Bash: the lookup timed out (an offline PATH drive?), so its statusLine capture and usage will not run`
+          )
+      } else {
         this.checks.log('session spawn without prepare: searching for Git Bash synchronously, which can freeze this thread on an offline PATH drive')
         gitBash = findGitBash(env, this.checks.syncExists)
       }
