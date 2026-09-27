@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { promises as fs, existsSync } from 'node:fs'
 import path from 'node:path'
-import { createWorktree } from './create'
+import { createWorktree, rollbackAdd } from './create'
 import type { WorktreeCreateProgress } from '../types'
 import { WorktreeRegistry } from './registry'
 import { git, localBranchExists } from './git'
@@ -381,5 +381,90 @@ describe('createWorktree — 되돌리기가 끝나지 못할 때', () => {
       remains: ['branch']
     })
     expect(err?.message).toContain('DISK_FULL')
+  })
+})
+
+// 리뷰 2 차: 답하지 않은 worktree add 도 되돌리고, 되돌리기는 이 호출이 만든 것만 건드린다.
+describe('createWorktree — worktree add 가 실패할 때', () => {
+  const wtDir = (name: string): string => path.join(root, path.basename(repo), name)
+  const sleepHook = async (secs: number): Promise<void> => {
+    const hook = path.join(repo, '.git', 'hooks', 'post-checkout')
+    await fs.writeFile(hook, `#!/bin/sh\nsleep ${secs}\n`, 'utf8')
+    await fs.chmod(hook, 0o755)
+  }
+
+  it('시간 제한에 걸려 git 이 답하지 않았으면 반쯤 만든 워크트리·폴더·브랜치를 되돌린다', async () => {
+    await sleepHook(30)
+    const started = Date.now()
+    await expect(
+      createWorktree({ repoPath: repo, name: 'slowadd', registry: reg, addTimeoutMs: 1500 })
+    ).rejects.toThrow(/GIT_ADD_FAILED/)
+    expect(Date.now() - started).toBeLessThan(15_000)
+    expect(existsSync(wtDir('slowadd'))).toBe(false)
+    expect(await localBranchExists(repo, 'Test-User/slowadd')).toBe(false)
+    expect(gitIn(repo, ['worktree', 'list', '--porcelain'])).not.toContain('slowadd')
+    expect(reg.list()).toEqual([])
+    // 이름이 타 버리지 않았다: 같은 이름으로 다시 만들 수 있다
+    await fs.rm(path.join(repo, '.git', 'hooks', 'post-checkout'))
+    const again = await createWorktree({ repoPath: repo, name: 'slowadd', registry: reg })
+    expect(again.info.name).toBe('slowadd')
+  }, 40_000)
+
+  it('git 이 오류로 답했으면(이미 있는 폴더) 되돌리지 않는다 — 그 사이 나타난 폴더는 지우지 않는다', async () => {
+    const theirs = wtDir('appeared')
+    await fs.mkdir(theirs, { recursive: true })
+    await fs.writeFile(path.join(theirs, 'mine.txt'), 'keep', 'utf8')
+    await expect(
+      createWorktree({ repoPath: repo, name: 'appeared', registry: reg, presence: async () => 'missing' })
+    ).rejects.toThrow(/GIT_ADD_FAILED/)
+    expect(await fs.readFile(path.join(theirs, 'mine.txt'), 'utf8')).toBe('keep')
+  })
+
+  it('같은 이름을 동시에 만들어도 서로 다른 이름을 받고, 한쪽의 취소가 다른 쪽을 지우지 않는다', async () => {
+    await sleepHook(3)
+    const ac = new AbortController()
+    const a = createWorktree({
+      repoPath: repo, name: 'dup', registry: reg, signal: ac.signal,
+      onProgress: (p) => { if (p.stage === 'checkout') setTimeout(() => ac.abort(), 700) }
+    }).then(() => 'made', (e: Error) => e.message)
+    const b = createWorktree({ repoPath: repo, name: 'dup', registry: reg })
+    const [aResult, bResult] = await Promise.all([a, b])
+    expect(aResult).toMatch(/WORKTREE_CANCELLED/)
+    expect(existsSync(bResult.info.path)).toBe(true)
+    expect(await localBranchExists(repo, bResult.info.branch)).toBe(true)
+    expect(reg.list().map((w) => w.id)).toEqual([bResult.info.id])
+    expect(gitIn(repo, ['worktree', 'list', '--porcelain'])).toContain(bResult.info.branch)
+  }, 40_000)
+})
+
+describe('rollbackAdd — 이 호출이 만든 것만', () => {
+  it('git 이 모르는 폴더에 내용이 있으면 지우지 않고 남았다고 알린다', async () => {
+    const theirs = path.join(root, 'someone')
+    await fs.mkdir(theirs, { recursive: true })
+    await fs.writeFile(path.join(theirs, 'a.txt'), 'a', 'utf8')
+    const remains = await rollbackAdd(repo, theirs, 'Test-User/none')
+    expect(remains).toContain('folder')
+    expect(await fs.readFile(path.join(theirs, 'a.txt'), 'utf8')).toBe('a')
+  })
+
+  it('그 경로의 워크트리가 다른 브랜치면 지우지 않는다', async () => {
+    const other = path.join(root, 'other-wt')
+    gitIn(repo, ['worktree', 'add', '-b', 'someone/else', other, 'main'])
+    const remains = await rollbackAdd(repo, other, 'Test-User/mine')
+    expect(remains).toContain('git-worktree')
+    expect(existsSync(path.join(other, 'f.txt'))).toBe(true)
+    expect(await localBranchExists(repo, 'someone/else')).toBe(true)
+  })
+
+  it('이 브랜치의 워크트리는 지우고, 빈 폴더만 남은 자리도 치운다', async () => {
+    const mine = path.join(root, 'mine-wt')
+    gitIn(repo, ['worktree', 'add', '-b', 'Test-User/mine', mine, 'main'])
+    expect(await rollbackAdd(repo, mine, 'Test-User/mine')).toEqual([])
+    expect(existsSync(mine)).toBe(false)
+    expect(await localBranchExists(repo, 'Test-User/mine')).toBe(false)
+    const empty = path.join(root, 'empty-left')
+    await fs.mkdir(empty)
+    expect(await rollbackAdd(repo, empty, 'Test-User/none')).toEqual([])
+    expect(existsSync(empty)).toBe(false)
   })
 })

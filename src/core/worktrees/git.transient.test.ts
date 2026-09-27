@@ -88,11 +88,32 @@ describe('git adapter, output limit', () => {
     expect(optsOf(mocked.mock.calls[0]).maxBuffer).toBe(GIT_MAX_BUFFER_BYTES)
   })
 
-  it('the write timeout is ten minutes and is passed through as given', async () => {
-    succeed()
-    await git(['merge', '--no-edit', 'x'], { timeoutMs: GIT_WRITE_TIMEOUT_MS })
-    expect(GIT_WRITE_TIMEOUT_MS).toBe(10 * 60 * 1000)
-    expect(optsOf(mocked.mock.calls[0]).timeout).toBe(GIT_WRITE_TIMEOUT_MS)
+  // The adapter keeps the deadline itself (not execFile's `timeout`): at the deadline it kills the
+  // process tree and answers as soon as git exits, instead of killing git alone and waiting for pipes a
+  // hook or helper still holds.
+  it('the write timeout is ten minutes and is kept as given — the call ends exactly at it', async () => {
+    vi.useFakeTimers()
+    try {
+      const child = Object.assign(new (await import('node:events')).EventEmitter(), {
+        pid: 4242, exitCode: null as number | null, signalCode: null, kill: vi.fn(() => true)
+      })
+      mocked.mockImplementationOnce(() => child) // git: never answers on its own
+      mocked.mockImplementationOnce(() => { setTimeout(() => child.emit('exit', 1), 10); return {} }) // taskkill, on win32
+      let done: unknown = null
+      void git(['merge', '--no-edit', 'x'], { timeoutMs: GIT_WRITE_TIMEOUT_MS }).then((r) => (done = r))
+      expect(GIT_WRITE_TIMEOUT_MS).toBe(10 * 60 * 1000)
+      expect(optsOf(mocked.mock.calls[0]).timeout).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(GIT_WRITE_TIMEOUT_MS - 1)
+      expect(done).toBeNull()
+      expect(child.kill).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(child.kill).toHaveBeenCalled()
+      if (process.platform !== 'win32') child.emit('exit', null)
+      await vi.advanceTimersByTimeAsync(20)
+      expect(done).toEqual({ ok: false, stdout: '', stderr: 'timed out', timedOut: true })
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

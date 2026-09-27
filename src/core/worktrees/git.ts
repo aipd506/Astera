@@ -14,6 +14,8 @@ export interface GitResult {
   exitCode?: number
   /** Set only when the call was stopped by its AbortSignal (see git's `signal`). */
   cancelled?: true
+  /** Set only when git ran past its deadline and was killed (no exitCode then: git did not answer). */
+  timedOut?: true
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -74,14 +76,19 @@ function killGitTree(child: ChildProcess): void {
  *  `signal`: aborting it kills git (its whole process tree on Windows) and answers ok=false with
  *  `cancelled` set, as soon as git itself has exited — not when its output pipes close, which a
  *  grandchild still holding them can put off for as long as it lives. An already-aborted signal starts
- *  nothing. Callers that pass no signal see no change. */
+ *  nothing. Callers that pass no signal see no change.
+ *
+ *  The deadline (`timeoutMs`) ends a call the same way — tree killed, answered at git's exit — with
+ *  `timedOut` set and no exitCode. Node's own execFile timeout killed git alone and then waited for
+ *  the pipes, so a hook or helper git had started kept both the process and the caller alive. */
 export function git(
   args: string[],
   opts?: { cwd?: string; timeoutMs?: number; trim?: boolean; signal?: AbortSignal }
 ): Promise<GitResult> {
   const signal = opts?.signal
   const cancelledResult = (): GitResult => ({ ok: false, stdout: '', stderr: 'cancelled', cancelled: true })
-  const once = (): Promise<{ err: unknown; stdout: string; stderr: string; cancelled?: true }> =>
+  type Raw = { err: unknown; stdout: string; stderr: string; cancelled?: true; timedOut?: true }
+  const once = (): Promise<Raw> =>
     new Promise((resolve) => {
       if (signal?.aborted) {
         resolve({ err: new Error('cancelled'), stdout: '', stderr: '', cancelled: true })
@@ -89,45 +96,55 @@ export function git(
       }
       let child: ChildProcess | null = null
       let settled = false
-      const onAbort = (): void => {
+      let deadline: ReturnType<typeof setTimeout> | null = null
+      /** Cancel and timeout end a call the same way: the tree is killed and the answer goes out once
+       *  git itself has exited (or after ABORT_EXIT_WAIT_MS), not when its pipes close. */
+      const stop = (why: 'cancelled' | 'timedOut'): void => {
         if (settled || !child) return
         const c = child
+        if (deadline) clearTimeout(deadline)
+        signal?.removeEventListener('abort', onAbort)
         killGitTree(c)
         const finish = (): void => {
           if (settled) return
           settled = true
           clearTimeout(timer)
-          resolve({ err: new Error('cancelled'), stdout: '', stderr: '', cancelled: true })
+          resolve(
+            why === 'cancelled'
+              ? { err: new Error('cancelled'), stdout: '', stderr: '', cancelled: true }
+              : { err: new Error('timed out'), stdout: '', stderr: 'timed out', timedOut: true }
+          )
         }
         const timer = setTimeout(finish, ABORT_EXIT_WAIT_MS)
         if (c.exitCode !== null || c.signalCode !== null) finish()
         else c.once('exit', finish)
       }
+      const onAbort = (): void => stop('cancelled')
       try {
         child = execFile(
           'git',
           args,
-          {
-            cwd: opts?.cwd,
-            timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-            windowsHide: true,
-            maxBuffer: GIT_MAX_BUFFER_BYTES
-          },
+          { cwd: opts?.cwd, windowsHide: true, maxBuffer: GIT_MAX_BUFFER_BYTES },
           (err, stdout, stderr) => {
             signal?.removeEventListener('abort', onAbort)
+            if (deadline) clearTimeout(deadline)
             if (settled) return
             settled = true
             resolve({ err, stdout: stdout ?? '', stderr: stderr ?? '' })
           }
         )
-        signal?.addEventListener('abort', onAbort, { once: true })
+        if (!settled) {
+          signal?.addEventListener('abort', onAbort, { once: true })
+          deadline = setTimeout(() => stop('timedOut'), opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+        }
       } catch (err) {
         settled = true
         resolve({ err, stdout: '', stderr: err instanceof Error ? err.message : String(err) })
       }
     })
-  const shape = (r: { err: unknown; stdout: string; stderr: string; cancelled?: true }): GitResult => {
+  const shape = (r: Raw): GitResult => {
     if (r.cancelled) return cancelledResult()
+    if (r.timedOut) return { ok: false, stdout: '', stderr: 'timed out', timedOut: true }
     const out: GitResult = {
       ok: !r.err,
       stdout: opts?.trim === false ? r.stdout : r.stdout.trim(),
@@ -138,7 +155,7 @@ export function git(
     return out
   }
   return once().then(async (first) => {
-    if (first.cancelled || !isTransientSpawnFailure(first.err)) return shape(first)
+    if (first.cancelled || first.timedOut || !isTransientSpawnFailure(first.err)) return shape(first)
     await new Promise((r) => setTimeout(r, RETRY_DELAY_MS))
     return shape(await once())
   })

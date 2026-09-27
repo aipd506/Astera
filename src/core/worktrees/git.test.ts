@@ -282,3 +282,17 @@ describe('git 어댑터 — 중단', () => {
     expect(r.cancelled).toBeUndefined()
   })
 })
+
+// 시간 제한도 중단과 같게: git 을(Windows 에서는 나무째) 죽이고, 자식이 파이프를 쥐고 있어도
+// git 이 끝나는 대로 답한다. 예전에는 git.exe 하나만 죽이고 파이프가 닫히기를 — 자식이 끝나기를 —
+// 기다렸다.
+describe('git 어댑터 — 시간 제한', () => {
+  it('시간이 지나면 git 과 그 자식을 죽이고 곧바로 timedOut 으로 답한다 — exitCode 는 없다', async () => {
+    const started = Date.now()
+    const r = await git(['-c', 'alias.slow=!sleep 30', 'slow'], { cwd: repo, timeoutMs: 500 })
+    expect(r.ok).toBe(false)
+    expect(r.timedOut).toBe(true)
+    expect(r.exitCode).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(8_000)
+  }, 40_000)
+})

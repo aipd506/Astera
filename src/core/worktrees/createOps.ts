@@ -5,9 +5,10 @@ import { throttleProgress } from './progress'
  *  tested without electron; main hands it createWorktree and a `send` to the renderer.
  *
  *  A call with an opId gets a progress callback (throttled — see progress.ts — and tagged with the id)
- *  and an AbortSignal that cancel(opId) trips. On success a last `progress: null` says the worktree is
- *  made and cancelling is over; on failure nothing more is sent (the rejection says it). A call with
- *  no opId gets neither, exactly as before. */
+ *  and an AbortSignal that cancel(opId) trips. On success the held last numbers are sent, then a last
+ *  `progress: null` says the worktree is made and cancelling is over; on failure nothing more is sent
+ *  (the rejection says it). A call with no opId gets neither, exactly as before. An id already running
+ *  is refused with DUPLICATE_OPERATION rather than started uncancellable. */
 export function createWorktreeOps<A extends object, R>(deps: {
   create: (args: A & { onProgress?: (p: WorktreeCreateProgress) => void; signal?: AbortSignal }) => Promise<R>
   send: (ev: WorktreeCreateEvent) => void
@@ -18,12 +19,15 @@ export function createWorktreeOps<A extends object, R>(deps: {
   const running = new Map<string, AbortController>()
   return {
     async create(args, opId) {
-      if (typeof opId !== 'string' || opId === '' || running.has(opId)) return deps.create(args)
+      if (typeof opId !== 'string' || opId === '') return deps.create(args)
+      // A second call under a live id would have no signal of its own that cancel could reach
+      if (running.has(opId)) throw new Error(`DUPLICATE_OPERATION: a worktree creation with id ${opId} is already running`)
       const ac = new AbortController()
       running.set(opId, ac)
       const throttle = throttleProgress((progress) => deps.send({ opId, progress }))
       try {
         const r = await deps.create({ ...args, signal: ac.signal, onProgress: (p) => throttle.push(p) })
+        throttle.flush() // the last numbers held in the window go before "done"
         throttle.dispose()
         try {
           deps.send({ opId, progress: null })

@@ -85,3 +85,44 @@ describe('createWorktreeOps', () => {
     expect(sent).toEqual([{ opId: 'op3', progress: { stage: 'copy-includes', filesCopied: 1, filesTotal: 2 } }])
   })
 })
+
+describe('createWorktreeOps — 리뷰 2 차', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('끝나기 직전에 붙잡힌 마지막 숫자를 progress: null 보다 먼저 보낸다', async () => {
+    const sent: WorktreeCreateEvent[] = []
+    const ops = createWorktreeOps({
+      create: async (a: Args) => {
+        a.onProgress?.({ stage: 'copy-includes', filesCopied: 1, filesTotal: 2 })
+        a.onProgress?.({ stage: 'copy-includes', filesCopied: 2, filesTotal: 2 }) // 창 안 — 붙잡힌다
+        return 'ok'
+      },
+      send: (ev) => sent.push(ev)
+    })
+    await ops.create({}, 'op4')
+    expect(sent).toEqual([
+      { opId: 'op4', progress: { stage: 'copy-includes', filesCopied: 1, filesTotal: 2 } },
+      { opId: 'op4', progress: { stage: 'copy-includes', filesCopied: 2, filesTotal: 2 } },
+      { opId: 'op4', progress: null }
+    ])
+  })
+
+  it('아직 도는 opId 를 다시 쓰면 조용히 취소할 수 없는 호출로 만들지 않고 분명히 거절한다', async () => {
+    let finish: () => void = () => {}
+    const made: string[] = []
+    const ops = createWorktreeOps({
+      create: (a: Args & { tag?: string }) =>
+        new Promise<string>((resolve) => {
+          made.push(a.tag ?? '')
+          finish = () => resolve('ok')
+        }),
+      send: () => {}
+    })
+    const first = ops.create({ tag: 'first' }, 'same')
+    await expect(ops.create({ tag: 'second' }, 'same')).rejects.toThrow(/DUPLICATE_OPERATION/)
+    expect(made).toEqual(['first'])
+    finish()
+    expect(await first).toBe('ok')
+  })
+})
