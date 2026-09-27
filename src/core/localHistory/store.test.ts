@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import type { TestContext } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
@@ -709,5 +709,59 @@ describe('LocalHistoryStore.discard', () => {
     expect(store.list(projDir).length).toBe(1) // 기존 항목은 그대로
     const after = await fs.readFile(path.join(historyDir, 'index.json'), 'utf8')
     expect(after).toBe(before) // save()조차 부르지 않았어야 한다
+  })
+})
+
+// Stage 4 T1: the snapshot's walk and copy, and the restore's copy, run outside the probe budget. The
+// project folder is asked once through it first; one that does not answer is refused before any call.
+describe('LocalHistoryStore — the project folder is asked through the probe budget first', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('snapshot refuses a target that did not answer, and copies nothing', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-lh-gate-'))
+    try {
+      const target = path.join(root, 'proj', 'a.txt')
+      await fs.mkdir(path.dirname(target), { recursive: true })
+      await fs.writeFile(target, 'a')
+      const asked: string[] = []
+      const store = new LocalHistoryStore(path.join(root, 'local-history'), process.platform, {
+        gate: async (p) => {
+          asked.push(p)
+          return 'timeout'
+        }
+      })
+      const cp = vi.spyOn(fs, 'cp')
+      await expect(store.snapshot(path.join(root, 'proj'), target, false)).rejects.toThrow(/ROOT_UNREACHABLE/)
+      expect(asked).toEqual([target])
+      expect(cp).not.toHaveBeenCalled()
+    } finally {
+      vi.restoreAllMocks()
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('restore refuses a destination that did not answer, and writes nothing', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-lh-gate-restore-'))
+    try {
+      const proj = path.join(root, 'proj')
+      const target = path.join(proj, 'a.txt')
+      await fs.mkdir(proj, { recursive: true })
+      await fs.writeFile(target, 'a')
+      let reach: 'present' | 'timeout' = 'present'
+      const store = new LocalHistoryStore(path.join(root, 'local-history'), process.platform, { gate: async () => reach })
+      const entry = await store.snapshot(proj, target, false)
+      await fs.rm(target)
+      reach = 'timeout'
+      const cp = vi.spyOn(fs, 'cp')
+      const mkdir = vi.spyOn(fs, 'mkdir')
+      await expect(store.restore(proj, entry!.id)).rejects.toThrow(/ROOT_UNREACHABLE/)
+      expect(cp).not.toHaveBeenCalled()
+      expect(mkdir).not.toHaveBeenCalled()
+    } finally {
+      vi.restoreAllMocks()
+      await fs.rm(root, { recursive: true, force: true })
+    }
   })
 })

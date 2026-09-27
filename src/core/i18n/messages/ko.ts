@@ -110,6 +110,7 @@ export const ko = {
   'files.error.alreadyExists': "'{name}' 이(가) 이미 있습니다",
   'files.error.alreadyExistsInDest': "'{name}' 이(가) 대상 폴더에 이미 있습니다",
   'files.error.renameStranded': "이름 변경에 실패했고 되돌리지도 못했습니다. 파일이 '{tmp}' 에 있습니다",
+  'files.error.unreachable': '폴더가 답하지 않아 아무것도 바꾸지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
   // worktrees/include.ts, worktrees/create.ts — worktree creation warnings
   'worktree.include.tooManyEntries': '.worktreeinclude 항목이 {max}개를 넘어 이후 줄은 무시했습니다',
   'worktree.include.globUnsupported': 'glob·부정 패턴 미지원: {line}',
@@ -120,6 +121,7 @@ export const ko = {
   'worktree.include.missing': '존재하지 않아 건너뜀: {entry}',
   'worktree.include.notIgnored': 'gitignore되지 않아 건너뜀: {entry}',
   'worktree.include.sizeFailed': '용량 계산 실패: {entry} ({detail})',
+  'worktree.include.unreachable': '프로젝트 폴더가 답하지 않아 .worktreeinclude 항목을 복사하지 않았습니다: {path}',
   'worktree.include.overLimit': '복사 상한(200MB) 초과로 건너뜀: {entry}',
   'worktree.include.linkFailed': '링크를 다시 만들지 못해 이 항목은 복사하지 않음: {entry} ({detail})',
   'worktree.include.unsafeDest': '복사할 자리로 가는 길에 링크({path})가 있어 그 아래는 복사하지 않음(워크트리 밖에 쓰지 않는다): {entry}',

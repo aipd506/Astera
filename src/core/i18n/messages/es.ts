@@ -85,6 +85,8 @@ export const es: Catalog = {
   'files.error.alreadyExistsInDest': '«{name}» ya existe en la carpeta de destino',
   'files.error.renameStranded':
     'No se pudo cambiar el nombre ni revertir el cambio. El archivo está en «{tmp}»',
+  'files.error.unreachable':
+    'La carpeta no respondió (¿una unidad de red desconectada?), así que no se cambió nada. Vuelve a intentarlo cuando sea accesible.',
   // worktrees/include.ts, worktrees/create.ts — worktree creation warnings
   'worktree.include.tooManyEntries':
     '.worktreeinclude supera las {max} entradas; se ignoraron las líneas restantes',
@@ -96,6 +98,7 @@ export const es: Catalog = {
   'worktree.include.missing': 'Omitido, no existe: {entry}',
   'worktree.include.notIgnored': 'Omitido, no está en gitignore: {entry}',
   'worktree.include.sizeFailed': 'No se pudo calcular el tamaño: {entry} ({detail})',
+  'worktree.include.unreachable': 'La carpeta del proyecto no respondió, así que no se copió ninguna entrada de .worktreeinclude: {path}',
   'worktree.include.overLimit': 'Omitido, supera el límite de copia (200 MB): {entry}',
   'worktree.include.linkFailed': 'Omitido, no se pudo recrear un enlace: {entry} ({detail})',
   'worktree.include.unsafeDest': 'No se copió bajo {path}: es un enlace y escribir a través de él saldría del worktree ({entry})',

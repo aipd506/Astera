@@ -82,4 +82,20 @@ describe('createPythonScanner', () => {
     m.findOnPath.mockRejectedValue(new Error('spawn failed'))
     await expect(createPythonScanner(m.deps).list('D:\\proj')).resolves.toEqual([])
   })
+
+  // Stage 4 T1: the project folder is asked once through the probe budget before its venv checks, which
+  // run outside it. A project on a dead share is not reachable: its venvs are not looked for (no fs call
+  // under it), the PATH interpreters are still listed, and the answer is not kept as "no venv".
+  it('does not look for venvs in a project folder that did not answer, and asks again next time', async () => {
+    const m = machine({ exists: new Set([SYSTEM]), onPath: SYSTEM })
+    let reach: 'timeout' | 'present' = 'timeout'
+    const asked: string[] = []
+    const scanner = createPythonScanner({ ...m.deps, gate: async (p) => { asked.push(p); return reach } })
+    expect(await scanner.list('D:/proj')).toEqual([{ path: SYSTEM, version: '3.11.4' }])
+    expect(asked).toEqual(['D:/proj'])
+    expect(m.access.mock.calls.some((c) => c[0].toLowerCase().includes('proj'))).toBe(false)
+    reach = 'present'
+    await scanner.list('D:/proj')
+    expect(m.access.mock.calls.some((c) => c[0].toLowerCase().includes('proj'))).toBe(true)
+  })
 })

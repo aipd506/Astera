@@ -8,6 +8,7 @@ import {
   pathPythonCandidates,
   type PythonInterpreter
 } from '../core/run/python'
+import { defaultCwdProbe, type Probe } from '../core/sessions/pathProbe'
 
 /** Python interpreter discovery. The pure decisions (candidate paths, output parsing, which `where`
  *  lines to drop) live in core/run/python.ts; this is the main-only layer that actually runs fs.access
@@ -34,6 +35,9 @@ export interface PythonScannerDeps {
    *  login-shell PATH can be applied after a first scan (main/startup.ts stops waiting for it at 6 s,
    *  but applyLoginPath still patches it when the shell answers). Defaults to process.env.PATH. */
   envPath?: () => string | undefined
+  /** Asked once about the project folder before its venv checks (the budgeted session-folder probe,
+   *  defaultCwdProbe, by default). See `lookup`. */
+  gate?: Probe
 }
 
 const liveDeps: PythonScannerDeps = {
@@ -119,12 +123,20 @@ export function createPythonScanner(deps: PythonScannerDeps = liveDeps): PythonS
     return [...byPath.values()]
   }
 
+  const gate = deps.gate ?? defaultCwdProbe
+
   const lookup = async (projectPath: string, key: string): Promise<PythonInterpreter[]> => {
-    const venvCandidates = venvInterpreterPaths(projectPath, deps.platform)
+    // **The project folder is asked once through the probe budget first** (stage 4 T1). The venv
+    // checks below run outside it, and on a dead share each can hold a libuv thread for as long as SMB
+    // takes. A folder that does not answer (or whose root the budget holds as stuck) is not reachable:
+    // no venv is looked for there, and the PATH interpreters are still listed. Its key says so, so the
+    // next open asks again instead of keeping "no venv".
+    const reachable = (await gate(projectPath).catch(() => 'timeout' as const)) !== 'timeout'
+    const venvCandidates = reachable ? venvInterpreterPaths(projectPath, deps.platform) : []
     const present = await Promise.all(venvCandidates.map(exists))
     const venvs = venvCandidates.filter((_, i) => present[i])
     // Which venvs exist and the PATH `where` will search: either changing means a different answer.
-    const venvKey = `${venvs.join('\n')}\n--PATH--\n${envPath() ?? ''}`
+    const venvKey = `${reachable ? venvs.join('\n') : '--UNREACHABLE--'}\n--PATH--\n${envPath() ?? ''}`
     const hit = cache.get(key)
     if (hit && hit.venvKey === venvKey) return hit.result
     const result = scan(venvs).catch(() => [] as PythonInterpreter[])

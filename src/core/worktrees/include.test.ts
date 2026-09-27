@@ -1,10 +1,11 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import type { TestContext } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { promises as fs, existsSync } from 'node:fs'
 import path from 'node:path'
 import { parseWorktreeInclude, copyWorktreeInclude, collapseIncludeEntries, dirSize, measureTree, linkTargetFor, type MakeLink } from './include'
 import { makeRepo, tempDir } from './testRepo'
+import { createProbePool, createProber, ProbeBudget, rootOf } from '../sessions/pathProbe'
 
 /** symlink 생성 실패가 권한 문제(EPERM/EACCES)면 실패가 아니라 스킵으로 처리한다(리뷰 Finding 5) —
  *  Windows는 보통 관리자 권한/Developer Mode가 있어야 symlink를 만들 수 있고, 그게 없는 CI나
@@ -525,5 +526,50 @@ describe('copyWorktreeInclude — no junction to outside the worktree', () => {
     const asked: Array<{ type: string; path: string }> = []
     await copyWorktreeInclude(repo, wt, { makeLink: recording(asked) })
     expect(asked.map((a) => a.type)).toEqual(['dir'])
+  })
+})
+
+// Stage 4 T1: the walk's calls run outside the probe budget, and on a dead share each one can hold a
+// libuv thread for as long as SMB takes. So the root is asked once through the budget first; one that
+// does not answer, or that the budget already holds as stuck, is refused before any walk call.
+describe('the include walk asks its root through the probe budget first', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('measureTree refuses a root that did not answer without reading it', async () => {
+    const dir = await tempDir('astera-wt-walk-gate-')
+    await fs.writeFile(path.join(dir, 'a.txt'), 'a', 'utf8')
+    const readdir = vi.spyOn(fs, 'readdir')
+    const asked: string[] = []
+    await expect(measureTree(dir, { gate: async (p) => { asked.push(p); return 'timeout' } })).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(asked).toEqual([dir])
+    expect(readdir).not.toHaveBeenCalled()
+  })
+
+  it('measureTree refuses a root the budget holds as stuck without any fs call', async () => {
+    const dir = await tempDir('astera-wt-walk-stuck-')
+    const budget = new ProbeBudget()
+    const ticket = await budget.enter(rootOf(dir))
+    if (typeof ticket === 'string') throw new Error(ticket)
+    ticket.timedOut()
+    const access = vi.fn(async () => {})
+    const gate = createProber({ access, skipQueue: true, pool: createProbePool(2, 60_000, budget), log: () => {} })
+    const readdir = vi.spyOn(fs, 'readdir')
+    await expect(measureTree(dir, { gate })).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(access).not.toHaveBeenCalled()
+    expect(readdir).not.toHaveBeenCalled()
+  })
+
+  it('copyWorktreeInclude says the repository is not reachable and copies nothing, reading nothing', async () => {
+    const repo = await tempDir('astera-wt-inc-gate-')
+    const wt = await tempDir('astera-wt-inc-gate-dest-')
+    await fs.writeFile(path.join(repo, '.worktreeinclude'), '.env\n', 'utf8')
+    const stat = vi.spyOn(fs, 'stat')
+    const readFile = vi.spyOn(fs, 'readFile')
+    const warnings = await copyWorktreeInclude(repo, wt, { gate: async () => 'timeout' })
+    expect(warnings).toEqual([{ key: 'worktree.include.unreachable', params: { path: repo } }])
+    expect(stat).not.toHaveBeenCalled()
+    expect(readFile).not.toHaveBeenCalled()
   })
 })

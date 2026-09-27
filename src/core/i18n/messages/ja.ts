@@ -84,6 +84,7 @@ export const ja: Catalog = {
   'files.error.alreadyExistsInDest': '「{name}」は移動先フォルダにすでに存在します',
   'files.error.renameStranded':
     '名前の変更に失敗し、元に戻すこともできませんでした。ファイルは「{tmp}」にあります',
+  'files.error.unreachable': 'フォルダーが応答しなかったため、何も変更していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   // worktrees/include.ts, worktrees/create.ts — worktree creation warnings
   'worktree.include.tooManyEntries':
     '.worktreeinclude の項目が {max} 件を超えたため、以降の行は無視しました',
@@ -95,6 +96,7 @@ export const ja: Catalog = {
   'worktree.include.missing': '存在しないためスキップしました: {entry}',
   'worktree.include.notIgnored': 'gitignore されていないためスキップしました: {entry}',
   'worktree.include.sizeFailed': '容量の計算に失敗しました: {entry} ({detail})',
+  'worktree.include.unreachable': 'プロジェクトのフォルダーが応答しなかったため、.worktreeinclude の項目をコピーしていません: {path}',
   'worktree.include.overLimit': 'コピー上限 (200MB) を超えたためスキップしました: {entry}',
   'worktree.include.linkFailed': 'リンクを再作成できなかったためスキップしました: {entry} ({detail})',
   'worktree.include.unsafeDest': '{path} はリンクのため、その下はコピーしませんでした (worktree の外に書き込むため): {entry}',

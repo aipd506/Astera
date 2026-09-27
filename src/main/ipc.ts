@@ -1,6 +1,5 @@
 import { ipcMain, dialog, app, shell, session, webContents, type BrowserWindow, type WebContents } from 'electron'
 import { promises as fs, existsSync, readFileSync } from 'node:fs'
-import { configuredModelOf } from '../core/models/parse'
 import path from 'node:path'
 import os from 'node:os'
 import net from 'node:net'
@@ -207,7 +206,8 @@ import { deleteProjectHistory } from './historyDeletion'
 import { removeWorktree } from '../core/worktrees/remove'
 import { listWithStatus } from '../core/worktrees/list'
 import { PresenceCache, PRESENCE_SWEEP_MS } from '../core/worktrees/presence'
-import { probeLog } from '../core/sessions/pathProbe'
+import { probeLog, gateRoot, isRootUnreachable } from '../core/sessions/pathProbe'
+import { readConfiguredModel } from './models/configuredModel'
 import { createPresenceRepush } from './worktreePresenceRepush'
 import {
   git,
@@ -5024,8 +5024,23 @@ export function registerIpc(
     const counter = fileOpCounter(opId)
     try {
       return await run(counter)
+    } catch (err) {
+      throw unreachableInLang(err)
     } finally {
       counter?.end()
+    }
+  }
+  /** fsTree's and the Local History store's ROOT_UNREACHABLE (core/sessions/pathProbe.ts gateRoot: a
+   *  folder that did not answer, refused before any call) in the person's language; anything else as is. */
+  const unreachableInLang = (err: unknown): unknown =>
+    isRootUnreachable(err) ? new Error(t(core.lang, 'files.error.unreachable')) : err
+  /** Asks each folder once through the probe budget before a handler touches it with unbudgeted calls
+   *  (stage 4 T1). Throws files.error.unreachable for one that does not answer. */
+  const gateFolders = async (...folders: string[]): Promise<void> => {
+    try {
+      for (const f of folders) await gateRoot(f)
+    } catch (err) {
+      throw unreachableInLang(err)
     }
   }
   ipcMain.handle('files.create', async (_e, parentDirPath: string, name: string, isDir: boolean) => {
@@ -5093,6 +5108,7 @@ export function registerIpc(
     // path.basename does not normalise, so a `from` of the form '...\sub\..' can return '..' — that
     // would leak `to` out into destDir's parent, so it is checked before the existence check
     await assertAllowedPath(to)
+    await gateFolders(from, destDir)
     try {
       await fs.access(to)
       throw new Error(t(core.lang, 'files.error.alreadyExistsInDest', { name: path.basename(from) }))
@@ -5150,6 +5166,7 @@ export function registerIpc(
     // copying into itself.
     const copyReason = canCopy(from, destDir)
     if (copyReason) throw new Error(t(core.lang, copyReason.key, copyReason.params))
+    await gateFolders(from, destDir)
     const existing = await fs.readdir(destDir)
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
@@ -5177,6 +5194,7 @@ export function registerIpc(
     await assertAllowedPath(destDir)
     const copyReason = canCopy(from, destDir)
     if (copyReason) throw new Error(t(core.lang, copyReason.key, copyReason.params))
+    await gateFolders(from, destDir)
     const existing = await fs.readdir(destDir)
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
@@ -5269,7 +5287,7 @@ export function registerIpc(
       // what keeps both consistent.
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.startsWith('LOCAL_HISTORY_NOT_FOUND')) throw new Error(t(core.lang, 'localHistory.notFound'))
-      throw err
+      throw unreachableInLang(err)
     }
   })
 
@@ -7070,7 +7088,7 @@ export function registerIpc(
   // are the only source there is. Read in Claude's own order — local, then project, then user — and
   // read fresh rather than cached, since a person changing it is exactly why they would reopen a pane.
   // Never throws: a file that is missing or malformed is simply not a source.
-  ipcMain.handle('chat.configuredModel', (_e, sessionId: string) => {
+  ipcMain.handle('chat.configuredModel', async (_e, sessionId: string) => {
     const session = allSessions().find((x) => x.id === sessionId)
     if (!session) return null
     let account: { provider?: string; configDir: string } | null = null
@@ -7081,18 +7099,8 @@ export function registerIpc(
     }
     // codex keeps its model on the thread and reports it back at thread/start, so it never needs this.
     if (!account || account.provider === 'codex') return null
-    const read = (file: string): unknown => {
-      try {
-        return JSON.parse(readFileSync(file, 'utf8'))
-      } catch {
-        return null
-      }
-    }
-    return configuredModelOf([
-      session.cwd ? read(path.join(session.cwd, '.claude', 'settings.local.json')) : null,
-      session.cwd ? read(path.join(session.cwd, '.claude', 'settings.json')) : null,
-      read(path.join(account.configDir, 'settings.json'))
-    ])
+    // Async, each folder asked through the probe budget first (models/configuredModel.ts).
+    return readConfiguredModel({ cwd: session.cwd || undefined, configDir: account.configDir })
   })
   // What the pane reads once on mount, so a tab reopened (or a renderer reloaded) mid-conversation
   // shows the state the adapter is actually in rather than waiting for the next event to arrive.

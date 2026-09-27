@@ -17,6 +17,7 @@ import {
   TOO_MANY_ENTRIES,
   type HistoryEntry
 } from '../files/localHistory'
+import { gateRoot, type Probe } from '../sessions/pathProbe'
 
 const INDEX_FILE = 'index.json'
 
@@ -120,10 +121,17 @@ export class LocalHistoryStore {
   constructor(
     private rootDir: string,
     private platform: string = process.platform,
-    limits: { maxEntries?: number } = {}
+    limits: { maxEntries?: number; gate?: Probe } = {}
   ) {
     this.maxEntries = limits.maxEntries ?? TOO_MANY_ENTRIES
+    this.gate = limits.gate
   }
+
+  /** The probe the project side of a snapshot or a restore is asked through first (gateRoot; the
+   *  budgeted session-folder probe when none is given). The walk and the copy run outside the probe
+   *  budget, and on a dead share each call can hold a libuv thread for as long as SMB takes; a folder
+   *  that does not answer is refused with ROOT_UNREACHABLE before any of them. */
+  private gate: Probe | undefined
 
   /** The index key for projectPath, after moving over what an older build filed for it under the
    *  lower-cased key (normalizeProjectPath's note). Only on a platform that does not fold case, and
@@ -191,6 +199,7 @@ export class LocalHistoryStore {
     isDir: boolean,
     opts: { onEntry?: () => void } = {}
   ): Promise<HistoryEntry | null> {
+    await gateRoot(targetPath, this.gate)
     const { size, entries } = await measure(targetPath, this.maxEntries)
     if (tooLarge(size) || entries > this.maxEntries) return null
     const key = this.adopt(projectPath)
@@ -299,6 +308,7 @@ export class LocalHistoryStore {
     // the final dest is checked once more right before fs.cp (two layers — the second validateDest call
     // below).
     if (validateDest) await validateDest(destParent)
+    await gateRoot(destParent, this.gate)
     await fs.mkdir(destParent, { recursive: true })
     let existing: string[] = []
     try {

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import type { TestContext } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
@@ -6,6 +6,7 @@ import path from 'node:path'
 import { removeTree, copyTree, removeWithSnapshot } from './fsTree'
 import { LocalHistoryStore } from '../localHistory/store'
 import type { FileOpStage } from '../types'
+import { createProbePool, createProber, ProbeBudget, rootOf } from '../sessions/pathProbe'
 
 const dirs: string[] = []
 async function tmp(prefix: string): Promise<string> {
@@ -179,5 +180,71 @@ describe('removeWithSnapshot', () => {
     const r = await removeWithSnapshot({ projectRoot: proj, targetPath: target, history })
     expect(r).toEqual({ snapshotSkipped: 'failed', snapshotId: null })
     expect(await exists(target)).toBe(false)
+  })
+})
+
+// Stage 4 T1: the walks' calls run outside the probe budget, and on a dead share each can hold a libuv
+// thread for as long as SMB takes. So each operation asks its roots once through the budget first; one
+// that does not answer, or that the budget already holds as stuck, is refused with ROOT_UNREACHABLE
+// before any fs call — nothing is copied, snapshotted or removed.
+describe('the explorer walks ask their roots through the probe budget first', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+  const timeout = async (): Promise<'timeout'> => 'timeout'
+
+  it('removeTree refuses a root that did not answer and removes nothing', async () => {
+    const d = await tmp('astera-fstree-gate-rm-')
+    await fs.writeFile(path.join(d, 'a.txt'), 'a')
+    const rm = vi.fn(fs.rm)
+    const lstat = vi.spyOn(fs, 'lstat')
+    await expect(removeTree(d, undefined, { rm, gate: timeout })).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(rm).not.toHaveBeenCalled()
+    expect(lstat).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
+    expect(await exists(path.join(d, 'a.txt'))).toBe(true)
+  })
+
+  it('removeTree refuses a root the budget holds as stuck without any fs call', async () => {
+    const d = await tmp('astera-fstree-gate-stuck-')
+    const budget = new ProbeBudget()
+    const ticket = await budget.enter(rootOf(d))
+    if (typeof ticket === 'string') throw new Error(ticket)
+    ticket.timedOut()
+    const access = vi.fn(async () => {})
+    const gate = createProber({ access, skipQueue: true, pool: createProbePool(2, 60_000, budget), log: () => {} })
+    const rm = vi.fn(fs.rm)
+    await expect(removeTree(d, undefined, { rm, gate })).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(access).not.toHaveBeenCalled()
+    expect(rm).not.toHaveBeenCalled()
+  })
+
+  it('copyTree asks the source and the destination, and copies nothing when one does not answer', async () => {
+    const from = await tmp('astera-fstree-gate-from-')
+    const destDir = await tmp('astera-fstree-gate-to-')
+    await fs.writeFile(path.join(from, 'a.txt'), 'a')
+    const to = path.join(destDir, 'copy')
+    const asked: string[] = []
+    const cp = vi.spyOn(fs, 'cp')
+    await expect(
+      copyTree(from, to, undefined, async (p) => {
+        asked.push(p)
+        return p === destDir ? 'timeout' : 'present'
+      })
+    ).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(asked).toEqual([from, destDir])
+    expect(cp).not.toHaveBeenCalled()
+  })
+
+  it('removeWithSnapshot takes no snapshot and deletes nothing when the target does not answer', async () => {
+    const d = await tmp('astera-fstree-gate-rws-')
+    const target = path.join(d, 'a.txt')
+    await fs.writeFile(target, 'a')
+    const snapshot = vi.fn(async () => null)
+    await expect(
+      removeWithSnapshot({ projectRoot: d, targetPath: target, history: { snapshot, discard: async () => {} }, gate: timeout })
+    ).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(snapshot).not.toHaveBeenCalled()
+    expect(await exists(target)).toBe(true)
   })
 })

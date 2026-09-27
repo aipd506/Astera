@@ -3,10 +3,18 @@
 // thousands of small files that is long enough for the explorer to look frozen; these do the same work
 // and report each entry as it is done, so main can pass a running count to the renderer. All async:
 // this runs in main, where a sync walk would freeze every window.
+//
+// **Each operation asks its roots once through the probe budget first** (gateRoot, stage 4 T1). Async
+// is not enough on its own: every call here runs on the libuv threadpool, outside the budget, and on a
+// dead share each one can hold a thread for as long as SMB takes — four of them stop every async fs
+// call in the process. A root that does not answer, or that the budget already holds as stuck, is
+// refused with ROOT_UNREACHABLE before any call: nothing is copied, snapshotted or removed. The
+// per-entry calls are not gated one by one; a root that just answered is alive.
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { FileOpStage } from '../types'
 import type { HistoryEntry } from './localHistory'
+import { gateRoot, type Probe } from '../sessions/pathProbe'
 
 /** How many entries of one folder are removed at once. Sequential unlinks are slow on a big folder;
  *  unbounded ones open thousands of handles at a time. Sub-folders are still walked one at a time,
@@ -25,6 +33,8 @@ const tick = (onEntry: (() => void) | undefined): void => {
 /** The single-entry removal removeTree uses — fs.rm; replaceable so a test can make one entry fail. */
 export interface RemoveTreeDeps {
   rm: typeof fs.rm
+  /** The probe the target is asked through first (the budgeted session-folder probe by default). */
+  gate?: Probe
 }
 
 /** The first failure of a removal. Kept rather than thrown so the walk goes on to the siblings. */
@@ -94,6 +104,7 @@ export async function removeTree(
   onEntry?: () => void,
   deps: RemoveTreeDeps = { rm: fs.rm }
 ): Promise<void> {
+  await gateRoot(target, deps.gate)
   const st = await fs.lstat(target)
   if (st.isDirectory()) {
     const f: FirstError = { failed: false }
@@ -107,7 +118,10 @@ export async function removeTree(
 /** fs.cp(from, to, { recursive: true, errorOnExist: true, force: false }) — the explorer's copy, which
  *  never overwrites — reporting each entry as it is reached (fs.cp's filter hook, which here only
  *  counts and always answers yes, so what is copied is unchanged). */
-export async function copyTree(from: string, to: string, onEntry?: () => void): Promise<void> {
+export async function copyTree(from: string, to: string, onEntry?: () => void, gate?: Probe): Promise<void> {
+  // Both ends: a copy between two drives touches both, and either may be the dead one.
+  await gateRoot(from, gate)
+  await gateRoot(path.dirname(to), gate)
   await fs.cp(from, to, {
     recursive: true,
     errorOnExist: true,
@@ -144,8 +158,13 @@ export async function removeWithSnapshot(o: {
   targetPath: string
   history: SnapshotHistory
   onEntry?: (stage: FileOpStage) => void
+  /** The probe the target is asked through first (the budgeted session-folder probe by default). */
+  gate?: Probe
 }): Promise<{ snapshotSkipped: 'too-large' | 'failed' | null; snapshotId: string | null }> {
-  const { projectRoot, targetPath, history, onEntry } = o
+  const { projectRoot, targetPath, history, onEntry, gate } = o
+  // Before the snapshot, not only before the delete: a target that does not answer is neither
+  // snapshotted nor deleted — "could not check" never proceeds to a delete.
+  await gateRoot(targetPath, gate)
   let snapshotSkipped: 'too-large' | 'failed' | null = null
   let snapshotId: string | null = null
   let isDir = false
@@ -160,7 +179,7 @@ export async function removeWithSnapshot(o: {
     snapshotSkipped = 'failed'
   }
   try {
-    await removeTree(targetPath, onEntry && (() => onEntry('delete')))
+    await removeTree(targetPath, onEntry && (() => onEntry('delete')), { rm: fs.rm, ...(gate ? { gate } : {}) })
   } catch (err) {
     // Even when the delete fails the snapshot is already committed to the index — leaving it means a
     // file that was not deleted shows up in Local History as "deleted", and pressing restore creates a

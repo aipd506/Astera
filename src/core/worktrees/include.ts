@@ -6,6 +6,7 @@ import { comparablePath, isPathWithin } from '../files/tree'
 import { runFsWork } from './fsWork'
 import { cancelledError, isCancelledError, throwIfCancelled } from './cancel'
 import type { Message } from '../i18n'
+import { gateRoot, isRootUnreachable, type Probe } from '../sessions/pathProbe'
 
 export const INCLUDE_FILE = '.worktreeinclude'
 const MAX_FILE_BYTES = 256 * 1024
@@ -156,11 +157,18 @@ export interface TreePlan {
  *    walk than a big one.
  *  - It checks `signal` on every entry and throws WORKTREE_CANCELLED once it is aborted.
  *
+ *  - **Its root is asked once through the probe budget first** (gateRoot, `gate`): the walk's own calls
+ *    run outside the budget, and on a dead share each one can hold a libuv thread for as long as SMB
+ *    takes. A root that does not answer, or that the budget already holds as stuck, throws
+ *    `ROOT_UNREACHABLE` before any walk call is made.
+ *
  *  A broken link is left out (there is nothing to copy it as). A folder that cannot be read throws. */
 export async function measureTree(
   root: string,
-  opts: { limit?: number; maxEntries?: number; signal?: AbortSignal } = {}
+  opts: { limit?: number; maxEntries?: number; signal?: AbortSignal; gate?: Probe } = {}
 ): Promise<TreePlan> {
+  throwIfCancelled(opts.signal)
+  await gateRoot(root, opts.gate)
   const limit = opts.limit ?? Infinity
   const maxEntries = opts.maxEntries ?? MAX_WALK_ENTRIES
   const plan: TreePlan = { files: [], dirs: [], links: [], bytes: 0, over: false, overEntries: false }
@@ -351,10 +359,22 @@ export async function copyWorktreeInclude(
     signal?: AbortSignal
     onProgress?: (p: IncludeCopyProgress) => void
     makeLink?: MakeLink
+    /** The probe the repository is asked through before anything is read from it, and each walked
+     *  entry's root before its walk (gateRoot; the budgeted session-folder probe by default). */
+    gate?: Probe
   } = {}
 ): Promise<Message[]> {
-  const { signal, onProgress } = opts
+  const { signal, onProgress, gate } = opts
   const makeLink: MakeLink = opts.makeLink ?? ((t, p, type) => fs.symlink(t, p, type))
+  // Everything below reads the repository outside the probe budget. A repository that stopped answering
+  // (it did a moment ago, for `worktree add`) is said so at once, with nothing read and nothing copied.
+  const unreachable = (): Message[] => [{ key: 'worktree.include.unreachable', params: { path: repoPath } }]
+  try {
+    await gateRoot(repoPath, gate)
+  } catch (err) {
+    if (isRootUnreachable(err)) return unreachable()
+    throw err
+  }
   const file = path.join(repoPath, INCLUDE_FILE)
   let content: string
   try {
@@ -403,13 +423,15 @@ export async function copyWorktreeInclude(
         plan = { ...empty(), links: [{ rel: '', raw: await fs.readlink(src), isDir: target.isDirectory() }] }
       } else if (own.isDirectory()) {
         kind = 'dir'
-        plan = await measureTree(src, { limit: budget, signal })
+        plan = await measureTree(src, { limit: budget, signal, gate })
       } else {
         kind = 'file'
         plan = { ...empty(), files: [{ rel: '', size: own.size }], bytes: own.size, over: own.size > budget }
       }
     } catch (err) {
       if (isCancelledError(err)) throw err
+      // The repository stopped answering: nothing more is asked of it, and nothing is copied.
+      if (isRootUnreachable(err)) return [...warnings, ...unreachable()]
       // a failure while measuring size (permission denied, deletion during the scan and other races) must not block creation itself
       warnings.push({
         key: 'worktree.include.sizeFailed',
