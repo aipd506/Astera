@@ -447,6 +447,42 @@ describe('createHostJournal', () => {
     await vi.waitFor(() => expect(checkpointOf('dsp_2')).not.toBeNull())
   })
 
+  // Stage 3 T1 review, minor 2: `runs follow` polls every 50 ms. A busy journal shows the rows last read,
+  // not an empty timeline, and one busy spell is one log line, not one per poll.
+  it('a busy journal shows the rows last read, and a busy spell is logged once', async () => {
+    await settings({ jobContinuityEnabled: true })
+    const { j, logs } = make()
+    await j.start()
+    const d: Dispatch = { id: 'dsp_1', taskId: 'tsk_1', provider: 'claude', accountId: 'acc', sessionId: 'ses_gone', cwd: dir, specPath: 's', startedAt: NOW, workerState: 'ready', retained: false }
+    const task = { id: 'tsk_1', runId: 'run_1', title: 'Auth refactor', spec: 's', deps: [], status: 'dispatched' as const, consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW }
+    const before = stateFromLegacy({ runs: [run], tasks: [task], dispatches: [d] })
+    const after = stateFromLegacy({ runs: [run], tasks: [task], dispatches: [{ ...d, endedAt: NOW, workerState: 'outcome_unknown' }] })
+    j.loaded({ before, state: after })
+    const first = j.timeline('run_1', after)
+    expect(first).toHaveLength(1)
+    const busy = (): never => {
+      throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR', errcode: 5 })
+    }
+    const busyLines = (): number => logs.filter((l) => /busy/.test(l)).length
+    let spy = vi.spyOn(JournalReader.prototype, 'changeMark').mockImplementation(busy)
+    try {
+      for (let i = 0; i < 5; i++) expect(j.timeline('run_1', after)).toEqual(first)
+      expect(busyLines()).toBe(1)
+    } finally {
+      spy.mockRestore()
+    }
+    expect(j.timeline('run_1', after)).toEqual(first)
+    // A new spell after a read that worked is a new line.
+    spy = vi.spyOn(JournalReader.prototype, 'changeMark').mockImplementation(busy)
+    try {
+      j.timeline('run_1', after)
+      j.timeline('run_1', after)
+    } finally {
+      spy.mockRestore()
+    }
+    expect(busyLines()).toBe(2)
+  })
+
   // Final review I2: a busy file is not a corrupt one, and a busy open is not a failure for the Host's life.
   describe('a journal another process holds locked', () => {
     const corrupt = async (): Promise<string[]> => (await fs.readdir(path.dirname(journalFile()))).filter((n) => n.includes('.corrupt-'))

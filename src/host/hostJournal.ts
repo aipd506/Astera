@@ -88,6 +88,8 @@ export function createHostJournal(d: HostJournalDeps): HostJournal {
    *  built from each call's state, so a renamed Task shows at once. A few Runs at most are followed. */
   const rowsCache = new Map<string, { mark: string; rows: JournalEventRow[] }>()
   const ROWS_CACHE_MAX = 16
+  /** Whether the last follow read met a busy journal: a spell of them is one log line (stage 3 T1). */
+  let followBusy = false
   const rowsOf = (runId: string): JournalEventRow[] => {
     const mark = reader.changeMark()
     if (mark === null) return []
@@ -313,8 +315,19 @@ export function createHostJournal(d: HostJournalDeps): HostJournal {
     timeline: (runId, state) => {
       if (!settings.enabled) return []
       try {
-        return journalTimeline(rowsOf(runId), state, 'en')
+        const lines = journalTimeline(rowsOf(runId), state, 'en')
+        followBusy = false
+        return lines
       } catch (err) {
+        if (isBusyError(err)) {
+          // Stage 3 T1: the follow polls every 50 ms, and the reader gives up within its short timeout.
+          // The rows last read stand in until the journal answers again, and one spell is one line.
+          if (!followBusy)
+            d.log(`continuity: reading run ${runId}'s journal rows failed: the journal is busy, the rows last read stand in (${String(err)})`)
+          followBusy = true
+          const hit = rowsCache.get(runId)
+          return hit ? journalTimeline(hit.rows, state, 'en') : []
+        }
         d.log(`continuity: reading run ${runId}'s journal rows failed: ${String(err)}`)
         return []
       }
