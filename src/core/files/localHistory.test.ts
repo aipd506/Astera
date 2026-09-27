@@ -7,6 +7,10 @@ import {
   selectEvictions,
   snapshotId,
   tooLarge,
+  tooManyEntries,
+  TOO_MANY_ENTRIES,
+  TOO_LARGE_BYTES,
+  snapshotSkipNotices,
   type HistoryEntry
 } from './localHistory'
 
@@ -77,6 +81,49 @@ describe('tooLarge', () => {
 
   it('50MB를 넘으면 스냅샷하지 않는다', () => {
     expect(tooLarge(50 * 1024 * 1024 + 1)).toBe(true)
+  })
+})
+
+describe('tooManyEntries — 스냅샷의 파일 수 상한', () => {
+  it('상한은 5,000개다', () => {
+    expect(TOO_MANY_ENTRIES).toBe(5000)
+  })
+
+  it('상한까지는 스냅샷하고, 넘으면 하지 않는다', () => {
+    expect(tooManyEntries(5000)).toBe(false)
+    expect(tooManyEntries(5001)).toBe(true)
+  })
+})
+
+// 스냅샷을 남기지 못한 삭제는 사람에게 알린다 — 크기든 파일 수든 같은 "너무 커서" 알림이고, 문구가
+// 두 상한을 함께 말한다(파일 수 때문에 빠졌는데 50MB 만 말하면 사람이 이유를 알 수 없다).
+describe('snapshotSkipNotices', () => {
+  it('삭제에서 too-large 는 두 상한을 담은 skippedTooLarge 를 알린다', () => {
+    expect(snapshotSkipNotices({ tooLarge: true, failed: false }, 'delete')).toEqual([
+      {
+        level: 'info',
+        message: {
+          key: 'files.delete.skippedTooLarge',
+          params: { maxMb: TOO_LARGE_BYTES / 1024 / 1024, maxFiles: TOO_MANY_ENTRIES }
+        }
+      }
+    ])
+  })
+
+  it('되돌리기에서 too-large 는 영구 삭제를 오류로 알린다', () => {
+    const n = snapshotSkipNotices({ tooLarge: true, failed: true }, 'undo')
+    expect(n.map((x) => [x.level, x.message.key])).toEqual([
+      ['error', 'files.undo.permanentTooLarge'],
+      ['error', 'files.undo.permanentSnapshotFailed']
+    ])
+    expect(n[0].message.params).toEqual({ maxMb: 50, maxFiles: 5000 })
+  })
+
+  it('건너뛴 것이 없으면 알리지 않는다', () => {
+    expect(snapshotSkipNotices({ tooLarge: false, failed: false }, 'delete')).toEqual([])
+    expect(snapshotSkipNotices({ tooLarge: false, failed: true }, 'delete')).toEqual([
+      { level: 'info', message: { key: 'files.delete.skippedFailed' } }
+    ])
   })
 })
 

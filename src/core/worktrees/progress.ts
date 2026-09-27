@@ -4,32 +4,33 @@ import type { WorktreeCreateProgress } from '../types'
  *  otherwise be thousands of IPC messages for a bar nobody can read that fast. */
 export const PROGRESS_INTERVAL_MS = 250
 
-export interface ProgressThrottle {
-  push(p: WorktreeCreateProgress): void
+export interface ProgressThrottle<P extends { stage: string } = WorktreeCreateProgress> {
+  push(p: P): void
   /** Sends the held report now, if there is one. */
   flush(): void
   /** Drops the held report and stops the timer; nothing is sent after this. */
   dispose(): void
 }
 
-/** Throttles createWorktree's progress for sending across a process boundary.
+/** Throttles createWorktree's progress (or any report that names its stage — the explorer's delete and
+ *  copy use it too, core/files/fileOpProgress.ts) for sending across a process boundary.
  *
  *  - A report for a **new stage** goes at once: which stage it is in is the one thing the person most
  *    needs to see, and stages change only a handful of times.
  *  - Within a stage, at most one report per PROGRESS_INTERVAL_MS; the one sent at the end of a window
  *    is the latest, so the last numbers are never lost.
  *  - A throwing `emit` (a window that went away) is swallowed: progress must never break the creation. */
-export function throttleProgress(
-  emit: (p: WorktreeCreateProgress) => void,
+export function throttleProgress<P extends { stage: string } = WorktreeCreateProgress>(
+  emit: (p: P) => void,
   intervalMs: number = PROGRESS_INTERVAL_MS
-): ProgressThrottle {
+): ProgressThrottle<P> {
   let lastStage: string | null = null
   let lastAt = -Infinity
-  let held: WorktreeCreateProgress | null = null
+  let held: P | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
   let disposed = false
 
-  const send = (p: WorktreeCreateProgress): void => {
+  const send = (p: P): void => {
     lastStage = p.stage
     lastAt = Date.now()
     held = null

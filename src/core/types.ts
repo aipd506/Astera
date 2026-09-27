@@ -159,6 +159,23 @@ export interface WorktreeCreateEvent {
   progress: WorktreeCreateProgress | null
 }
 
+/** What a long explorer operation is doing right now: copying the target into Local History before a
+ *  delete, removing it, or copying (paste, duplicate, a move across drives). */
+export type FileOpStage = 'snapshot' | 'delete' | 'copy'
+
+/** One progress report for an explorer file operation. count is the entries done so far in this
+ *  stage (files, folders and links alike) — it starts again from 1 when the stage changes. */
+export interface FileOpProgress {
+  stage: FileOpStage
+  count: number
+}
+
+/** main → renderer, for a files.remove / copy / importExternal / move call that carried an opId. */
+export interface FileOpEvent {
+  opId: string
+  progress: FileOpProgress
+}
+
 export interface WorktreeListItem extends WorktreeInfo {
   status: WorktreeStatus // result of cross-checking `git worktree list` against directory existence
 }
@@ -702,6 +719,8 @@ export interface CoreEvents {
   'files:changedBatch': FileChangeBatch
   /** Stage and copy progress of one worktrees.create, throttled to about 4 a second (core/worktrees/progress.ts). */
   'worktree:createProgress': WorktreeCreateEvent
+  /** Progress of one explorer delete or copy that carried an opId, about 4 a second (core/files/fileOpProgress.ts). */
+  'files:opProgress': FileOpEvent
   'git:changed': void // index/HEAD changes in the git dir, e.g. a commit from a session terminal — triggers a tree state refresh
   /** One repository's PR snapshot was refreshed (or marked stale by the rate-limit breaker).
    *  The whole snapshot rides along — the renderer replaces, never merges. */
@@ -1212,7 +1231,9 @@ export interface CoreApi {
     unwatch(): Promise<void>
     create(parentDir: string, name: string, isDir: boolean): Promise<string> // returns the created path
     rename(from: string, newName: string): Promise<string> // returns the new path
-    move(from: string, destDir: string): Promise<string>
+    // opId (optional, here and on remove/copy/importExternal): the running entry count arrives on
+    // 'files:opProgress' under this id while the call works — see FileOpEvent.
+    move(from: string, destDir: string, opId?: string): Promise<string>
     // Delete. projectRoot is the project root the explorer is showing (useFileOps' root) — it is
     // required so the snapshot's key lines up with that root exactly. Using the matching root that
     // assertAllowedPath finds internally instead would, with nested cwds, differ from the explorer
@@ -1224,14 +1245,15 @@ export interface CoreApi {
     // (see useFileOps.removeSelection).
     remove(
       path: string,
-      projectRoot: string
+      projectRoot: string,
+      opId?: string
     ): Promise<{ snapshotSkipped: 'too-large' | 'failed' | null; snapshotId: string | null }>
-    copy(from: string, destDir: string): Promise<string> // duplicate — suffixes ' copy' on a collision
+    copy(from: string, destDir: string, opId?: string): Promise<string> // duplicate — suffixes ' copy' on a collision
     /** Copy in something that was copied outside the app (the OS clipboard, via a paste event).
      *  Identical to copy but for the source check: these paths are outside every allowed root by
      *  definition, so requiring one would reject the whole feature. The destination is checked as
      *  always, so nothing lands outside a project. */
-    importExternal(from: string, destDir: string): Promise<string>
+    importExternal(from: string, destDir: string, opId?: string): Promise<string>
     /** Where a File handed over by a paste lives on disk. Empty for a File that is not a file on disk
      *  (an image copied from a web page). Synchronous — Electron's webUtils, not an IPC call. */
     pathForFile(file: File): string

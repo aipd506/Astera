@@ -4,7 +4,14 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { LocalHistoryStore } from './store'
-import { MAX_AGE_MS, MAX_TOTAL_BYTES, TOO_LARGE_BYTES, projectKey, normalizeProjectPath } from '../files/localHistory'
+import {
+  MAX_AGE_MS,
+  MAX_TOTAL_BYTES,
+  TOO_LARGE_BYTES,
+  TOO_MANY_ENTRIES,
+  projectKey,
+  normalizeProjectPath
+} from '../files/localHistory'
 
 // 실제 임시 디렉터리를 만들어 fs를 그대로 태운다 — src/core/worktrees/include.test.ts의 dirSize
 // 테스트와 같은 방식. 각 테스트가 만든 디렉터리는 afterEach에서 정리한다.
@@ -148,6 +155,76 @@ describe('LocalHistoryStore.load', () => {
     const r = await store2.load()
     expect(r.recovered).toBe(false)
     expect(store2.list(projDir).length).toBe(1)
+  })
+})
+
+// 크기 상한만으로는 5만 개의 작은 파일(50MB 미만)이 한 개씩 복사된 뒤에야 지워진다 — 파일 수에도
+// 상한을 두고, 넘으면 too-large 와 똑같이 스냅샷 없이 null 을 돌려준다(호출자가 알린다).
+describe('LocalHistoryStore.snapshot — 파일 수 상한', () => {
+  it(
+    `하위 항목이 TOO_MANY_ENTRIES(${TOO_MANY_ENTRIES})개를 넘으면 아무것도 복사하지 않고 null 을 돌려준다`,
+    async () => {
+      const root = await tmp('astera-lh-snap-many-')
+      const historyDir = path.join(root, 'local-history')
+      const store = new LocalHistoryStore(historyDir)
+      await store.load()
+      const projDir = await tmp('astera-lh-snap-many-proj-')
+      const folder = path.join(projDir, 'many')
+      await fs.mkdir(folder)
+      const names = Array.from({ length: TOO_MANY_ENTRIES + 1 }, (_, i) => `f${i}.txt`)
+      for (let i = 0; i < names.length; i += 200) {
+        await Promise.all(names.slice(i, i + 200).map((n) => fs.writeFile(path.join(folder, n), 'x')))
+      }
+      const entry = await store.snapshot(projDir, folder, true)
+      expect(entry).toBeNull()
+      expect(store.list(projDir)).toEqual([])
+      await expect(fs.access(path.join(historyDir, 'index.json'))).rejects.toThrow()
+    },
+    60_000
+  )
+
+  it('상한과 같은 수까지는 스냅샷한다(상한은 주입할 수 있다)', async () => {
+    const root = await tmp('astera-lh-snap-cap-')
+    const store = new LocalHistoryStore(path.join(root, 'local-history'), process.platform, { maxEntries: 3 })
+    await store.load()
+    const projDir = await tmp('astera-lh-snap-cap-proj-')
+    const folder = path.join(projDir, 'three')
+    await fs.mkdir(path.join(folder, 'sub'), { recursive: true })
+    await fs.writeFile(path.join(folder, 'a.txt'), 'a')
+    await fs.writeFile(path.join(folder, 'sub', 'b.txt'), 'b') // sub, a.txt, sub/b.txt = 3
+    expect(await store.snapshot(projDir, folder, true)).not.toBeNull()
+    await fs.writeFile(path.join(folder, 'c.txt'), 'c') // 4
+    expect(await store.snapshot(projDir, folder, true)).toBeNull()
+  })
+
+  it('재는 동안 폴더를 가리키는 링크를 따라가지 않는다 — 링크는 한 항목으로만 센다', async (ctx) => {
+    const root = await tmp('astera-lh-snap-linkcount-')
+    const store = new LocalHistoryStore(path.join(root, 'local-history'), process.platform, { maxEntries: 3 })
+    await store.load()
+    const projDir = await tmp('astera-lh-snap-linkcount-proj-')
+    const outside = await tmp('astera-lh-snap-linkcount-out-')
+    for (let i = 0; i < 10; i++) await fs.writeFile(path.join(outside, `o${i}.txt`), 'o')
+    const folder = path.join(projDir, 'folder')
+    await fs.mkdir(folder)
+    await fs.writeFile(path.join(folder, 'own.txt'), 'own')
+    await trySymlink(ctx, outside, path.join(folder, 'link'), 'dir')
+    // 링크를 따라가면 own.txt + link + 10 = 12 로 상한(3)을 넘어 null 이 된다
+    const entry = await store.snapshot(projDir, folder, true)
+    expect(entry).not.toBeNull()
+  })
+
+  it('복사하는 항목마다 onEntry 로 알린다', async () => {
+    const root = await tmp('astera-lh-snap-progress-')
+    const store = new LocalHistoryStore(path.join(root, 'local-history'))
+    await store.load()
+    const projDir = await tmp('astera-lh-snap-progress-proj-')
+    const folder = path.join(projDir, 'p')
+    await fs.mkdir(folder)
+    for (let i = 0; i < 4; i++) await fs.writeFile(path.join(folder, `f${i}.txt`), 'x')
+    let seen = 0
+    const entry = await store.snapshot(projDir, folder, true, { onEntry: () => seen++ })
+    expect(entry).not.toBeNull()
+    expect(seen).toBeGreaterThanOrEqual(4)
   })
 })
 

@@ -197,6 +197,8 @@ import { filterFilePaths } from '../core/files/fileMatch'
 import { sortEntries, isPathWithin, isSamePath, renamePlan, resolveProjectRootFrom } from '../core/files/tree'
 import { writeFilesToClipboard } from './clipboardFiles'
 import { validateName, uniqueName, canMove, canCopy } from '../core/files/ops'
+import { copyTree, removeTree, removeWithSnapshot } from '../core/files/fsTree'
+import { countFileOp, type FileOpCounter } from '../core/files/fileOpProgress'
 import { imageMime } from '../core/files/imageMime'
 import { parsePorcelainZ, type GitState } from '../core/git/status'
 import { readHostMerges, hostMergesPathIn } from '../core/git/hostMerges'
@@ -5008,6 +5010,23 @@ export function registerIpc(
   // ---- File operations. Validation runs a second time through the same pure module the renderer uses
   // (ops.ts) — this is a trust boundary.
   // assertAllowedPath is applied to both source and destination, blocking operations outside the project.
+
+  /** A delete or copy that can take long (move, remove, copy, importExternal) may carry an opId; its
+   *  running entry count then goes to the renderer on 'files:opProgress' under that id, about 4 a
+   *  second (fileOpProgress.ts), so the explorer can show it is working rather than look frozen.
+   *  Without one nothing is sent — the calls are exactly what they were. */
+  const fileOpCounter = (opId: unknown): FileOpCounter | null =>
+    typeof opId === 'string' && opId !== ''
+      ? countFileOp((progress) => send('files:opProgress', { opId, progress }))
+      : null
+  const withFileOp = async <T>(opId: unknown, run: (c: FileOpCounter | null) => Promise<T>): Promise<T> => {
+    const counter = fileOpCounter(opId)
+    try {
+      return await run(counter)
+    } finally {
+      counter?.end()
+    }
+  }
   ipcMain.handle('files.create', async (_e, parentDirPath: string, name: string, isDir: boolean) => {
     const reason = validateName(name)
     if (reason) throw new Error(t(core.lang, reason.key, reason.params))
@@ -5064,7 +5083,7 @@ export function registerIpc(
     return to
   })
 
-  ipcMain.handle('files.move', async (_e, from: string, destDir: string) => {
+  ipcMain.handle('files.move', async (_e, from: string, destDir: string, opId?: string) => {
     const reason = canMove(from, destDir)
     if (reason) throw new Error(t(core.lang, reason.key, reason.params))
     await assertAllowedPath(from)
@@ -5086,13 +5105,15 @@ export function registerIpc(
       // A different volume — copy, then remove the original. force:false gives the same guarantee as the
       // copy handler, so nothing is silently overwritten in the race window between the existence check
       // above and the actual copy.
-      await fs.cp(from, to, { recursive: true, errorOnExist: true, force: false })
-      await fs.rm(from, { recursive: true })
+      await withFileOp(opId, async (c) => {
+        await copyTree(from, to, c ? () => c.entry('copy') : undefined)
+        await removeTree(from, c ? () => c.entry('delete') : undefined)
+      })
     }
     return to
   })
 
-  ipcMain.handle('files.remove', async (_e, targetPath: string, projectRoot: string) => {
+  ipcMain.handle('files.remove', async (_e, targetPath: string, projectRoot: string, opId?: string) => {
     await assertAllowedPath(targetPath)
     // The snapshot's key (projectPath) must be **exactly** the root the restore UI (localHistory.list)
     // queries. The matched root assertAllowedPath returns is the first match in the insertion order of
@@ -5104,44 +5125,23 @@ export function registerIpc(
     // really is under it.
     await assertAllowedPath(projectRoot)
     if (!isPathWithin(projectRoot, targetPath)) throw new Error(t(core.lang, 'files.error.pathNotAllowed'))
-    // The snapshot taken just before deleting. Deletion is still permanent — Local History is not a
-    // recycle bin but the safety net in front of one, so a failed snapshot (size limit exceeded, a
-    // permissions error, …) does not block the delete. The reason is reported through the return value
-    // and the delete proceeds. Size is measured inside core.localHistory.snapshot() on the same
-    // (non-dereferencing) basis as fs.cp, so it is not measured again here — it used to be measured here
-    // with dirSize (which dereferences), and that basis differed from what fs.cp actually copies, so the
-    // too-large verdict for a folder containing symbolic links disagreed with reality.
-    let snapshotSkipped: 'too-large' | 'failed' | null = null
-    let snapshotId: string | null = null
-    let isDir = false
-    try {
-      isDir = (await fs.stat(targetPath)).isDirectory()
-      const entry = await core.localHistory.snapshot(projectRoot, targetPath, isDir)
-      if (entry === null) snapshotSkipped = 'too-large'
-      else snapshotId = entry.id
-    } catch {
-      snapshotSkipped = 'failed'
-    }
-    try {
-      await fs.rm(targetPath, { recursive: true })
-    } catch (err) {
-      // Even when fs.rm fails the snapshot is already committed to the index — leaving it means a file
-      // that was not deleted shows up in Local History as "deleted", and pressing restore creates a
-      // duplicate next to the original.
-      // A file: deleting a single entry is atomic, so on failure the original is intact → discard the
-      // snapshot, nothing is lost. A folder: a recursive rm can fail after deleting some children, so
-      // discarding the snapshot would lose the only copy of children that are already gone → leave the
-      // snapshot in place.
-      // A failed discard is swallowed too — it must not mask the original fs.rm failure.
-      if (snapshotId !== null && !isDir) {
-        await core.localHistory.discard(projectRoot, snapshotId).catch(() => {})
-      }
-      throw err
-    }
-    return { snapshotSkipped, snapshotId }
+    // The snapshot taken just before deleting, then the delete (fsTree.ts removeWithSnapshot): a skipped
+    // snapshot (over the byte or entry cap) or a failed one does not block the delete — the reason comes
+    // back and the renderer tells the user. Size and entry count are measured inside
+    // core.localHistory.snapshot() on the same (non-dereferencing) basis as fs.cp, so they are not
+    // measured again here — measuring here with dirSize (which dereferences) once made the too-large
+    // verdict for a folder containing symbolic links disagree with reality.
+    return withFileOp(opId, (c) =>
+      removeWithSnapshot({
+        projectRoot,
+        targetPath,
+        history: core.localHistory,
+        onEntry: c ? (stage) => c.entry(stage) : undefined
+      })
+    )
   })
 
-  ipcMain.handle('files.copy', async (_e, from: string, destDir: string) => {
+  ipcMain.handle('files.copy', async (_e, from: string, destDir: string, opId?: string) => {
     await assertAllowedPath(from)
     await assertAllowedPath(destDir)
     // The same rule as the renderer's (ops.ts canCopy) is applied here as well — a caller that does not
@@ -5155,7 +5155,7 @@ export function registerIpc(
     // path.basename does not normalise, so a `from` of the form '...\sub\..' can return '..' as-is —
     // that would leak `to` out into destDir's parent, so `to` is checked separately from destDir
     await assertAllowedPath(to)
-    await fs.cp(from, to, { recursive: true, errorOnExist: true, force: false })
+    await withFileOp(opId, (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
     return to
   })
 
@@ -5168,7 +5168,7 @@ export function registerIpc(
    *  canCopy is kept for the same reason files.copy keeps it — copying a folder into itself or into
    *  its own descendant is reachable from outside too (a parent directory of the project), and it
    *  should say so in the user's language rather than surface fs.cp's EINVAL. */
-  ipcMain.handle('files.importExternal', async (_e, from: string, destDir: string) => {
+  ipcMain.handle('files.importExternal', async (_e, from: string, destDir: string, opId?: string) => {
     // A relative source would be resolved against main's own working directory, which is not a place
     // this IPC has any business reading from. Everything the OS clipboard hands over is absolute, so
     // this only closes the case where the renderer sends something else.
@@ -5180,7 +5180,7 @@ export function registerIpc(
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
     await assertAllowedPath(to)
-    await fs.cp(from, to, { recursive: true, errorOnExist: true, force: false })
+    await withFileOp(opId, (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
     return to
   })
 

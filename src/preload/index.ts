@@ -30,6 +30,7 @@ const EVENT_CHANNELS = [
   'accounts:ghostsChanged',
   'files:changed',
   'files:changedBatch',
+  'files:opProgress',
   'worktree:createProgress',
   'git:changed',
   'cli:install',

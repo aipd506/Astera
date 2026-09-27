@@ -14,6 +14,7 @@ import {
   tooLarge,
   selectEvictions,
   TOO_LARGE_BYTES,
+  TOO_MANY_ENTRIES,
   type HistoryEntry
 } from '../files/localHistory'
 
@@ -45,30 +46,38 @@ function isValidEntry(e: unknown): e is HistoryEntry {
   )
 }
 
-/** Measures the bytes targetPath will actually occupy on disk **by the same rule** as
- *  fs.cp(..., { recursive: isDir }) — a symbolic link counts only the link's own size and is not
- *  followed to its target (the same rule as the default dereference:false). dirSize in
+/** Measures what targetPath will actually occupy on disk **by the same rule** as
+ *  fs.cp(..., { recursive: isDir }): its bytes and its entry count (every descendant — files, folders
+ *  and links — or 1 for a lone file). A symbolic link counts only as itself, its own size and one entry,
+ *  and is never followed to its target (the same rule as the default dereference:false). dirSize in
  *  worktrees/include.ts measures by the dereference rule (the right contract on the worktree-copy
  *  side), so it must not be reused here — when the two rules diverge, a small folder holding a few
  *  symbolic links that point at large targets is falsely judged tooLarge and gets permanently deleted
- *  with no snapshot. The walk stops the moment TOO_LARGE_BYTES is exceeded — on a bulk delete of
- *  something like node_modules it does not keep lstat-ing the remaining tens of thousands of entries
- *  after the decision is already made (the same reason files.countEntries stops at 9999). */
-async function measureSize(targetPath: string): Promise<number> {
+ *  with no snapshot. The walk stops the moment either cap is exceeded — on a bulk delete of something
+ *  like node_modules it does not keep lstat-ing the remaining tens of thousands of entries after the
+ *  decision is already made (the same reason files.countEntries stops at 9999). All of it is async:
+ *  this runs in main, and a sync walk there freezes every window. */
+async function measure(targetPath: string, maxEntries: number): Promise<{ size: number; entries: number }> {
   const top = await fs.lstat(targetPath)
-  if (!top.isDirectory()) return top.size
+  if (!top.isDirectory()) return { size: top.size, entries: 1 }
   let total = 0
+  let entries = 0
   let stopped = false
   const walk = async (dir: string): Promise<void> => {
     if (stopped) return
-    const entries = await fs.readdir(dir, { withFileTypes: true })
-    for (const e of entries) {
+    const list = await fs.readdir(dir, { withFileTypes: true })
+    for (const e of list) {
       if (stopped) return
       const child = path.join(dir, e.name)
+      entries++
+      if (entries > maxEntries) {
+        stopped = true
+        return
+      }
       if (e.isDirectory()) {
-        await walk(child) // recurse into real directories only — for a symbolic link that points at a
-        // directory dirent reports isDirectory() as false, so it never comes in here and the else
-        // below counts only the link's own size.
+        await walk(child) // recurse into real directories only — for a symbolic link (or a Windows
+        // junction) that points at a directory, dirent reports isDirectory() as false, so it never
+        // comes in here and the else below counts only the link itself.
       } else {
         try {
           total += (await fs.lstat(child)).size
@@ -84,7 +93,7 @@ async function measureSize(targetPath: string): Promise<number> {
     }
   }
   await walk(targetPath)
-  return total
+  return { size: total, entries }
 }
 
 // Full index.json schema: { <normalizeProjectPath result>: HistoryEntry[] }. The key being the
@@ -104,10 +113,17 @@ export class LocalHistoryStore {
   // out — always use this key.
   private byProject: Record<string, HistoryEntry[]> = {}
 
+  private maxEntries: number
+
+  /** limits.maxEntries replaces TOO_MANY_ENTRIES — for tests, which should not have to write five
+   *  thousand files to reach the cap. */
   constructor(
     private rootDir: string,
-    private platform: string = process.platform
-  ) {}
+    private platform: string = process.platform,
+    limits: { maxEntries?: number } = {}
+  ) {
+    this.maxEntries = limits.maxEntries ?? TOO_MANY_ENTRIES
+  }
 
   /** The index key for projectPath, after moving over what an older build filed for it under the
    *  lower-cased key (normalizeProjectPath's note). Only on a platform that does not fold case, and
@@ -160,16 +176,23 @@ export class LocalHistoryStore {
     return [...(this.byProject[this.adopt(projectPath)] ?? [])]
   }
 
-  /** The snapshot taken just before files.remove. On tooLarge it does nothing and returns null (the
-   *  caller tells the user). The size is measured here directly (measureSize) — if the caller measured
+  /** The snapshot taken just before files.remove. Over either cap (TOO_LARGE_BYTES, or the entry cap —
+   *  TOO_MANY_ENTRIES unless the constructor was given another) it does nothing and returns null (the
+   *  caller tells the user). onEntry hears each entry as it is copied. The size and entry count are
+   *  measured here directly (measure) — if the caller measured
    *  it and passed it in, that measurement rule could diverge from fs.cp's actual copy rule, and this
    *  store has been bitten repeatedly by exactly that "two places, two rules" failure. If the snapshot
    *  itself fails (permissions and so on) the exception is thrown straight up — files.remove catches it
    *  and translates it into "the delete proceeds" (deciding that a failed snapshot does not block the
    *  delete is the IPC layer's call). */
-  async snapshot(projectPath: string, targetPath: string, isDir: boolean): Promise<HistoryEntry | null> {
-    const size = await measureSize(targetPath)
-    if (tooLarge(size)) return null
+  async snapshot(
+    projectPath: string,
+    targetPath: string,
+    isDir: boolean,
+    opts: { onEntry?: () => void } = {}
+  ): Promise<HistoryEntry | null> {
+    const { size, entries } = await measure(targetPath, this.maxEntries)
+    if (tooLarge(size) || entries > this.maxEntries) return null
     const key = this.adopt(projectPath)
     const projectDir = path.join(this.rootDir, projectKey(projectPath))
     await fs.mkdir(projectDir, { recursive: true })
@@ -194,7 +217,24 @@ export class LocalHistoryStore {
     const snapDir = path.join(projectDir, id)
     try {
       await fs.mkdir(snapDir, { recursive: true })
-      await fs.cp(targetPath, path.join(snapDir, name), { recursive: isDir })
+      // filter is fs.cp's one per-entry hook; it is used only to count (always true), so the copy is
+      // exactly what it was. A throwing onEntry must not fail the snapshot — progress is a nicety.
+      const onEntry = opts.onEntry
+      await fs.cp(targetPath, path.join(snapDir, name), {
+        recursive: isDir,
+        ...(onEntry
+          ? {
+              filter: () => {
+                try {
+                  onEntry()
+                } catch {
+                  // the progress receiver is gone
+                }
+                return true
+              }
+            }
+          : {})
+      })
     } catch (err) {
       // On a copy failure (permissions, a race, and so on) no half-written snapshot directory is left
       // behind — this entry never makes it into the index, so if it is not removed it stays outside the

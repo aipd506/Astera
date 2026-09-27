@@ -4,8 +4,9 @@
 // be verified (the same reason as explorerState.ts).
 // It uses neither node:path nor node:crypto — the renderer has to see the same rules when it shows
 // the history list.
-// Its one import is paths.ts, which is node-free for the same reason.
+// Its imports are paths.ts, which is node-free for the same reason, and a type from i18n.
 import { foldPathCase, runtimePlatform } from './paths'
+import type { Message } from '../i18n'
 
 /** Cap on total snapshot bytes per project. Past it, the oldest go first */
 export const MAX_TOTAL_BYTES = 200 * 1024 * 1024
@@ -84,6 +85,37 @@ export function snapshotId(deletedAt: number, originalName: string, taken: strin
 /** This size is not snapshotted */
 export function tooLarge(size: number): boolean {
   return size > TOO_LARGE_BYTES
+}
+
+/** Cap on the number of entries (files, folders and links, the top item included) in a single
+ *  snapshot. The byte cap alone lets through a folder of tens of thousands of tiny files — well under
+ *  50MB, yet copying it one file at a time before the delete even starts takes minutes. Past this it
+ *  is treated exactly like a too-large item: no snapshot, the delete still happens, the user is told. */
+export const TOO_MANY_ENTRIES = 5000
+
+/** This many entries is not snapshotted */
+export function tooManyEntries(count: number): boolean {
+  return count > TOO_MANY_ENTRIES
+}
+
+/** What to tell the user when a delete kept no snapshot. `tooLarge` covers both caps (bytes and entry
+ *  count), and its wording names both, so a folder skipped for its file count does not read as "over
+ *  50MB". 'delete' is the explorer's delete, which the user confirmed (so it is information); 'undo' is
+ *  a Ctrl+Z that removed something permanently without asking (so it is an error). */
+export function snapshotSkipNotices(
+  skipped: { tooLarge: boolean; failed: boolean },
+  context: 'delete' | 'undo'
+): { level: 'info' | 'error'; message: Message }[] {
+  const caps = { maxMb: TOO_LARGE_BYTES / 1024 / 1024, maxFiles: TOO_MANY_ENTRIES }
+  const out: { level: 'info' | 'error'; message: Message }[] = []
+  if (context === 'delete') {
+    if (skipped.tooLarge) out.push({ level: 'info', message: { key: 'files.delete.skippedTooLarge', params: caps } })
+    if (skipped.failed) out.push({ level: 'info', message: { key: 'files.delete.skippedFailed' } })
+  } else {
+    if (skipped.tooLarge) out.push({ level: 'error', message: { key: 'files.undo.permanentTooLarge', params: caps } })
+    if (skipped.failed) out.push({ level: 'error', message: { key: 'files.undo.permanentSnapshotFailed' } })
+  }
+  return out
 }
 
 /** The ids to evict, oldest first. Entries past the retention window go first, and if the total is
