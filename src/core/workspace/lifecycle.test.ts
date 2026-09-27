@@ -67,12 +67,36 @@ describe('workspaces.json', () => {
 })
 
 describe('workspaceRefusal', () => {
-  it('refuses off Windows and in an SSH session, with the reason', () => {
+  const ssh = { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' }
+
+  it('win32: runs on a desktop, refuses over SSH', () => {
     expect(workspaceRefusal({ platform: 'win32', env: {} })).toBeNull()
-    expect(workspaceRefusal({ platform: 'darwin', env: {} })).toContain('Windows only')
-    expect(workspaceRefusal({ platform: 'linux', env: {} })).toContain('linux')
-    expect(workspaceRefusal({ platform: 'win32', env: { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' } })).toContain('SSH')
+    expect(workspaceRefusal({ platform: 'win32', env: ssh })).toContain('SSH')
     expect(workspaceRefusal({ platform: 'win32', env: { SSH_TTY: '/dev/pts/0' } })).toContain('SSH')
     expect(NOT_INTERACTIVE).toContain('no interactive desktop')
+  })
+
+  it('linux: runs over SSH and with no desktop (L2), and refuses only for a missing tool, with the install line (L1)', () => {
+    expect(workspaceRefusal({ platform: 'linux', env: ssh })).toBeNull()
+    expect(workspaceRefusal({ platform: 'linux', env: {}, linuxTools: { missing: [], installLine: '' } })).toBeNull()
+    expect(workspaceRefusal({ platform: 'linux', env: {}, linuxTools: { missing: ['xdotool'], installLine: 'sudo apt-get install -y xdotool' } })).toBe(
+      'app js: the agent app workspace on Linux needs xdotool, and it is not installed here. Install it with: sudo apt-get install -y xdotool'
+    )
+    expect(workspaceRefusal({ platform: 'linux', env: {}, linuxTools: { missing: ['Xvfb', 'xdotool', 'import'], installLine: 'L' } })).toBe(
+      "app js: the agent app workspace on Linux needs Xvfb, xdotool and ImageMagick's import, and they are not installed here. Install them with: L"
+    )
+  })
+
+  it('darwin: runs in the person session, refuses over SSH', () => {
+    expect(workspaceRefusal({ platform: 'darwin', env: {} })).toBeNull()
+    expect(workspaceRefusal({ platform: 'darwin', env: { SSH_CLIENT: '1.2.3.4 5 22' } })).toBe(
+      'app js: no GUI session here (this Host runs in an SSH session), so there is nothing to launch the app in'
+    )
+  })
+
+  it('any other platform is unsupported', () => {
+    expect(workspaceRefusal({ platform: 'freebsd', env: {} })).toBe(
+      'app js: the agent app workspace does not run on freebsd (it runs on Windows, Linux and macOS)'
+    )
   })
 })

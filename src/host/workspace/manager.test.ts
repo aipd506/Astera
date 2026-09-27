@@ -150,9 +150,9 @@ const rig = async (over: Partial<WorkspaceManagerDeps> = {}) => {
 const body = (r: { status: number; body: unknown }) => r.body as { log: string[]; error?: { message: string; at: string } }
 
 describe('refusals', () => {
-  it('off Windows, switched off, unreadable settings, and an unknown session', async () => {
-    const { m: linux } = await rig({ platform: 'linux' })
-    expect(await linux.run('s1', 'log(1)')).toMatchObject({ status: 409, body: { error: expect.stringContaining('Windows only') } })
+  it('an unsupported platform, switched off, unreadable settings, and an unknown session', async () => {
+    const { m: other } = await rig({ platform: 'freebsd' })
+    expect(await other.run('s1', 'log(1)')).toMatchObject({ status: 409, body: { error: expect.stringContaining('does not run on freebsd') } })
     const { m: off } = await rig({ enabled: async () => false })
     expect(await off.run('s1', 'log(1)')).toEqual({ status: 409, body: { error: 'agent app workspace is off' } })
     const { m: broken } = await rig({

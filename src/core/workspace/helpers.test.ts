@@ -205,6 +205,17 @@ describe('launch', () => {
     expect(await r.h.windows()).toEqual([{ title: 'Fixture', className: 'Chrome_WidgetWin_1', pid: 501, width: 800, height: 600 }])
     await expect(r.h.snapshot()).rejects.toThrow(NO_CDP)
   })
+
+  it('names the port variable in sh syntax off Windows, and on macOS says only the page can be driven (R12)', async () => {
+    const linux = rig({ connectCdp: vi.fn(async () => null), platform: 'linux' })
+    await expect(linux.h.launch({ command: 'app' })).rejects.toThrow('--remote-debugging-port=$ASTERA_APP_CDP_PORT (for example')
+    await expect(linux.h.launch({ command: 'app' })).rejects.toThrow('already launched')
+    const mac = rig({ connectCdp: vi.fn(async () => null), platform: 'darwin' })
+    const err = await mac.h.launch({ command: 'app' }).catch((e: Error) => e.message)
+    expect(err).toContain('--remote-debugging-port=$ASTERA_APP_CDP_PORT')
+    expect(err).toContain('on macOS only its page can be driven')
+    expect(err).not.toContain('windowShot() and keys() work')
+  })
 })
 
 describe('relaunch and close', () => {

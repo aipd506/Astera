@@ -1,6 +1,8 @@
 // When a workspace ends by itself, and which leftovers a new Host may kill (agent workspace design,
 // Lifecycle). Pure.
 
+import type { LinuxTool, LinuxTools } from './platform'
+
 /** A desktop with no script for this long is cleaned up (W5). */
 export const WORKSPACE_IDLE_MS = 10 * 60_000
 
@@ -71,13 +73,29 @@ export function serializeWorkspacesFile(records: readonly WorkspaceRecord[]): st
   return `${JSON.stringify({ version: 1, workspaces: records }, null, 2)}\n`
 }
 
-/** Why `app js` cannot run on this Host at all, or null (spec, Errors; plan ruling P10). The helper
- *  answers the other half, a window station that is not visible, with NOT_INTERACTIVE. */
-export function workspaceRefusal(a: { platform: string; env: Record<string, string | undefined> }): string | null {
-  if (a.platform !== 'win32') return `app js: the agent app workspace runs on Windows only in this version (this Host runs on ${a.platform})`
-  if (a.env.SSH_CONNECTION || a.env.SSH_CLIENT || a.env.SSH_TTY)
-    return 'app js: no interactive desktop here (this Host runs in an SSH session), so there is no screen to protect and nothing to launch on'
-  return null
+const TOOL_LABEL: Record<LinuxTool, string> = { Xvfb: 'Xvfb', xdotool: 'xdotool', import: "ImageMagick's import" }
+
+const joined = (names: string[]): string => (names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`)
+
+/** Why `app js` cannot run on this Host at all, or null (Linux and macOS design, Refusal). win32
+ *  refuses over SSH, and its helper answers a window station that is not visible with NOT_INTERACTIVE;
+ *  linux refuses only for a missing tool (L1, L2: Xvfb is the display, so SSH and servers are fine);
+ *  darwin refuses over SSH (no GUI session to launch in); anything else is unsupported. */
+export function workspaceRefusal(a: { platform: string; env: Record<string, string | undefined>; linuxTools?: LinuxTools | null }): string | null {
+  const ssh = Boolean(a.env.SSH_CONNECTION || a.env.SSH_CLIENT || a.env.SSH_TTY)
+  if (a.platform === 'win32')
+    return ssh ? 'app js: no interactive desktop here (this Host runs in an SSH session), so there is no screen to protect and nothing to launch on' : null
+  if (a.platform === 'darwin') return ssh ? 'app js: no GUI session here (this Host runs in an SSH session), so there is nothing to launch the app in' : null
+  if (a.platform === 'linux') {
+    const missing = a.linuxTools?.missing ?? []
+    if (missing.length === 0) return null
+    const one = missing.length === 1
+    return (
+      `app js: the agent app workspace on Linux needs ${joined(missing.map((t) => TOOL_LABEL[t]))}, and ${one ? 'it is' : 'they are'} not installed here. ` +
+      `Install ${one ? 'it' : 'them'} with: ${a.linuxTools!.installLine}`
+    )
+  }
+  return `app js: the agent app workspace does not run on ${a.platform} (it runs on Windows, Linux and macOS)`
 }
 
 export const NOT_INTERACTIVE =

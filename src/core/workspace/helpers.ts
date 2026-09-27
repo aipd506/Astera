@@ -10,6 +10,7 @@ import type { RunContext } from '../agentBrowser/scriptRunner'
 import { clampSnapshot, type Snapshot } from '../agentBrowser/snapshot'
 import { clickScript, embedJson, fillScript, snapshotScript, waitForScript } from '../agentBrowser/guestScripts'
 import { section } from '../agentBrowser/section'
+import { cdpPortRef } from './platform'
 import type { DeskLaunched, DeskShot, DeskWindow } from './protocol'
 
 export interface Cdp {
@@ -84,6 +85,9 @@ export interface HelperDeps {
   stopped(): boolean
   /** app-guide.md, which `help()` prints. */
   guide: string
+  /** The Host's platform, for the words of the launch hint: the port variable's shell syntax, and
+   *  which helpers are there without CDP (R12). Absent means win32, the first platform. */
+  platform?: string
 }
 
 export const CDP_WAIT_MS = 60_000
@@ -99,8 +103,8 @@ const PAGE_POLL_MS = 100
 /** Parsed, and past the blank page an Electron window shows before its first loadURL. */
 const PAGE_READY = "document.readyState !== 'loading' && location.href !== 'about:blank'"
 
-/** Key names `press` and `keys` accept besides a single character. The Windows helper's `Vk` switch
- *  in desk.ts knows the same names. */
+/** Key names `press` and `keys` accept besides a single character. The Windows helper's Vk switch
+ *  in desk.ts and XDOTOOL_KEYS in deskLinux.ts know the same names. */
 export const NAMED_KEYS = [
   'Enter', 'Escape', 'Tab', 'Backspace', 'Delete', 'Space',
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'
@@ -279,12 +283,19 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
     }
     deps.state.cdp = cdp
     deps.changed()
-    if (!cdp)
+    if (!cdp) {
+      const platform = deps.platform ?? 'win32'
+      const portRef = cdpPortRef(platform)
+      const after =
+        platform === 'darwin'
+          ? 'The app is still running, but on macOS only its page can be driven, so the helpers other than close() and relaunch() cannot reach it until it opens the port.'
+          : `The app is still running, so windows(), windowShot() and keys() work; the page helpers throw "${NO_CDP}".`
       throw new Error(
         `${at}: the app started (pid ${started.pid}) but nothing answered on its debugging port ${port} within ${Math.round(budget / 1000)} s. ` +
-          'Start Electron with --remote-debugging-port=%ASTERA_APP_CDP_PORT% (for example: electron . --remote-debugging-port=%ASTERA_APP_CDP_PORT%). ' +
-          `The app is still running, so windows(), windowShot() and keys() work; the page helpers throw "${NO_CDP}".`
+          `Start Electron with --remote-debugging-port=${portRef} (for example: electron . --remote-debugging-port=${portRef}). ` +
+          after
       )
+    }
     await pageSettled(cdp, deps, deps.now() + Math.max(0, Math.min(PAGE_READY_MS, deps.deadline() - deps.now() - LAUNCH_MARGIN_MS)))
     return { pid: started.pid, port }
   }
