@@ -1,20 +1,27 @@
-// The process tools the workspace needs outside a helper: creation times for the leftover rule, a
-// tree kill, and a free loopback port. Windows PowerShell and taskkill, the conhost reaper's route
-// (src/host/conhostReaper.ts); the port is Node's own.
+// The process tools the workspace needs outside a desk: creation times for the leftover rule, a tree
+// kill, and a free loopback port. On Windows, PowerShell and taskkill (the conhost reaper's route,
+// src/host/conhostReaper.ts); on Linux and macOS, /proc or ps and a process group kill (posixProc.ts).
 import { execFile } from 'node:child_process'
 import net from 'node:net'
 import { treeKillCommand } from '../../core/run/kill'
+import { killGroup, linuxStartTimes, macStartTimes, realLinuxProcFs, realSignals, type LinuxProcFs, type Signals } from './posixProc'
 
 export type Exec = (file: string, args: string[]) => Promise<string>
 
 const defaultExec: Exec = (file, args) =>
   new Promise((resolve, reject) => {
-    execFile(file, args, { windowsHide: true, timeout: 30_000 }, (err, stdout) => (err ? reject(err) : resolve(String(stdout))))
+    execFile(file, args, { windowsHide: true, timeout: 30_000 }, (err, stdout) =>
+      err ? reject(Object.assign(err, { stdout: String(stdout) })) : resolve(String(stdout))
+    )
   })
 
+let defaultLinuxProc: LinuxProcFs | null = null
+
 /** Each live pid's creation time in epoch ms. One query for all of them. */
-export async function processStartTimes(pids: number[], exec: Exec = defaultExec): Promise<Map<number, number>> {
+export async function processStartTimes(pids: number[], exec: Exec = defaultExec, platform: string = process.platform): Promise<Map<number, number>> {
   for (const p of pids) if (!Number.isSafeInteger(p) || p <= 0) throw new Error(`not a pid: ${p}`)
+  if (platform === 'linux') return linuxStartTimes(pids, exec === defaultExec ? (defaultLinuxProc ??= realLinuxProcFs(exec)) : realLinuxProcFs(exec))
+  if (platform === 'darwin') return macStartTimes(pids, exec)
   const out = new Map<number, number>()
   if (pids.length === 0) return out
   const filter = pids.map((p) => `ProcessId=${p}`).join(' OR ')
@@ -29,9 +36,11 @@ export async function processStartTimes(pids: number[], exec: Exec = defaultExec
   return out
 }
 
-/** Ends `pid` and every process it started. A process already gone is not a failure: taskkill
- *  answers 128 for it, and the result the caller wanted is already true. */
-export async function killTree(pid: number, exec: Exec = defaultExec): Promise<void> {
+/** Ends `pid` and every process it started. On Windows through taskkill, which answers 128 for a
+ *  process already gone; elsewhere its process group (R10). Gone is not a failure: the result the
+ *  caller wanted is already true. */
+export async function killTree(pid: number, exec: Exec = defaultExec, platform: string = process.platform, signals: Signals = realSignals): Promise<void> {
+  if (platform !== 'win32') return killGroup(pid, signals)
   const cmd = treeKillCommand('win32', pid)
   if (!cmd) return
   await exec(cmd.file, cmd.args).catch((err: { code?: unknown }) => {

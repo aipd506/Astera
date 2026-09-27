@@ -4,7 +4,7 @@ import { freePort, killTree, processStartTimes } from './native'
 describe('processStartTimes', () => {
   it('asks once for every pid and reads pid|ms lines', async () => {
     const exec = vi.fn(async () => '100|1700000000000\r\n200|1700000000500\r\nnoise\r\n')
-    const r = await processStartTimes([100, 200, 300], exec)
+    const r = await processStartTimes([100, 200, 300], exec, 'win32')
     expect([...r.entries()]).toEqual([
       [100, 1700000000000],
       [200, 1700000000500]
@@ -16,16 +16,23 @@ describe('processStartTimes', () => {
 
   it('asks nothing for no pids, and refuses a pid that is not a positive integer', async () => {
     const exec = vi.fn(async () => '')
-    expect((await processStartTimes([], exec)).size).toBe(0)
+    expect((await processStartTimes([], exec, 'win32')).size).toBe(0)
     expect(exec).not.toHaveBeenCalled()
-    await expect(processStartTimes([1.5], exec)).rejects.toThrow('not a pid')
+    await expect(processStartTimes([1.5], exec, 'win32')).rejects.toThrow('not a pid')
+  })
+
+  it('on macOS reads ps lstart, and never runs PowerShell', async () => {
+    const exec = vi.fn(async () => '  100 Sat Sep 27 10:11:12 2026\n')
+    const r = await processStartTimes([100, 200], exec, 'darwin')
+    expect([...r.entries()]).toEqual([[100, new Date(2026, 8, 27, 10, 11, 12).getTime()]])
+    expect(exec).toHaveBeenCalledWith('env', ['LC_ALL=C', 'ps', '-o', 'pid=,lstart=', '-p', '100,200'])
   })
 })
 
 describe('killTree', () => {
   it('ends the tree with taskkill', async () => {
     const exec = vi.fn(async () => '')
-    await killTree(321, exec)
+    await killTree(321, exec, 'win32')
     expect(exec).toHaveBeenCalledWith('taskkill', ['/pid', '321', '/T', '/F'])
   })
 
@@ -33,7 +40,22 @@ describe('killTree', () => {
     const exec = vi.fn(async () => {
       throw Object.assign(new Error('Command failed'), { code: 128 })
     })
-    await expect(killTree(321, exec)).resolves.toBeUndefined()
+    await expect(killTree(321, exec, 'win32')).resolves.toBeUndefined()
+  })
+
+  it('off Windows ends the process group, never through taskkill (R10)', async () => {
+    const exec = vi.fn(async () => '')
+    const sent: Array<[number, NodeJS.Signals | 0]> = []
+    const signals = {
+      kill: (pid: number, sig: NodeJS.Signals | 0) => {
+        sent.push([pid, sig])
+        if (sig === 0) throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' })
+      },
+      sleep: async () => {}
+    }
+    await killTree(321, exec, 'linux', signals)
+    expect(exec).not.toHaveBeenCalled()
+    expect(sent).toEqual([[-321, 'SIGTERM'], [-321, 0]])
   })
 })
 
