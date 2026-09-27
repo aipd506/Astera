@@ -635,6 +635,7 @@ export const ja: Catalog = {
   'session.new.blocked.cliMissing': 'このアカウントの CLI が見つかりません',
   'session.new.blocked.noSchedule': '予約時刻を決めてください',
   'session.new.blocked.checkingFolder': 'リポジトリを確認しています…',
+  'startup.readingShellEnv': 'シェル環境を読み込んでいます…',
   'session.new.starting': 'セッションを開始しています…',
   'session.new.startingWorktree': 'worktree を作成しています…',
   'session.new.stage.fetch': 'ベースブランチを取得しています…',

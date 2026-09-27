@@ -730,6 +730,7 @@ export const en: Record<keyof typeof ko, string> = {
   'session.new.blocked.cliMissing': "This account's CLI was not found",
   'session.new.blocked.noSchedule': 'Set a schedule time',
   'session.new.blocked.checkingFolder': 'Checking the repository…',
+  'startup.readingShellEnv': 'Reading your shell environment…',
   'session.new.starting': 'Starting session…',
   'session.new.startingWorktree': 'Creating worktree…',
   'session.new.stage.fetch': 'Fetching the base branch…',

@@ -21,6 +21,8 @@ import trayAsset from '../../resources/tray.png?asset'
 import { createCore, type Core } from './core'
 import { clearAppRunning, markAppRunning } from '../core/host/pidFile'
 import { applyLoginPath } from './loginPath'
+import { startUp, startingPageUrl } from './startup'
+import { pickInitialLang } from '../core/i18n/locale'
 import { shouldForceWaylandOzone } from './ozone'
 import { registerIpc, parseAllowedExternalUrl, type OrchHandle } from './ipc'
 import { isOwnDocument } from './navigationGuard'
@@ -204,7 +206,17 @@ function buildMacMenu(): Menu {
  *  guest belongs to an agent — the guard would let an agent's tab walk off this machine. */
 const agentGuests = new AgentGuestRegistry((id) => webContents.fromId(id))
 
-function createWindow(): BrowserWindow {
+/** Loads the app's own page into the window. Split from createWindow because on macOS/Linux the
+ *  window opens before core exists (startup.ts) and shows a start-up page until this runs — which it
+ *  does right where the window used to be created, ahead of registerIpc with no await in between. */
+function loadApp(win: BrowserWindow): void {
+  if (process.env['ELECTRON_RENDERER_URL']) void win.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  else void win.loadFile(path.join(__dirname, '../renderer/index.html'))
+}
+
+/** `startingText` null loads the app at once (win32, exactly as before); otherwise the window shows
+ *  that text on a start-up page, and the caller loads the app with loadApp once core is ready. */
+function createWindow(startingText: string | null = null): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -238,8 +250,8 @@ function createWindow(): BrowserWindow {
     // in Electron; installPreviewGuards below is what makes turning it on safe.
     webPreferences: { preload: path.join(__dirname, '../preload/index.js'), sandbox: false, webviewTag: true }
   })
-  if (process.env['ELECTRON_RENDERER_URL']) win.loadURL(process.env['ELECTRON_RENDERER_URL'])
-  else win.loadFile(path.join(__dirname, '../renderer/index.html'))
+  if (startingText === null) loadApp(win)
+  else void win.loadURL(startingPageUrl(startingText))
   win.maximize()
 
   // DevTools in development. Its usual accelerators (Ctrl/Cmd+Shift+I, F12) come from Electron's
@@ -407,10 +419,26 @@ app.whenReady().then(async () => {
   if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(APP_ICON)
   // Launched from Finder on macOS or from a .desktop entry on Linux, there's no login shell PATH.
   // claude/codex/git/node are all looked up via PATH, so this must be restored before createCore
-  // (= StatusLineManager.init, account detection).
-  await applyLoginPath((m) => console.log(m))
-  core = await createCore(app.getPath('userData'), app.getLocale())
-  const win = createWindow()
+  // (= StatusLineManager.init, account detection) — and so before any session spawns, which all come
+  // after core. The window no longer waits for it: on macOS/Linux it opens first with a start-up page
+  // saying what is being waited on, and the wait is bounded (startup.ts). Windows is unchanged.
+  const started = await startUp({
+    platform: process.platform,
+    probeLoginPath: () => applyLoginPath((m) => console.log(m)),
+    openWindow: () => {
+      const w =
+        process.platform === 'win32'
+          ? createWindow()
+          : createWindow(t(pickInitialLang(app.getLocale()), 'startup.readingShellEnv'))
+      mainWindow = w
+      return w
+    },
+    createCore: () => createCore(app.getPath('userData'), app.getLocale()),
+    log: (m) => console.log(m)
+  })
+  core = started.core
+  const win = started.win
+  if (process.platform !== 'win32') loadApp(win)
   mainWindow = win
   // Slack progress notifications: hook events, roll state, limits and exits go out over an Incoming
   // Webhook or a Slack bot (chat.postMessage) — SlackNotifier abstracts both behind a transport, so

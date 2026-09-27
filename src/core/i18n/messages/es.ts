@@ -641,6 +641,7 @@ export const es: Catalog = {
   'session.new.blocked.cliMissing': 'No se encontró la CLI de esta cuenta',
   'session.new.blocked.noSchedule': 'Fija una hora programada',
   'session.new.blocked.checkingFolder': 'Comprobando el repositorio…',
+  'startup.readingShellEnv': 'Leyendo el entorno de la shell…',
   'session.new.starting': 'Iniciando la sesión…',
   'session.new.startingWorktree': 'Creando el worktree…',
   'session.new.stage.fetch': 'Obteniendo la rama base…',

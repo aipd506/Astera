@@ -844,6 +844,7 @@ export const ko = {
   'session.new.blocked.cliMissing': '이 계정의 CLI 를 찾지 못했습니다',
   'session.new.blocked.noSchedule': '예약 시각을 정하세요',
   'session.new.blocked.checkingFolder': '저장소를 확인하는 중…',
+  'startup.readingShellEnv': '셸 환경을 읽는 중…',
   // Waiting text between pressing Start and the tab opening. Splitting off a worktree chains fetch, worktree add and
   // the include copy, taking several seconds, so what is in progress is announced separately.
   'session.new.starting': '세션을 시작하는 중…',
