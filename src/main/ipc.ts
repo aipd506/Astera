@@ -6994,13 +6994,15 @@ export function registerIpc(
   // person installs something, which is not while they are typing, and the pane asks once when it
   // opens. Answers an empty list rather than throwing for a session whose account has gone.
   // What `@` offers. The walk behind it is cached per project (main/fileIndex.ts), so this is one
-  // in-memory filter per keystroke rather than one tree walk.
+  // in-memory filter per keystroke rather than one tree walk. While the first walk of a project is
+  // still under way this answers at once with what it has found, and says it is still indexing.
   ipcMain.handle('conversation.files', async (_e, sessionId: string, query: string) => {
     const session = allSessions().find((s) => s.id === sessionId)
-    if (!session) return []
-    const files = session.cwd
-      ? await fileIndex.search(session.cwd, query, CONVERSATION_FILE_MATCHES)
-      : []
+    if (!session) return { paths: [], indexing: false }
+    const found = session.cwd
+      ? await fileIndex.lookup(session.cwd, query, CONVERSATION_FILE_MATCHES)
+      : { paths: [], indexing: false }
+    const files = found.paths
     // codex asks for a skill by mentioning it, the same way it mentions a file, so both belong in
     // the one list — skills first, being far fewer and named rather than found.
     let account: { provider?: string; configDir: string } | null = null
@@ -7009,13 +7011,16 @@ export function registerIpc(
     } catch {
       account = null
     }
-    if (account?.provider !== 'codex') return files
+    if (account?.provider !== 'codex') return { paths: files, indexing: found.indexing }
     const skills = filterFilePaths(
       await listCodexMentions(account.configDir),
       query,
       CONVERSATION_FILE_MATCHES
     )
-    return [...skills, ...files].slice(0, CONVERSATION_FILE_MATCHES)
+    return {
+      paths: [...skills, ...files].slice(0, CONVERSATION_FILE_MATCHES),
+      indexing: found.indexing
+    }
   })
   ipcMain.handle('conversation.commands', async (_e, sessionId: string) => {
     const session = allSessions().find((s) => s.id === sessionId)

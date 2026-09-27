@@ -1483,6 +1483,7 @@ export const en: Record<keyof typeof ko, string> = {
   'conversation.model.change': 'Change model and effort (in the terminal)',
   'conversation.model.aria': 'Model and effort',
   'conversation.model.unknown': 'Model',
+  'conversation.indexingFiles': 'Indexing files…',
   'conversation.unavailable': 'This session has no transcript yet',
   'conversation.empty': 'Nothing has been said yet',
   'conversation.composer.placeholder': 'What should it do',

@@ -1730,6 +1730,7 @@ export const ko = {
   'conversation.model.aria': '모델과 effort',
   'conversation.model.unknown': '모델',
   // ConversationPane.tsx — open() answering null, and a transcript that exists but has no turns yet.
+  'conversation.indexingFiles': '파일 목록을 만드는 중…',
   'conversation.unavailable': '이 세션은 아직 기록이 없습니다',
   'conversation.empty': '아직 주고받은 것이 없습니다',
   'conversation.composer.placeholder': '무엇을 시킬까요',

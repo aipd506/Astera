@@ -293,6 +293,8 @@ const PENDING_SWEEP_MS = 5_000
 /** How long the button may say a change is on its way before giving up on saying so. Longer than the
  *  walk's own wait, so an answer that is merely slow still lands while it is still being waited for,
  *  and short enough that a change the CLI quietly refused stops pretending. */
+/** How soon the `@` menu asks again while main says the project's first walk is still under way. */
+const FILE_INDEX_POLL_MS = 400
 const MODEL_BUSY_MAX_MS = 6_000
 
 
@@ -429,6 +431,8 @@ export function ConversationPane({
   const [composerText, setComposerText] = useState("");
   const [composerCaret, setComposerCaret] = useState(0);
   const [fileMatches, setFileMatches] = useState<readonly string[]>([]);
+  /** The project's first `@` walk is still under way — the menu says so instead of sitting empty. */
+  const [fileIndexing, setFileIndexing] = useState(false);
   const [slashActive, setSlashActive] = useState(0);
   /** What this session's CLI says it can run. Asked once per session — see conversation.models. */
   const [models, setModels] = useState<readonly ModelDescriptor[]>([]);
@@ -835,28 +839,41 @@ export function ConversationPane({
 
   // What `@` is asking for, fetched per keystroke. Cheap after the first one: main walks the project
   // once and keeps the list (main/fileIndex.ts), so this is an in-memory filter and a round trip.
+  // While the first walk of a large project (or a slow share) is under way, main answers with what it
+  // has found so far and `indexing`; this asks again shortly, so the menu fills in as the walk goes.
   useEffect(() => {
     if (fileQuery === null) {
       setFileMatches([]);
+      setFileIndexing(false);
       return;
     }
     const generation = generationRef.current;
     let cancelled = false;
-    void window.api.conversation
-      .files(sessionId, fileQuery)
-      .then((paths) => {
-        if (cancelled || generationRef.current !== generation) return;
-        setFileMatches(paths);
-      })
-      .catch(() => {});
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    const ask = (): void => {
+      void window.api.conversation
+        .files(sessionId, fileQuery)
+        .then(({ paths, indexing }) => {
+          if (cancelled || generationRef.current !== generation) return;
+          setFileMatches(paths);
+          setFileIndexing(indexing);
+          if (indexing) retry = setTimeout(ask, FILE_INDEX_POLL_MS);
+        })
+        .catch(() => {
+          if (!cancelled) setFileIndexing(false);
+        });
+    };
+    ask();
     return () => {
       cancelled = true;
+      if (retry !== null) clearTimeout(retry);
     };
   }, [sessionId, fileQuery]);
 
   const rows: CompletionRow[] =
     fileToken === null ? [] : fileMatches.map((p) => ({ key: p, label: p }));
   const slashOpen = rows.length > 0;
+  const fileIndexingShown = fileToken !== null && fileIndexing;
   const slashOpenRef = useRef(slashOpen);
   slashOpenRef.current = slashOpen;
   const rowsRef = useRef(rows);
@@ -1327,6 +1344,7 @@ export function ConversationPane({
       active={Math.min(slashActive, Math.max(rows.length - 1, 0))}
       onPick={takeRow}
       onHover={setSlashActive}
+      status={fileIndexingShown ? t("conversation.indexingFiles") : undefined}
     />
   );
   /** What the banner slot is for, in the order paneTransport.ts sets out. */
@@ -1362,7 +1380,7 @@ export function ConversationPane({
     <ChatNotice text={t("chat.notice.checking")} />
   ) : chatBanner.kind === "endsWithApp" ? (
     <ChatNotice text={t("chat.notice.endsWithApp")} />
-  ) : slashOpen ? (
+  ) : slashOpen || fileIndexingShown ? (
     completionMenu
   ) : null;
 

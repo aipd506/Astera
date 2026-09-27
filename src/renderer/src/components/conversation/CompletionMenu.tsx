@@ -22,11 +22,20 @@ export interface CompletionMenuProps {
   active: number;
   onPick: (row: CompletionRow) => void;
   onHover: (index: number) => void;
+  /** A line under the rows saying the list is still being built (the `@` index's first walk). With it
+   *  the menu is drawn even with no rows yet, so a slow walk reads as work under way, not as nothing. */
+  status?: string;
 }
 
 /** The list `/` and `@` open, drawn in the banner slot so it sits directly above the composer with no
  *  positioning of its own. */
-export function CompletionMenu({ rows, active, onPick, onHover }: CompletionMenuProps): ReactNode {
+export function CompletionMenu({
+  rows,
+  active,
+  onPick,
+  onHover,
+  status,
+}: CompletionMenuProps): ReactNode {
   const activeRef = useRef<HTMLButtonElement | null>(null);
 
   // Arrowing past the bottom of a long list has to bring the row with it.
@@ -67,6 +76,15 @@ export function CompletionMenu({ rows, active, onPick, onHover }: CompletionMenu
           )}
         </button>
       ))}
+      {status !== undefined && (
+        <div
+          role="status"
+          className="text-muted-foreground flex items-center gap-2 px-3 py-1.5 text-xs"
+        >
+          <span className="loading-spinner small" aria-hidden="true" />
+          {status}
+        </div>
+      )}
     </div>
   );
 }

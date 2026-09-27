@@ -676,6 +676,7 @@ export const es: Catalog = {
   // ConversationPane.tsx — exited banner (session-failure-visibility design D2/F2). Este catálogo
   // parcial aún no tiene el resto de las claves conversation.* (se sustituyen por en/ko); estas tres
   // se añaden antes que las demás.
+  'conversation.indexingFiles': 'Indexando archivos…',
   'conversation.exited.withCode': 'Esta sesión ha terminado (código {code})',
   'conversation.exited.detail': 'Detalles',
   'conversation.exited.restart': 'Reiniciar',
