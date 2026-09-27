@@ -252,3 +252,33 @@ describe('gitDir', () => {
     expect(await gitDir(plain)).toBeNull()
   })
 })
+
+// 중단 신호: 걸린 git 을 (Windows 에서는 자식까지) 죽이고 곧바로 답한다. git 이 띄운 자식이 출력
+// 파이프를 쥐고 있어도 기다리지 않는다 — 'close' 가 아니라 git 자신의 종료만 본다.
+describe('git 어댑터 — 중단', () => {
+  it('도는 중에 중단하면 git 을 죽이고 cancelled 로 곧바로 답한다', async () => {
+    const ac = new AbortController()
+    const started = Date.now()
+    const p = git(['-c', 'alias.slow=!sleep 30', 'slow'], { cwd: repo, signal: ac.signal })
+    setTimeout(() => ac.abort(), 300)
+    const r = await p
+    expect(r.ok).toBe(false)
+    expect(r.cancelled).toBe(true)
+    expect(r.exitCode).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(8_000)
+  }, 15_000)
+
+  it('이미 중단된 신호면 git 을 띄우지 않는다', async () => {
+    const ac = new AbortController()
+    ac.abort()
+    const r = await git(['--version'], { signal: ac.signal })
+    expect(r).toMatchObject({ ok: false, cancelled: true })
+    expect(r.stdout).toBe('')
+  })
+
+  it('신호를 주지 않는 호출은 그대로다', async () => {
+    const r = await git(['--version'])
+    expect(r.ok).toBe(true)
+    expect(r.cancelled).toBeUndefined()
+  })
+})

@@ -96,6 +96,7 @@ export const ja: Catalog = {
   'worktree.include.notIgnored': 'gitignore されていないためスキップしました: {entry}',
   'worktree.include.sizeFailed': '容量の計算に失敗しました: {entry} ({detail})',
   'worktree.include.overLimit': 'コピー上限 (200MB) を超えたためスキップしました: {entry}',
+  'worktree.include.linkedDirSkipped': 'リンクされたフォルダー {count} 個はコピーしませんでした: {entry}',
   'worktree.include.copyFailed': 'コピーに失敗しました: {entry} ({detail})',
   'worktree.create.fetchFailed':
     'リモートの更新に失敗したため、ローカルの {baseRef} を基準に作成しました',

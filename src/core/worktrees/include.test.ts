@@ -3,7 +3,7 @@ import type { TestContext } from 'vitest'
 import { execFileSync } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { parseWorktreeInclude, copyWorktreeInclude, dirSize } from './include'
+import { parseWorktreeInclude, copyWorktreeInclude, dirSize, measureTree } from './include'
 import { makeRepo, tempDir } from './testRepo'
 
 /** symlink 생성 실패가 권한 문제(EPERM/EACCES)면 실패가 아니라 스킵으로 처리한다(리뷰 Finding 5) —
@@ -132,4 +132,81 @@ describe('dirSize', () => {
     },
     2000 // vitest 기본 타임아웃보다 훨씬 짧게 — 회귀 시 hang이 아니라 타임아웃으로 빠르게 실패
   )
+})
+
+// 크기 재기는 링크된 폴더 안으로 내려가지 않는다. pnpm 의 node_modules 는 링크(Windows 에서는
+// 정션)로 된 폴더 나무라, 링크를 따라가면 같은 패키지를 수없이 다시 세면서 realpath·stat 을 끝없이
+// 불렀다. 그리고 상한을 넘는 순간 세기를 멈춘다 — 넘은 뒤로 더 셀 이유가 없다.
+describe('measureTree — 묶인 크기 재기', () => {
+  it('링크된 폴더(정션)는 따라가지 않고 세지도 않는다', async () => {
+    const dir = await tempDir('astera-wt-walk-link-')
+    const outside = await tempDir('astera-wt-walk-outside-')
+    await fs.writeFile(path.join(outside, 'big.bin'), 'x'.repeat(5000), 'utf8')
+    await fs.writeFile(path.join(dir, 'real.txt'), 'x'.repeat(100), 'utf8')
+    // 정션은 Windows 에서 권한 없이 만들어지고, 다른 OS 에서는 'junction' 이 무시되어 폴더 링크가 된다
+    await fs.symlink(outside, path.join(dir, 'linked'), 'junction')
+    const plan = await measureTree(dir)
+    expect(plan.bytes).toBe(100)
+    expect(plan.files.map((f) => f.rel)).toEqual(['real.txt'])
+    expect(plan.linkedDirs).toBe(1)
+    expect(plan.over).toBe(false)
+    expect(await dirSize(dir)).toBe(100)
+  })
+
+  it('상한을 넘으면 그 자리에서 세기를 멈춘다 — 나머지 파일은 보지 않는다', async () => {
+    const dir = await tempDir('astera-wt-walk-cap-')
+    for (let i = 0; i < 40; i++) await fs.writeFile(path.join(dir, `f${i}.txt`), 'x'.repeat(100), 'utf8')
+    const plan = await measureTree(dir, { limit: 250 })
+    expect(plan.over).toBe(true)
+    expect(plan.files.length).toBe(3) // 100, 200, 300 에서 멈춘다
+    expect(plan.bytes).toBe(300)
+  })
+
+  it('중단 신호가 오면 WORKTREE_CANCELLED 로 멈춘다', async () => {
+    const dir = await tempDir('astera-wt-walk-abort-')
+    await fs.writeFile(path.join(dir, 'a.txt'), 'a', 'utf8')
+    const ac = new AbortController()
+    ac.abort()
+    await expect(measureTree(dir, { signal: ac.signal })).rejects.toThrow(/WORKTREE_CANCELLED/)
+  })
+})
+
+describe('copyWorktreeInclude — 링크된 폴더', () => {
+  const setup = async (): Promise<{ repo: string; outside: string }> => {
+    const repo = await makeRepo('astera-wt-inc-link-')
+    const outside = await tempDir('astera-wt-inc-outside-')
+    await fs.writeFile(path.join(outside, 'pkg.js'), 'p', 'utf8')
+    await fs.writeFile(path.join(repo, '.gitignore'), 'deps/\nlinkdir\n', 'utf8')
+    await fs.mkdir(path.join(repo, 'deps'))
+    await fs.writeFile(path.join(repo, 'deps', 'own.txt'), 'o', 'utf8')
+    await fs.symlink(outside, path.join(repo, 'deps', 'pkg'), 'junction')
+    await fs.symlink(outside, path.join(repo, 'linkdir'), 'junction')
+    await fs.writeFile(path.join(repo, '.worktreeinclude'), 'deps\nlinkdir\n', 'utf8')
+    execFileSync('git', ['add', '.gitignore', '.worktreeinclude'], { cwd: repo, windowsHide: true })
+    execFileSync('git', ['commit', '-m', 'inc'], { cwd: repo, windowsHide: true })
+    return { repo, outside }
+  }
+
+  it('항목 안의 링크된 폴더는 복사하지 않고, 항목 자체가 링크된 폴더면 건너뛰며 경고한다', async () => {
+    const { repo } = await setup()
+    const wt = await tempDir('astera-wt-inc-link-dest-')
+    const warnings = await copyWorktreeInclude(repo, wt)
+    expect(await fs.readFile(path.join(wt, 'deps', 'own.txt'), 'utf8')).toBe('o')
+    await expect(fs.lstat(path.join(wt, 'deps', 'pkg'))).rejects.toThrow()
+    await expect(fs.lstat(path.join(wt, 'linkdir'))).rejects.toThrow()
+    expect(warnings).toEqual([
+      { key: 'worktree.include.linkedDirSkipped', params: { entry: 'deps', count: 1 } },
+      { key: 'worktree.include.linkedDirSkipped', params: { entry: 'linkdir', count: 1 } }
+    ])
+  })
+
+  it('복사 진행을 바이트와 파일 수로 알린다 — 마지막 알림은 총량과 같다', async () => {
+    const { repo } = await setup()
+    const wt = await tempDir('astera-wt-inc-prog-dest-')
+    const seen: Array<Record<string, number | undefined>> = []
+    await copyWorktreeInclude(repo, wt, { onProgress: (p) => seen.push({ ...p }) })
+    expect(seen[0]).toEqual({}) // 재는 중 — 아직 수가 없다
+    const last = seen[seen.length - 1]
+    expect(last).toEqual({ bytesCopied: 1, bytesTotal: 1, filesCopied: 1, filesTotal: 1 })
+  })
 })

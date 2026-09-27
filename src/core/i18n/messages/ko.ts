@@ -121,6 +121,7 @@ export const ko = {
   'worktree.include.notIgnored': 'gitignore되지 않아 건너뜀: {entry}',
   'worktree.include.sizeFailed': '용량 계산 실패: {entry} ({detail})',
   'worktree.include.overLimit': '복사 상한(200MB) 초과로 건너뜀: {entry}',
+  'worktree.include.linkedDirSkipped': '링크된 폴더 {count}개는 복사하지 않음: {entry}',
   'worktree.include.copyFailed': '복사 실패: {entry} ({detail})',
   'worktree.create.fetchFailed': '원격 갱신에 실패해 로컬에 있는 {baseRef} 기준으로 생성했습니다',
   'worktree.create.baseRecordFailed': 'branch.base 기록 실패 — 삭제 시 머지 판정이 HEAD 기준이 됩니다',

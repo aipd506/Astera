@@ -1,6 +1,7 @@
-import { execFile } from 'node:child_process'
+import { execFile, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import type { BranchRef } from '../types'
+import { treeKillCommand } from '../run/kill'
 
 export interface GitResult {
   ok: boolean
@@ -10,6 +11,8 @@ export interface GitResult {
    *  when git answered ok, and absent when it did not answer at all (killed at its deadline, output
    *  over the limit, or never started), so a caller can tell "git said no" from "git said nothing". */
   exitCode?: number
+  /** Set only when the call was stopped by its AbortSignal (see git's `signal`). */
+  cancelled?: true
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -40,18 +43,67 @@ function isTransientSpawnFailure(err: unknown): boolean {
   return !!e && typeof e.code === 'string' && SPAWN_TRANSIENT.has(e.code) && e.killed !== true
 }
 
+/** How long an aborted call waits for git itself to exit after the kill. The kill is asynchronous
+ *  (taskkill on Windows), and a caller that rolls back right after a cancel should not race a git that
+ *  still holds a lock — but a git that will not die is no reason to hang the caller either. */
+const ABORT_EXIT_WAIT_MS = 5_000
+
+/** Kills a git child and, on Windows, everything it started (a fetch's remote helper, a hook's shell).
+ *  Never throws: the process may be gone already. */
+function killGitTree(child: ChildProcess): void {
+  const pid = child.pid
+  const cmd = pid !== undefined ? treeKillCommand(process.platform, pid) : null
+  try {
+    if (cmd) {
+      execFile(cmd.file, cmd.args, { windowsHide: true }, () => {
+        // taskkill failing means the tree is already gone — the child.kill below is the backstop
+      })
+    }
+    child.kill()
+  } catch {
+    // already exited
+  }
+}
+
 /** git execution adapter. No shell (avoids quoting problems); a failure does not throw, it returns ok=false —
  *  including when node's execFile throws synchronously instead of calling back, which it does for some
  *  spawn failures on Windows. A transient spawn failure is retried once (see SPAWN_TRANSIENT).
- *  trim defaults to true — pass false for output where leading whitespace is meaningful, such as porcelain. */
+ *  trim defaults to true — pass false for output where leading whitespace is meaningful, such as porcelain.
+ *
+ *  `signal`: aborting it kills git (its whole process tree on Windows) and answers ok=false with
+ *  `cancelled` set, as soon as git itself has exited — not when its output pipes close, which a
+ *  grandchild still holding them can put off for as long as it lives. An already-aborted signal starts
+ *  nothing. Callers that pass no signal see no change. */
 export function git(
   args: string[],
-  opts?: { cwd?: string; timeoutMs?: number; trim?: boolean }
+  opts?: { cwd?: string; timeoutMs?: number; trim?: boolean; signal?: AbortSignal }
 ): Promise<GitResult> {
-  const once = (): Promise<{ err: unknown; stdout: string; stderr: string }> =>
+  const signal = opts?.signal
+  const cancelledResult = (): GitResult => ({ ok: false, stdout: '', stderr: 'cancelled', cancelled: true })
+  const once = (): Promise<{ err: unknown; stdout: string; stderr: string; cancelled?: true }> =>
     new Promise((resolve) => {
+      if (signal?.aborted) {
+        resolve({ err: new Error('cancelled'), stdout: '', stderr: '', cancelled: true })
+        return
+      }
+      let child: ChildProcess | null = null
+      let settled = false
+      const onAbort = (): void => {
+        if (settled || !child) return
+        const c = child
+        killGitTree(c)
+        const finish = (): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve({ err: new Error('cancelled'), stdout: '', stderr: '', cancelled: true })
+        }
+        const timer = setTimeout(finish, ABORT_EXIT_WAIT_MS)
+        if (c.exitCode !== null || c.signalCode !== null) finish()
+        else c.once('exit', finish)
+      }
       try {
-        execFile(
+        child = execFile(
           'git',
           args,
           {
@@ -60,13 +112,21 @@ export function git(
             windowsHide: true,
             maxBuffer: GIT_MAX_BUFFER_BYTES
           },
-          (err, stdout, stderr) => resolve({ err, stdout: stdout ?? '', stderr: stderr ?? '' })
+          (err, stdout, stderr) => {
+            signal?.removeEventListener('abort', onAbort)
+            if (settled) return
+            settled = true
+            resolve({ err, stdout: stdout ?? '', stderr: stderr ?? '' })
+          }
         )
+        signal?.addEventListener('abort', onAbort, { once: true })
       } catch (err) {
+        settled = true
         resolve({ err, stdout: '', stderr: err instanceof Error ? err.message : String(err) })
       }
     })
-  const shape = (r: { err: unknown; stdout: string; stderr: string }): GitResult => {
+  const shape = (r: { err: unknown; stdout: string; stderr: string; cancelled?: true }): GitResult => {
+    if (r.cancelled) return cancelledResult()
     const out: GitResult = {
       ok: !r.err,
       stdout: opts?.trim === false ? r.stdout : r.stdout.trim(),
@@ -77,7 +137,7 @@ export function git(
     return out
   }
   return once().then(async (first) => {
-    if (!isTransientSpawnFailure(first.err)) return shape(first)
+    if (first.cancelled || !isTransientSpawnFailure(first.err)) return shape(first)
     await new Promise((r) => setTimeout(r, RETRY_DELAY_MS))
     return shape(await once())
   })

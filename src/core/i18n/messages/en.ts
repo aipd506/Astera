@@ -115,6 +115,7 @@ export const en: Record<keyof typeof ko, string> = {
   'worktree.include.notIgnored': 'Skipped, not gitignored: {entry}',
   'worktree.include.sizeFailed': 'Failed to measure size: {entry} ({detail})',
   'worktree.include.overLimit': 'Skipped, over the 200MB copy limit: {entry}',
+  'worktree.include.linkedDirSkipped': 'Linked folders not copied ({count}): {entry}',
   'worktree.include.copyFailed': 'Copy failed: {entry} ({detail})',
   'worktree.create.fetchFailed': 'Could not refresh from remote; created from local {baseRef}',
   'worktree.create.baseRecordFailed': 'Failed to record branch.base — merge detection on delete will use HEAD',
