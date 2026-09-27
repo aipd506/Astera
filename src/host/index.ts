@@ -18,7 +18,7 @@ import { SPAWN_DEADLINE_MS } from '../core/host/unresponsive'
 import { hideForkedConsoleWindows } from './childWindows'
 import { trustSystemCa } from './systemCa'
 import { openHostLog, logUnhandledRejections } from './log'
-import { flushAllLogsSync } from '../core/log/logWriter'
+import { flushAll, flushAllLogsSync } from '../core/log/logWriter'
 import { startHostServer, ADDRESS_TAKEN } from './server'
 import { PtyRegistry } from './registry'
 import { createConhostReaper, reapWindowsConsoleHosts } from './conhostReaper'
@@ -71,6 +71,9 @@ const EXIT_SETTLE_MS = 300
  *  ended its sessions has nothing left to do gracefully, and one that will not leave is worse than
  *  one that leaves hard: it holds the address's twin, and it is invisible outside Task Manager. */
 const EXIT_HAMMER_MS = 1_500
+/** How long `leave` waits for the log appends already in flight before its final sync flush (stage 3,
+ *  task 3, review I1). Short: a disk that stalls this long gets the sync flush anyway. */
+const LEAVE_LOG_FLUSH_CAP_MS = 1_000
 
 async function main(): Promise<void> {
   // Before anything can create a child: node-pty forks a helper on every ConPTY kill, and from 1.3.20
@@ -217,14 +220,18 @@ async function main(): Promise<void> {
       await server
         .close()
         .catch((err) => log.write(`the server did not close cleanly: ${String(err)}`))
-        .finally(() => {
+        .finally(async () => {
           // The journal's handle, once no command can reach a commit any more: the spawns have settled and
           // the server has closed. Never throws.
           hostJournal.close()
           registry.killAll()
           procs.killAll()
-          // Every buffered log line on disk before the exits below are armed (stage 3, task 3). The
-          // process's exit hook flushes once more for anything written after this. Never throws.
+          // Every buffered log line on disk before the exits below are armed (stage 3, task 3). First the
+          // async appends already in flight are awaited, capped so a stuck disk cannot hold the way out
+          // (review I1): a sync line written while one is in flight could land before it. Then what is
+          // left goes synchronously. The process's exit hook flushes once more for anything written
+          // after this. Neither throws nor rejects.
+          await disposeWithin(flushAll(), LEAVE_LOG_FLUSH_CAP_MS, () => {})
           flushAllLogsSync()
           // Both deferred, and both unref'd: see EXIT_SETTLE_MS. Unref'd so that a Host whose loop
           // empties on its own is not held open by its own way out. Armed after the settle, so the

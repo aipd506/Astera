@@ -27,6 +27,8 @@ export const LOG_FLUSH_MS = 200
 export const LOG_FLUSH_BYTES = 64 * 1024
 /** A disk that cannot keep up must not grow the heap without end: past this, new lines are dropped. */
 export const LOG_MAX_PENDING_BYTES = 4 * 1024 * 1024
+/** A rotation that failed (a `.1` another program holds open) is not tried again for this long. */
+export const LOG_ROTATE_RETRY_MS = 60_000
 
 /** The fs calls the writer makes, injectable for tests. */
 export interface LogFs {
@@ -70,6 +72,8 @@ export interface LogWriterOptions {
   /** Make the parent directory (once) before the first write. */
   ensureDir?: boolean
   fs?: LogFs
+  /** Test injection for the rotation backoff's clock. */
+  now?: () => number
 }
 
 const noted = new Set<string>()
@@ -80,8 +84,13 @@ function note(op: string, file: string, err: unknown): void {
   const kind = `${op}:${typeof code === 'string' ? code : err instanceof Error ? err.name : typeof err}`
   if (noted.has(kind)) return
   noted.add(kind)
+  say(`[astera log] ${op} failed (${kind.slice(op.length + 1)}) for ${path.basename(file)}; later lines of this kind are dropped silently\n`)
+}
+
+/** One line on stderr. Never throws, never logs. */
+function say(line: string): void {
   try {
-    process.stderr.write(`[astera log] ${op} failed (${kind.slice(op.length + 1)}) for ${path.basename(file)}; later lines of this kind are dropped silently\n`)
+    process.stderr.write(line)
   } catch {
     /* nowhere left to say it */
   }
@@ -109,6 +118,25 @@ export function createLogWriter(o: LogWriterOptions): LogWriter {
   let timer: ReturnType<typeof setTimeout> | null = null
   let chain: Promise<void> = Promise.resolve()
   let queued = false
+  /** True while an async drain is between its take and its append (review I1). */
+  let draining = false
+  const now = o.now ?? Date.now
+  /** A rename that failed (a locked .1, say) is not tried again before this time (review M3). */
+  let rotateBlockedUntil = 0
+  /** Inside a spell of failing renames: noted once at its start, not per attempt. */
+  let rotateFailing = false
+  const rotationAllowed = (): boolean => now() >= rotateBlockedUntil
+  const rotated = (): void => {
+    rotateFailing = false
+    rotateBlockedUntil = 0
+  }
+  const rotationFailed = (err: unknown): void => {
+    rotateBlockedUntil = now() + LOG_ROTATE_RETRY_MS
+    if (rotateFailing) return
+    rotateFailing = true
+    const code = (err as { code?: unknown } | null)?.code
+    say(`[astera log] could not rotate ${path.basename(file)} (${typeof code === 'string' ? code : 'error'}); it grows past its cap, next try in ${LOG_ROTATE_RETRY_MS / 1000} s\n`)
+  }
 
   const take = (): { data: string; bytes: number } | null => {
     if (buf.length === 0) return null
@@ -134,7 +162,7 @@ export function createLogWriter(o: LogWriterOptions): LogWriter {
         }
       )
     }
-    if (size > 0 && size + t.bytes > maxBytes) {
+    if (size > 0 && size + t.bytes > maxBytes && rotationAllowed()) {
       // Read once more before renaming: another process that writes the same file (the Host and the
       // app share rolling.log and slack.log) may have rotated it already. Only at the cap, so rare.
       const actual = await fs.stat(file).then(
@@ -144,9 +172,10 @@ export function createLogWriter(o: LogWriterOptions): LogWriter {
       if (actual > 0 && actual + t.bytes > maxBytes) {
         try {
           await fs.rename(file, `${file}.1`)
+          rotated()
           size = 0
         } catch (err) {
-          note('rotate', file, err)
+          rotationFailed(err)
           size = actual
         }
       } else size = actual
@@ -156,6 +185,15 @@ export function createLogWriter(o: LogWriterOptions): LogWriter {
       size += t.bytes
     } catch (err) {
       note('append', file, err)
+    }
+  }
+
+  const runDrain = async (): Promise<void> => {
+    draining = true
+    try {
+      await drain()
+    } finally {
+      draining = false
     }
   }
 
@@ -169,7 +207,7 @@ export function createLogWriter(o: LogWriterOptions): LogWriter {
       chain = chain
         .then(() => {
           queued = false
-          return drain()
+          return runDrain()
         })
         .catch((err) => note('flush', file, err))
     }
@@ -200,13 +238,27 @@ export function createLogWriter(o: LogWriterOptions): LogWriter {
           size = 0
         }
       }
-      if (size > 0 && size + t.bytes > maxBytes) {
+      // **Not while an async drain is in flight** (review I1): that drain may be about to rename this
+      // file, and lines appended here would go to .1 with it — or its own append would land in a file
+      // this rename just emptied. Skipping costs one flush's worth past the cap, once.
+      if (!draining && size > 0 && size + t.bytes > maxBytes && rotationAllowed()) {
+        // Re-read first, as the async path does (review M2): another process may have rotated it.
+        let actual = 0
         try {
-          fs.renameSync(file, `${file}.1`)
-          size = 0
-        } catch (err) {
-          note('rotate', file, err)
+          actual = fs.statSync(file).size
+        } catch {
+          actual = 0
         }
+        if (actual > 0 && actual + t.bytes > maxBytes) {
+          try {
+            fs.renameSync(file, `${file}.1`)
+            rotated()
+            size = 0
+          } catch (err) {
+            rotationFailed(err)
+            size = actual
+          }
+        } else size = actual
       }
       fs.appendFileSync(file, t.data)
       size += t.bytes
@@ -273,7 +325,23 @@ export function lineLog(p: string, opts: Omit<LogWriterOptions, 'path'> = {}): (
   }
 }
 
-/** Writes every shared writer's buffer synchronously. For exit and quit paths. Never throws. */
+/** Every shared writer's buffer drained, and every append already in flight awaited (review I1). For a
+ *  way out that can wait — the Host's `leave` awaits this (capped) before its final `flushAllLogsSync`,
+ *  so no sync line races an async one. Never rejects. */
+export function flushAll(): Promise<void> {
+  return Promise.all([...writers.values()].map((w) => w.flush().catch(() => {}))).then(
+    () => undefined,
+    () => undefined
+  )
+}
+
+/** Writes every shared writer's buffer synchronously. For exit and quit paths. Never throws.
+ *
+ *  An async append already in flight is not waited for: a synchronous caller cannot. Where that
+ *  matters, `await flushAll()` first. The app's `will-quit` cannot await (Electron does not wait on
+ *  it), so there a flush that started within the last few milliseconds may land after these lines, or
+ *  not at all if the process ends first; rotation is skipped while one is in flight, so no line lands
+ *  in a file that is being renamed. */
 export function flushAllLogsSync(): void {
   for (const w of writers.values()) {
     try {

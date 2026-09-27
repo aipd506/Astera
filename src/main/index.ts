@@ -1569,6 +1569,11 @@ app.on('will-quit', () => {
 // Registered after the cleanup above, so it runs after it: the lines that cleanup writes are on disk
 // too before the process ends (stage 3, task 3). Separate so the cleanup's early return (no core yet)
 // cannot skip it. The process's own `exit` hook (logWriter.ts) flushes once more for anything later.
+// **A few milliseconds are left open here** (review I1): Electron does not wait on a promise from
+// will-quit, so unlike the Host's `leave` this cannot `await flushAll()`. An async append that started
+// within the last flush (at most one, LOG_FLUSH_MS apart) may land after these sync lines, or be lost
+// if the process ends before the thread pool writes it. The writer skips rotation while one is in
+// flight, so no line goes into a file that is being renamed.
 app.on('will-quit', () => {
   flushAllLogsSync()
 })
