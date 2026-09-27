@@ -14,8 +14,13 @@ export interface HostClientDeps {
   address: string
   appVersion: string
   /** Start a Host. Called at most once per connect cycle; the client then waits for the address to
-   *  answer rather than for the process. */
-  spawnHost(): void
+   *  answer rather than for the process.
+   *
+   *  **May be asynchronous, and is awaited** (stage 3 task 2): the app's spawnHost first waits for the
+   *  Host runtime to be installed, which after an update can take many seconds. The attempts to reach
+   *  the address start counting only once it has resolved — they are for a Host binding after its
+   *  process starts, not for the install before it. A rejection is the same as a throw. */
+  spawnHost(): void | Promise<void>
   log(m: string): void
   /** The protocol this app speaks. Injected only so a test can be the odd one out. */
   protocol?: number
@@ -425,7 +430,7 @@ export class HostClient {
           asked = true
           this.deps.log('no Host at the address — starting one')
           try {
-            this.deps.spawnHost()
+            await this.deps.spawnHost()
           } catch (err) {
             this.fail(`the Host could not be started: ${String(err)}`)
             return

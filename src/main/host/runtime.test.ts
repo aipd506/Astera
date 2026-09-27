@@ -29,11 +29,18 @@ class FakeFs implements RuntimeFs {
     return this
   }
 
-  exists(p: string): boolean {
+  /** The test's own question, answered at once — the module's questions go through `exists`. */
+  has(p: string): boolean {
     return this.paths.has(p)
   }
 
-  readdir(p: string): string[] {
+  async exists(p: string): Promise<boolean> {
+    await Promise.resolve()
+    return this.paths.has(p)
+  }
+
+  async readdir(p: string): Promise<string[]> {
+    await Promise.resolve()
     const names = new Set<string>()
     for (const e of this.paths) {
       if (!e.startsWith(p + '\\')) continue
@@ -42,7 +49,12 @@ class FakeFs implements RuntimeFs {
     return [...names]
   }
 
-  copy(from: string, to: string): void {
+  async copy(from: string, to: string): Promise<void> {
+    await Promise.resolve()
+    this.copyNow(from, to)
+  }
+
+  private copyNow(from: string, to: string): void {
     this.log.push(`copy ${from} -> ${to}`)
     if (this.throwOn.has(`copy:${from}`)) throw new Error('copy refused')
     const moved = [...this.paths].filter((p) => this.under(p, from))
@@ -50,14 +62,20 @@ class FakeFs implements RuntimeFs {
     for (const p of moved) this.paths.add(to + p.slice(from.length))
   }
 
-  rename(from: string, to: string): void {
+  async rename(from: string, to: string): Promise<void> {
+    await Promise.resolve()
     this.log.push(`rename ${from} -> ${to}`)
     if (this.throwOn.has(`rename:${from}`)) throw new Error('rename refused')
-    this.copy(from, to)
-    this.rm(from)
+    this.copyNow(from, to)
+    this.rmNow(from)
   }
 
-  rm(p: string): void {
+  async rm(p: string): Promise<void> {
+    await Promise.resolve()
+    this.rmNow(p)
+  }
+
+  private rmNow(p: string): void {
     if (this.throwOn.has(`rm:${p}`)) throw new Error('in use')
     for (const e of [...this.paths]) if (this.under(e, p)) this.paths.delete(e)
   }
@@ -87,7 +105,7 @@ const FILES = {
   build: ['host.js', 'chunks\\framing-abc.js']
 }
 
-function prepare(fs: FakeFs, files: typeof FILES = FILES): ReturnType<typeof prepareHostRuntime> {
+function prepare(fs: FakeFs, files: typeof FILES = FILES, onInstall?: () => void): ReturnType<typeof prepareHostRuntime> {
   return prepareHostRuntime({
     paths,
     shipped: SHIPPED,
@@ -95,6 +113,7 @@ function prepare(fs: FakeFs, files: typeof FILES = FILES): ReturnType<typeof pre
     stamp: '7788',
     files,
     fs,
+    onInstall,
     log: (m) => fs.log.push(`log ${m}`)
   })
 }
@@ -103,86 +122,86 @@ function prepare(fs: FakeFs, files: typeof FILES = FILES): ReturnType<typeof pre
 // functions themselves — this file keeps only what still lives here.
 
 describe('staleNodeDirs', () => {
-  it('keeps the current Node and names every other one', () => {
+  it('keeps the current Node and names every other one', async () => {
     expect(staleNodeDirs(['node-24.15.0', 'node-22.9.0', 'node-25.0.0'], '24.15.0')).toEqual([
       'node-22.9.0',
       'node-25.0.0'
     ])
   })
 
-  it('never names something that is not ours — this list gets deleted', () => {
+  it('never names something that is not ours — this list gets deleted', async () => {
     expect(staleNodeDirs(['notes', 'node_modules', '.keep', 'node-22.9.0'], '24.15.0')).toEqual(['node-22.9.0'])
   })
 
-  it('does not mistake node-1 for a prefix of node-10', () => {
+  it('does not mistake node-1 for a prefix of node-10', async () => {
     expect(staleNodeDirs(['node-1', 'node-10'], '1')).toEqual(['node-10'])
   })
 })
 
 describe('staleBuildDirs', () => {
-  it('keeps this version and names the rest', () => {
+  it('keeps this version and names the rest', async () => {
     expect(staleBuildDirs(['1.3.20', '1.3.21', '1.3.19'], '1.3.21')).toEqual(['1.3.20', '1.3.19'])
   })
 })
 
 describe('prepareHostRuntime', () => {
-  it('falls back when no runtime was shipped — a partial build must not stop the app', () => {
+  it('falls back when no runtime was shipped — a partial build must not stop the app', async () => {
     const fs = new FakeFs()
-    expect(prepare(fs)).toMatchObject({ ready: false, did: 'nothing' })
+    expect(await prepare(fs)).toMatchObject({ ready: false, did: 'nothing' })
     expect(fs.log.some((l) => l.startsWith('log no host runtime shipped'))).toBe(true)
   })
 
-  it('installs the whole runtime on a machine that has none', () => {
+  it('installs the whole runtime on a machine that has none', async () => {
     const fs = shippedFs()
-    expect(prepare(fs)).toMatchObject({ ready: true, did: 'node' })
-    expect(fs.exists(paths.exePath)).toBe(true)
-    expect(fs.exists(paths.entryPath)).toBe(true)
-    expect(fs.exists(paths.nodeDir + '\\node_modules\\node-pty\\lib\\index.js')).toBe(true)
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'node' })
+    expect(fs.has(paths.exePath)).toBe(true)
+    expect(fs.has(paths.entryPath)).toBe(true)
+    expect(fs.has(paths.nodeDir + '\\node_modules\\node-pty\\lib\\index.js')).toBe(true)
   })
 
-  it('lands through a staging directory and a rename, never writing node.exe in place', () => {
+  it('lands through a staging directory and a rename, never writing node.exe in place', async () => {
     const fs = shippedFs()
-    prepare(fs)
+    await prepare(fs)
     expect(fs.log).toContain(`copy ${SHIPPED} -> ${paths.nodeDir}.staging-7788`)
     expect(fs.log).toContain(`rename ${paths.nodeDir}.staging-7788 -> ${paths.nodeDir}`)
-    expect(fs.exists(paths.nodeDir + '.staging-7788')).toBe(false)
+    expect(fs.has(paths.nodeDir + '.staging-7788')).toBe(false)
   })
 
-  it('writes only the build directory when the Node is already there — the ordinary update', () => {
+  it('writes only the build directory when the Node is already there — the ordinary update', async () => {
     const fs = shippedFs().add(paths.exePath, paths.nodeDir + '\\node_modules\\node-pty\\lib\\index.js')
-    expect(prepare(fs)).toMatchObject({ ready: true, did: 'build' })
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'build' })
     expect(fs.log.some((l) => l.startsWith(`copy ${SHIPPED} ->`))).toBe(false)
-    expect(fs.exists(paths.entryPath)).toBe(true)
+    expect(fs.has(paths.entryPath)).toBe(true)
   })
 
-  it('does nothing at all when this version has run before', () => {
+  it('does nothing at all when this version has run before', async () => {
     const fs = shippedFs()
       .add(...FILES.node.map((f) => `${paths.nodeDir}\\${f}`))
       .add(...FILES.build.map((f) => `${paths.buildDir}\\${f}`))
-    expect(prepare(fs)).toMatchObject({ ready: true, did: 'nothing' })
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'nothing' })
     expect(fs.log.filter((l) => l.startsWith('copy'))).toEqual([])
   })
 
-  it('accepts a lost race: another instance produced the same runtime while this one copied', () => {
+  it('accepts a lost race: another instance produced the same runtime while this one copied', async () => {
     const fs = shippedFs()
     fs.throwOn.add(`rename:${paths.nodeDir}.staging-7788`)
     // What the winner left behind — a whole node directory, because it landed by one rename.
     fs.add(...FILES.node.map((f) => `${paths.nodeDir}\\${f}`))
-    expect(prepare(fs)).toMatchObject({ ready: true, did: 'build' })
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'build' })
   })
 
-  it('falls back when the copy fails and nothing appeared, leaving no staging directory behind', () => {
+  it('falls back when the copy fails and nothing appeared, leaving no staging directory behind', async () => {
     const fs = shippedFs()
     fs.throwOn.add(`copy:${SHIPPED}`)
-    expect(prepare(fs)).toMatchObject({ ready: false, did: 'nothing' })
-    expect(fs.exists(paths.nodeDir + '.staging-7788')).toBe(false)
+    expect(await prepare(fs)).toMatchObject({ ready: false, did: 'nothing' })
+    expect(fs.has(paths.nodeDir + '.staging-7788')).toBe(false)
     expect(fs.log.some((l) => l.includes('could not be installed'))).toBe(true)
   })
 
-  it('falls back when the entry cannot be written, even though node.exe is in place', () => {
+  it('falls back when the entry cannot be written, even though node.exe is in place', async () => {
     const fs = shippedFs().add(...FILES.node.map((f) => `${paths.nodeDir}\\${f}`))
     fs.throwOn.add(`copy:${SHIPPED}\\builds\\1.3.21`)
-    expect(prepare(fs)).toMatchObject({ ready: false, did: 'nothing' })
+    expect(await prepare(fs)).toMatchObject({ ready: false, did: 'nothing' })
   })
 })
 
@@ -199,61 +218,61 @@ describe('prepareHostRuntime — a runtime that is missing files', () => {
       .add(...FILES.build.map((f) => `${paths.buildDir}\\${f}`))
   }
 
-  it('does nothing when every file the manifest names is there', () => {
+  it('does nothing when every file the manifest names is there', async () => {
     const fs = installed()
-    expect(prepare(fs)).toMatchObject({ ready: true, did: 'nothing', incomplete: false })
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'nothing', incomplete: false })
     expect(fs.log.filter((l) => l.startsWith('copy'))).toEqual([])
   })
 
-  it('reinstalls the whole node directory when one of its files is gone', () => {
+  it('reinstalls the whole node directory when one of its files is gone', async () => {
     const fs = installed()
     fs.paths.delete(`${paths.nodeDir}\\node_modules\\node-pty\\lib\\index.js`)
-    expect(prepare(fs)).toMatchObject({ ready: true, did: 'node', incomplete: false })
-    expect(fs.exists(`${paths.nodeDir}\\node_modules\\node-pty\\lib\\index.js`)).toBe(true)
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'node', incomplete: false })
+    expect(fs.has(`${paths.nodeDir}\\node_modules\\node-pty\\lib\\index.js`)).toBe(true)
     expect(fs.log.some((l) => l.includes('is missing'))).toBe(true)
   })
 
   // `host.js` present and a chunk it requires gone is a Host that dies on its first line, and the
   // `exists(entryPath)` test alone reads that as a build already in place.
-  it('rewrites the build directory when a chunk is gone, even though host.js is there', () => {
+  it('rewrites the build directory when a chunk is gone, even though host.js is there', async () => {
     const fs = installed()
     fs.paths.delete(`${paths.buildDir}\\chunks\\framing-abc.js`)
-    expect(prepare(fs)).toMatchObject({ ready: true, did: 'build', incomplete: false })
-    expect(fs.exists(`${paths.buildDir}\\chunks\\framing-abc.js`)).toBe(true)
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'build', incomplete: false })
+    expect(fs.has(`${paths.buildDir}\\chunks\\framing-abc.js`)).toBe(true)
   })
 
   // The directory most worth replacing is the one a Host is still running out of, and Windows will not
   // delete a locked `node.exe`. Saying so is the point: the caller puts it in the status, the Host is
   // replaced the first moment it holds nothing, and the repair happens then (design F6).
-  it('reports the runtime as incomplete when the old Host still holds it', () => {
+  it('reports the runtime as incomplete when the old Host still holds it', async () => {
     const fs = installed()
     fs.paths.delete(`${paths.nodeDir}\\node_modules\\node-pty\\lib\\index.js`)
     fs.throwOn.add(`rm:${paths.nodeDir}`)
-    expect(prepare(fs)).toMatchObject({ ready: true, incomplete: true })
+    expect(await prepare(fs)).toMatchObject({ ready: true, incomplete: true })
     expect(fs.log.some((l) => l.includes('could not be repaired'))).toBe(true)
   })
 
   // A check that cannot be made is not a failure — the same rule host/nodePtyCheck.ts follows. An
   // empty manifest is a fault in our own packaging, and refusing to start a Host over it would turn
   // that into an app with no Host at all.
-  it('skips the check when the manifest names nothing', () => {
+  it('skips the check when the manifest names nothing', async () => {
     const fs = installed()
     fs.paths.delete(`${paths.nodeDir}\\node_modules\\node-pty\\lib\\index.js`)
-    expect(prepare(fs, { node: [], build: [] })).toMatchObject({ ready: true, did: 'nothing', incomplete: false })
+    expect(await prepare(fs, { node: [], build: [] })).toMatchObject({ ready: true, did: 'nothing', incomplete: false })
     expect(fs.log.some((l) => l.includes('lists no files'))).toBe(true)
   })
 
   // An ordinary first install, and an ordinary app update. Neither is damage, and calling either one
   // incomplete would put a repair notice on screen for every new machine and every update.
-  it('does not call a first install or an update incomplete', () => {
-    expect(prepare(shippedFs())).toMatchObject({ ready: true, did: 'node', incomplete: false })
+  it('does not call a first install or an update incomplete', async () => {
+    expect(await prepare(shippedFs())).toMatchObject({ ready: true, did: 'node', incomplete: false })
     const updating = shippedFs().add(...FILES.node.map((f) => `${paths.nodeDir}\\${f}`))
-    expect(prepare(updating)).toMatchObject({ ready: true, did: 'build', incomplete: false })
+    expect(await prepare(updating)).toMatchObject({ ready: true, did: 'build', incomplete: false })
   })
 })
 
 describe('sweepHostRuntime', () => {
-  function sweep(fs: FakeFs): number {
+  function sweep(fs: FakeFs): Promise<number> {
     return sweepHostRuntime({
       paths,
       nodeVersion: '24.15.0',
@@ -263,41 +282,86 @@ describe('sweepHostRuntime', () => {
     })
   }
 
-  it('removes other Nodes and other builds, and keeps this version untouched', () => {
+  it('removes other Nodes and other builds, and keeps this version untouched', async () => {
     const fs = new FakeFs().add(
       paths.exePath,
       paths.entryPath,
       BASE + '\\node-22.9.0\\node.exe',
       paths.buildsDir + '\\1.3.20\\host.js'
     )
-    expect(sweep(fs)).toBe(2)
-    expect(fs.exists(BASE + '\\node-22.9.0\\node.exe')).toBe(false)
-    expect(fs.exists(paths.buildsDir + '\\1.3.20\\host.js')).toBe(false)
-    expect(fs.exists(paths.exePath)).toBe(true)
-    expect(fs.exists(paths.entryPath)).toBe(true)
+    expect(await sweep(fs)).toBe(2)
+    expect(fs.has(BASE + '\\node-22.9.0\\node.exe')).toBe(false)
+    expect(fs.has(paths.buildsDir + '\\1.3.20\\host.js')).toBe(false)
+    expect(fs.has(paths.exePath)).toBe(true)
+    expect(fs.has(paths.entryPath)).toBe(true)
   })
 
-  it('clears a staging directory an interrupted copy left behind', () => {
+  it('clears a staging directory an interrupted copy left behind', async () => {
     const fs = new FakeFs().add(paths.exePath, paths.entryPath, `${paths.nodeDir}.staging-4242\\node.exe`)
-    expect(sweep(fs)).toBe(1)
-    expect(fs.exists(`${paths.nodeDir}.staging-4242\\node.exe`)).toBe(false)
+    expect(await sweep(fs)).toBe(1)
+    expect(fs.has(`${paths.nodeDir}.staging-4242\\node.exe`)).toBe(false)
   })
 
-  it('keeps going when a directory is locked — an old Host still holds its node.exe', () => {
+  it('keeps going when a directory is locked — an old Host still holds its node.exe', async () => {
     const fs = new FakeFs().add(
       paths.exePath,
       BASE + '\\node-22.9.0\\node.exe',
       paths.buildsDir + '\\1.3.20\\host.js'
     )
     fs.throwOn.add(`rm:${BASE}\\node-22.9.0`)
-    expect(sweep(fs)).toBe(1)
-    expect(fs.exists(BASE + '\\node-22.9.0\\node.exe')).toBe(true) // retried next launch
-    expect(fs.exists(paths.buildsDir + '\\1.3.20\\host.js')).toBe(false)
+    expect(await sweep(fs)).toBe(1)
+    expect(fs.has(BASE + '\\node-22.9.0\\node.exe')).toBe(true) // retried next launch
+    expect(fs.has(paths.buildsDir + '\\1.3.20\\host.js')).toBe(false)
   })
 
-  it('says nothing when there was nothing to sweep', () => {
+  it('says nothing when there was nothing to sweep', async () => {
     const fs = new FakeFs().add(paths.exePath, paths.entryPath)
-    expect(sweep(fs)).toBe(0)
+    expect(await sweep(fs)).toBe(0)
     expect(fs.log).toEqual([])
+  })
+})
+
+// Stage 3 task 2: the install runs off the main thread's sync fs calls, and the app says so while it
+// does. `onInstall` is the moment the status appears; a runtime that is already whole never raises it,
+// so an ordinary launch does not flash "Preparing" for a handful of existence checks.
+describe('prepareHostRuntime — async, and saying when it writes', () => {
+  it('raises onInstall before the first write, and only once', async () => {
+    const fs = shippedFs()
+    const seen: string[] = []
+    const onInstall = (): void => {
+      seen.push(`install at ${fs.log.filter((l) => l.startsWith('copy')).length} copies`)
+    }
+    expect(await prepare(fs, FILES, onInstall)).toMatchObject({ ready: true, did: 'node' })
+    expect(seen).toEqual(['install at 0 copies'])
+  })
+
+  it('does not raise onInstall when the runtime is already whole', async () => {
+    const fs = shippedFs()
+      .add(...FILES.node.map((f) => `${paths.nodeDir}\\${f}`))
+      .add(...FILES.build.map((f) => `${paths.buildDir}\\${f}`))
+    let raised = 0
+    await prepare(fs, FILES, () => (raised += 1))
+    expect(raised).toBe(0)
+  })
+
+  it('names the failure when the runtime could not be installed', async () => {
+    const fs = shippedFs()
+    fs.throwOn.add(`copy:${SHIPPED}`)
+    const r = await prepare(fs)
+    expect(r.ready).toBe(false)
+    expect(r.failure).toMatch(/copy refused/)
+  })
+
+  it('names no failure when nothing was shipped — that is a fallback, not a fault', async () => {
+    expect((await prepare(new FakeFs())).failure).toBeNull()
+  })
+
+  it('never leaves a half-written node directory where the spawn looks', async () => {
+    const fs = shippedFs()
+    fs.throwOn.add(`rename:${paths.nodeDir}.staging-7788`)
+    const r = await prepare(fs)
+    expect(r.ready).toBe(false)
+    expect(fs.has(paths.exePath)).toBe(false)
+    expect(fs.has(`${paths.nodeDir}.staging-7788\\node.exe`)).toBe(false)
   })
 })

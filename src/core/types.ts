@@ -924,6 +924,19 @@ export interface HostStatus {
   features: string[]
 }
 
+/** Putting the Host's own runtime in place (win32), as the window shows it (stage 3 task 2).
+ *
+ *  `preparing` only while something is actually being written: a runtime that is already whole is
+ *  checked without ever leaving `idle`, so an ordinary launch shows nothing. `slow` turns true once the
+ *  install has run past about a second — a first install copies an 87 MB `node.exe` that an antivirus
+ *  then scans — so the status bar can say it is still working rather than sit on the same words.
+ *  `failed` stays until a later install succeeds; the Host then runs from the app executable, as every
+ *  version before the runtime did, and the next start tries again. */
+export type HostRuntimeInstallState =
+  | { phase: 'idle' }
+  | { phase: 'preparing'; slow: boolean; startedAt: number }
+  | { phase: 'failed'; detail: string }
+
 /** Who drives Jobs, as a Host that announced HOST_FEATURE_DRIVER says it (limits pass L3). The app
  *  keeps the last one it was told on this connection and forgets it when the connection drops; an
  *  older Host says nothing, and then nothing is known. Written out here rather than imported from
@@ -1743,6 +1756,10 @@ export type RendererApi = CoreApi & {
      *  open, and half a minute of a stale "connected" is the silence this exists to end
      *  (docs/2026-09-22-host-unresponsive-recovery-design.md F1). */
     onStatus(cb: (s: HostStatus) => void): () => void
+    /** Where putting the Host's own runtime in place stands (stage 3 task 2) — read once at mount. */
+    runtimeInstall(): Promise<HostRuntimeInstallState>
+    /** Every change of that, pushed as it happens; returns an unsubscribe. */
+    onRuntimeInstall(cb: (s: HostRuntimeInstallState) => void): () => void
     /** How many of the running sessions would keep running if the app quit — the ones whose ptys the
      *  Host owns. Asked at the moment the window-close confirmation is about to tell the person what
      *  quitting costs them, because the answer changes during a run (the Host connects some

@@ -4,6 +4,7 @@ import type {
   CoreEventChannel,
   CoreEvents,
   HostStatus,
+  HostRuntimeInstallState,
   UpdateCampaignInfo,
   UpdateStatus
 } from '../core/types'
@@ -327,6 +328,15 @@ const api = {
       ipcRenderer.on('host:status', l)
       return (): void => {
         ipcRenderer.removeListener('host:status', l)
+      }
+    },
+    /** The Host runtime's install, as the status bar shows it (stage 3 task 2). */
+    runtimeInstall: invoke('host.runtimeInstall'),
+    onRuntimeInstall: (cb: (s: HostRuntimeInstallState) => void) => {
+      const l = (_e: unknown, s: HostRuntimeInstallState): void => cb(s)
+      ipcRenderer.on('host:runtime-install', l)
+      return (): void => {
+        ipcRenderer.removeListener('host:runtime-install', l)
       }
     },
     sessionsOutlivingApp: invoke('host.sessionsOutlivingApp'),

@@ -1,5 +1,5 @@
 import { ipcMain, dialog, app, shell, session, webContents, type BrowserWindow, type WebContents } from 'electron'
-import { promises as fs, cpSync, existsSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs'
+import { promises as fs, existsSync, readFileSync } from 'node:fs'
 import { configuredModelOf } from '../core/models/parse'
 import path from 'node:path'
 import os from 'node:os'
@@ -31,13 +31,8 @@ import {
 } from './conversation'
 import { HostClient, READY_TIMEOUT_MS } from './host/client'
 import { hostSpawnPlan, resolveHostEntry } from '../core/host/spawn'
-import { hostRuntimeBase, hostRuntimePaths, type HostRuntimePaths } from '../core/host/runtime'
-import {
-  prepareHostRuntime,
-  sweepHostRuntime,
-  type RuntimeFs,
-  type RuntimeFiles
-} from './host/runtime'
+import { hostRuntimeBase } from '../core/host/runtime'
+import { createRuntimeInstaller, installHostRuntime, spawnWhenInstalled, type InstalledRuntime } from './host/runtimeInstall'
 import { executableProbe, parseExecutablePath, hostKillPlan, killHostCommand } from './host/hostProcess'
 import { hostPidFilePath, parseHostPidFile } from '../core/host/pidFile'
 import { hostAddress, retireOlderHosts } from '../host/address'
@@ -5593,83 +5588,51 @@ export function registerIpc(
    * Windows update. macOS and Linux replace a running binary without complaint, so `hostRuntimeBase`
    * returns null there and nothing below runs.
    *
-   * Every failure here returns null rather than throwing. A Host spawned from the app executable is
-   * exactly today's behaviour — worse on update day, and completely fine otherwise — so there is no
-   * failure in this function worth refusing to start a Host over.
+   * Every failure here resolves to null rather than rejecting. A Host spawned from the app executable
+   * is exactly today's behaviour — worse on update day, and completely fine otherwise — so there is no
+   * failure in this function worth refusing to start a Host over. It is shown, though: the status bar
+   * says the runtime could not be prepared, and the next start tries again.
+   *
+   * **Off the main thread's sync fs, and one at a time** (stage 3 task 2). This used to run `cpSync`
+   * and `rmSync` right here, and a first install after an update — 87 MB of `node.exe`, then an
+   * antivirus scan — froze the window with nothing on screen. Now every call is `fs.promises`, the
+   * window is told while it runs (`host:runtime-install`), and everyone who needs the runtime awaits
+   * the one install in flight: `startHostClient` before anything else, and `spawnHost` before every
+   * spawn, so no Host is ever started from a runtime still being written. See host/runtimeInstall.ts.
    */
-  const prepareHostRuntimeFor = (profileDir: string, log: (m: string) => void): { paths: HostRuntimePaths; incomplete: boolean } | null => {
-    const base = hostRuntimeBase({
-      platform: process.platform,
-      localAppData: process.env.LOCALAPPDATA,
-      userData: profileDir,
-      appName: app.getName()
-    })
-    if (!base) return null
-    // **Packaged builds only**, unlike `skillsPath` above, which reads the same resource either way.
-    // The runtime carries a *copy* of host.js taken when the payload was assembled, and in development
-    // host.js is rebuilt constantly — a dev Host would silently run whatever `npm run host-runtime`
-    // last produced. `npm run dev` therefore keeps spawning from the Electron binary, which is what it
-    // has always done and what the packaged fallback does too.
-    if (!app.isPackaged) return null
-    const shippedRoot = path.join(process.resourcesPath, 'host-runtime')
-    // Which Node is actually in that directory is read from the directory, not from a constant in
-    // this file: the two can then never disagree about what was shipped.
-    let nodeVersion = ''
-    // What a whole copy of that directory contains, written by the same script that assembled it
-    // (scripts/host-runtime.mjs). Empty is not an error here: `prepareHostRuntime` treats it as "do
-    // not check", which is the right answer for an older shipped runtime and for a manifest this
-    // build could not parse.
-    let files: RuntimeFiles = { node: [], build: [] }
-    const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
-    try {
-      const manifest: unknown = JSON.parse(readFileSync(path.join(shippedRoot, 'runtime.json'), 'utf8'))
-      if (manifest && typeof manifest === 'object' && typeof (manifest as { node?: unknown }).node === 'string') {
-        nodeVersion = (manifest as { node: string }).node.trim()
-      }
-      const listed = (manifest as { files?: { node?: unknown; build?: unknown } } | null)?.files
-      if (listed) files = { node: strings(listed.node), build: strings(listed.build) }
-    } catch {
-      /* nothing shipped, or unreadable — prepareHostRuntime says so below */
-    }
-    if (!nodeVersion) {
-      log('no host runtime shipped with this build — the Host runs from the app executable')
-      return null
-    }
-    const appVersion = app.getVersion()
-    const paths = hostRuntimePaths({ base, nodeVersion, appVersion })
-    // The shipped tree carries the same `node-<version>` directory the install uses, so putting it in
-    // place is one copy. scripts/host-runtime.mjs says why it is nested rather than flat.
-    const shipped = path.join(shippedRoot, path.basename(paths.nodeDir))
-    const runtimeFs: RuntimeFs = {
-      exists: existsSync,
-      readdir: (p) => {
-        try {
-          return readdirSync(p)
-        } catch {
-          return []
-        }
-      },
-      copy: (from, to) => cpSync(from, to, { recursive: true }),
-      rename: (from, to) => renameSync(from, to),
-      rm: (p) => rmSync(p, { recursive: true, force: true })
-    }
-    const installed = prepareHostRuntime({
-      paths,
-      shipped,
-      appVersion,
-      // Two app instances cannot share a profile (the single-instance lock), but they can share this
-      // machine-wide directory — a second profile, or another user's install. The pid keeps their
-      // staging directories apart; the rename decides who wins.
-      stamp: String(process.pid),
-      files,
-      fs: runtimeFs,
-      log
-    })
-    if (!installed.ready) return null
-    if (installed.did !== 'nothing') log(`host runtime installed (${installed.did}): ${paths.exePath}`)
-    sweepHostRuntime({ paths, nodeVersion, appVersion, fs: runtimeFs, log })
-    return { paths, incomplete: installed.incomplete }
-  }
+  const runtimeInstaller = createRuntimeInstaller<InstalledRuntime>({
+    run: async ({ installing }) => {
+      const base = hostRuntimeBase({
+        platform: process.platform,
+        localAppData: process.env.LOCALAPPDATA,
+        userData: app.getPath('userData'),
+        appName: app.getName()
+      })
+      if (!base) return { value: null, failure: null }
+      // **Packaged builds only**, unlike `skillsPath` above, which reads the same resource either way.
+      // The runtime carries a *copy* of host.js taken when the payload was assembled, and in development
+      // host.js is rebuilt constantly — a dev Host would silently run whatever `npm run host-runtime`
+      // last produced. `npm run dev` therefore keeps spawning from the Electron binary, which is what it
+      // has always done and what the packaged fallback does too.
+      if (!app.isPackaged) return { value: null, failure: null }
+      const r = await installHostRuntime({
+        base,
+        shippedRoot: path.join(process.resourcesPath, 'host-runtime'),
+        appVersion: app.getVersion(),
+        // Two app instances cannot share a profile (the single-instance lock), but they can share this
+        // machine-wide directory — a second profile, or another user's install. The pid keeps their
+        // staging directories apart; the rename decides who wins.
+        stamp: String(process.pid),
+        fs,
+        onInstall: installing,
+        log: (m) => hostWiring?.log(m)
+      })
+      return { value: r.runtime, failure: r.failure }
+    },
+    onState: (s) => send('host:runtime-install', s),
+    log: (m) => hostWiring?.log(m)
+  })
+  ipcMain.handle('host.runtimeInstall', () => runtimeInstaller.state())
 
   // Astera Host. Unconditional — the Host is not an orchestration feature, so this must not go inside
   // bootOrch, which only runs when that toggle is on. A missing out/main/host.js (a partial build, or
@@ -5701,7 +5664,11 @@ export function registerIpc(
     // what repairs one that is missing files, and the moment that repair can actually happen is the
     // moment the Host holding those files has gone — which is exactly when the next spawn is about to
     // run (design F6). Kept here as well so `hostSurvivesUpdate` and the first spawn have an answer.
-    let runtime = prepareHostRuntimeFor(profileDir, hostLog)
+    //
+    // **Awaited, and first.** Nothing below may spawn a Host until the install has landed; the one
+    // install in flight is shared with every later `spawnHost`, and the window says "Preparing the
+    // Astera Host…" while it runs rather than freezing (stage 3 task 2).
+    let runtime: InstalledRuntime | null = await runtimeInstaller.ensure()
     hostSurvivesUpdate = process.platform !== 'win32' || runtime !== null
     // An update changes the protocol, and the Host from the previous version is still there holding
     // terminals this app cannot speak to. Ask it to leave first. A restart does not come through
@@ -5755,12 +5722,14 @@ export function registerIpc(
       // Slack in the Host, Task 8 carry 3: a hello sent while this app holds its Slack socket leaves the
       // slack yield out, or a Slack-owning Host would open a second socket before this app hears it.
       keepsSlack: () => slack?.ownership.helloKeeps() ?? false,
-      spawnHost: () => {
-        // Checked and repaired again here, not reused from startup: the old Host held its `node.exe`
-        // and nothing could be replaced while it did. By the time a spawn is wanted that Host is gone,
-        // which is the first moment a missing file can actually be put back (design F6). Costs a
-        // handful of `existsSync` calls on a runtime that is whole.
-        runtime = prepareHostRuntimeFor(profileDir, hostLog)
+      // Checked and repaired again before every spawn, not reused from startup: the old Host held its
+      // `node.exe` and nothing could be replaced while it did. By the time a spawn is wanted that Host
+      // is gone, which is the first moment a missing file can actually be put back (design F6). Costs a
+      // handful of asynchronous existence checks on a runtime that is whole. `spawnWhenInstalled`
+      // spawns only once that install has settled, and HostClient awaits it before it starts counting
+      // its attempts to reach the address.
+      spawnHost: spawnWhenInstalled(runtimeInstaller, (installed) => {
+        runtime = installed
         // The three paths a Host needs to spawn workers itself (host S2 design §2.2). The same guard
         // bootOrch applies: with either one missing the Host is started without any of them and
         // spawns nothing, rather than being handed a path that is not there.
@@ -5780,7 +5749,7 @@ export function registerIpc(
         // to the person; this only has to keep the failure from being fatal.
         child.on('error', (err) => hostLog(`the Host could not be started: ${String(err)}`))
         child.unref()
-      }
+      })
     })
     hostClient = client
     // Slack in the Host (P17): the Host half of the ownership. slack-reload is an app-only orch-call the
@@ -6884,7 +6853,12 @@ export function registerIpc(
   // they survive this app process ending. On win32 they only do once the Host runs from its own
   // runtime; the renderer asks rather than assuming, because the fallback path (no runtime shipped,
   // or it could not be installed) is real and must not be promised over.
-  ipcMain.handle('host.survivesUpdate', () => hostSurvivesUpdate)
+  // Waits for an install in flight: until it lands, whether the Host can run from its own runtime is
+  // not known yet, and the install confirmation must not answer from a guess.
+  ipcMain.handle('host.survivesUpdate', async () => {
+    await runtimeInstaller.whenSettled()
+    return hostSurvivesUpdate
+  })
   // What the Host is holding, for the Info tab's Host row — the connection facts on their own say
   // nothing about whether a person's work survives closing the app.
   //

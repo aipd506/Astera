@@ -41,17 +41,21 @@ export function staleBuildDirs(names: readonly string[], keepAppVersion: string)
 }
 
 /** The filesystem this module needs, injected so the sequencing below is testable. Every one of
- *  these is allowed to throw; the callers here say what that means in each place. */
+ *  these is allowed to reject; the callers here say what that means in each place.
+ *
+ *  **Asynchronous, every one of them** (stage 3 task 2). This runs on Electron's main thread, and the
+ *  first half of an install is an 87 MB copy of `node.exe` that an antivirus then scans: done with
+ *  `cpSync` it froze the window for as long as that took, with nothing on screen to say why. */
 export interface RuntimeFs {
-  exists(p: string): boolean
+  exists(p: string): Promise<boolean>
   /** The entries of a directory, or `[]` when it is not there — "nothing to sweep" and "no such
    *  directory" are the same answer to the only question asked of it. */
-  readdir(p: string): string[]
+  readdir(p: string): Promise<string[]>
   /** Recursive copy, creating the destination's parents. */
-  copy(from: string, to: string): void
-  rename(from: string, to: string): void
+  copy(from: string, to: string): Promise<void>
+  rename(from: string, to: string): Promise<void>
   /** Recursive delete that does not mind a path which is not there. */
-  rm(p: string): void
+  rm(p: string): Promise<void>
 }
 
 export interface PrepareResult {
@@ -65,6 +69,10 @@ export interface PrepareResult {
    *  spawn away from stalling, so the app carries this in its status and replaces it the first moment
    *  it holds nothing (docs/2026-09-22-host-unresponsive-recovery-design.md F6). */
   incomplete: boolean
+  /** Why the runtime could not be put in place, or null when nothing went wrong — including when
+   *  nothing was shipped, which is a fallback and not a fault. The caller shows it; the next start
+   *  tries again, as it always did. */
+  failure: string | null
 }
 
 /**
@@ -101,7 +109,7 @@ export interface RuntimeFiles {
  * anything at all. So every file the build recorded is checked, and a node directory that is missing
  * one is not patched but replaced (design D5, F6).
  */
-export function prepareHostRuntime(a: {
+export async function prepareHostRuntime(a: {
   paths: HostRuntimePaths
   /** `<resources>\host-runtime`, as shipped in the installer. */
   shipped: string
@@ -113,21 +121,38 @@ export function prepareHostRuntime(a: {
    *  — see where that is decided. */
   files: RuntimeFiles
   fs: RuntimeFs
+  /** Called once, just before the first thing is written or removed — the moment the app starts
+   *  saying "Preparing the Astera Host". A runtime that is already whole never calls it, so an
+   *  ordinary launch does not flash a status for a handful of existence checks. */
+  onInstall?: () => void
   log(m: string): void
-}): PrepareResult {
+}): Promise<PrepareResult> {
   const { paths, fs, shipped } = a
-  if (!fs.exists(w.join(shipped, 'node.exe'))) {
+  let announced = false
+  const installing = (): void => {
+    if (announced) return
+    announced = true
+    try {
+      a.onInstall?.()
+    } catch (err) {
+      a.log(`the host runtime's install status could not be shown: ${String(err)}`)
+    }
+  }
+  if (!(await fs.exists(w.join(shipped, 'node.exe')))) {
     a.log('no host runtime shipped with this build — the Host runs from the app executable')
-    return { ready: false, did: 'nothing', incomplete: false }
+    return { ready: false, did: 'nothing', incomplete: false, failure: null }
   }
 
   /** The first of `names` that is not under `dir`, or null. Swallows a filesystem that refuses to
    *  answer: **a check that cannot be made is not a failure**, and reading it as one would replace a
    *  working runtime, or worse refuse to start a Host, on no evidence at all. The same rule
    *  `host/nodePtyCheck.ts` follows on the other side of this. */
-  const firstMissing = (dir: string, names: string[]): string | null => {
+  const firstMissing = async (dir: string, names: string[]): Promise<string | null> => {
     try {
-      return names.find((n) => !fs.exists(w.join(dir, n))) ?? null
+      // One at a time, in the manifest's order: the answer is the *first* missing name, and the list
+      // is a few dozen entries at most.
+      for (const n of names) if (!(await fs.exists(w.join(dir, n)))) return n
+      return null
     } catch {
       return null
     }
@@ -139,14 +164,15 @@ export function prepareHostRuntime(a: {
   let incomplete = false
   // Only for a runtime that is already installed. A machine that has none is the ordinary first
   // install, and the copy below is what puts every one of these files there.
-  if (fs.exists(paths.exePath)) {
-    const missing = firstMissing(paths.nodeDir, a.files.node)
+  if (await fs.exists(paths.exePath)) {
+    const missing = await firstMissing(paths.nodeDir, a.files.node)
     if (missing) {
       a.log(`the host runtime is missing ${missing} — replacing it`)
+      installing()
       try {
         // The whole directory, not the one file: what took that file took whatever else was not
         // locked at the time, and the list is only as complete as this build's own manifest.
-        fs.rm(paths.nodeDir)
+        await fs.rm(paths.nodeDir)
       } catch (err) {
         // The expected failure, and the one worth reporting: a Host is still running out of this
         // directory and holds its `node.exe`. Nothing can be repaired until that Host is gone, so the
@@ -158,47 +184,53 @@ export function prepareHostRuntime(a: {
   }
 
   let did: PrepareResult['did'] = 'nothing'
-  if (!fs.exists(paths.exePath)) {
+  if (!(await fs.exists(paths.exePath))) {
     const stage = `${paths.nodeDir}.staging-${a.stamp}`
+    installing()
     try {
-      fs.rm(stage)
-      fs.copy(shipped, stage)
-      fs.rename(stage, paths.nodeDir)
+      await fs.rm(stage)
+      await fs.copy(shipped, stage)
+      await fs.rename(stage, paths.nodeDir)
       did = 'node'
     } catch (err) {
       // A second instance that got there first is the expected loser here, and it has already
       // produced exactly what this one was going to. Anything else leaves `ready` false below.
-      fs.rm(stage)
-      if (!fs.exists(paths.exePath)) {
-        a.log(`the host runtime could not be installed: ${String(err)}`)
-        return { ready: false, did: 'nothing', incomplete }
+      await fs.rm(stage)
+      if (!(await fs.exists(paths.exePath))) {
+        const failure = `the host runtime could not be installed: ${String(err)}`
+        a.log(failure)
+        return { ready: false, did: 'nothing', incomplete, failure }
       }
     }
   }
 
   // The entry alone is not the question either: `host.js` requires the chunks beside it, and a build
   // directory with the entry and none of them is a Host that dies on its first line.
-  const buildMissing = firstMissing(paths.buildDir, a.files.build)
-  if (buildMissing && fs.exists(paths.entryPath)) a.log(`this build's host runtime is missing ${buildMissing} — rewriting it`)
-  if (!fs.exists(paths.entryPath) || buildMissing) {
+  const buildMissing = await firstMissing(paths.buildDir, a.files.build)
+  const entryThere = await fs.exists(paths.entryPath)
+  if (buildMissing && entryThere) a.log(`this build's host runtime is missing ${buildMissing} — rewriting it`)
+  if (!entryThere || buildMissing) {
     const from = w.join(shipped, 'builds', a.appVersion)
     const stage = `${paths.buildDir}.staging-${a.stamp}`
+    installing()
     try {
-      fs.rm(stage)
-      fs.copy(from, stage)
-      fs.rm(paths.buildDir)
-      fs.rename(stage, paths.buildDir)
+      await fs.rm(stage)
+      await fs.copy(from, stage)
+      await fs.rm(paths.buildDir)
+      await fs.rename(stage, paths.buildDir)
       if (did === 'nothing') did = 'build'
     } catch (err) {
-      fs.rm(stage)
-      if (!fs.exists(paths.entryPath)) {
-        a.log(`the host runtime's entry could not be installed: ${String(err)}`)
-        return { ready: false, did: 'nothing', incomplete }
+      await fs.rm(stage)
+      if (!(await fs.exists(paths.entryPath))) {
+        const failure = `the host runtime's entry could not be installed: ${String(err)}`
+        a.log(failure)
+        return { ready: false, did: 'nothing', incomplete, failure }
       }
     }
   }
 
-  return { ready: fs.exists(paths.exePath) && fs.exists(paths.entryPath), did, incomplete }
+  const ready = (await fs.exists(paths.exePath)) && (await fs.exists(paths.entryPath))
+  return { ready, did, incomplete, failure: ready ? null : 'the host runtime is not whole after installing it' }
 }
 
 /**
@@ -210,17 +242,17 @@ export function prepareHostRuntime(a: {
  * delete a locked image. So each removal stands alone and a refusal is swallowed: the sweep is
  * self-healing, and the next launch after that Host exits finishes the job.
  */
-export function sweepHostRuntime(a: {
+export async function sweepHostRuntime(a: {
   paths: HostRuntimePaths
   nodeVersion: string
   appVersion: string
   fs: RuntimeFs
   log(m: string): void
-}): number {
+}): Promise<number> {
   let removed = 0
-  const drop = (p: string): void => {
+  const drop = async (p: string): Promise<void> => {
     try {
-      a.fs.rm(p)
+      await a.fs.rm(p)
       removed += 1
     } catch {
       /* still in use, or gone already — either way the next launch tries again */
@@ -228,14 +260,14 @@ export function sweepHostRuntime(a: {
   }
   // Staging directories too: a copy killed between `copy` and `rename` leaves one behind, and
   // nothing else will ever look at it.
-  for (const name of a.fs.readdir(a.paths.base)) {
-    if (name.includes('.staging-')) drop(w.join(a.paths.base, name))
+  for (const name of await a.fs.readdir(a.paths.base)) {
+    if (name.includes('.staging-')) await drop(w.join(a.paths.base, name))
   }
-  for (const name of staleNodeDirs(a.fs.readdir(a.paths.base), a.nodeVersion)) {
-    drop(w.join(a.paths.base, name))
+  for (const name of staleNodeDirs(await a.fs.readdir(a.paths.base), a.nodeVersion)) {
+    await drop(w.join(a.paths.base, name))
   }
-  for (const name of staleBuildDirs(a.fs.readdir(a.paths.buildsDir), a.appVersion)) {
-    drop(w.join(a.paths.buildsDir, name))
+  for (const name of staleBuildDirs(await a.fs.readdir(a.paths.buildsDir), a.appVersion)) {
+    await drop(w.join(a.paths.buildsDir, name))
   }
   if (removed > 0) a.log(`swept ${removed} unused host runtime director${removed === 1 ? 'y' : 'ies'}`)
   return removed

@@ -279,6 +279,51 @@ describe('HostClient', () => {
     await c.stop()
   })
 
+  // Stage 3 task 2: spawnHost now waits for the runtime install before it spawns, and a first install
+  // after an update can run for many seconds (87 MB of node.exe, then an antivirus scan). The attempts
+  // to reach the address are for the Host binding after its process starts — counting them while the
+  // spawn has not even happened would give up on a Host that was never started.
+  it('waits for an asynchronous spawnHost before counting its attempts', async () => {
+    const addr = addressFor('slow-spawn')
+    let spawned = false
+    const c = new HostClient({
+      address: addr.address,
+      appVersion: '9.0.0',
+      attempts: 3,
+      retryMs: 10,
+      spawnHost: async () => {
+        // Far longer than attempts × retryMs.
+        await new Promise((r) => setTimeout(r, 200))
+        spawned = true
+        void serveAt(addr)
+      },
+      log: () => {}
+    })
+    c.start()
+    await settled(c, (s) => s.connected || s.problem !== null)
+    expect(spawned).toBe(true)
+    expect(c.status().connected).toBe(true)
+    await c.stop()
+  })
+
+  it('reports a rejected asynchronous spawnHost as a problem, not an unhandled rejection', async () => {
+    const addr = addressFor('spawn-rejects')
+    const c = new HostClient({
+      address: addr.address,
+      appVersion: '9.0.0',
+      attempts: 2,
+      retryMs: 10,
+      spawnHost: async () => {
+        throw new Error('EACCES')
+      },
+      log: () => {}
+    })
+    c.start()
+    await settled(c, (s) => s.problem !== null)
+    expect(c.status().problem).toContain('EACCES')
+    await c.stop()
+  })
+
   // A Host on another protocol holds nothing in slice 1, so the app tells it to leave. What comes
   // next is the ordinary reconnect: the Host the app then starts is from its own build, so it speaks
   // the app's protocol. Slice 2 has to answer this differently.
