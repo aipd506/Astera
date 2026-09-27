@@ -6,6 +6,7 @@ import { createWorktree } from './create'
 import { WorktreeRegistry } from './registry'
 import { git, localBranchExists } from './git'
 import { makeRepo, addOrigin, tempDir } from './testRepo'
+import { createProbePool, ProbeBudget, PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
 
 let repo: string
 let root: string
@@ -183,3 +184,68 @@ describe('createWorktree, names and the repo folder', () => {
     expect(info.name).toBe('again')
   })
 })
+
+// Review round 2, I2. The cleanup of the repo folder create made itself: only that folder, never one
+// the person made or a link at that path, never on the unreachable path, and never waited on past the
+// probe limit.
+describe('createWorktree, taking back the repo folder', () => {
+  const repoDir = (): string => path.join(root, path.basename(repo))
+
+  it('does not touch the folder at all on the unreachable path', async () => {
+    const removed: string[] = []
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'dead', registry: reg,
+        presence: async () => 'unreachable',
+        removeDirAccess: async (d) => { removed.push(d) }
+      })
+    ).rejects.toThrow(/WORKTREE_ROOT_UNREACHABLE/)
+    expect(removed).toEqual([])
+    expect(existsSync(repoDir())).toBe(true)
+  })
+
+  it('leaves a repo folder that was there before this call', async () => {
+    await fs.mkdir(repoDir(), { recursive: true })
+    const removed: string[] = []
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'full', registry: reg,
+        presence: async () => 'present',
+        removeDirAccess: async (d) => { removed.push(d) }
+      })
+    ).rejects.toThrow(/NAME_EXHAUSTED/)
+    expect(removed).toEqual([])
+    expect(existsSync(repoDir())).toBe(true)
+  })
+
+  it('never removes a link that stands at that path, even when this call reports it made the folder', async () => {
+    const target = await tempDir('astera-wt-linktarget-')
+    await fs.writeFile(path.join(target, 'keep.txt'), 'k')
+    await fs.symlink(target, repoDir(), 'junction')
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'full', registry: reg,
+        presence: async () => 'present',
+        makeDir: async () => 'created'
+      })
+    ).rejects.toThrow(/NAME_EXHAUSTED/)
+    expect((await fs.lstat(repoDir())).isSymbolicLink()).toBe(true)
+    expect(existsSync(path.join(target, 'keep.txt'))).toBe(true)
+  })
+
+  it('does not wait on a cleanup that hangs past the probe limit', async () => {
+    const started = Date.now()
+    let asked = false
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'full', registry: reg,
+        presence: async () => 'present',
+        removeDirAccess: () => { asked = true; return new Promise<void>(() => {}) },
+        cleanupPool: createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, new ProbeBudget())
+      })
+    ).rejects.toThrow(/NAME_EXHAUSTED/)
+    expect(asked).toBe(true)
+    expect(Date.now() - started).toBeLessThan(PROBE_TIMEOUT_MS + 8_000)
+  }, 20_000)
+})
+

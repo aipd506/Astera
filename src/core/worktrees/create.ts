@@ -12,17 +12,36 @@ import {
 import { copyWorktreeInclude } from './include'
 import type { WorktreeStore } from './registry'
 import type { Message } from '../i18n'
-import { createProber, type Probe } from '../sessions/pathProbe'
+import { createProber, type ProbePool } from '../sessions/pathProbe'
 import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
 
 const WORKTREE_ADD_TIMEOUT_MS = 180_000
 
-let mkdirProber: Probe | null = null
-/** Makes a folder (recursively) through the session folder's probe rules (pathProbe.ts): cut at
- *  PROBE_TIMEOUT_MS, one call per dead root at a time. `present` = the folder is there now. */
-function defaultMakeDir(p: string): ReturnType<Probe> {
-  mkdirProber ??= createProber({ access: (d) => fs.mkdir(d, { recursive: true }).then(() => undefined), skipQueue: true })
-  return mkdirProber(p)
+/** What making the repo's folder answered: `created` when this call made it, `present` when it was
+ *  already there, or the probe's `absent` / `timeout`. */
+export type MakeDirResult = 'created' | 'present' | 'absent' | 'timeout'
+
+/** Makes a folder (recursively) through the session folder's probe lane (pathProbe.ts): cut at
+ *  PROBE_TIMEOUT_MS, inside the process-wide probe budget. `created` only when this call made it. */
+async function defaultMakeDir(p: string): Promise<MakeDirResult> {
+  let made = false
+  const probe = createProber({
+    access: (d) =>
+      fs.mkdir(d, { recursive: true }).then((first) => {
+        made = first !== undefined
+      }),
+    skipQueue: true
+  })
+  const r = await probe(p)
+  return r === 'present' ? (made ? 'created' : 'present') : r
+}
+
+/** Takes back a folder create made itself: only a real, empty directory, never a link or a junction
+ *  (lstat), and never a folder with anything in it (rmdir is not recursive). */
+async function removeOwnEmptyDir(d: string): Promise<void> {
+  const st = await fs.lstat(d)
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`not a plain directory: ${d}`)
+  await fs.rmdir(d)
 }
 
 export async function createWorktree(args: {
@@ -35,7 +54,11 @@ export async function createWorktree(args: {
   /** Test seams: whether a candidate folder is taken (presence.ts), and making the repo's folder
    *  under the root. Default to the process-wide action-lane check and a time-limited mkdir. */
   presence?: PresenceCheck
-  makeDir?: Probe
+  makeDir?: (p: string) => Promise<MakeDirResult>
+  /** Test seams for taking the repo folder back: the fs work, run inside a time-limited probe call,
+   *  and the pool that call goes through (the process-wide budget by default). */
+  removeDirAccess?: (p: string) => Promise<void>
+  cleanupPool?: ProbePool
 }): Promise<{ info: WorktreeInfo; warnings: Message[] }> {
   const repo = await repoRoot(args.repoPath)
   if (!repo) throw new Error(`NOT_GIT_REPO: ${args.repoPath}`)
@@ -67,10 +90,13 @@ export async function createWorktree(args: {
   if (!isPathWithin(root, parent)) throw new Error(`DANGEROUS_PATH: ${parent}`)
   const made = await (args.makeDir ?? defaultMakeDir)(parent)
   if (made === 'timeout') throw new Error(`WORKTREE_ROOT_UNREACHABLE: folder not reachable: ${parent}`)
-  if (made !== 'present') throw new Error(`WORKTREE_ROOT_UNREACHABLE: cannot create the folder ${parent}`)
+  if (made !== 'present' && made !== 'created')
+    throw new Error(`WORKTREE_ROOT_UNREACHABLE: cannot create the folder ${parent}`)
   let slug: string | null = null
   let branch = ''
   let wtPath = ''
+  /** The root stopped answering: nothing more is asked of it, the cleanup included. */
+  let unreachable = false
   try {
     for (let attempt = 1; attempt <= MAX_SUFFIX_ATTEMPTS; attempt++) {
       const cand = candidateName(baseSlug, attempt)
@@ -82,17 +108,33 @@ export async function createWorktree(args: {
       // again (askUntilAnswered); one that lasts is "could not check", never "free".
       const at = await askUntilAnswered(presence, candPath)
       if (at === 'present') continue
-      if (at === 'refused') throw new Error(`WORKTREE_ROOT_UNREACHABLE: could not check just now whether ${candPath} is free`)
-      if (at !== 'missing') throw new Error(`WORKTREE_ROOT_UNREACHABLE: could not check whether ${candPath} is free`)
+      if (at !== 'missing') {
+        unreachable = true
+        throw new Error(
+          at === 'refused'
+            ? `WORKTREE_ROOT_UNREACHABLE: could not check just now whether ${candPath} is free`
+            : `WORKTREE_ROOT_UNREACHABLE: could not check whether ${candPath} is free`
+        )
+      }
       slug = cand
       branch = candBranch
       wtPath = candPath
       break
     }
   } finally {
-    // The repo's folder was made before a name was picked. When none was, it is taken back if it is
-    // empty (rmdir is not recursive: a sibling worktree keeps it).
-    if (!slug) await fs.rmdir(parent).catch(() => {})
+    // The repo's folder was made before a name was picked. When none was, it is taken back — but only
+    // when **this call made it** (never one that was there before, a link or a junction included), only
+    // when the root is still answering, and only through a time-limited probe call inside the
+    // process-wide budget: a cleanup never waits past the probe limit. rmdir is not recursive, so a
+    // sibling worktree keeps the folder. What the cleanup answers changes nothing.
+    if (!slug && !unreachable && made === 'created') {
+      const cleanup = createProber({
+        access: args.removeDirAccess ?? removeOwnEmptyDir,
+        skipQueue: true,
+        ...(args.cleanupPool ? { pool: args.cleanupPool } : {})
+      })
+      await cleanup(parent)
+    }
   }
   if (!slug) throw new Error(`NAME_EXHAUSTED: no name starting with '${baseSlug}' is available (20 attempts)`)
 
