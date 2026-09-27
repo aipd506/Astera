@@ -39,3 +39,9 @@ describe('orchSnapshotOf (the push path)', () => {
     expect(ipcSource).toMatch(/listWithStatus\(\s*core\.worktrees\s*,\s*\(p\)\s*=>\s*worktreePresence\.refresh\(p\)\s*\)/)
   })
 })
+
+describe('the re-push after a presence answer', () => {
+  it('goes through createPresenceRepush (unit-tested in worktreePresenceRepush.test.ts)', () => {
+    expect(ipcSource).toMatch(/onChange:\s*createPresenceRepush(<\w+>)?\(/)
+  })
+})

@@ -210,6 +210,7 @@ import { removeWorktree } from '../core/worktrees/remove'
 import { listWithStatus } from '../core/worktrees/list'
 import { PresenceCache, PRESENCE_SWEEP_MS } from '../core/worktrees/presence'
 import { probeLog } from '../core/sessions/pathProbe'
+import { createPresenceRepush } from './worktreePresenceRepush'
 import {
   git,
   repoRoot,
@@ -1387,27 +1388,18 @@ export function registerIpc(
   let orchRequest = 0
   /** The last state pushOrchState folded, so a presence answer that lands later can fold it again. */
   let orchLastPushed: OrchState | null = null
-  let orchRepushQueued = false
   /** 워크트리 폴더가 아직 있는가 — 비동기로 묻고, 시간 제한이 있고, 캐시된다(core/worktrees/presence.ts).
    *  **푸시 경로는 캐시만 읽는다.** 동기 existsSync 였을 때는 네트워크 공유·OneDrive·`\\wsl$` 위의
    *  워크트리 하나가 모든 setState 마다 메인 스레드를 20~60초씩 세웠다. 답이 아직 없으면 unknown 이고
    *  (사라졌다고 하지 않는다) 확인이 예약된다. 답이 새로 오거나 바뀌면 마지막 상태를 한 번 더 접어
    *  보낸다 — sameSnapshot 이 달라진 것이 없으면 버린다. 여러 답이 한꺼번에 와도 다시 접는 것은 한 번이다. */
   const worktreePresence = new PresenceCache({
-    onChange: () => {
-      if (orchRepushQueued) return
-      orchRepushQueued = true
-      setTimeout(() => {
-        orchRepushQueued = false
-        // orch.list 가 접은 상태는 pushOrchState 를 지나지 않으므로 지금 상태를 먼저 읽는다
-        try {
-          const state = orch ? orch.deps.getState() : orchLastPushed
-          if (state) pushOrchState(state)
-        } catch (err) {
-          orchLog(`orch:state re-push after a worktree presence answer failed: ${String(err)}`)
-        }
-      }, 0)
-    },
+    onChange: createPresenceRepush<OrchState>({
+      // orch.list 가 접은 상태는 pushOrchState 를 지나지 않으므로 지금 상태를 먼저 읽는다
+      current: () => (orch ? orch.deps.getState() : orchLastPushed),
+      push: (state) => pushOrchState(state),
+      log: orchLog
+    }),
     log: probeLog
   })
   // 주기적으로 알려진 경로 전부와 레지스트리의 워크트리를 다시 묻는다. 타이머는 프로세스를 붙잡지 않는다.
