@@ -416,7 +416,7 @@ export const es: Catalog = {
   'files.commit.failed': 'Error en {action}: {detail}',
   // useFileOps.ts — delete confirmation modal
   'files.delete.undoHint':
-    'Puede recuperarlo con Ctrl+Z o desde Local History (se guarda hasta 30 días · se excluyen los elementos de más de 50MB).',
+    'Puede recuperarlo con Ctrl+Z o desde Local History (se guarda hasta 30 días · se excluyen los elementos de más de 50MB o 5.000 archivos).',
   'files.delete.confirmOne': '¿Eliminar «{name}»?\n{undoHint}',
   'files.delete.confirmDirWithCount':
     '¿Eliminar la carpeta «{name}» y los {count} elementos que contiene?\n{undoHint}',
@@ -424,7 +424,12 @@ export const es: Catalog = {
   'files.delete.confirmMany': '{shown}{more} — ¿eliminar {total} elementos?{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' Se eliminará también el contenido de {count} carpetas.',
   'files.delete.moreNames': ', y {count} más',
-  'files.delete.skippedTooLarge': 'El elemento era demasiado grande para guardarlo en Local History',
+  'files.delete.skippedTooLarge': 'El elemento era demasiado grande para guardarlo en Local History (más de {maxMb}MB o {maxFiles} archivos)',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': 'Eliminando… {count} elementos',
+  'files.op.snapshotting': 'Guardando una copia en Local History… {count} elementos',
+  'files.op.copying': 'Copiando… {count} elementos',
+  'files.op.busy': 'Trabajando…',
   'files.delete.skippedFailed':
     'No se pudo crear la instantánea en Local History — la eliminación sí se completó',
   // useFileOps.ts — cut/copy and paste
@@ -445,7 +450,7 @@ export const es: Catalog = {
   'files.undo.partialFail': 'Al deshacer fallaron {failed} de {attempted} elementos: {shown}{more}',
   'files.undo.partialMissing': 'Al deshacer fallaron {missing} de {total} elementos: {shown}{more}',
   'files.undo.permanentTooLarge':
-    'Se eliminó de forma permanente al deshacer — era demasiado grande para guardarlo en Local History, así que no se puede recuperar',
+    'Se eliminó de forma permanente al deshacer — era demasiado grande para guardarlo en Local History (más de {maxMb}MB o {maxFiles} archivos), así que no se puede recuperar',
   'files.undo.permanentSnapshotFailed':
     'Se eliminó al deshacer — la instantánea en Local History falló, así que no se puede recuperar',
   'files.undo.done': 'Se deshizo {desc}',

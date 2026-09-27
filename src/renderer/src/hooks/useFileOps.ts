@@ -1,7 +1,15 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { parentDir } from '../../../core/files/paths'
 import { validateName, canMove, canCopy, isSubPath } from '../../../core/files/ops'
 import { pasteSource } from '../../../core/files/explorerState'
+import { snapshotSkipNotices } from '../../../core/files/localHistory'
+import {
+  createFileOpBusy,
+  type FileOpBusy,
+  type FileOpBusyView,
+  type FileOpKind,
+  type FileOpStatus
+} from '../../../core/files/fileOpBusy'
 import {
   pushEntry,
   invert,
@@ -71,6 +79,10 @@ export interface FileOps {
    *  behavior).
    */
   resetEditingState: () => void
+  /** Rows a delete or copy is working on, once it has lasted ROW_SPINNER_DELAY_MS — they show the spinner. */
+  busyRows: ReadonlySet<string>
+  /** The "Deleting… N items" line, once the operation has lasted OP_STATUS_DELAY_MS; null otherwise. */
+  opStatus: FileOpStatus | null
 }
 
 export function useFileOps(deps: {
@@ -97,6 +109,40 @@ export function useFileOps(deps: {
 
   const editingRef = useRef<Editing>(null)
   editingRef.current = editing // mirrored on every render — blocks the stale closure of an unmount blur
+
+  // Busy state of a delete or paste/copy (core/files/fileOpBusy.ts decides when the row spinner and
+  // the status line appear). Each files.* call gets a fresh opId; main reports that call's running
+  // entry count on 'files:opProgress', and only reports for the call now running are taken.
+  const [busyView, setBusyView] = useState<FileOpBusyView>(() => ({ rows: new Set(), status: null }))
+  const busyRef = useRef<FileOpBusy | null>(null)
+  if (!busyRef.current) busyRef.current = createFileOpBusy(setBusyView)
+  const busy = busyRef.current
+  const opIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    const off = window.api.on('files:opProgress', (ev) => {
+      if (ev.opId === opIdRef.current) busyRef.current?.progress(ev.progress)
+    })
+    return () => {
+      off()
+      busyRef.current?.dispose()
+    }
+  }, [])
+  /** A new opId for the next files.* call; reports for any earlier call are ignored from here on. */
+  const nextOpId = (): string => {
+    const id = crypto.randomUUID()
+    opIdRef.current = id
+    return id
+  }
+  /** Runs one delete or copy batch under the busy indicator; it goes away however the batch ends. */
+  const withBusy = async <T>(kind: FileOpKind, run: () => Promise<T>): Promise<T> => {
+    busy.begin(kind)
+    try {
+      return await run()
+    } finally {
+      opIdRef.current = null
+      busy.end()
+    }
+  }
 
   /** Applies the same operation to several items sequentially and reports partial failure in one go.
    *  Why sequential: firing them in parallel scrambles the order of the failures and calls loadDir on
@@ -257,16 +303,19 @@ export function useFileOps(deps: {
     // Across the whole batch, report each kind of skipped-snapshot reason exactly once (same reason as
     // runBatch's failure aggregation) — a toast per item during a multi-delete is noisy
     const skipped = { tooLarge: false, failed: false }
-    await runBatch(t('files.action.delete'), paths, async (p) => {
-      const { snapshotSkipped, snapshotId } = await window.api.files.remove(p, root)
-      if (snapshotSkipped === 'too-large') skipped.tooLarge = true
-      else if (snapshotSkipped === 'failed') skipped.failed = true
-      if (snapshotId !== null) snapshotted.push({ id: snapshotId, originalPath: p })
-      removed.push(p)
-      touched.add(parentDir(p))
-    })
-    if (skipped.tooLarge) toast.info(t('files.delete.skippedTooLarge'))
-    if (skipped.failed) toast.info(t('files.delete.skippedFailed'))
+    await withBusy('delete', () =>
+      runBatch(t('files.action.delete'), paths, async (p) => {
+        busy.rows([p])
+        const { snapshotSkipped, snapshotId } = await window.api.files.remove(p, root, nextOpId())
+        if (snapshotSkipped === 'too-large') skipped.tooLarge = true
+        else if (snapshotSkipped === 'failed') skipped.failed = true
+        if (snapshotId !== null) snapshotted.push({ id: snapshotId, originalPath: p })
+        removed.push(p)
+        touched.add(parentDir(p))
+      })
+    )
+    // "Too large" covers both caps — over 50MB or over 5,000 entries — and the message names both
+    for (const n of snapshotSkipNotices(skipped, 'delete')) toast[n.level](t(n.message.key, n.message.params))
     // If there is no snapshot at all, do not create a journal entry — Ctrl+Z should reach the previous
     // operation instead (pushing an entry with no way to undo it means Ctrl+Z at that entry always ends
     // in failure)
@@ -284,11 +333,14 @@ export function useFileOps(deps: {
     if (paths.length === 0) return
     const touched = new Set<string>()
     const last: string[] = []
-    await runBatch(t('files.action.duplicate'), paths, async (p) => {
-      const to = await window.api.files.copy(p, parentDir(p))
-      touched.add(parentDir(p))
-      last.push(to)
-    })
+    await withBusy('copy', () =>
+      runBatch(t('files.action.duplicate'), paths, async (p) => {
+        busy.rows([p])
+        const to = await window.api.files.copy(p, parentDir(p), nextOpId())
+        touched.add(parentDir(p))
+        last.push(to)
+      })
+    )
     for (const d of touched) loadDir(d)
     // Select the duplicated results (same behavior as the earlier single-item duplicate)
     if (last.length > 0) {
@@ -403,12 +455,12 @@ export function useFileOps(deps: {
       const landed: string[] = []
       // {from,to} pairs for undoing a move — filled only inside the op callback, where both are in hand (cut only)
       const movedPairs: { from: string; to: string }[] = []
-      const ok = await runBatch(
-        mode === 'cut' ? t('files.action.move') : t('files.action.copy'),
-        doable,
-        async (p) => {
+      const ok = await withBusy('copy', () =>
+        runBatch(mode === 'cut' ? t('files.action.move') : t('files.action.copy'), doable, async (p) => {
+          // The destination folder is the row being written into; the source row shows too when on screen
+          busy.rows([p, destDir])
           if (mode === 'cut') {
-            const to = await window.api.files.move(p, destDir)
+            const to = await window.api.files.move(p, destDir, nextOpId())
             onPathRenamed(p, to) // open tabs inherit the new path (a move is treated the same as a rename)
             touched.add(parentDir(p))
             landed.push(to)
@@ -416,11 +468,11 @@ export function useFileOps(deps: {
           } else {
             landed.push(
               external
-                ? await window.api.files.importExternal(p, destDir)
-                : await window.api.files.copy(p, destDir)
+                ? await window.api.files.importExternal(p, destDir, nextOpId())
+                : await window.api.files.copy(p, destDir, nextOpId())
             )
           }
-        }
+        })
       )
       // Only successes are recorded — movedPairs/landed are pushed to inside runBatch's op callback only
       // right after a successful await, so failures do not get in. Paste (Ctrl+V and the menu) and the
@@ -703,8 +755,7 @@ export function useFileOps(deps: {
       // for a delete). There is no IPC to know the size up front (snapshotSkipped is only known after
       // the delete), so no pre-confirmation modal is added — a modal on every Ctrl+Z would stop it from
       // being an undo.
-      if (skipped.tooLarge) toast.error(t('files.undo.permanentTooLarge'))
-      if (skipped.failed) toast.error(t('files.undo.permanentSnapshotFailed'))
+      for (const n of snapshotSkipNotices(skipped, 'undo')) toast[n.level](t(n.message.key, n.message.params))
       if (removed.length > 0) {
         onPathDeleted(removed) // close the tabs the undo removed (undoing a created/copied entry)
         sel.dispatch({ type: 'pathsRemoved', removed }) // clean up selection and clipboard — same reason as removeSelection
@@ -760,6 +811,8 @@ export function useFileOps(deps: {
     startRename,
     commitEdit,
     cancelEdit,
-    resetEditingState
+    resetEditingState,
+    busyRows: busyView.rows,
+    opStatus: busyView.status
   }
 }

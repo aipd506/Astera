@@ -412,7 +412,7 @@ export const ja: Catalog = {
   'files.commit.failed': '{action}に失敗しました: {detail}',
   // useFileOps.ts — delete confirmation modal
   'files.delete.undoHint':
-    'Ctrl+Z または Local History から復元できます (最大30日間保管 · 50MB を超える項目は除く)。',
+    'Ctrl+Z または Local History から復元できます (最大30日間保管 · 50MB または 5,000 ファイルを超える項目は除く)。',
   'files.delete.confirmOne': '「{name}」を削除しますか？\n{undoHint}',
   'files.delete.confirmDirWithCount':
     'フォルダ「{name}」と配下の {count} 件の項目を削除しますか？\n{undoHint}',
@@ -420,7 +420,12 @@ export const ja: Catalog = {
   'files.delete.confirmMany': '{shown}{more} — {total} 件の項目を削除しますか？{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' フォルダ {count} 件の配下の項目も一緒に削除されます。',
   'files.delete.moreNames': ' ほか {count} 件',
-  'files.delete.skippedTooLarge': '項目が大きすぎるため Local History に残しませんでした',
+  'files.delete.skippedTooLarge': '項目が大きすぎるため ({maxMb}MB または {maxFiles} ファイル超) Local History に残しませんでした',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': '削除中… {count} 項目',
+  'files.op.snapshotting': 'Local History に保存中… {count} 項目',
+  'files.op.copying': 'コピー中… {count} 項目',
+  'files.op.busy': '処理中…',
   'files.delete.skippedFailed':
     'Local History のスナップショットに失敗しました — 削除は完了しています',
   // useFileOps.ts — cut/copy and paste
@@ -441,7 +446,7 @@ export const ja: Catalog = {
   'files.undo.partialFail': '元に戻す {attempted} 件中 {failed} 件が失敗しました: {shown}{more}',
   'files.undo.partialMissing': '元に戻す {total} 件中 {missing} 件が失敗しました: {shown}{more}',
   'files.undo.permanentTooLarge':
-    '元に戻す操作で完全に削除されました — 容量が大きく Local History に残していないため復元できません',
+    '元に戻す操作で完全に削除されました — 容量が大きく ({maxMb}MB または {maxFiles} ファイル超) Local History に残していないため復元できません',
   'files.undo.permanentSnapshotFailed':
     '元に戻す操作で削除されました — Local History のスナップショットに失敗したため復元できません',
   'files.undo.done': '{desc}を元に戻しました',

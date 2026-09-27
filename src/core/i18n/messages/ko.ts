@@ -575,14 +575,19 @@ export const ko = {
   // useFileOps.ts — delete confirmation modal. The undoHint wording is settled —
   // the "up to" and "over 50MB excluded" specifics have to stay (no over-promising; see the undoHint declaration comment).
   'files.delete.undoHint':
-    'Ctrl+Z 또는 Local History에서 복구할 수 있습니다 (최대 30일 보관 · 50MB 초과 항목은 제외).',
+    'Ctrl+Z 또는 Local History에서 복구할 수 있습니다 (최대 30일 보관 · 50MB 또는 파일 5,000개 초과 항목은 제외).',
   'files.delete.confirmOne': "'{name}' 을(를) 삭제할까요?\n{undoHint}",
   'files.delete.confirmDirWithCount': "'{name}' 폴더와 하위 {count}개 항목을 삭제할까요?\n{undoHint}",
   'files.delete.confirmDirAll': "'{name}' 폴더와 하위 항목 전부를 삭제할까요?\n{undoHint}",
   'files.delete.confirmMany': '{shown}{more} — {total}개 항목을 삭제할까요?{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' 폴더 {count}개의 하위 항목이 함께 삭제됩니다.',
   'files.delete.moreNames': ' 외 {count}개',
-  'files.delete.skippedTooLarge': '항목이 너무 커서 Local History에 남기지 않았습니다',
+  'files.delete.skippedTooLarge': '항목이 너무 커서({maxMb}MB 또는 파일 {maxFiles}개 초과) Local History에 남기지 않았습니다',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': '삭제하는 중… {count}개 항목',
+  'files.op.snapshotting': 'Local History에 남기는 중… {count}개 항목',
+  'files.op.copying': '복사하는 중… {count}개 항목',
+  'files.op.busy': '작업 중…',
   'files.delete.skippedFailed': 'Local History 스냅샷에 실패했습니다 — 삭제는 완료됐습니다',
   // useFileOps.ts — cut/copy and paste
   'files.clipboard.cutDone': '{count}개 항목을 잘라냈습니다',
@@ -602,7 +607,7 @@ export const ko = {
   'files.undo.partialFail': '되돌리기 {attempted}개 중 {failed}개 실패: {shown}{more}',
   'files.undo.partialMissing': '되돌리기 {total}개 중 {missing}개 실패: {shown}{more}',
   'files.undo.permanentTooLarge':
-    '되돌리기로 영구 삭제됐습니다 — 용량이 커 Local History에 남기지 않아 복구할 수 없습니다',
+    '되돌리기로 영구 삭제됐습니다 — 용량이 커({maxMb}MB 또는 파일 {maxFiles}개 초과) Local History에 남기지 않아 복구할 수 없습니다',
   'files.undo.permanentSnapshotFailed':
     '되돌리기로 지워졌습니다 — Local History 스냅샷에 실패해 복구할 수 없습니다',
   'files.undo.done': '{desc} 되돌렸습니다',

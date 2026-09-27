@@ -492,14 +492,19 @@ export const en: Record<keyof typeof ko, string> = {
   'files.batch.moreCount': ', and {count} more',
   'files.commit.failed': '{action} failed: {detail}',
   'files.delete.undoHint':
-    'You can recover this via Ctrl+Z or Local History (kept for up to 30 days · items over 50MB are excluded).',
+    'You can recover this via Ctrl+Z or Local History (kept for up to 30 days · items over 50MB or 5,000 files are excluded).',
   'files.delete.confirmOne': 'Delete “{name}”?\n{undoHint}',
   'files.delete.confirmDirWithCount': 'Delete the folder “{name}” and its {count} items inside?\n{undoHint}',
   'files.delete.confirmDirAll': 'Delete the folder “{name}” and everything inside it?\n{undoHint}',
   'files.delete.confirmMany': '{shown}{more} — delete {total} items?{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' {count} of them are folders — their contents will be deleted too.',
   'files.delete.moreNames': ', and {count} more',
-  'files.delete.skippedTooLarge': 'The item was too large to keep in Local History',
+  'files.delete.skippedTooLarge': 'The item was too large to keep in Local History (over {maxMb}MB or {maxFiles} files)',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': 'Deleting… {count} items',
+  'files.op.snapshotting': 'Keeping a Local History copy… {count} items',
+  'files.op.copying': 'Copying… {count} items',
+  'files.op.busy': 'Working…',
   'files.delete.skippedFailed': 'Failed to snapshot to Local History — the delete still completed',
   'files.clipboard.cutDone': 'Cut {count} items',
   'files.clipboard.copyDone': 'Copied {count} items',
@@ -517,7 +522,7 @@ export const en: Record<keyof typeof ko, string> = {
   'files.undo.partialFail': 'Undo failed on {failed} of {attempted} items: {shown}{more}',
   'files.undo.partialMissing': 'Undo failed on {missing} of {total} items: {shown}{more}',
   'files.undo.permanentTooLarge':
-    'Permanently deleted by undo — it was too large to keep in Local History, so it cannot be recovered',
+    'Permanently deleted by undo — it was too large to keep in Local History (over {maxMb}MB or {maxFiles} files), so it cannot be recovered',
   'files.undo.permanentSnapshotFailed':
     'Deleted by undo — the Local History snapshot failed, so it cannot be recovered',
   'files.undo.done': 'Undid {desc}',

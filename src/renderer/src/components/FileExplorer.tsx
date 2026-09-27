@@ -5,7 +5,7 @@ import { resolveFileIcon, resolveFolderIcon } from '../../../core/files/icons'
 import { FileIcon } from './FileIcon'
 import { ContextMenu, type MenuItem } from './ContextMenu'
 import { LocalHistoryDialog } from './LocalHistoryDialog'
-import { RowLoading, RootReading, ROOT_SLOW_MS } from './ExplorerLoading'
+import { RowLoading, RootReading, FileOpStatusLine, ROOT_SLOW_MS } from './ExplorerLoading'
 import { toast } from '../lib/toast'
 import { useFileTree, type Entry, type DirState } from '../hooks/useFileTree'
 import { useExplorerSelection } from '../hooks/useExplorerSelection'
@@ -633,6 +633,8 @@ export function FileExplorer({
                 <span className={`fx-name${gitStatus.fileState[entry.path] ? ` git-${gitStatus.fileState[entry.path]}` : ''}`}>
                   {entry.name}
                 </span>
+                {/* a delete or copy working on this file, past ROW_SPINNER_DELAY_MS */}
+                <RowLoading pending={ops.busyRows.has(entry.path)} label="files.op.busy" />
                 {gitStatus.fileState[entry.path] && (
                   <span
                     className={`fx-git-mark git-${gitStatus.fileState[entry.path]}`}
@@ -670,7 +672,12 @@ export function FileExplorer({
                   <FileIcon {...resolveFolderIcon(entry.name, isOpen)} />
                   <span className="fx-name">{entry.name}</span>
                   {/* A first read already shows 'Loading…' under the row — the spinner is for re-reads only */}
-                  <RowLoading pending={tree.loading.has(entry.path) && !!dirs[entry.path]} />
+                  {ops.busyRows.has(entry.path) ? (
+                    // a delete or copy working on (or into) this folder, past ROW_SPINNER_DELAY_MS
+                    <RowLoading pending label="files.op.busy" />
+                  ) : (
+                    <RowLoading pending={tree.loading.has(entry.path) && !!dirs[entry.path]} />
+                  )}
                   {gitStatus.folderCount[entry.path] > 0 && (
                     <span
                       className="fx-git-count"
@@ -798,6 +805,8 @@ export function FileExplorer({
           {t('explorer.git.unavailable')}
         </div>
       )}
+      {/* A delete or paste past OP_STATUS_DELAY_MS: what it is doing and how many entries so far */}
+      <FileOpStatusLine status={ops.opStatus} />
       <div
         className={`fx-tree${gitStatus.stale ? ' git-stale' : ''}`}
         ref={treeRef}
