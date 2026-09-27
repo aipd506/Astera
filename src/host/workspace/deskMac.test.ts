@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
+import { execFile } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -140,7 +141,8 @@ describe('the macOS desk', () => {
     expect(r.procs[0]).toMatchObject({
       file: 'sh',
       // `wait` keeps sh, the group's leader, alive while anything the command backgrounded still runs.
-      args: ['-c', 'npm run dev\nwait'],
+      // A blank line before it, so a command ending in a backslash cannot join `wait` (review M3).
+      args: ['-c', 'npm run dev\n\nwait'],
       cwd: '/Users/me/proj',
       env: { ELECTRON_ENABLE_LOGGING: '1', ASTERA_APP_CDP_PORT: '9333', ASTERA_APP_CHROMIUM_FLAGS: MAC_BACKGROUND_FLAGS }
     })
@@ -167,7 +169,7 @@ describe('the macOS desk', () => {
     const got = await desk.launch({ command: '"/Applications/My App.app" --remote-debugging-port=$ASTERA_APP_CDP_PORT', cwd: '/Users/me/proj', env: {} })
     expect(r.procs[0].args).toEqual([
       '-c',
-      'exec open -g -j -n -a "$0" --args --remote-debugging-port=$ASTERA_APP_CDP_PORT "$1" $ASTERA_APP_CHROMIUM_FLAGS',
+      'exec open -g -j -n -a "$0" --args "$1" --remote-debugging-port=$ASTERA_APP_CDP_PORT $ASTERA_APP_CHROMIUM_FLAGS',
       bundle,
       '--astera-desk=mac-bg-a-1'
     ])
@@ -307,6 +309,49 @@ describe('the macOS desk: start times, failures and close', () => {
       'launch: open could not start /Applications/Broken.app (exited 1: LSOpenURLsWithRole() failed with error -10810)'
     )
     expect(r.procs[0].stderr).toBe(true)
+  })
+
+  it("reports open's own failure, not a missing process, when it fails in the same poll the limit passes (review M1)", async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    r.deps.sleep = async (ms) => {
+      r.procs[0].exit('exited 1')
+      // The clock jumps past the ready limit in the same poll.
+      r.deps.now = () => at(27, 10, 11, 12) + DESK_READY_MS + ms
+    }
+    await expect(desk.launch({ command: '/Applications/Broken.app', cwd: '/', env: {} })).rejects.toThrow(
+      'launch: open could not start /Applications/Broken.app (exited 1: LSOpenURLsWithRole() failed with error -10810)'
+    )
+  })
+
+  it('puts the tag first after --args, so a comment, a `;` or a `--` in the rest cannot cut it off (review I2)', async () => {
+    const r = rig()
+    appsAppear(r, '/A.app')
+    const desk = await r.desks.start('a')
+    await desk.launch({ command: '/A.app --x -- y ; z # note', cwd: '/', env: {} })
+    expect(r.procs[0].args[1]).toBe('exec open -g -j -n -a "$0" --args "$1" --x -- y ; z # note $ASTERA_APP_CHROMIUM_FLAGS')
+    expect(r.procs[0].args[3]).toBe('--astera-desk=mac-bg-a-1')
+  })
+
+  it.runIf(process.platform !== 'win32')('hands open the tag through a real sh, whatever the rest holds (review I2)', async () => {
+    const r = rig()
+    appsAppear(r, '/A.app')
+    const desk = await r.desks.start('a')
+    await desk.launch({ command: '/A.app --x # note', cwd: '/', env: {} })
+    const [, script, bundle, tag] = r.procs[0].args
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-deskmac-open-'))
+    try {
+      // A stand in for open that prints each argument it got on a line of its own.
+      await fs.writeFile(path.join(dir, 'open'), '#!/bin/sh\nfor a in "$@"; do printf \'%s\\n\' "$a"; done\n', { mode: 0o755 })
+      const out = await new Promise<string>((resolve, reject) =>
+        execFile('sh', ['-c', script, bundle, tag], { env: { PATH: `${dir}:/usr/bin:/bin`, ASTERA_APP_CHROMIUM_FLAGS: '--f1' } }, (err, stdout) =>
+          err ? reject(err) : resolve(stdout)
+        )
+      )
+      expect(out.split('\n').filter(Boolean)).toEqual(['-g', '-j', '-n', '-a', '/A.app', '--args', tag, '--x'])
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('keeps looking after open exits 0, since the app may appear a moment later', async () => {

@@ -152,8 +152,10 @@ export function createMacDesks(d: MacDeskDeps): { start(name: string): Promise<D
         const since = d.now()
         // -g: not brought to the front; -j: launched hidden; -n: a new instance beside the person's.
         // The bundle is $0 and the tag $1, so neither needs quoting; the rest is the command's own
-        // shell text.
-        const opener = d.spawn('sh', ['-c', `exec open -g -j -n -a "$0" --args ${b.rest} "$1" $ASTERA_APP_CHROMIUM_FLAGS`, bundle, tag], {
+        // shell text. The tag comes first, before that text: a `#`, a `;` or a `--` in the rest would
+        // otherwise cut it off, and the app would run with nothing to find it by (review I2). The flags
+        // may be lost that way; they only make rendering better.
+        const opener = d.spawn('sh', ['-c', `exec open -g -j -n -a "$0" --args "$1" ${b.rest} $ASTERA_APP_CHROMIUM_FLAGS`, bundle, tag], {
           env: { ...a.env, ASTERA_APP_CHROMIUM_FLAGS: MAC_BACKGROUND_FLAGS },
           cwd: a.cwd,
           stderr: true
@@ -174,13 +176,14 @@ export function createMacDesks(d: MacDeskDeps): { start(name: string): Promise<D
             why = closedError()
             break
           }
-          if (d.now() >= until) {
-            why = new Error(`launch: ${bundle} was opened, but no process of it appeared within ${DESK_READY_MS / 1000} s`)
-            break
-          }
+          // Before the limit: an open that failed in the same poll the limit passed says why (review M1).
           if (openFailed()) {
             const tail = opener.stderrTail()
             throw new Error(`launch: open could not start ${bundle} (${tail ? `${st.opened}: ${tail}` : st.opened})`)
+          }
+          if (d.now() >= until) {
+            why = new Error(`launch: ${bundle} was opened, but no process of it appeared within ${DESK_READY_MS / 1000} s`)
+            break
           }
           const hit = await findTagged(tag, since, openerPid).catch((err: unknown) => {
             throw new Error(`launch: ${bundle} was opened, but ps could not list its processes: ${messageOf(err)}`)
@@ -212,8 +215,9 @@ export function createMacDesks(d: MacDeskDeps): { start(name: string): Promise<D
       const launchCommand = async (a: { command: string; cwd: string; env: Record<string, string> }): Promise<DeskLaunched> => {
         // `wait` keeps sh, the group's leader, alive while anything the command put in the background
         // still runs, so the group always has a leader with a real start time to kill by. A newline,
-        // not `;`, so a command ending in a comment still reaches it.
-        const child = d.spawn('sh', ['-c', `${a.command}\nwait`], { env: { ...a.env, ASTERA_APP_CHROMIUM_FLAGS: MAC_BACKGROUND_FLAGS }, cwd: a.cwd })
+        // not `;`, so a command ending in a comment still reaches it, and a blank line, so a command
+        // ending in a backslash continues onto the empty line, not onto `wait` (review M3).
+        const child = d.spawn('sh', ['-c', `${a.command}\n\nwait`], { env: { ...a.env, ASTERA_APP_CHROMIUM_FLAGS: MAC_BACKGROUND_FLAGS }, cwd: a.cwd })
         if (child.pid === undefined) throw new Error(`launch: sh could not start (${child.stderrTail() || 'no reason given'})`)
         const cpid = child.pid
         // From ps, never the clock: the leftover sweep compares this with the kernel's own record. When
