@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Account, CliStatus, HistoryEntry, HostDriverReport, HostHoldings, HostStatus, RollStateEvent, SchedStateEvent, ScheduleConfig, SessionInfo, SessionKind, SessionUsage, UpdateStatus, UpdateCampaignInfo, InstallOutcome } from '../../core/types'
+import type { Account, CliStatus, HistoryEntry, HostDriverReport, HostHoldings, HostStatus, HostRuntimeInstallState, RollStateEvent, SchedStateEvent, ScheduleConfig, SessionInfo, SessionKind, SessionUsage, UpdateStatus, UpdateCampaignInfo, InstallOutcome } from '../../core/types'
 import type { UnattendedPermission } from '../../core/chat/types'
 import type { Lang, MessageKey } from '../../core/i18n'
 import { CATALOGS, LANGS } from '../../core/i18n'
@@ -124,6 +124,7 @@ import { PaneGrid } from './components/PaneGrid'
 import { ContextMenu, type MenuItem } from './components/ContextMenu'
 import { onFileChanges } from './lib/fileChanges'
 import type { FileChange } from '../../core/files/changeBatch'
+import { HostRuntimeNotice } from './components/HostRuntimeNotice'
 import { House, PanelLeft, Settings, X } from 'lucide-react'
 
 sessionBus.init()
@@ -514,6 +515,35 @@ export default function App(): React.JSX.Element {
       off()
     }
   }, [])
+  /** Putting the Host's own runtime in place (stage 3 task 2), as main last said it. Read once at mount
+   *  and then pushed; the notice it drives sits in the status bar beside the other Host notices. */
+  const [hostRuntime, setHostRuntime] = useState<HostRuntimeInstallState | null>(null)
+  useEffect(() => {
+    let current = true
+    void window.api.host
+      .runtimeInstall()
+      .then((s) => {
+        if (current) setHostRuntime(s)
+      })
+      .catch(() => {})
+    const off = window.api.host.onRuntimeInstall((s) => {
+      if (current) setHostRuntime(s)
+    })
+    return () => {
+      current = false
+      off()
+    }
+  }, [])
+  /** The clock the notice's elapsed seconds read, ticked once a second only while a slow install is on
+   *  screen — the count moving is what tells a long antivirus scan from a hang. */
+  const [hostRuntimeNow, setHostRuntimeNow] = useState(() => Date.now())
+  const hostRuntimeSlow = hostRuntime?.phase === 'preparing' && hostRuntime.slow
+  useEffect(() => {
+    if (!hostRuntimeSlow) return
+    setHostRuntimeNow(Date.now())
+    const timer = setInterval(() => setHostRuntimeNow(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [hostRuntimeSlow])
   const [hostRestarting, setHostRestarting] = useState(false)
   /** The Info tab's *Restart now*: confirm with what ends, replace, then re-read the row. */
   const restartHost = async (): Promise<void> => {
@@ -4367,6 +4397,10 @@ export default function App(): React.JSX.Element {
 
             Outside the `active` branches above on purpose: the Host's state is the same fact whether or
             not a session is showing, and the two branches would otherwise each need their own copy. */}
+        {/* The Host's own runtime being put in place after an update (stage 3 task 2): the copy used to
+            freeze the window with nothing on screen. Beside the other Host notices, for the same reason
+            they are outside the session branches. */}
+        <HostRuntimeNotice state={hostRuntime} nowMs={hostRuntimeNow} />
         {hostStatus?.connected && hostStatus.outdated && (
           <button
             type="button"

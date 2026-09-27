@@ -222,6 +222,11 @@ export const es: Catalog = {
   'settings.info.hostConnected': 'Conectado · protocolo {protocol} · desde hace {uptime}',
   'settings.info.hostNotConnected': 'Sin conexión',
   'settings.info.hostNotConnectedWhy': 'Sin conexión · {detail}',
+  'status.hostPreparing': 'Preparando el Astera Host…',
+  'status.hostPreparingSlow': 'Preparando el Astera Host… sigue en curso ({seconds} s)',
+  'status.hostPrepareFailed': 'No se pudo preparar el Astera Host',
+  'status.hostPrepareFailedTitle':
+    '{detail} — esta vez el Host se inicia desde el ejecutable de la app, y se vuelve a preparar en el próximo inicio.',
   'settings.slack.save': 'Guardar',
   'settings.slack.saved': 'Guardado',
   'settings.slack.saveFailed': 'No se pudo guardar la configuración de Slack: {detail}',

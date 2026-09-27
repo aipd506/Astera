@@ -2027,6 +2027,17 @@ input[type="checkbox"]:not(.md-task input):focus-visible {
 }
 .statusbar .status-host-outdated:hover { background: var(--warn-bg); }
 .statusbar .status-host-outdated:disabled { cursor: default; opacity: 0.6; }
+/* The Host runtime being put in place (stage 3 task 2). Plain text and the shared spinner while it
+   works — nothing is wrong, it is only slow — and the same amber outline as the notices above if it
+   failed, because that is the same kind of fact: worth a look, not broken. */
+.statusbar .status-host-runtime {
+  flex: none; margin-left: 12px; display: inline-flex; align-items: center; gap: 6px;
+  color: var(--text-dim); white-space: nowrap;
+}
+.statusbar .status-host-runtime.failed {
+  padding: 2px 8px; line-height: 1.4; color: var(--warn-ink);
+  border: 1px solid var(--warn-ink); border-radius: 999px; cursor: default;
+}
 /* The Host row's three facts, stacked. Right-aligned so their ragged left edges do not read as three
    unrelated things, and so the restart button beside them keeps one place whatever they say. */
 .host-row-detail { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; }

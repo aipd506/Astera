@@ -311,6 +311,11 @@ export const en: Record<keyof typeof ko, string> = {
   'status.hostUnresponsive': 'Host not answering',
   'status.hostUnresponsiveTitle':
     'The Host is not answering. New sessions open inside the app and end when it closes. Press to restart the Host.',
+  'status.hostPreparing': 'Preparing the Astera Host…',
+  'status.hostPreparingSlow': 'Preparing the Astera Host… still working ({seconds}s)',
+  'status.hostPrepareFailed': 'Could not prepare the Astera Host',
+  'status.hostPrepareFailedTitle':
+    '{detail} — the Host runs from the app executable this time, and it is prepared again on the next start.',
   'settings.slack.save': 'Save',
   'settings.slack.saved': 'Saved',
   'settings.slack.saveFailed': 'Could not save the Slack settings: {detail}',

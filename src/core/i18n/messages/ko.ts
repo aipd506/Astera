@@ -364,6 +364,11 @@ export const ko = {
     '응답하지 않는 Host 를 강제로 끝내고 새로 시작합니다. 그 Host 가 들고 있던 것은 없습니다. 계속할까요?',
   'status.hostUnresponsive': '호스트 응답 없음',
   'status.hostUnresponsiveTitle': 'Host 가 응답하지 않습니다. 새 세션은 앱 안에서 열리고 앱을 끄면 함께 끝납니다. 눌러서 Host 를 다시 시작합니다.',
+  // 업데이트 뒤 Host 실행 환경을 깔아 두는 동안(첫 설치는 node.exe 87MB 복사와 백신 검사). 1초를 넘기면 Slow 문구로 바뀐다
+  'status.hostPreparing': 'Astera Host 준비 중…',
+  'status.hostPreparingSlow': 'Astera Host 준비 중… 아직 진행 중입니다 ({seconds}초)',
+  'status.hostPrepareFailed': 'Astera Host 를 준비하지 못했습니다',
+  'status.hostPrepareFailedTitle': '{detail} — 이번에는 앱 실행 파일로 Host 를 띄우고, 다음 시작 때 다시 준비합니다.',
   'settings.slack.save': '저장',
   'settings.slack.saved': '저장됨',
   'settings.slack.saveFailed': 'Slack 설정을 저장하지 못했습니다: {detail}',
