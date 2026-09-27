@@ -96,6 +96,13 @@ describe('macStartTimes', () => {
     })
     expect([...(await macStartTimes([100, 300], exec)).keys()]).toEqual([100])
   })
+
+  it('rejects when ps fails for a reason other than "no such pid" (code 1): an ENOENT, a timeout, a signal', async () => {
+    const exec = vi.fn(async () => {
+      throw Object.assign(new Error('spawn env ENOENT'), { code: 'ENOENT' })
+    })
+    await expect(macStartTimes([100], exec)).rejects.toThrow('ENOENT')
+  })
 })
 
 describe('killGroup', () => {
@@ -160,7 +167,7 @@ describe.runIf(process.platform !== 'win32')('spawnDetached, killGroup and the s
     expect(p.pid).toBeGreaterThan(1)
     const exited = new Promise<string>((r) => p.onExit(r))
     await killGroup(p.pid!)
-    expect(await exited).toMatch(/SIGTERM|exited/)
+    expect(await exited).toBe('exited SIGTERM')
     expect(() => process.kill(-p.pid!, 0)).toThrow()
   })
 

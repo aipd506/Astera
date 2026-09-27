@@ -7,9 +7,11 @@ import type { LinuxTool, LinuxTools } from './platform'
 export const WORKSPACE_IDLE_MS = 10 * 60_000
 
 /** How far a live process's creation time may be from the recorded one and still be the same
- *  process. Both come from the kernel's creation time (GetProcessTimes when recorded, the CIM
- *  CreationDate when checked), so they agree to the millisecond; the slack covers rounding only. A
- *  pid Windows reuses belongs to a process created after the recorded one died, which is far outside. */
+ *  process. Both come from the kernel's own record of when it started: GetProcessTimes when
+ *  recorded and the CIM CreationDate when checked on Windows; /proc/<pid>/stat's ticks since boot on
+ *  Linux; `ps lstart` on macOS. Windows and Linux agree to the millisecond; `ps lstart` only has
+ *  whole-second resolution, so the slack also covers that rounding. A pid the OS reuses belongs to a
+ *  process created after the recorded one died, which is far outside. */
 export const START_TIME_TOLERANCE_MS = 2_000
 
 export function idleExpired(a: { lastActivityAt: number; now: number; running: boolean; idleMs?: number }): boolean {

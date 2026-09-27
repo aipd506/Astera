@@ -17,11 +17,7 @@ const defaultExec: Exec = (file, args) =>
 
 let defaultLinuxProc: LinuxProcFs | null = null
 
-/** Each live pid's creation time in epoch ms. One query for all of them. */
-export async function processStartTimes(pids: number[], exec: Exec = defaultExec, platform: string = process.platform): Promise<Map<number, number>> {
-  for (const p of pids) if (!Number.isSafeInteger(p) || p <= 0) throw new Error(`not a pid: ${p}`)
-  if (platform === 'linux') return linuxStartTimes(pids, exec === defaultExec ? (defaultLinuxProc ??= realLinuxProcFs(exec)) : realLinuxProcFs(exec))
-  if (platform === 'darwin') return macStartTimes(pids, exec)
+async function windowsStartTimes(pids: number[], exec: Exec): Promise<Map<number, number>> {
   const out = new Map<number, number>()
   if (pids.length === 0) return out
   const filter = pids.map((p) => `ProcessId=${p}`).join(' OR ')
@@ -36,17 +32,33 @@ export async function processStartTimes(pids: number[], exec: Exec = defaultExec
   return out
 }
 
-/** Ends `pid` and every process it started. On Windows through taskkill, which answers 128 for a
- *  process already gone; elsewhere its process group (R10). Gone is not a failure: the result the
- *  caller wanted is already true. */
-export async function killTree(pid: number, exec: Exec = defaultExec, platform: string = process.platform, signals: Signals = realSignals): Promise<void> {
-  if (platform !== 'win32') return killGroup(pid, signals)
+/** Each live pid's creation time in epoch ms. One query for all of them. The `platform === 'win32'`
+ *  branch here and in `killTree` must agree on every other platform value (fix round 1): anything not
+ *  win32 is POSIX, so both dispatch the same way, and only the start-time source further splits on
+ *  darwin vs. linux (both use the same process group kill either way). */
+export async function processStartTimes(pids: number[], exec: Exec = defaultExec, platform: string = process.platform): Promise<Map<number, number>> {
+  for (const p of pids) if (!Number.isSafeInteger(p) || p <= 0) throw new Error(`not a pid: ${p}`)
+  return platform === 'win32'
+    ? windowsStartTimes(pids, exec)
+    : platform === 'darwin'
+      ? macStartTimes(pids, exec)
+      : linuxStartTimes(pids, exec === defaultExec ? (defaultLinuxProc ??= realLinuxProcFs(exec)) : realLinuxProcFs(exec))
+}
+
+async function windowsKillTree(pid: number, exec: Exec): Promise<void> {
   const cmd = treeKillCommand('win32', pid)
   if (!cmd) return
   await exec(cmd.file, cmd.args).catch((err: { code?: unknown }) => {
     if (err?.code === 128) return ''
     throw err
   })
+}
+
+/** Ends `pid` and every process it started. On Windows through taskkill, which answers 128 for a
+ *  process already gone; elsewhere its process group (R10). Gone is not a failure: the result the
+ *  caller wanted is already true. */
+export async function killTree(pid: number, exec: Exec = defaultExec, platform: string = process.platform, signals: Signals = realSignals): Promise<void> {
+  return platform === 'win32' ? windowsKillTree(pid, exec) : killGroup(pid, signals)
 }
 
 export function freePort(): Promise<number> {

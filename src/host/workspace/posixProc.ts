@@ -83,13 +83,16 @@ export async function linuxStartTimes(pids: number[], d: LinuxProcFs): Promise<M
 
 /** Each live pid's start time, epoch ms, from one `ps` call. LC_ALL=C, so the month names are the
  *  ones parseLstart reads whatever the person's locale (Review Focus 5). ps exits 1 when one of the
- *  pids is gone, and still prints the rest. */
+ *  pids is gone, and still prints the rest, so only that code is swallowed; anything else (an ENOENT,
+ *  a timeout, a signal) is rethrown, since silently answering an empty map here reads as "every pid is
+ *  gone" to the leftover sweep and leaves those processes running forever (fix round 1). */
 export async function macStartTimes(pids: number[], exec: ExecText): Promise<Map<number, number>> {
   const out = new Map<number, number>()
   if (pids.length === 0) return out
-  const text = await exec('env', ['LC_ALL=C', 'ps', '-o', 'pid=,lstart=', '-p', pids.join(',')]).catch((err: { stdout?: unknown }) =>
-    String(err?.stdout ?? '')
-  )
+  const text = await exec('env', ['LC_ALL=C', 'ps', '-o', 'pid=,lstart=', '-p', pids.join(',')]).catch((err: { code?: unknown; stdout?: unknown }) => {
+    if (err?.code === 1) return String(err.stdout ?? '')
+    throw err
+  })
   for (const line of text.split('\n')) {
     const m = /^\s*(\d+)\s+(.+)$/.exec(line)
     if (!m) continue
@@ -112,6 +115,7 @@ export const realSignals: Signals = {
   sleep: (ms) =>
     new Promise((r) => {
       const t = setTimeout(r, ms)
+      // Unref'd: a grace poll in progress must never be the reason the Host's own process stays up.
       t.unref?.()
     })
 }
@@ -191,11 +195,16 @@ export const spawnDetached: SpawnDetached = (file, args, o) => {
     child.stderr.on('data', (c: string) => {
       tail = (tail + c).slice(-2_000)
     })
+    // R3: a broken pipe here is not this call's failure; 'close' still judges the exit either way.
+    child.stderr.on('error', () => {})
     ;(child.stderr as unknown as { unref?(): void }).unref?.()
   }
   // R3: a spawn that fails emits 'error', which is an exit here, never an unhandled event.
   child.on('error', (err) => end(`${file} could not start: ${err.message}`))
-  child.on('exit', (code, signal) => end(`exited ${String(signal ?? code)}`))
+  // 'close', not 'exit': close comes once stdio has fully closed too, so stderrTail() has read
+  // everything the process wrote by the time onExit fires (the same ordering as endChild's judge in
+  // scriptWorker.ts, 37c31855).
+  child.on('close', (code, signal) => end(`exited ${String(signal ?? code)}`))
   child.unref()
   return {
     get pid() {
