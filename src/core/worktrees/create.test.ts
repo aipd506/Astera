@@ -154,6 +154,40 @@ describe('createWorktree, 루트에 닿지 않을 때', () => {
     expect(reg.list()).toEqual([])
   })
 
+  // Stage 4 T1: 저장소 폴더를 git 보다 먼저 묻는다. 끊긴 공유 위의 폴더를 cwd 로 git 을 띄우면
+  // Windows 는 그 폴더를 부르는 스레드(Host 의 하나뿐인 스레드)에서 동기로 들여다본다.
+  it('저장소 폴더가 답하지 않으면 git 을 띄우지 않고 REPO_UNREACHABLE 로 실패한다 — NOT_GIT_REPO 가 아니다', async () => {
+    const asked: string[] = []
+    const err = await createWorktree({
+      repoPath: repo, name: 'deadrepo', registry: reg,
+      repoProbe: async (p) => { asked.push(p); return 'timeout' }
+    }).catch((e: unknown) => e)
+    expect(String(err)).toMatch(/REPO_UNREACHABLE: folder not reachable/)
+    expect(String(err)).not.toMatch(/NOT_GIT_REPO/)
+    expect(asked).toEqual([repo])
+    expect(reg.list()).toEqual([])
+    expect(await fs.readdir(root)).toEqual([])
+  })
+
+  it('저장소 폴더가 없다고 답하면 NOT_GIT_REPO 다', async () => {
+    await expect(
+      createWorktree({ repoPath: repo, name: 'gone', registry: reg, repoProbe: async () => 'absent' })
+    ).rejects.toThrow(/NOT_GIT_REPO/)
+  })
+
+  it('예산이 막힌 것으로 아는 루트는 호출 없이 거절된다', async () => {
+    const budget = new ProbeBudget()
+    const ticket = await budget.enter(rootOf(repo))
+    if (typeof ticket === 'string') throw new Error(ticket)
+    ticket.timedOut()
+    const calls: string[] = []
+    const repoProbe = createProber({
+      access: async (p) => { calls.push(p) }, skipQueue: true, pool: createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, budget), log: () => {}
+    })
+    await expect(createWorktree({ repoPath: repo, name: 'stuck', registry: reg, repoProbe })).rejects.toThrow(/REPO_UNREACHABLE/)
+    expect(calls).toEqual([])
+  })
+
   it('이름이 쓰였는지는 비동기 확인의 답으로 정한다', async () => {
     const first = path.join(root, path.basename(repo), 'taken')
     const { info } = await createWorktree({

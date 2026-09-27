@@ -15,6 +15,7 @@ import { git as realGit, gitDir, gitVersionAtLeast, listGitWorktrees, GIT_WRITE_
 import { removeWorktree } from '../../worktrees/remove'
 import { askUntilAnswered, defaultActionPresenceCheck, type CheckResult, type PresenceCheck } from '../../worktrees/presence'
 import type { WorktreeStore } from '../../worktrees/registry'
+import { defaultCwdProbe, type Probe } from '../../sessions/pathProbe'
 
 /** 프로젝트 폴더가 **서 있는 브랜치**에서 워크트리를 하나 만들고 그 경로를 낸다.
  *
@@ -50,8 +51,21 @@ import type { WorktreeStore } from '../../worktrees/registry'
  *  있다. */
 export async function forkWorktree(
   a: { repoPath: string; name?: string },
-  ctx: { registry: WorktreeStore; log(m: string): void }
+  ctx: {
+    registry: WorktreeStore
+    log(m: string): void
+    /** Test seam: the probe the project folder is asked through before git is spawned in it. */
+    probe?: Probe
+  }
 ): Promise<string> {
+  // **폴더를 git 보다 먼저 묻는다** (예산 안의 세션 폴더 probe). 끊긴 공유 위의 폴더를 cwd 로
+  // git 을 띄우면 Windows 는 그 폴더를 부르는 스레드 — Host 의 하나뿐인 스레드 — 에서 동기로
+  // 들여다보고, 그동안 그 스레드가 쥔 모든 pty 가 멈춘다. 답이 없으면 "닿지 않는다"이지 "저장소가
+  // 사라졌다"(NO_REPO)가 아니다.
+  const at = await (ctx.probe ?? defaultCwdProbe)(a.repoPath)
+  if (at === 'timeout') throw new Error(`REPO_UNREACHABLE: folder not reachable: ${a.repoPath}`)
+  if (at === 'absent')
+    throw new Error(workerBaseFailure({ repoPath: a.repoPath, repoReachable: false, onBranch: false, stderr: 'the folder is not there' }) ?? '')
   const gitDirProbe = await realGit(['rev-parse', '--git-dir'], { cwd: a.repoPath })
   const head = gitDirProbe.ok
     ? await realGit(['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: a.repoPath })
@@ -67,7 +81,8 @@ export async function forkWorktree(
     repoPath: a.repoPath,
     name: a.name,
     baseRef: head.stdout,
-    registry: ctx.registry
+    registry: ctx.registry,
+    ...(ctx.probe ? { repoProbe: ctx.probe } : {})
   })
   // 경고를 버리지 않는다 — worktree.create.fetchFailed 는 "base 를 가져올 수 없어 낡은 참조에서
   // 만들었다" 는 뜻이고 워커는 그 위에서 일한다. 이 경로에는 사용자 화면이 없어 로그가 유일한

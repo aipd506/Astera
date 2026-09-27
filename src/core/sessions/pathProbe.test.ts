@@ -580,3 +580,29 @@ describe('ProbeBudget, a root that answered and then timed out', () => {
     expect(typeof (await budget.enter('z:\\'))).toBe('string')
   })
 })
+
+// Stage 4 T1: one budgeted look at a folder before an operation issues unbudgeted fs calls under it.
+describe('gateRoot', () => {
+  it('lets a present or absent folder through, and names a timeout "not reachable"', async () => {
+    const { gateRoot, isRootUnreachable } = await import('./pathProbe')
+    await expect(gateRoot('C:/a', async () => 'present')).resolves.toBe('present')
+    await expect(gateRoot('C:/a', async () => 'absent')).resolves.toBe('absent')
+    const err = await gateRoot('Z:/dead', async () => 'timeout').catch((e: unknown) => e)
+    expect(String(err)).toMatch(/ROOT_UNREACHABLE: folder not reachable: Z:\/dead/)
+    expect(isRootUnreachable(err)).toBe(true)
+    expect(isRootUnreachable(new Error('ENOENT'))).toBe(false)
+    expect(isRootUnreachable(new Error('WORKTREE_ROOT_UNREACHABLE: x'))).toBe(false)
+  })
+
+  it('refuses a root the process budget holds as stuck without making a call', async () => {
+    const { gateRoot, createProber, createProbePool, ProbeBudget, rootOf } = await import('./pathProbe')
+    const budget = new ProbeBudget()
+    const ticket = await budget.enter(rootOf('Z:/dead'))
+    if (typeof ticket === 'string') throw new Error(ticket)
+    ticket.timedOut()
+    const access = vi.fn(async () => {})
+    const probe = createProber({ access, skipQueue: true, pool: createProbePool(2, 60_000, budget), log: () => {} })
+    await expect(gateRoot('Z:/dead/project', probe)).rejects.toThrow(/ROOT_UNREACHABLE/)
+    expect(access).not.toHaveBeenCalled()
+  })
+})

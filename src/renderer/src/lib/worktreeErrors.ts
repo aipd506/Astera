@@ -19,6 +19,9 @@ const MESSAGES: Array<[string, MessageKey]> = [
   // A folder or root that did not answer in time (an offline network drive). Nothing was created or removed.
   ['WORKTREE_ROOT_UNREACHABLE', 'worktree.error.rootUnreachable'],
   ['WORKTREE_UNREACHABLE', 'worktree.error.unreachable'],
+  // The project folder did not answer before git was spawned in it (create.ts resolveRepo): could not
+  // check, not "not a repository". Nothing was created.
+  ['REPO_UNREACHABLE', 'worktree.error.repoUnreachable'],
   // The links inside the folder could not all be taken out before git removes it (a junction would carry
   // the removal outside the folder). Nothing was removed.
   ['LINKS_UNVERIFIED', 'worktree.error.linksUnverified'],

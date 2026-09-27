@@ -506,6 +506,36 @@ export async function checkCwd(cwd: string, probe: Probe = defaultCwdProbe, miss
   if (r === 'timeout') throw new Error(`CWD_UNREACHABLE: folder not reachable: ${cwd}`)
 }
 
+/** The prefix of gateRoot's refusal. A caller that words errors for a person looks for it. */
+export const ROOT_UNREACHABLE = 'ROOT_UNREACHABLE'
+
+/**
+ * **One budgeted look at a folder before an operation issues fs calls under it that the budget does
+ * not see** — a tree walk, a copy, a removal, a handful of existence checks. Those calls run on the
+ * libuv threadpool like any other, and on a dead share every one of them can hold a thread for as long
+ * as SMB takes to give up, so four of them are enough to stop every async fs call in the process.
+ *
+ * So the operation asks here first, once per root it is about to touch: the session folder's lane
+ * (`defaultCwdProbe`), inside the process-wide budget. A root the budget already holds as stuck is
+ * refused at once without a call; a probe that gets no answer within PROBE_TIMEOUT_MS is refused too.
+ * Either way this throws `ROOT_UNREACHABLE: folder not reachable: <p>` and the operation issues
+ * nothing more. `present` and `absent` are handed back: a missing folder is the operation's own
+ * business (it fails with its own ENOENT, as before). Not every per-file call goes through here —
+ * one gate per operation per root is enough, since a root that just answered is alive.
+ */
+export async function gateRoot(p: string, probe: Probe = defaultCwdProbe): Promise<'present' | 'absent'> {
+  const r = await probe(p)
+  if (r === 'timeout') throw new Error(`${ROOT_UNREACHABLE}: folder not reachable: ${p}`)
+  return r
+}
+
+/** Whether `err` is gateRoot's refusal. */
+export function isRootUnreachable(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err)
+  // Not WORKTREE_ROOT_UNREACHABLE, which ends the same way and means something else.
+  return /(^|[^A-Z_])ROOT_UNREACHABLE:/.test(m)
+}
+
 /**
  * Whether `file` sits in any directory of `pathValue`, and whether any directory timed out (a
  * caller caches such an answer only briefly). The directories are probed together; the probe's own

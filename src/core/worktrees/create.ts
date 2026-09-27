@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import type { WorktreeCreateProgress, WorktreeInfo } from '../types'
 import { comparablePath, isPathWithin, isSamePath } from '../files/tree'
 import {
-  git, repoRoot, gitUserName, detectBaseRef, toFullRef, fetchBaseRef, localBranchExists, listGitWorktrees,
+  git, probeRepoRoot, gitUserName, detectBaseRef, toFullRef, fetchBaseRef, localBranchExists, listGitWorktrees,
   GIT_WRITE_TIMEOUT_MS
 } from './git'
 import { cancelledError, throwIfCancelled } from './cancel'
@@ -14,7 +14,7 @@ import {
 import { copyWorktreeInclude } from './include'
 import type { WorktreeStore } from './registry'
 import type { Message } from '../i18n'
-import { createProber, type ProbePool } from '../sessions/pathProbe'
+import { createProber, defaultCwdProbe, type Probe, type ProbePool } from '../sessions/pathProbe'
 import { runFsWork, FS_WORK_TIMEOUT_MS } from './fsWork'
 import { detachLinks } from './detachLinks'
 import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
@@ -176,6 +176,28 @@ async function removeOwnEmptyDir(d: string): Promise<void> {
   await fs.rmdir(d)
 }
 
+/** How long the repo root question may take here. The default git deadline, as `repoRoot` had: nobody
+ *  is holding a button on this answer, and a slow share that does answer should still get its worktree. */
+const REPO_ROOT_TIMEOUT_MS = 30_000
+
+/**
+ * The repository root of `repoPath`, **asked through probeRepoRoot**: the folder is probed inside the
+ * process-wide budget before git is spawned there. Spawning with its cwd on a dead share looks into that
+ * folder synchronously on the calling thread (the Host's only thread, or the Electron main thread) for
+ * the 20 to 60 s the SMB redirector takes, before any deadline can fire.
+ *
+ * `NOT_GIT_REPO` only when it is known: git said no, or the folder is not there. A folder that did not
+ * answer, or a git that did not (timeout, could not start), is `REPO_UNREACHABLE` — "could not check",
+ * never "not a repository".
+ */
+async function resolveRepo(repoPath: string, probe: Probe): Promise<string> {
+  const r = await probeRepoRoot(repoPath, git, REPO_ROOT_TIMEOUT_MS, undefined, probe)
+  if (r.kind === 'repo') return r.root
+  if (r.kind === 'none' || r.reason === 'no-folder') throw new Error(`NOT_GIT_REPO: ${repoPath}`)
+  if (r.reason === 'timeout') throw new Error(`REPO_UNREACHABLE: folder not reachable: ${repoPath}`)
+  throw new Error(`REPO_UNREACHABLE: could not ask git about ${repoPath} (${r.reason})`)
+}
+
 export async function createWorktree(args: {
   repoPath: string
   name?: string
@@ -193,6 +215,9 @@ export async function createWorktree(args: {
   removeDirAccess?: (p: string) => Promise<void>
   cleanupPool?: ProbePool
   fsWorkTimeoutMs?: number
+  /** Test seam: the probe the repo folder is asked through before git is spawned in it (the session
+   *  folder's lane of the process-wide budget by default — see resolveRepo). */
+  repoProbe?: Probe
   /** Test seam: the deadline of `worktree add` (WORKTREE_ADD_TIMEOUT_MS by default). */
   addTimeoutMs?: number
   /** Stage and copy progress (fetch → checkout → copy-includes). Optional; a throwing callback is ignored. */
@@ -213,8 +238,7 @@ export async function createWorktree(args: {
   }
   throwIfCancelled(signal)
   report({ stage: 'fetch' })
-  const repo = await repoRoot(args.repoPath)
-  if (!repo) throw new Error(`NOT_GIT_REPO: ${args.repoPath}`)
+  const repo = await resolveRepo(args.repoPath, args.repoProbe ?? defaultCwdProbe)
 
   const warnings: Message[] = []
   const baseSlug = args.name && args.name.trim() !== '' ? slugify(args.name) : autoName()

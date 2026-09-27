@@ -49,6 +49,23 @@ describe('forkWorktree', () => {
     const plain = await tempDir('astera-integrate-plain-')
     await expect(forkWorktree({ repoPath: plain, name: 'a' }, { registry, log: () => {} })).rejects.toThrow(/NO_REPO/)
   })
+  // Stage 4 T1: the project folder is asked before git is spawned in it (the Host's one thread).
+  it('says REPO_UNREACHABLE, never NO_REPO, when the project folder does not answer, and makes nothing', async () => {
+    const asked: string[] = []
+    const err = await forkWorktree(
+      { repoPath: repo, name: 'a' },
+      { registry, log: () => {}, probe: async (p) => { asked.push(p); return 'timeout' } }
+    ).catch((e: unknown) => e)
+    expect(String(err)).toMatch(/REPO_UNREACHABLE: folder not reachable/)
+    expect(String(err)).not.toMatch(/NO_REPO/)
+    expect(asked).toEqual([repo])
+    expect(registry.list()).toEqual([])
+  })
+  it('says NO_REPO when the probe finds no folder', async () => {
+    await expect(
+      forkWorktree({ repoPath: repo, name: 'a' }, { registry, log: () => {}, probe: async () => 'absent' })
+    ).rejects.toThrow(/NO_REPO/)
+  })
   it('says NO_BASE on a detached HEAD', async () => {
     gitSync(repo, ['checkout', '--detach'])
     await expect(forkWorktree({ repoPath: repo, name: 'a' }, { registry, log: () => {} })).rejects.toThrow(/NO_BASE/)

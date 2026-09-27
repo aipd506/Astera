@@ -412,6 +412,7 @@ export function createDispatchLoop(c: DispatchLoopContext): DispatchLoop {
         state = c.getState()
         run = state.runs.find((r) => r.id === slot.runId)!
       } catch (e) {
+        // 프로젝트 폴더가 답하지 않으면(끊긴 공유) `REPO_UNREACHABLE:` 이고 git 은 뜨지 않는다.
         // 저장소에 닿을 수 없으면 `NO_REPO:`, HEAD 가 분리됐으면 `NO_BASE:` 다 —
         // workerBaseFailure 가 그 문장을 만들고 forkWorktree 가 던진다. **저장소가 아닌
         // 폴더도 `NO_REPO:` 다** — forkWorktree 의 `rev-parse --git-dir` 탐침이 먼저
