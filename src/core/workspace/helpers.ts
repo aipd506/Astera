@@ -78,6 +78,10 @@ export interface HelperDeps {
   /** When this script's deadline falls, epoch ms (plan ruling P1). */
   deadline(): number
   now(): number
+  /** The script was stopped (Stop, the session ending, the Host leaving) while a helper was still on
+   *  its way: `launch` asks before it creates the desktop and before it starts the app, so a stop that
+   *  lands mid launch leaves neither behind (preflight ruling F1). */
+  stopped(): boolean
   /** app-guide.md, which `help()` prints. */
   guide: string
 }
@@ -211,7 +215,9 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
   const start = async (at: string, spec: LaunchSpec, waitMs: number): Promise<{ pid: number; port: number }> => {
     const resolved = await deps.resolveLaunch(spec)
     const port = await deps.freePort()
+    if (deps.stopped()) throw new Error(`${at}: stopped`)
     const desk = await deps.desk()
+    if (deps.stopped()) throw new Error(`${at}: stopped`)
     const started = await desk.launch({ command: resolved.command, cwd: resolved.cwd, env: { ...resolved.env, ASTERA_APP_CDP_PORT: String(port) } })
     const launched: Launched = { ...started, port, spec }
     deps.state.launched = launched

@@ -64,9 +64,11 @@ const srcRoot = path.resolve(here, '..')
 
 describe('the Host import fence (constraint 10)', () => {
   it('nothing reachable from src/host imports electron, chokidar, src/main or src/renderer', () => {
-    const starts = readdirSync(here)
-      .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
-      .map((f) => path.join(here, f))
+    const inDir = (d: string): string[] =>
+      readdirSync(d)
+        .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts'))
+        .map((f) => path.join(d, f))
+    const starts = [...inDir(here), ...inDir(path.join(here, 'workspace'))]
     expect(starts.length).toBeGreaterThan(10)
     expect(fenceViolations(srcRoot, starts)).toEqual([])
   })

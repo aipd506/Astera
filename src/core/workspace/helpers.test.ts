@@ -102,6 +102,7 @@ const rig = (over: Partial<HelperDeps> = {}) => {
     cleanup: vi.fn(async () => {}),
     deadline: () => 100_000,
     now: () => 0,
+    stopped: () => false,
     guide: '# guide\n\n## launch(spec)\nStarts it.\n\n## windows()\nLists them.\n',
     ...over
   }
@@ -139,6 +140,27 @@ describe('launch', () => {
     const r = rig({ deadline: () => 10_000, now: () => 0 })
     await r.h.launch({ command: 'app.exe' }, { waitMs: 60_000 })
     expect(r.deps.connectCdp).toHaveBeenCalledWith(9333, 8_000)
+  })
+
+  it('a stop that lands before the desktop, or before the launch, starts neither (ruling F1)', async () => {
+    const before = rig({ stopped: () => true })
+    await expect(before.h.launch({ command: 'app.exe' })).rejects.toThrow('launch: stopped')
+    expect(before.deps.deskIfOpen()).toBeNull()
+    expect(before.desk.launches).toEqual([])
+
+    let stopped = false
+    const desk = new FakeDesk()
+    const during = rig({
+      stopped: () => stopped,
+      desk: async () => {
+        stopped = true
+        return desk
+      }
+    })
+    await expect(during.h.launch({ command: 'app.exe' })).rejects.toThrow('launch: stopped')
+    expect(desk.launches).toEqual([])
+    expect(during.state.launched).toBeNull()
+    expect(during.deps.recordLaunch).not.toHaveBeenCalled()
   })
 
   it('a port that never opens fails launch with the hint, and the native helpers still work', async () => {
