@@ -33,10 +33,16 @@ and the Host announces `workspace` on all three.
   frame offset, `getBoundingClientRect` and `devicePixelRatio`), moves in five steps to the target
   and holds the button while CDP drops the intercepted data, then lets go and parks the pointer again.
   It is real X input, but on the workspace's own display. xdotool runs with `LC_ALL=C.UTF-8` unless
-  the Host already has a UTF-8 locale, since under the C locale `xdotool type` refuses non-ASCII text. `keys()` types text the US keyboard has keys for at xdotool's default 12 ms a character, and
-  text with anything else in it (Hangul, emoji, accented letters) at 100 ms a character, all of it,
-  since xdotool binds each such character to a spare key just for it and Chromium, reading the
-  binding late, drops some at the default. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
+  the Host already has a UTF-8 locale, since under the C locale `xdotool type` refuses non-ASCII text. Left to itself, xdotool
+  types a character the US keyboard has no key for (Hangul, emoji, accented letters) by binding it
+  to a spare key for that one press and unbinding it right after, and Chromium, reading the binding
+  late, drops some whatever the delay. So `keys()` first reads the display's keyboard map with
+  `xkbcomp`, binds every such character of the text to a key the map leaves free (17 on Xvfb's
+  default map; longer texts go in pieces), waits 300 ms, types at xdotool's default 12 ms a
+  character, waits again, and puts the map back. Where the map cannot be read, or has no free key,
+  such text is typed at 100 ms a character instead. `drag()` reads an element's centre again, for up
+  to 5 s, while it lies outside the page's viewport, and then fails with the numbers rather than
+  press where nothing is. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
   `app js` is refused, with the install line for the distribution, when Xvfb, xdotool or `import` is
   missing.
 - **macOS** (`src/host/workspace/deskMac.ts`). Nothing is created. The app starts in the person's
