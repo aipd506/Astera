@@ -326,6 +326,35 @@ describe('agentBrowserEnabled', () => {
   })
 })
 
+describe('agentAppEnabled', () => {
+  it('defaults to off, round trips, and does not disturb the agent browser toggle', async () => {
+    const store = new AppSettingsStore(file())
+    await store.load()
+    expect(store.getAgentAppEnabled()).toBe(false)
+    await store.setAgentBrowserEnabled(true)
+    await store.setAgentAppEnabled(true)
+    const b = new AppSettingsStore(file())
+    await b.load()
+    expect(b.getAgentAppEnabled()).toBe(true)
+    expect(b.getAgentBrowserEnabled()).toBe(true)
+  })
+
+  it('a value that is not true reads as off, and a repaired or missing file starts off', async () => {
+    await fs.writeFile(file(), JSON.stringify({ agentAppEnabled: 1 }), 'utf8')
+    const a = new AppSettingsStore(file())
+    await a.load()
+    expect(a.getAgentAppEnabled()).toBe(false)
+    await a.setAgentAppEnabled(true)
+    await fs.writeFile(file(), '{ not json', 'utf8')
+    await a.load()
+    expect(a.getAgentAppEnabled()).toBe(false)
+    await a.setAgentAppEnabled(true)
+    await fs.rm(file())
+    await a.load()
+    expect(a.getAgentAppEnabled()).toBe(false)
+  })
+})
+
 describe('githubPolling', () => {
   it('githubPolling defaults to on', async () => {
     const store = new AppSettingsStore(file())

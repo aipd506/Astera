@@ -514,47 +514,29 @@ describe('여러 스킬 설치', () => {
 // The one list of stubs and their gates. The app (ipc.ts installStubsForCurrentToggles) and the
 // CLI (`astera skills`) both build from it, so what the two install cannot drift apart.
 describe('skillStubs', () => {
-  const off = { workUnitTrackingEnabled: false, agentBrowserEnabled: false, resumeStrategy: 'original' as const }
+  const off = { workUnitTrackingEnabled: false, agentBrowserEnabled: false, agentAppEnabled: false, resumeStrategy: 'original' as const }
 
-  it('lists the four stubs in install order, orchestration first and always on', () => {
+  it('lists the five stubs in install order, orchestration first and always on', () => {
     const list = skillStubs('/skills', off)
-    expect(list.map((s) => s.skillName)).toEqual([
-      'astera-orchestration',
-      'astera-task',
-      'astera-browser',
-      'astera-handoff'
-    ])
+    expect(list.map((s) => s.skillName)).toEqual(['astera-orchestration', 'astera-task', 'astera-browser', 'astera-handoff', 'astera-app'])
     expect(list.map((s) => s.stubPath)).toEqual([
       path.join('/skills', 'orchestration-stub.md'),
       path.join('/skills', 'task-stub.md'),
       path.join('/skills', 'browser-stub.md'),
-      path.join('/skills', 'handoff-stub.md')
+      path.join('/skills', 'handoff-stub.md'),
+      path.join('/skills', 'app-stub.md')
     ])
-    expect(list.map((s) => s.enabled)).toEqual([true, false, false, false])
+    expect(list.map((s) => s.enabled)).toEqual([true, false, false, false, false])
     // the unconditional one has no setting to name; every gated one names the setting that turns it on
     expect(list[0].setting).toBe(null)
     for (const s of list.slice(1)) expect(typeof s.setting).toBe('string')
   })
 
   it('each gate follows its own setting', () => {
-    expect(skillStubs('/s', { ...off, workUnitTrackingEnabled: true }).map((s) => s.enabled)).toEqual([
-      true,
-      true,
-      false,
-      false
-    ])
-    expect(skillStubs('/s', { ...off, agentBrowserEnabled: true }).map((s) => s.enabled)).toEqual([
-      true,
-      false,
-      true,
-      false
-    ])
-    expect(skillStubs('/s', { ...off, resumeStrategy: 'smart' }).map((s) => s.enabled)).toEqual([
-      true,
-      false,
-      false,
-      true
-    ])
+    expect(skillStubs('/s', { ...off, workUnitTrackingEnabled: true }).map((s) => s.enabled)).toEqual([true, true, false, false, false])
+    expect(skillStubs('/s', { ...off, agentBrowserEnabled: true }).map((s) => s.enabled)).toEqual([true, false, true, false, false])
+    expect(skillStubs('/s', { ...off, resumeStrategy: 'smart' }).map((s) => s.enabled)).toEqual([true, false, false, true, false])
+    expect(skillStubs('/s', { ...off, agentAppEnabled: true }).map((s) => s.enabled)).toEqual([true, false, false, false, true])
   })
 
   it('every stub it names ships in resources/skills', async () => {

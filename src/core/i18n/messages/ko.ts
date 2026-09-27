@@ -65,6 +65,13 @@ export const ko = {
     '모든 계정에 astera-browser 스킬을 설치합니다. localhost 만 열 수 있습니다. ' +
     '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다.',
   'settings.agentBrowser.saveFailed': '에이전트 브라우저 설정을 저장하지 못했습니다: {detail}',
+  // 에이전트 앱 작업 공간
+  'settings.agentApp.label': '에이전트 앱 작업 공간 (실험)',
+  'settings.agentApp.hint':
+    '켜면 에이전트가 이 프로젝트의 앱을 사람이 보지 않는 Windows 데스크톱에서 띄우고 조작하고 찍을 수 있습니다. ' +
+    '화면과 포인터는 건드리지 않지만 클립보드는 함께 씁니다. 모든 계정에 astera-app 스킬을 설치합니다. ' +
+    '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다.',
+  'settings.agentApp.saveFailed': '에이전트 앱 작업 공간 설정을 저장하지 못했습니다: {detail}',
   // 설명 생성 (How It Works)
   'settings.gen.label': '설명 생성 계정',
   'settings.gen.hint': '선택한 계정으로 기능 설명을 만듭니다.',

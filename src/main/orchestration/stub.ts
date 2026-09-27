@@ -147,6 +147,12 @@ export function skillStubs(skillsPath: string, s: SkillSettings): SkillStub[] {
       stubPath: at('handoff-stub.md'),
       enabled: s.resumeStrategy === 'smart',
       setting: 'Settings → Agents → Session resume strategy → Smart Resume'
+    },
+    {
+      skillName: 'astera-app',
+      stubPath: at('app-stub.md'),
+      enabled: s.agentAppEnabled,
+      setting: 'Settings → Agents → Agent app workspace'
     }
   ]
 }

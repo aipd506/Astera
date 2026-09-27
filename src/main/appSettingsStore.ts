@@ -27,6 +27,7 @@ import { RepairNeeded } from '../core/settings/repairNeeded'
 export const SKILL_SETTINGS_DEFAULTS: SkillSettings = {
   workUnitTrackingEnabled: false,
   agentBrowserEnabled: false,
+  agentAppEnabled: false,
   resumeStrategy: 'original'
 }
 
@@ -38,6 +39,7 @@ function skillSettingsOf(parsed: Record<string, unknown>): SkillSettings {
     // file content) reads as off, so the feature stays off until the user explicitly turns it on.
     workUnitTrackingEnabled: parsed.workUnitTrackingEnabled === true,
     agentBrowserEnabled: parsed.agentBrowserEnabled === true,
+    agentAppEnabled: parsed.agentAppEnabled === true,
     // Narrowed to === 'smart' — the file is user-editable, so anything else ('ask', 42, null) reads as 'original'
     resumeStrategy: parsed.resumeStrategy === 'smart' ? 'smart' : 'original'
   }
@@ -84,6 +86,7 @@ export class AppSettingsStore {
   private dismissedCampaignId: string | null = null
   private workUnitTrackingEnabled = SKILL_SETTINGS_DEFAULTS.workUnitTrackingEnabled
   private agentBrowserEnabled = SKILL_SETTINGS_DEFAULTS.agentBrowserEnabled
+  private agentAppEnabled = SKILL_SETTINGS_DEFAULTS.agentAppEnabled
   /** Ruling F62 — whether the one-time pause for work the old orchestration toggle had parked has
    *  already run on this profile. Written once and never cleared; see `orchAlwaysOnMigration`. It is
    *  also what tells `persist` to stop carrying `orchestrationEnabled` (ruling F67). */
@@ -154,6 +157,7 @@ export class AppSettingsStore {
         typeof dismissed === 'string' && dismissed.trim() ? dismissed : null
       this.workUnitTrackingEnabled = gates.workUnitTrackingEnabled
       this.agentBrowserEnabled = gates.agentBrowserEnabled
+      this.agentAppEnabled = gates.agentAppEnabled
       // **The absence of the key is what says "off"**, not a stored `false`: `persist` omitted falsy
       // values, so `orchestrationEnabled` was only ever written when it was on. A profile that never
       // used the feature at all reads the same way, which costs nothing — the pause finds no parked
@@ -216,6 +220,7 @@ export class AppSettingsStore {
         this.dismissedCampaignId = null
         this.workUnitTrackingEnabled = SKILL_SETTINGS_DEFAULTS.workUnitTrackingEnabled
         this.agentBrowserEnabled = SKILL_SETTINGS_DEFAULTS.agentBrowserEnabled
+        this.agentAppEnabled = SKILL_SETTINGS_DEFAULTS.agentAppEnabled
         // No file means no toggle to have been off, and no orchestration state to have parked —
         // this profile has never run anything. The F62 pause must not fire here.
         this.oldOrchestrationToggle = 'unknown'
@@ -241,6 +246,7 @@ export class AppSettingsStore {
       // survives the corrupt-file recovery and leaves a setting enabled that the file does not contain
       this.workUnitTrackingEnabled = SKILL_SETTINGS_DEFAULTS.workUnitTrackingEnabled
       this.agentBrowserEnabled = SKILL_SETTINGS_DEFAULTS.agentBrowserEnabled
+      this.agentAppEnabled = SKILL_SETTINGS_DEFAULTS.agentAppEnabled
       // A file this could not read cannot say what the toggle was, and the F62 pause is not something
       // to do on a guess — it stops Runs the person may be watching. Both stay false, so a recovered
       // profile is left alone in either direction.
@@ -357,6 +363,18 @@ export class AppSettingsStore {
    *  on their behalf. */
   async setAgentBrowserEnabled(enabled: boolean): Promise<void> {
     this.agentBrowserEnabled = enabled
+    await this.persist()
+  }
+
+  getAgentAppEnabled(): boolean {
+    return this.agentAppEnabled
+  }
+
+  /** The agent app workspace: `astera app js` launches the project's app on a desktop the person
+   *  never sees, and the astera-app skill is installed for every account. Off by default: it installs
+   *  files into the user's skill directories and runs their app on their behalf. */
+  async setAgentAppEnabled(enabled: boolean): Promise<void> {
+    this.agentAppEnabled = enabled
     await this.persist()
   }
 
@@ -496,6 +514,7 @@ export class AppSettingsStore {
       dismissedCampaignId?: string
       workUnitTrackingEnabled?: boolean
       agentBrowserEnabled?: boolean
+      agentAppEnabled?: boolean
       orchAlwaysOnMigrated?: boolean
       orchestrationEnabled?: true
       jobContinuityEnabled?: boolean
@@ -513,6 +532,7 @@ export class AppSettingsStore {
     if (this.dismissedCampaignId) data.dismissedCampaignId = this.dismissedCampaignId
     if (this.workUnitTrackingEnabled) data.workUnitTrackingEnabled = true
     if (this.agentBrowserEnabled) data.agentBrowserEnabled = true
+    if (this.agentAppEnabled) data.agentAppEnabled = true
     if (this.orchAlwaysOnMigrated) data.orchAlwaysOnMigrated = true
     // **The one key here that is not a setting** (ruling F67). Orchestration stopped being a setting
     // and nothing reads this as one any more — but until the migration has run, the *absence* of this

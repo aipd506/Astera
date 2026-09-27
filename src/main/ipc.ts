@@ -2335,6 +2335,7 @@ export function registerIpc(
     const stubs = skillStubs(orch.skillsPath, {
       workUnitTrackingEnabled: core.appSettings.getWorkUnitTrackingEnabled(),
       agentBrowserEnabled: core.appSettings.getAgentBrowserEnabled(),
+      agentAppEnabled: core.appSettings.getAgentAppEnabled(),
       resumeStrategy: core.appSettings.getResumeStrategy()
     }).filter((s) => s.enabled)
     // installStub swallows per-stub and per-account failures itself and does not throw, but the
@@ -5373,6 +5374,17 @@ export function registerIpc(
     await core.appSettings.setAgentBrowserEnabled(enabled)
     // Same two lines the work-unit setter above uses, for the same two reasons. Turning it off does
     // not close the server — browserEnabled() is read per request.
+    if (enabled && orchWiring) await startOrch()
+    if (enabled) installStubsForCurrentToggles()
+  })
+
+  // The agent app workspace toggle. Same trust boundary check and the same two lines as the agent
+  // browser's. The Host reads the file itself on every `app js` (readAgentAppEnabled), so nothing is
+  // sent to it: the write below is what it will read.
+  ipcMain.handle('settings.getAgentAppEnabled', () => core.appSettings.getAgentAppEnabled())
+  ipcMain.handle('settings.setAgentAppEnabled', async (_e, enabled: boolean) => {
+    if (typeof enabled !== 'boolean') throw new Error(`INVALID_AGENT_APP_ENABLED: ${String(enabled)}`)
+    await core.appSettings.setAgentAppEnabled(enabled)
     if (enabled && orchWiring) await startOrch()
     if (enabled) installStubsForCurrentToggles()
   })

@@ -154,6 +154,8 @@ const api = {
     setWorkUnitTrackingEnabled: invoke('settings.setWorkUnitTrackingEnabled'),
     getAgentBrowserEnabled: invoke('settings.getAgentBrowserEnabled'),
     setAgentBrowserEnabled: invoke('settings.setAgentBrowserEnabled'),
+    getAgentAppEnabled: invoke('settings.getAgentAppEnabled'),
+    setAgentAppEnabled: invoke('settings.setAgentAppEnabled'),
     getGithubPolling: invoke('settings.getGithubPolling'),
     setGithubPolling: invoke('settings.setGithubPolling'),
     getDesktopNotify: invoke('settings.getDesktopNotify'),

@@ -74,7 +74,8 @@ describe('skills list', () => {
         { name: 'astera-orchestration', enabled: true, installed: 'missing' },
         { name: 'astera-task', enabled: false, installed: 'missing' },
         { name: 'astera-browser', enabled: false, installed: 'missing' },
-        { name: 'astera-handoff', enabled: false, installed: 'missing' }
+        { name: 'astera-handoff', enabled: false, installed: 'missing' },
+        { name: 'astera-app', enabled: false, installed: 'missing' }
       ])
   })
 
@@ -107,7 +108,8 @@ describe('skills install', () => {
     expect(body.notEnabled).toEqual([
       { name: 'astera-task', setting: 'Settings → How It Works → Work unit tracking' },
       { name: 'astera-browser', setting: 'Settings → Agents → Agent browser' },
-      { name: 'astera-handoff', setting: 'Settings → Agents → Session resume strategy → Smart Resume' }
+      { name: 'astera-handoff', setting: 'Settings → Agents → Session resume strategy → Smart Resume' },
+      { name: 'astera-app', setting: 'Settings → Agents → Agent app workspace' }
     ])
     expect(String(body.note)).toMatch(/new session/)
     for (const cfg of [claudeDir, codexDir]) {
@@ -145,7 +147,11 @@ describe('skills install', () => {
         { name: 'astera-orchestration', result: 'unchanged' },
         { name: 'astera-browser', result: 'written' }
       ])
-    expect((body.notEnabled as { name: string }[]).map((n) => n.name)).toEqual(['astera-task', 'astera-handoff'])
+    expect((body.notEnabled as { name: string }[]).map((n) => n.name)).toEqual([
+      'astera-task',
+      'astera-handoff',
+      'astera-app'
+    ])
     expect(await fs.readFile(stubTargetPath(codexDir, 'astera-browser'), 'utf8')).toContain(STUB_MARKER)
   })
 

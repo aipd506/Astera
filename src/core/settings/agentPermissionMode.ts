@@ -1,8 +1,6 @@
 // The permission mode from app-settings.json, read by a process that is not the app (the Host).
-import { promises as fs } from 'node:fs'
 import type { AgentPermissionMode } from '../types'
-import { settingsObjectOf } from './settingsObject'
-import { RepairNeeded } from './repairNeeded'
+import { readAppSettingsObject } from './settingsObject'
 
 /** The store's own narrowing: only the explicit 'manual' turns the bypass off. */
 export function agentPermissionModeOf(value: unknown): AgentPermissionMode {
@@ -20,20 +18,10 @@ export function agentPermissionModeOf(value: unknown): AgentPermissionMode {
  *   answer 'yolo', because the file may have said 'manual', and answering the bypass would start the
  *   Host's workers with permissions off. The caller refuses the spawn. The same rule
  *   readSkillSettings (main/appSettingsStore.ts) and accountsFile.ts apply.
+ *
+ * Shares its file read with `readAgentAppEnabled` (`readAppSettingsObject`, preflight ruling F5).
  */
 export async function readAgentPermissionMode(filePath: string): Promise<AgentPermissionMode> {
-  let text: string
-  try {
-    text = await fs.readFile(filePath, 'utf8')
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'yolo'
-    throw new RepairNeeded(`app-settings.json could not be read (${String(err)}); open Astera to repair it`, 'app-settings.json')
-  }
-  let parsed: Record<string, unknown>
-  try {
-    parsed = settingsObjectOf(text)
-  } catch {
-    throw new RepairNeeded('app-settings.json is not a valid settings file; open Astera to repair it', 'app-settings.json')
-  }
-  return agentPermissionModeOf(parsed.agentPermissionMode)
+  const parsed = await readAppSettingsObject(filePath)
+  return agentPermissionModeOf(parsed?.agentPermissionMode)
 }

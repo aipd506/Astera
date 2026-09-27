@@ -14,6 +14,8 @@ export type StubState = 'missing' | 'current' | 'stale' | 'not-ours'
 export interface SkillSettings {
   workUnitTrackingEnabled: boolean
   agentBrowserEnabled: boolean
+  /** The agent app workspace (`astera app js`, the `astera-app` skill). */
+  agentAppEnabled: boolean
   resumeStrategy: ResumeStrategy
 }
 

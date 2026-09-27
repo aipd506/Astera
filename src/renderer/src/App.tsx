@@ -619,6 +619,7 @@ export default function App(): React.JSX.Element {
   const [agentYolo, setAgentYolo] = useState(true)
   const [workUnitTrackingEnabled, setWorkUnitTrackingEnabled] = useState(false) // the work unit tracking toggle
   const [agentBrowserEnabled, setAgentBrowserEnabled] = useState(false) // the agent browser toggle
+  const [agentAppEnabled, setAgentAppEnabled] = useState(false) // the agent app workspace toggle
   // Which kind the new-session and resume dialogs open on. Needed outside the settings modal — both
   // dialogs seed their own selection from it — so it is loaded at mount rather than only while the
   // modal is open.
@@ -915,6 +916,7 @@ export default function App(): React.JSX.Element {
     void window.api.system.checkCliInstalled().then(setCliInstalled)
     void window.api.system.appVersion().then(setAppVersion)
     void window.api.settings.getAgentBrowserEnabled().then(setAgentBrowserEnabled)
+    void window.api.settings.getAgentAppEnabled().then(setAgentAppEnabled)
     // Both session dialogs seed their kind from this, so it has to be loaded before either can open —
     // it cannot wait for the settings modal.
     void window.api.settings.getDefaultSessionKind().then(setDefaultSessionKind)
@@ -1133,6 +1135,7 @@ export default function App(): React.JSX.Element {
       .getAgentPermissionMode()
       .then((m) => setAgentYolo(m === 'yolo'))
     void window.api.settings.getAgentBrowserEnabled().then(setAgentBrowserEnabled)
+    void window.api.settings.getAgentAppEnabled().then(setAgentAppEnabled)
     // Re-syncs the new-session default too — the mount-time read above is what it keeps honest.
     void window.api.settings.getDefaultSessionKind().then(setDefaultSessionKind)
     // Re-read on open beside the effect below, which is what keeps it current the rest of the time:
@@ -4448,6 +4451,31 @@ export default function App(): React.JSX.Element {
                         />
                       </label>
                       <span className="settings-hint">{t('settings.agentBrowser.hint')}</span>
+                    </div>
+                    {/* Agent app workspace: the same shape and the same optimistic update as the
+                        agent browser above. Off by default: it installs a skill into every account
+                        and lets the agent launch this project's app on a hidden desktop. */}
+                    <div className="settings-group">
+                      <label className="settings-row">
+                        <span>{t('settings.agentApp.label')}</span>
+                        <input
+                          type="checkbox"
+                          checked={agentAppEnabled}
+                          onChange={(e) => {
+                            const next = e.target.checked
+                            setAgentAppEnabled(next)
+                            void window.api.settings.setAgentAppEnabled(next).catch((err) => {
+                              setAgentAppEnabled(!next)
+                              toast.error(
+                                t('settings.agentApp.saveFailed', {
+                                  detail: err instanceof Error ? err.message : String(err)
+                                })
+                              )
+                            })
+                          }}
+                        />
+                      </label>
+                      <span className="settings-hint">{t('settings.agentApp.hint')}</span>
                     </div>
                   </div>
                 )}

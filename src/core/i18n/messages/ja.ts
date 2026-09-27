@@ -40,6 +40,13 @@ export const ja: Catalog = {
     'すべてのアカウントに astera-browser スキルをインストールします。localhost のみ開けます。' +
     '既に開いているセッションには適用されません。新しいセッションから有効です。',
   'settings.agentBrowser.saveFailed': 'エージェントブラウザ設定を保存できませんでした: {detail}',
+  // エージェントアプリ作業スペース
+  'settings.agentApp.label': 'エージェントアプリ作業スペース（実験的）',
+  'settings.agentApp.hint':
+    'オンにすると、エージェントがこのプロジェクトのアプリを、あなたには見えない Windows デスクトップで起動し、操作し、撮影できます。' +
+    '画面とポインターには触れませんが、クリップボードは共有します。すべてのアカウントに astera-app スキルをインストールします。' +
+    '既に開いているセッションには適用されません。新しいセッションから有効です。',
+  'settings.agentApp.saveFailed': 'エージェントアプリ作業スペースの設定を保存できませんでした: {detail}',
   // 説明生成 (How It Works)
   'settings.gen.label': '説明生成アカウント',
   'settings.gen.hint': '作業が終わると、このアカウントが機能の説明を書きます。選ぶまでは生成しません。',

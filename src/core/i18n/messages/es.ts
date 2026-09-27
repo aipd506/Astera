@@ -41,6 +41,13 @@ export const es: Catalog = {
     'Instala la habilidad astera-browser en todas las cuentas. Solo se puede abrir localhost. ' +
     'No afecta a las sesiones ya abiertas; sí a las nuevas.',
   'settings.agentBrowser.saveFailed': 'No se pudo guardar el ajuste del navegador del agente: {detail}',
+  // Espacio de trabajo de apps del agente
+  'settings.agentApp.label': 'Espacio de trabajo de apps del agente (experimental)',
+  'settings.agentApp.hint':
+    'Activado, un agente puede abrir la app de este proyecto en un escritorio de Windows que usted no ve, manejarla y fotografiarla. ' +
+    'Nunca toma su pantalla ni su puntero, pero comparte su portapapeles. Instala la habilidad astera-app en todas las cuentas. ' +
+    'No afecta a las sesiones ya abiertas; sí a las nuevas.',
+  'settings.agentApp.saveFailed': 'No se pudo guardar el ajuste del espacio de trabajo de apps del agente: {detail}',
   // Generación de explicaciones (How It Works)
   'settings.gen.label': 'Cuenta para explicaciones',
   'settings.gen.hint': 'Cuando termina un trabajo, esta cuenta escribe la explicación de la función. No se genera nada hasta que elijas una.',

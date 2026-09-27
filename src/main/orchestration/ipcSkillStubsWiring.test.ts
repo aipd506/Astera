@@ -40,7 +40,7 @@ describe('ipc.ts skill stub wiring (source guard)', () => {
 
   it('names no stub file or skill directory of its own', () => {
     const body = installerBody()
-    for (const name of ['-stub.md', 'astera-orchestration', 'astera-task', 'astera-browser', 'astera-handoff'])
+    for (const name of ['-stub.md', 'astera-orchestration', 'astera-task', 'astera-browser', 'astera-handoff', 'astera-app'])
       expect(body.includes(name), `${name} appears in installStubsForCurrentToggles`).toBe(false)
   })
 })

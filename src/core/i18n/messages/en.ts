@@ -63,6 +63,13 @@ export const en: Record<keyof typeof ko, string> = {
     'Installs the astera-browser skill for every account. Only localhost can be opened. ' +
     'Sessions already open are not affected; new sessions are.',
   'settings.agentBrowser.saveFailed': 'Could not save the agent browser setting: {detail}',
+  // Agent app workspace
+  'settings.agentApp.label': 'Agent app workspace (experimental)',
+  'settings.agentApp.hint':
+    'On, an agent can launch this project’s app on a Windows desktop you never see, drive it and photograph it. ' +
+    'It never takes your screen or pointer, but it shares your clipboard. Installs the astera-app skill for every account. ' +
+    'Sessions already open are not affected; new sessions are.',
+  'settings.agentApp.saveFailed': 'Could not save the agent app workspace setting: {detail}',
   // Explanation generation (How It Works)
   'settings.gen.label': 'Explanation account',
   'settings.gen.hint': 'When a piece of work finishes, this account writes the feature explanation. Nothing is generated until you pick one.',

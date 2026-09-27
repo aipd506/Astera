@@ -1099,6 +1099,11 @@ export interface CoreApi {
     // `astera browser js`. Sessions already open do not see it until restarted.
     getAgentBrowserEnabled(): Promise<boolean>
     setAgentBrowserEnabled(enabled: boolean): Promise<void>
+    // The agent app workspace (docs/superpowers/specs/2026-09-27-agent-workspace-isolation-design.md).
+    // Off by default; on, the astera-app skill is installed for every account and sessions may run
+    // `astera app js`, which the Host answers whether or not this app is open.
+    getAgentAppEnabled(): Promise<boolean>
+    setAgentAppEnabled(enabled: boolean): Promise<void>
     // Whether the worktree PR badges poll GitHub in the background. Off leaves the cache as-is —
     // refresh only happens on an explicit github.refresh call.
     getGithubPolling(): Promise<boolean>
