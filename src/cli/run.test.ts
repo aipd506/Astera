@@ -1506,6 +1506,18 @@ describe('startKeepalive — 기다리는 동안 내는 줄', () => {
       expect(lines).toEqual(['waiting for the Host to answer status, 3s so far'])
     })
 
+    // 스크립트는 제 60초 시한 안에서 몇 초씩 도는 것이 정상이고, 부르는 쪽은 에이전트다 — 그 도구
+    // 출력이 이 줄로 차면 안 된다.
+    it('browser js 와 app js 에는 알림을 내지 않고 묻지도 않는다', () => {
+      for (const cmd of ['browser-js', 'app-js']) {
+        const { conn, keepalive } = start({ cmd })
+        pass(60_000)
+        expect(lines, cmd).toEqual([])
+        expect(conn.sent, cmd).toEqual([])
+        keepalive.stop()
+      }
+    })
+
     it('--no-keepalive 는 이 알림도 끈다', () => {
       // 켜 두면 같은 시간에 줄이 나온다 — 조용한 것은 이 플래그 때문이다
       const on = start({ cmd: 'jobs-list' })

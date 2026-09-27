@@ -1277,6 +1277,10 @@ busy with the call from one that did not answer at all. A Host too old to know t
 ping, and the line ends after `so far`. The lines stop the moment the answer or an error arrives, so
 nothing is printed after the result.
 
+`browser js` and `app js` never print this line. Their scripts may run for many seconds within their
+own 60 second deadline, which is the script working rather than a slow Host, and the agents that
+call them would only get their tool output filled with it.
+
 **Nothing of this reaches stdout**, which carries one result and nothing else, so there is nothing to
 filter out of a pipeline: `astera runs wait --id "$run" | jq .data` is unaffected, and neither are
 the exit codes. `--no-keepalive` turns both kinds of line off for a caller that wants stderr empty; `2>/dev/null` does the same from the shell.

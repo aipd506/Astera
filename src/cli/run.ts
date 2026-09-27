@@ -45,6 +45,7 @@ import {
   keepaliveLine,
   mergeCommand,
   slowAnswerLine,
+  slowAnswerNotice,
   waitingCommand
 } from '../core/orchestration/cliKeepalive'
 import { agentContext, sessionUsage } from '../core/orchestration/cliAgentContext'
@@ -799,6 +800,7 @@ export function startKeepalive(a: {
 }): { stop: () => void } {
   if (!a.enabled) return { stop: () => {} }
   const waiting = waitingCommand({ cmd: a.cmd, args: a.args })
+  if (!waiting && !slowAnswerNotice(a.cmd)) return { stop: () => {} }
   const now = a.now ?? Date.now
   const write = a.write ?? logToStderr
   const lineMs = a.lineMs ?? KEEPALIVE_MS
