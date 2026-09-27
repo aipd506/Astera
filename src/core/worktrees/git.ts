@@ -4,6 +4,7 @@ import path from 'node:path'
 import type { BranchRef, RepoProbe } from '../types'
 import { treeKillCommand } from '../run/kill'
 import { cancelledError } from './cancel'
+import { defaultCwdProbe, type Probe } from '../sessions/pathProbe'
 
 export interface GitResult {
   ok: boolean
@@ -183,6 +184,12 @@ export const REPO_PROBE_TIMEOUT_MS = 5_000
  *
  * Answers at the deadline even when git itself will not die (git's own kill waits for the exit), and
  * never rejects.
+ *
+ * **The folder is probed before git is spawned there** (`probe`, the budgeted session-folder probe of
+ * sessions/pathProbe.ts). On Windows, spawning with its cwd on a dead share looks into that folder
+ * synchronously on the calling thread, the Electron main thread here, and can hold it for the 20 to
+ * 60 s the SMB redirector takes, before any deadline can fire. A probe that times out answers
+ * `unknown`/`timeout` and one that finds nothing answers `no-folder`, both without spawning.
  */
 export async function probeRepoRoot(
   dir: string,
@@ -192,13 +199,17 @@ export async function probeRepoRoot(
     fs.stat(d).then(
       (st) => st.isDirectory(),
       () => false
-    )
+    ),
+  probe: Probe = defaultCwdProbe
 ): Promise<RepoProbe> {
   let timer: ReturnType<typeof setTimeout> | null = null
   const deadline = new Promise<RepoProbe>((resolve) => {
     timer = setTimeout(() => resolve({ kind: 'unknown', reason: 'timeout' }), timeoutMs)
   })
   const asked = (async (): Promise<RepoProbe> => {
+    const at = await probe(dir)
+    if (at === 'timeout') return { kind: 'unknown', reason: 'timeout' }
+    if (at === 'absent') return { kind: 'unknown', reason: 'no-folder' }
     const r = await run(['rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs })
     if (r.ok && r.stdout) return { kind: 'repo', root: path.resolve(r.stdout) }
     // git ran and said no.
