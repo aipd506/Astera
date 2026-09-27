@@ -38,6 +38,16 @@ export interface Desk {
   close(): Promise<void>
 }
 
+/** A desktop the manager holds: the Desk and the process that keeps it alive, when there is one.
+ *  Windows: the PowerShell helper (DesktopHelper); Linux: Xvfb; macOS: none, since the app runs in the
+ *  person's own session, so `pid` is null and nothing but the launched app is recorded (R7). */
+export interface DeskHandle extends Desk {
+  readonly pid: number | null
+  readonly startedAt: number
+  alive(): boolean
+  onExit(cb: (why: string) => void): void
+}
+
 export type LaunchSpec = { config: string } | { command: string; cwd?: string }
 
 export interface Launched extends DeskLaunched {

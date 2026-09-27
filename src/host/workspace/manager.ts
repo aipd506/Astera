@@ -10,7 +10,7 @@ import path from 'node:path'
 import { SCRIPT_TIMEOUT_MS } from '../../core/agentBrowser/script'
 import { evictionPlan } from '../../core/preview/pick/shots'
 import { ScriptSlots } from '../../core/workspace/script'
-import { workspaceHelpers, type AppState, type Cdp, type Desk, type HelperDeps, type LaunchSpec, type ResolvedLaunch } from '../../core/workspace/helpers'
+import { workspaceHelpers, type AppState, type Cdp, type Desk, type DeskHandle, type HelperDeps, type LaunchSpec, type ResolvedLaunch } from '../../core/workspace/helpers'
 import {
   idleExpired,
   leftoverPidsToKill,
@@ -20,7 +20,7 @@ import {
   type RecordedPid,
   type WorkspaceRecord
 } from '../../core/workspace/lifecycle'
-import type { DesktopHelper } from './desktopHelper'
+import type { LinuxTools } from '../../core/workspace/platform'
 import { runScriptInWorker } from './scriptWorker'
 import type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary } from '../../core/host/protocol'
 export type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary }
@@ -65,7 +65,10 @@ export interface WorkspaceManagerDeps {
   /** The session's folder, or null when this Host holds no such session. */
   sessionCwd(sessionId: string): Promise<string | null>
   resolveLaunch(a: { sessionId: string; cwd: string; spec: LaunchSpec }): Promise<ResolvedLaunch>
-  startDesk(name: string): Promise<DesktopHelper>
+  startDesk(name: string): Promise<DeskHandle>
+  /** Linux only (L1, R8): which of Xvfb, xdotool and import are missing. Asked on every `app js`.
+   *  Absent: nothing is checked. */
+  linuxTools?(): Promise<LinuxTools>
   connectCdp(port: number, waitMs: number): Promise<Cdp | null>
   freePort(): Promise<number>
   killTree(pid: number): Promise<void>
@@ -93,8 +96,8 @@ export interface WorkspaceManager {
 
 interface Entry {
   sessionId: string
-  desk: DesktopHelper | null
-  deskStarting: Promise<DesktopHelper> | null
+  desk: DeskHandle | null
+  deskStarting: Promise<DeskHandle> | null
   state: AppState
   lastActivityAt: number
   helper: string | null
@@ -153,7 +156,8 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
         desktop: e.desk!.name,
         pids: [
           ...(e.state.launched ? [{ pid: e.state.launched.pid, startedAt: e.state.launched.startedAt }] : []),
-          { pid: e.desk!.pid, startedAt: e.desk!.startedAt }
+          // A desktop with no helper process (macOS) records only the app (R7).
+          ...(e.desk!.pid !== null ? [{ pid: e.desk!.pid, startedAt: e.desk!.startedAt }] : [])
         ]
       }))
     writing = writing
@@ -199,7 +203,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     if (!slots.isRunning(e.sessionId) && entries.get(e.sessionId) === e) entries.delete(e.sessionId)
   }
 
-  const helperDied = (e: Entry, desk: DesktopHelper, why: string): void => {
+  const helperDied = (e: Entry, desk: DeskHandle, why: string): void => {
     if (e.desk !== desk) return
     d.log(`workspace ${e.sessionId}: the desktop helper ended (${why}); cleaning up`)
     const launched = e.state.launched
@@ -213,7 +217,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     finish(e)
   }
 
-  const ensureDesk = (e: Entry): Promise<DesktopHelper> => {
+  const ensureDesk = (e: Entry): Promise<DeskHandle> => {
     // Ruling F1's other half (review critical 1): an entry the manager has already forgotten (its
     // script ended and nothing was open) or a Host that is leaving never gets a desktop, which nothing
     // would record, list or close.
@@ -350,7 +354,7 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
    *  (Close, the session ending, the Host leaving, while the app was starting) started an app nobody
    *  holds: it is ended at once, by pid and start time, and the launch fails as stopped (review
    *  important 2). */
-  const guardedDesk = (e: Entry, desk: DesktopHelper): Desk => ({
+  const guardedDesk = (e: Entry, desk: DeskHandle): Desk => ({
     name: desk.name,
     launch: async (a) => {
       const started = await desk.launch(a)
@@ -392,7 +396,8 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
     cleanup: () => cleanup(e, 'close()', false),
     deadline: () => deadline,
     now,
-    guide: d.guide()
+    guide: d.guide(),
+    platform: d.platform
   })
 
   const stopIdle = every(IDLE_TICK_MS, () => {
@@ -424,7 +429,13 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   return {
     run: async (sessionId, script) => {
       if (disposed) return { status: 409, body: { error: 'the Host is leaving' } }
-      const refusal = workspaceRefusal({ platform: d.platform, env: d.env })
+      let linuxTools: LinuxTools | null = null
+      if (d.platform === 'linux' && d.linuxTools)
+        linuxTools = await d.linuxTools().catch((err: unknown) => {
+          d.log(`workspace: the Linux tool check failed (${messageOf(err)}); going on without it`)
+          return null
+        })
+      const refusal = workspaceRefusal({ platform: d.platform, env: d.env, linuxTools })
       if (refusal) return { status: 409, body: { error: refusal } }
       let on: boolean
       try {

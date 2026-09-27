@@ -3,7 +3,7 @@ import { promises as fs, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Cdp } from '../../core/workspace/helpers'
+import type { Cdp, DeskHandle } from '../../core/workspace/helpers'
 import type { DeskShot, DeskWindow } from '../../core/workspace/protocol'
 import type { DesktopHelper } from './desktopHelper'
 import { DISPOSE_CAP_MS, createWorkspaceManager, disposeWithin, type WorkspaceEvent, type WorkspaceManager, type WorkspaceManagerDeps } from './manager'
@@ -171,6 +171,59 @@ describe('refusals', () => {
     expect(deps.startDesk).not.toHaveBeenCalled()
     expect(events).toEqual([])
     expect(m.list()).toEqual([])
+  })
+})
+
+describe('Linux and macOS', () => {
+  it('on Linux, refuses with the missing tools and the install line, before anything starts (L1)', async () => {
+    const linuxTools = vi.fn(async () => ({ missing: ['xdotool' as const], installLine: 'sudo apt-get install -y xdotool' }))
+    const { m, deps } = await rig({ platform: 'linux', linuxTools })
+    expect(await m.run('s1', "await launch({ command: 'app' })")).toEqual({
+      status: 409,
+      body: { error: 'app js: the agent app workspace on Linux needs xdotool, and it is not installed here. Install it with: sudo apt-get install -y xdotool' }
+    })
+    expect(linuxTools).toHaveBeenCalledTimes(1)
+    expect(deps.startDesk).not.toHaveBeenCalled()
+  })
+
+  it('on Linux with every tool there, runs over SSH too (L2)', async () => {
+    const { m } = await rig({ platform: 'linux', env: { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' }, linuxTools: async () => ({ missing: [], installLine: '' }) })
+    expect(await m.run('s1', "log('ok')")).toEqual({ status: 200, body: { log: ['ok'] } })
+  })
+
+  it('a tool check that fails is logged and refuses nothing (R8)', async () => {
+    const log: string[] = []
+    const { m } = await rig({
+      platform: 'linux',
+      log: (x) => log.push(x),
+      linuxTools: async () => {
+        throw new Error('EACCES /usr/bin')
+      }
+    })
+    expect((await m.run('s1', "log('ok')")).status).toBe(200)
+    expect(log.some((l) => l.includes('the Linux tool check failed') && l.includes('EACCES'))).toBe(true)
+  })
+
+  it('on macOS, refuses over SSH', async () => {
+    const { m } = await rig({ platform: 'darwin', env: { SSH_TTY: '/dev/ttys001' } })
+    expect(await m.run('s1', 'log(1)')).toMatchObject({ status: 409, body: { error: expect.stringContaining('SSH') } })
+  })
+
+  it('a desktop with no helper process records only the launched app (R7)', async () => {
+    const startDesk = vi.fn(async (name: string) => Object.assign(new FakeDesk(`mac-bg-${name}`), { pid: null }) as unknown as DeskHandle)
+    const { m, file, settle } = await rig({ platform: 'darwin', startDesk })
+    expect((await m.run('s1', "await launch({ command: 'app' })")).status).toBe(200)
+    await settle()
+    expect(await file()).toEqual({
+      version: 1,
+      workspaces: [{ sessionId: 's1', desktop: expect.stringMatching(/^mac-bg-astera-ws-/), pids: [{ pid: 501, startedAt: 3_000 }] }]
+    })
+  })
+
+  it('hands the platform to the helpers, so the launch hint names the port the POSIX way (R12)', async () => {
+    const { m } = await rig({ platform: 'linux', connectCdp: vi.fn(async () => null) })
+    const r = await m.run('s1', "await launch({ command: 'app' }, { waitMs: 0 })")
+    expect(body(r).error?.message).toContain('--remote-debugging-port=$ASTERA_APP_CDP_PORT')
   })
 })
 
