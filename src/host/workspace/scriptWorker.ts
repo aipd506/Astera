@@ -165,10 +165,18 @@ type FromWorker =
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
 /** What a helper's failure carries across: its message, and the `at` of an Interrupted (a helper's own
- *  deadline), which outranks the running helper's name just as shapeError lets it. */
-function errorOf(err: unknown): { message: string; at?: string } {
-  if (err instanceof Interrupted) return { message: err.message, at: err.at }
-  return { message: messageOf(err) }
+ *  deadline), which outranks the running helper's name just as shapeError lets it. An error nothing can
+ *  read (String() throws on it, or its message is not a string) still gets an answer, with a fallback
+ *  message, so the script's call settles at once instead of waiting for the deadline. */
+function errorOf(err: unknown, name: string): { message: string; at?: string } {
+  try {
+    if (err instanceof Interrupted) return { message: err.message, at: err.at }
+    const message: unknown = messageOf(err)
+    if (typeof message === 'string') return { message }
+  } catch {
+    /* unreadable: the fallback below */
+  }
+  return { message: `${name}: the helper failed with an error that cannot be read` }
 }
 
 /** Runs one script in a worker of its own. The contract is core/workspace/script.ts's
@@ -182,6 +190,8 @@ export async function runScriptInWorker(a: {
   guide: string
   timeoutMs?: number
 }): Promise<RunResult> {
+  // A Stop already given: the answer is known, so no worker is started for it.
+  if (a.stop.aborted) return { log: [], error: { message: 'stopped', at: 'stopped' } }
   const timeoutMs = a.timeoutMs ?? SCRIPT_TIMEOUT_MS
   const ctx: RunContext = { at: 'script' }
   const inner = new AbortController()
@@ -245,7 +255,7 @@ export async function runScriptInWorker(a: {
         },
         (err: unknown) => {
           try {
-            reply({ id: m.id, ok: false, error: errorOf(err) })
+            reply({ id: m.id, ok: false, error: errorOf(err, m.name) })
           } catch {
             /* the worker is gone */
           }

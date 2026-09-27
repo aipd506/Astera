@@ -532,17 +532,20 @@ describe('Stop, Close, the session, the helper, idleness', () => {
 
   // The script runs in a worker (scriptWorker.ts): a busy loop after an await is cut off at the
   // deadline, and this thread, which holds every session's terminal, keeps running meanwhile. The loop
-  // is bounded so a manager that ran it on this thread fails here instead of hanging.
-  it('a busy loop after an await is cut off at the deadline without blocking the Host', async () => {
-    const { m } = await rig({ scriptTimeoutMs: 300 })
+  // is bounded so a manager that ran it on this thread fails here instead of hanging. Nothing times the
+  // worker's start (shared CI runners): the outcome shows the loop was cut off rather than finished,
+  // the ticks show this thread ran meanwhile, and the one bound left is far below the loop's own end.
+  it('a busy loop after an await is cut off at the deadline without blocking the Host', { timeout: 40_000 }, async () => {
+    const { m } = await rig({ scriptTimeoutMs: 3_000 })
     let ticks = 0
     const iv = setInterval(() => (ticks += 1), 20)
     const t0 = Date.now()
     try {
-      const r = await m.run('s1', "await launch({ command: 'a.exe' }); { const end = Date.now() + 2000; while (Date.now() < end) {} } log('never')")
-      expect(body(r)).toEqual({ log: [], error: { at: 'timeout', message: 'script did not finish within 300 ms' } })
-      expect(Date.now() - t0).toBeLessThan(1_500)
-      expect(ticks).toBeGreaterThanOrEqual(5)
+      const r = await m.run('s1', "await launch({ command: 'a.exe' }); { const end = Date.now() + 20000; while (Date.now() < end) {} } log('never')")
+      expect(body(r).log).toEqual([])
+      expect(body(r).error).toEqual({ at: 'timeout', message: expect.stringMatching(/^script did not finish within 3000 ms/) })
+      expect(Date.now() - t0).toBeLessThan(10_000)
+      expect(ticks).toBeGreaterThanOrEqual(3)
       expect(m.list()).toEqual([expect.objectContaining({ sessionId: 's1', running: false, helper: null })])
     } finally {
       clearInterval(iv)

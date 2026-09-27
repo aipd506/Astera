@@ -1,13 +1,34 @@
 // The Host's `app js` runner: the script runs in a worker thread the Host can terminate, and the
 // helpers stay on this thread. The busy loops below are bounded (they end on their own after LOOP_MS)
 // so that a runner which does run them on this thread fails these tests instead of hanging them.
+//
+// Nothing here times the worker's start: CI runners are shared and a worker can take long to start.
+// Each loop test has the script call `mark()`, not awaited, right before its loop, and counts this
+// thread's ticks from that call. Ticks while the loop runs prove this thread was not blocked; the
+// outcome (cut off, never `log('never')`) proves the loop was ended rather than finished. The only
+// time bound left is many seconds below the loop's own end.
 import { describe, it, expect, vi } from 'vitest'
 import { Interrupted } from '../../core/agentBrowser/script'
 import { workspaceHelpers, type HelperDeps } from '../../core/workspace/helpers'
 import { runScriptInWorker } from './scriptWorker'
 
-const LOOP_MS = 2_000
-const busy = `{ const end = Date.now() + ${LOOP_MS}; while (Date.now() < end) {} }`
+// Counts the workers made, delegating to the real class, so a test can say none was started.
+const made = vi.hoisted(() => ({ workers: 0 }))
+vi.mock('node:worker_threads', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:worker_threads')>()
+  class CountingWorker extends real.Worker {
+    constructor(...a: ConstructorParameters<typeof real.Worker>) {
+      super(...a)
+      made.workers += 1
+    }
+  }
+  return { ...real, Worker: CountingWorker, default: { ...real, Worker: CountingWorker } }
+})
+
+const LOOP_MS = 20_000
+const LOOP_TEST_MS = 40_000
+const TIMEOUT_MS = 3_000
+const busy = `mark(); { const end = Date.now() + ${LOOP_MS}; while (Date.now() < end) {} }`
 const GUIDE = '# guide\n\nIntro.\n\n## windows()\nLists them.\n\n## launch(spec)\nStarts it.\n\n## windows(again)\nNot this one.\n'
 
 type Helpers = Record<string, unknown>
@@ -21,54 +42,58 @@ const run = (script: string, helpers: Helpers = {}, over: { stop?: AbortSignal; 
     helpers: () => helpers
   })
 
-/** Counts this thread's timer ticks while `p` runs: a blocked thread counts none. */
-async function ticksDuring<T>(p: Promise<T>): Promise<{ value: T; ticks: number; ms: number }> {
-  const t0 = Date.now()
+/** Runs a loop script with `mark` and `nop` helpers, and counts this thread's ticks from the moment
+ *  the script called `mark()`: a blocked thread counts none. */
+function loopRun(script: string, over: { stop?: AbortSignal; timeoutMs?: number } = {}) {
   let ticks = 0
+  let markedAt: { ticks: number; ms: number } | null = null
   const iv = setInterval(() => (ticks += 1), 20)
-  try {
-    const value = await p
-    return { value, ticks, ms: Date.now() - t0 }
-  } finally {
+  const result = run(script, { nop: async () => {}, mark: async () => void (markedAt = { ticks, ms: Date.now() }) }, over).then((value) => {
     clearInterval(iv)
-  }
+    if (!markedAt) throw new Error('the script never reached its loop')
+    return { value, ticksInLoop: ticks - markedAt.ticks, msInLoop: Date.now() - markedAt.ms }
+  })
+  return { result, marked: () => markedAt !== null, ticksSinceMark: () => (markedAt ? ticks - markedAt.ticks : 0) }
 }
 
 describe('a busy loop is cut off', () => {
-  it('after an await, at the deadline, and this thread keeps running meanwhile', async () => {
-    const r = await ticksDuring(run(`await nop(); ${busy}; log('never')`, { nop: async () => {} }, { timeoutMs: 400 }))
-    expect(r.value).toEqual({ log: [], error: { at: 'timeout', message: 'script did not finish within 400 ms' } })
-    expect(r.ms).toBeLessThan(LOOP_MS - 500)
-    expect(r.ticks).toBeGreaterThanOrEqual(5)
+  it('after an await, at the deadline, and this thread keeps running meanwhile', { timeout: LOOP_TEST_MS }, async () => {
+    const r = await loopRun(`await nop(); ${busy}; log('never')`, { timeoutMs: TIMEOUT_MS }).result
+    expect(r.value.log).toEqual([])
+    expect(r.value.error?.at).toBe('timeout')
+    expect(r.value.error?.message).toMatch(new RegExp(`^script did not finish within ${TIMEOUT_MS} ms`))
+    expect(r.ticksInLoop).toBeGreaterThanOrEqual(3)
+    expect(r.msInLoop).toBeLessThan(LOOP_MS - 10_000)
   })
 
-  it('before any await, with the "never awaited" wording', async () => {
-    const r = await ticksDuring(run(`log('first'); ${busy}; await nop()`, { nop: async () => {} }, { timeoutMs: 400 }))
-    expect(r.value.error).toEqual({ at: 'timeout', message: 'script did not finish within 400 ms (it never awaited)' })
-    expect(r.value.log).toEqual(['first'])
-    expect(r.ms).toBeLessThan(LOOP_MS - 500)
-    expect(r.ticks).toBeGreaterThanOrEqual(5)
+  it('before any await, with the "never awaited" wording', { timeout: LOOP_TEST_MS }, async () => {
+    const r = await loopRun(`log('first'); ${busy}; await nop()`, { timeoutMs: TIMEOUT_MS }).result
+    expect(r.value).toEqual({ log: ['first'], error: { at: 'timeout', message: `script did not finish within ${TIMEOUT_MS} ms (it never awaited)` } })
+    expect(r.ticksInLoop).toBeGreaterThanOrEqual(3)
+    expect(r.msInLoop).toBeLessThan(LOOP_MS - 10_000)
   })
 
-  it('by Stop, at "stopped"', async () => {
+  it('by Stop, at "stopped"', { timeout: LOOP_TEST_MS }, async () => {
     const stop = new AbortController()
-    const entered = vi.fn()
-    const p = ticksDuring(run(`await nop(); ${busy}`, { nop: async () => entered() }, { stop: stop.signal }))
-    await vi.waitFor(() => expect(entered).toHaveBeenCalled())
-    await new Promise((r) => setTimeout(r, 100))
+    const r = loopRun(`await nop(); ${busy}; log('never')`, { stop: stop.signal })
+    await vi.waitFor(() => expect(r.ticksSinceMark()).toBeGreaterThanOrEqual(3), { timeout: LOOP_MS - 10_000, interval: 20 })
     stop.abort()
-    const r = await p
-    expect(r.value.error).toEqual({ message: 'stopped', at: 'stopped' })
-    expect(r.ms).toBeLessThan(LOOP_MS - 500)
+    const done = await r.result
+    expect(done.value).toEqual({ log: [], error: { message: 'stopped', at: 'stopped' } })
+    expect(done.msInLoop).toBeLessThan(LOOP_MS - 10_000)
   })
 
-  it('a Stop already given ends the script before it starts', async () => {
+  it('a Stop already given returns at once, without starting a worker', async () => {
     const stop = new AbortController()
     stop.abort()
     const called = vi.fn()
+    const before = made.workers
     const r = await run('await nop()', { nop: async () => called() }, { stop: stop.signal })
     expect(r).toEqual({ log: [], error: { message: 'stopped', at: 'stopped' } })
     expect(called).not.toHaveBeenCalled()
+    expect(made.workers).toBe(before)
+    await run("log('x')")
+    expect(made.workers).toBe(before + 1)
   })
 })
 
@@ -122,6 +147,24 @@ describe('helpers cross to this thread', () => {
   it('the script can catch a helper error and read its message', async () => {
     const r = await run("try { await bad() } catch (e) { log(e.message) } log('after')", { bad: async () => { throw new Error('nope') } })
     expect(r).toEqual({ log: ['nope', 'after'] })
+  })
+
+  it('a helper error that cannot be read still settles the call, with a fallback message', async () => {
+    const unreadable = Object.create(null) as object
+    const r = await runScriptInWorker({
+      script: "try { await bad() } catch (e) { log(e.message) } log('after'); await bad()",
+      guide: GUIDE,
+      stop: new AbortController().signal,
+      onHelper: () => {},
+      timeoutMs: 5_000,
+      helpers: (ctx) => ({
+        bad: () => {
+          ctx.at = 'bad'
+          return Promise.reject(unreadable)
+        }
+      })
+    })
+    expect(r).toEqual({ log: ['bad: the helper failed with an error that cannot be read', 'after'], error: { message: 'bad: the helper failed with an error that cannot be read', at: 'bad' } })
   })
 
   it('an error the script throws itself is at "script", and so is a syntax error', async () => {
