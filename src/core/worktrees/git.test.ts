@@ -23,6 +23,16 @@ describe('git 어댑터', () => {
     expect(await repoRoot(out)).toBeNull()
   })
 
+  // git 을 시작조차 못 한 실패는 종료 코드가 없고, 대신 spawn 의 오류 코드를 싣는다 — 저장소 검사가
+  // "느린 공유" 와 "git 없음·폴더 없음" 을 가르는 근거다
+  it('git: 시작하지 못한 실패는 exitCode 없이 errorCode 를 싣는다', async () => {
+    const gone = path.join(await tempDir('astera-wt-gone-'), 'nope')
+    const r = await git(['--version'], { cwd: gone })
+    expect(r.ok).toBe(false)
+    expect(r.exitCode).toBeUndefined()
+    expect(r.errorCode).toBe('ENOENT')
+  })
+
   it('gitUserName: 설정값 반환', async () => {
     expect(await gitUserName(repo)).toBe('Test User')
   })

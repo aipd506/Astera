@@ -63,7 +63,14 @@ export type { Provider } from './providers/meta'
 /** The new-session dialog's repository check (core/worktrees/git.ts probeRepoRoot). `unknown` is git
  *  not answering in time — a slow share, not a verdict — so Start stays open and only the worktree
  *  option, which needs the root, is held back. */
-export type RepoProbe = { kind: 'repo'; root: string } | { kind: 'none' } | { kind: 'unknown' }
+export type RepoProbe =
+  | { kind: 'repo'; root: string }
+  | { kind: 'none' }
+  | { kind: 'unknown'; reason: RepoUnknownReason }
+/** Why the repository check could not answer: git ran past its deadline (a slow share), git could not
+ *  be started (not installed), the folder is not there, or something else failed (IPC, an odd spawn
+ *  error). Each gets its own hint — blaming a slow share for a missing git sends people the wrong way. */
+export type RepoUnknownReason = 'timeout' | 'no-git' | 'no-folder' | 'error'
 
 export interface Account {
   id: string

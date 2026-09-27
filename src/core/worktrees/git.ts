@@ -1,4 +1,5 @@
 import { execFile, type ChildProcess } from 'node:child_process'
+import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { BranchRef, RepoProbe } from '../types'
 import { treeKillCommand } from '../run/kill'
@@ -16,6 +17,9 @@ export interface GitResult {
   cancelled?: true
   /** Set only when git ran past its deadline and was killed (no exitCode then: git did not answer). */
   timedOut?: true
+  /** Set only when git could not be started at all: the spawn's own error code (ENOENT when git is
+   *  not on PATH — or when the cwd does not exist, which Node reports the same way). No exitCode then. */
+  errorCode?: string
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -152,6 +156,7 @@ export function git(
     }
     const e = r.err as { code?: unknown; killed?: unknown } | null
     if (e && typeof e.code === 'number' && e.killed !== true) out.exitCode = e.code
+    else if (e && typeof e.code === 'string') out.errorCode = e.code
     return out
   }
   return once().then(async (first) => {
@@ -182,18 +187,31 @@ export const REPO_PROBE_TIMEOUT_MS = 5_000
 export async function probeRepoRoot(
   dir: string,
   run: typeof git = git,
-  timeoutMs: number = REPO_PROBE_TIMEOUT_MS
+  timeoutMs: number = REPO_PROBE_TIMEOUT_MS,
+  folderExists: (dir: string) => Promise<boolean> = (d) =>
+    fs.stat(d).then(
+      (st) => st.isDirectory(),
+      () => false
+    )
 ): Promise<RepoProbe> {
   let timer: ReturnType<typeof setTimeout> | null = null
   const deadline = new Promise<RepoProbe>((resolve) => {
-    timer = setTimeout(() => resolve({ kind: 'unknown' }), timeoutMs)
+    timer = setTimeout(() => resolve({ kind: 'unknown', reason: 'timeout' }), timeoutMs)
   })
   const asked = (async (): Promise<RepoProbe> => {
     const r = await run(['rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs })
     if (r.ok && r.stdout) return { kind: 'repo', root: path.resolve(r.stdout) }
-    // git ran and said no. No exit code means it never answered (deadline, spawn failure): unknown.
-    return r.exitCode !== undefined ? { kind: 'none' } : { kind: 'unknown' }
-  })().catch((): RepoProbe => ({ kind: 'unknown' }))
+    // git ran and said no.
+    if (r.exitCode !== undefined) return { kind: 'none' }
+    if (r.timedOut) return { kind: 'unknown', reason: 'timeout' }
+    // git never started. Node says ENOENT both for a git that is not on PATH and for a cwd that does
+    // not exist, so the folder is looked at to tell the two apart — the hint says different things.
+    if (r.errorCode === 'ENOENT')
+      return (await folderExists(dir))
+        ? { kind: 'unknown', reason: 'no-git' }
+        : { kind: 'unknown', reason: 'no-folder' }
+    return { kind: 'unknown', reason: 'error' }
+  })().catch((): RepoProbe => ({ kind: 'unknown', reason: 'error' }))
   try {
     return await Promise.race([asked, deadline])
   } finally {

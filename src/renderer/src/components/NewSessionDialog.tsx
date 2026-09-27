@@ -19,6 +19,7 @@ import {
   isWaitingReason,
   startBlockedBy,
   worktreeOption,
+  repoUnknownHint,
   type StartBlocked
 } from '../../../core/sessions/startBlocked'
 import type { MessageKey } from '../../../core/i18n'
@@ -253,7 +254,7 @@ export function NewSessionDialog({
         probe = await window.api.worktrees.isGitRepo(cwd)
       } catch {
         // An IPC failure is "could not check", not "not a repo" — Start stays open, the worktree option waits
-        probe = { kind: 'unknown' }
+        probe = { kind: 'unknown', reason: 'error' }
       } finally {
         if (!cancelled) setResolvingRepo(false)
       }
@@ -525,7 +526,9 @@ export function NewSessionDialog({
               <input type="checkbox" checked={false} disabled />
               {t('session.new.useWorktree')}
             </label>
-            <span className="modal-hint">{t('session.new.worktreeRepoUnknown')}</span>
+            <span className="modal-hint">
+              {t(repoUnknownHint(repoProbe?.kind === 'unknown' ? repoProbe.reason : 'error'))}
+            </span>
           </>
         )}
         {wtOption === 'available' && (

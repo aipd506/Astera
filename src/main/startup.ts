@@ -89,3 +89,33 @@ body{display:flex;align-items:center;justify-content:center;-webkit-app-region:d
 </style></head><body><div class="box"><div class="name">Astera</div><div class="row"><span class="spinner"></span><span>${escaped}</span></div></div></body></html>`
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`
 }
+
+/** The part of a BrowserWindow loadInto uses. */
+export interface LoadableWindow {
+  isDestroyed(): boolean
+  loadURL(url: string): Promise<void>
+  loadFile(file: string): Promise<void>
+}
+
+/**
+ * Loads a page into the window without letting the load's failure escape.
+ *
+ * Both loads here can fail in ordinary ways: the start-up page is replaced by the app's page mid-load
+ * when the probe answers quickly (loadURL rejects with ERR_ABORTED), and on Linux closing the window
+ * during the probe quits the app and destroys the window before the app's page is loaded into it —
+ * where loadURL would throw inside whenReady. A destroyed window is left alone; a rejected load is
+ * logged, never unhandled.
+ */
+export function loadInto(
+  win: LoadableWindow,
+  target: { url: string } | { file: string },
+  log: (m: string) => void
+): void {
+  if (win.isDestroyed()) return
+  try {
+    const loading = 'url' in target ? win.loadURL(target.url) : win.loadFile(target.file)
+    loading.catch((err: unknown) => log(`window load did not finish: ${(err as Error)?.message ?? String(err)}`))
+  } catch (err) {
+    log(`window load failed: ${(err as Error)?.message ?? String(err)}`)
+  }
+}

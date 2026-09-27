@@ -63,6 +63,20 @@ describe('createPythonScanner', () => {
     expect((await scanner.list('D:\\proj')).map((p) => p.path)).toEqual([venv, SYSTEM])
   })
 
+  // On macOS/Linux the login-shell PATH can land after the first scan (startup.ts gives up waiting at
+  // 6 s but applyLoginPath still patches PATH when the shell answers). The next open must see it.
+  it('a PATH change since the scan rescans', async () => {
+    const m = machine({ exists: new Set([SYSTEM]), onPath: SYSTEM })
+    let envPath = '/usr/bin:/bin'
+    const scanner = createPythonScanner({ ...m.deps, envPath: () => envPath })
+    await scanner.list('D:/proj')
+    await scanner.list('D:/proj')
+    expect(m.findOnPath).toHaveBeenCalledTimes(2) // one scan, two names
+    envPath = '/opt/homebrew/bin:/usr/bin:/bin'
+    await scanner.list('D:/proj')
+    expect(m.findOnPath).toHaveBeenCalledTimes(4)
+  })
+
   it('a probe that throws leaves the interpreter out, never a rejection', async () => {
     const m = machine({ exists: new Set([SYSTEM]), onPath: SYSTEM })
     m.findOnPath.mockRejectedValue(new Error('spawn failed'))

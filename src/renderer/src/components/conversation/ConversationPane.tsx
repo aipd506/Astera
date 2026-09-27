@@ -293,10 +293,10 @@ const PENDING_SWEEP_MS = 5_000
 /** How long the button may say a change is on its way before giving up on saying so. Longer than the
  *  walk's own wait, so an answer that is merely slow still lands while it is still being waited for,
  *  and short enough that a change the CLI quietly refused stops pretending. */
-/** How soon the `@` menu asks again while main says the project's first walk is still under way. */
-const FILE_INDEX_POLL_MS = 400
 const MODEL_BUSY_MAX_MS = 6_000
 
+/** How soon the `@` menu asks again while main says the project's first walk is still under way. */
+const FILE_INDEX_POLL_MS = 400
 
 /** How often a pane with nothing to show asks again whether a transcript has appeared. */
 const UNAVAILABLE_RETRY_MS = 2_000;

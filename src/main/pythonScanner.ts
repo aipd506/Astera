@@ -17,8 +17,8 @@ import {
  *  was once left uncached on purpose: a venv is created inside the project *while the app is open*
  *  (`python -m venv .venv` in the project terminal is the ordinary way to start), and a cache that
  *  never invalidated hid it until a restart. So the cache is keyed on which of the project's venv
- *  interpreters exist — two fs.access calls, checked on every open — and a venv appearing or going
- *  away rescans. What stays cached is the expensive part: `where`/`which` and every `--version`
+ *  interpreters exist — two fs.access calls, checked on every open — and on the PATH string; a venv
+ *  appearing or going away, or PATH changing (a late login-shell PATH), rescans. What stays cached is the expensive part: `where`/`which` and every `--version`
  *  probe, which on a machine with the Store alias on PATH could hold the dialog for seconds each time
  *  it opened. */
 
@@ -30,6 +30,10 @@ export interface PythonScannerDeps {
   findOnPath: (name: string) => Promise<string>
   /** `<exe> --version` stdout+stderr; '' when it fails. */
   version: (exe: string) => Promise<string>
+  /** The PATH the lookups run under, read on every open. Part of the cache key: on macOS/Linux the
+   *  login-shell PATH can be applied after a first scan (main/startup.ts stops waiting for it at 6 s,
+   *  but applyLoginPath still patches it when the shell answers). Defaults to process.env.PATH. */
+  envPath?: () => string | undefined
 }
 
 const liveDeps: PythonScannerDeps = {
@@ -63,6 +67,7 @@ export interface PythonScanner {
 
 export function createPythonScanner(deps: PythonScannerDeps = liveDeps): PythonScanner {
   const cache = new Map<string, { venvKey: string; result: Promise<PythonInterpreter[]> }>()
+  const envPath = deps.envPath ?? ((): string | undefined => process.env.PATH)
 
   const exists = (p: string): Promise<boolean> =>
     deps.access(p).then(
@@ -118,7 +123,8 @@ export function createPythonScanner(deps: PythonScannerDeps = liveDeps): PythonS
     const venvCandidates = venvInterpreterPaths(projectPath, deps.platform)
     const present = await Promise.all(venvCandidates.map(exists))
     const venvs = venvCandidates.filter((_, i) => present[i])
-    const venvKey = venvs.join('\n')
+    // Which venvs exist and the PATH `where` will search: either changing means a different answer.
+    const venvKey = `${venvs.join('\n')}\n--PATH--\n${envPath() ?? ''}`
     const hit = cache.get(key)
     if (hit && hit.venvKey === venvKey) return hit.result
     const result = scan(venvs).catch(() => [] as PythonInterpreter[])

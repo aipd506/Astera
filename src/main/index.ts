@@ -21,7 +21,7 @@ import trayAsset from '../../resources/tray.png?asset'
 import { createCore, type Core } from './core'
 import { clearAppRunning, markAppRunning } from '../core/host/pidFile'
 import { applyLoginPath } from './loginPath'
-import { startUp, startingPageUrl } from './startup'
+import { startUp, startingPageUrl, loadInto } from './startup'
 import { pickInitialLang } from '../core/i18n/locale'
 import { shouldForceWaylandOzone } from './ozone'
 import { registerIpc, parseAllowedExternalUrl, type OrchHandle } from './ipc'
@@ -69,7 +69,12 @@ import type {
   InstallOutcome,
   UpdateStatus
 } from '../core/types'
-import { afterCheckTimeout, checkWithTimeout, UPDATE_CHECK_TIMEOUT_MS } from '../core/update/checkTimeout'
+import {
+  afterCheckTimeout,
+  checkWithTimeout,
+  createUpdateStateTracker,
+  UPDATE_CHECK_TIMEOUT_MS
+} from '../core/update/checkTimeout'
 import { providerOf } from '../core/providers/meta'
 import { USAGE_GATE_MAX_AGE_MS } from '../core/usage/rateLimitFetcher'
 
@@ -217,8 +222,12 @@ const agentGuests = new AgentGuestRegistry((id) => webContents.fromId(id))
  *  window opens before core exists (startup.ts) and shows a start-up page until this runs — which it
  *  does right where the window used to be created, ahead of registerIpc with no await in between. */
 function loadApp(win: BrowserWindow): void {
-  if (process.env['ELECTRON_RENDERER_URL']) void win.loadURL(process.env['ELECTRON_RENDERER_URL'])
-  else void win.loadFile(path.join(__dirname, '../renderer/index.html'))
+  const devUrl = process.env['ELECTRON_RENDERER_URL']
+  loadInto(
+    win,
+    devUrl ? { url: devUrl } : { file: path.join(__dirname, '../renderer/index.html') },
+    (m) => console.log(m)
+  )
 }
 
 /** `startingText` null loads the app at once (win32, exactly as before); otherwise the window shows
@@ -258,7 +267,7 @@ function createWindow(startingText: string | null = null): BrowserWindow {
     webPreferences: { preload: path.join(__dirname, '../preload/index.js'), sandbox: false, webviewTag: true }
   })
   if (startingText === null) loadApp(win)
-  else void win.loadURL(startingPageUrl(startingText))
+  else loadInto(win, { url: startingPageUrl(startingText) }, (m) => console.log(m))
   win.maximize()
 
   // DevTools in development. Its usual accelerators (Ctrl/Cmd+Shift+I, F12) come from Electron's
@@ -445,6 +454,9 @@ app.whenReady().then(async () => {
   })
   core = started.core
   const win = started.win
+  // On Linux a close is a real close (see createWindow): closed during the probe, the window is gone
+  // and the app is already quitting — there is nothing to load and nothing to wire up.
+  if (win.isDestroyed()) return
   if (process.platform !== 'win32') loadApp(win)
   mainWindow = win
   // Slack progress notifications: hook events, roll state, limits and exits go out over an Incoming
@@ -1252,14 +1264,9 @@ app.whenReady().then(async () => {
     }
     // The last state pushed, so a check that runs out of time knows what the screen is showing
     // (afterCheckTimeout).
-    let lastUpdateState: UpdateStatus['state'] | null = null
-    const push = (s: {
-      state: UpdateStatus['state']
-      version?: string
-      percent?: number
-      message?: string
-    }): void => {
-      lastUpdateState = s.state
+    const updateStates = createUpdateStateTracker()
+    const push = (s: UpdateStatus): void => {
+      updateStates.record(s)
       flog(JSON.stringify(s))
       try {
         if (!win.isDestroyed()) win.webContents.send('update:status', s)
@@ -1373,13 +1380,13 @@ app.whenReady().then(async () => {
             () => flog(`WARN update check timed out after ${UPDATE_CHECK_TIMEOUT_MS / 1000}s (${userInitiated ? 'manual' : 'automatic'})`)
           )
           if (r !== 'timedOut') return 'done'
-          const next = afterCheckTimeout(lastUpdateState, userInitiated)
-          if (next?.state === 'error')
+          const next = afterCheckTimeout(updateStates.last(), userInitiated, updateStates.beforeCheck())
+          if (next && 'messageKey' in next)
             push({
               state: 'error',
               message: t(core!.lang, next.messageKey, { seconds: UPDATE_CHECK_TIMEOUT_MS / 1000 })
             })
-          else if (next) push({ state: 'init', version: app.getVersion() })
+          else if (next) push(next)
           if (userInitiated) settleCheck()
           return 'timedOut'
         }

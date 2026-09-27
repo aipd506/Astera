@@ -38,21 +38,44 @@ export function checkWithTimeout<T>(
   })
 }
 
-/** What to push once a check has run out of time, given the last state pushed and whether the person
- *  asked for the check. Null means push nothing.
+/** What to push once a check has run out of time, given the last state pushed, whether the person
+ *  asked for the check, and what was on screen when the check began (createUpdateStateTracker). Null
+ *  means push nothing.
  *
- *  - An update already on its way (available, downloading, downloaded, manual) is left alone — the
- *    check did its job and the late part is someone else's.
- *  - A check the person asked for gets an answer they can read, whatever the screen said before:
- *    they are waiting on the settings button.
- *  - An automatic check only clears a "checking" it put up. Automatic failures are not surfaced (the
- *    error handler's rule), so it goes back to `init`, which the titlebar shows as nothing. */
+ *  - An update that arrived during the check (available, downloading, downloaded, manual) is left
+ *    alone — the check did its job and the late part is someone else's.
+ *  - A download that was already finished before the check (downloaded, manual) comes back, for
+ *    either kind of check: a periodic check over it must not hide the install button.
+ *  - A check the person asked for otherwise gets an answer they can read: they are waiting on it.
+ *  - An automatic check only undoes a "checking" it put up, back to what was there before (or
+ *    `init`, which the titlebar shows as nothing). Automatic failures are not surfaced. */
 export function afterCheckTimeout(
   lastState: UpdateStatus['state'] | null,
-  userInitiated: boolean
-): { state: 'error'; messageKey: 'update.checkTimedOut' } | { state: 'init' } | null {
+  userInitiated: boolean,
+  before: UpdateStatus | null
+): UpdateStatus | { state: 'error'; messageKey: 'update.checkTimedOut' } | null {
   if (lastState === 'available' || lastState === 'downloading' || lastState === 'downloaded' || lastState === 'manual')
     return null
+  if (before && (before.state === 'downloaded' || before.state === 'manual')) return before
   if (userInitiated) return { state: 'error', messageKey: 'update.checkTimedOut' }
-  return lastState === 'checking' ? { state: 'init' } : null
+  return lastState === 'checking' ? (before ?? { state: 'init' }) : null
+}
+
+/** The update states main has pushed: the last one, and the one on screen when the current check
+ *  began — what a timed-out check puts back. */
+export function createUpdateStateTracker(): {
+  record(s: UpdateStatus): void
+  last(): UpdateStatus['state'] | null
+  beforeCheck(): UpdateStatus | null
+} {
+  let last: UpdateStatus | null = null
+  let before: UpdateStatus | null = null
+  return {
+    record(s) {
+      if (s.state === 'checking' && last?.state !== 'checking') before = last
+      last = s
+    },
+    last: () => last?.state ?? null,
+    beforeCheck: () => before
+  }
 }

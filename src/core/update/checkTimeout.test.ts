@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { checkWithTimeout, afterCheckTimeout, UPDATE_CHECK_TIMEOUT_MS } from './checkTimeout'
+import {
+  checkWithTimeout,
+  afterCheckTimeout,
+  createUpdateStateTracker,
+  UPDATE_CHECK_TIMEOUT_MS
+} from './checkTimeout'
 
 afterEach(() => {
   vi.useRealTimers()
@@ -59,24 +64,50 @@ describe('checkWithTimeout', () => {
 
 // What the titlebar and the settings modal are told when a check runs out of time.
 describe('afterCheckTimeout', () => {
+  const init = { state: 'init' as const, version: '1.0.0' }
+  const downloaded = { state: 'downloaded' as const, version: '1.1.0' }
+
   it('a check the person asked for ends in an error they can read', () => {
-    expect(afterCheckTimeout('checking', true)).toEqual({ state: 'error', messageKey: 'update.checkTimedOut' })
+    expect(afterCheckTimeout('checking', true, init)).toEqual({ state: 'error', messageKey: 'update.checkTimedOut' })
   })
-  it('an automatic check clears "checking" quietly — automatic failures are not surfaced', () => {
-    expect(afterCheckTimeout('checking', false)).toEqual({ state: 'init' })
+  it('an automatic check puts back what was on screen before it — automatic failures are not surfaced', () => {
+    expect(afterCheckTimeout('checking', false, init)).toEqual(init)
+    expect(afterCheckTimeout('checking', false, null)).toEqual({ state: 'init' })
+  })
+  // A periodic check over a finished download must not hide the install button.
+  it('a finished download before the check comes back, for either kind of check', () => {
+    expect(afterCheckTimeout('checking', false, downloaded)).toEqual(downloaded)
+    expect(afterCheckTimeout('checking', true, downloaded)).toEqual(downloaded)
+    const manual = { state: 'manual' as const, version: '1.1.0' }
+    expect(afterCheckTimeout('checking', false, manual)).toEqual(manual)
   })
   it('a check the person asked for is answered even if "checking" was never announced', () => {
-    expect(afterCheckTimeout(null, true)).toEqual({ state: 'error', messageKey: 'update.checkTimedOut' })
-    expect(afterCheckTimeout('uptodate', true)).toEqual({ state: 'error', messageKey: 'update.checkTimedOut' })
+    expect(afterCheckTimeout(null, true, null)).toEqual({ state: 'error', messageKey: 'update.checkTimedOut' })
+    expect(afterCheckTimeout('uptodate', true, null)).toEqual({ state: 'error', messageKey: 'update.checkTimedOut' })
   })
   it('an automatic check that never showed "checking" leaves the screen alone', () => {
-    expect(afterCheckTimeout('uptodate', false)).toBeNull()
-    expect(afterCheckTimeout(null, false)).toBeNull()
+    expect(afterCheckTimeout('uptodate', false, init)).toBeNull()
+    expect(afterCheckTimeout(null, false, null)).toBeNull()
   })
   it('nothing is pushed when an update is already on its way (a late event, a download under way)', () => {
     for (const s of ['available', 'downloading', 'downloaded', 'manual'] as const) {
-      expect(afterCheckTimeout(s, true)).toBeNull()
-      expect(afterCheckTimeout(s, false)).toBeNull()
+      expect(afterCheckTimeout(s, true, init)).toBeNull()
+      expect(afterCheckTimeout(s, false, init)).toBeNull()
     }
+  })
+})
+
+describe('createUpdateStateTracker', () => {
+  it('remembers the last state and what was on screen when a check began', () => {
+    const tr = createUpdateStateTracker()
+    expect(tr.last()).toBeNull()
+    expect(tr.beforeCheck()).toBeNull()
+    tr.record({ state: 'downloaded', version: '1.1.0' })
+    tr.record({ state: 'checking' })
+    expect(tr.last()).toBe('checking')
+    expect(tr.beforeCheck()).toEqual({ state: 'downloaded', version: '1.1.0' })
+    // a second "checking" in a row does not overwrite it with "checking"
+    tr.record({ state: 'checking' })
+    expect(tr.beforeCheck()).toEqual({ state: 'downloaded', version: '1.1.0' })
   })
 })

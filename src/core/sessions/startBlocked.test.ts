@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isWaitingReason, startBlockedBy, worktreeOption, type StartBlocked } from './startBlocked'
+import { isWaitingReason, startBlockedBy, worktreeOption, repoUnknownHint, type StartBlocked } from './startBlocked'
 
 const ok = {
   cwd: 'D:/p', starting: false, resolvingRepo: false,
@@ -50,10 +50,20 @@ describe('worktreeOption', () => {
     expect(worktreeOption({ kind: 'repo', root: 'D:/r' })).toBe('available')
   })
   it('unknown 이면 보이되 막히고 안내가 붙는다', () => {
-    expect(worktreeOption({ kind: 'unknown' })).toBe('unknown')
+    expect(worktreeOption({ kind: 'unknown', reason: 'timeout' })).toBe('unknown')
   })
   it('저장소가 아니거나 아직 모르면 숨긴다', () => {
     expect(worktreeOption({ kind: 'none' })).toBe('hidden')
     expect(worktreeOption(null)).toBe('hidden')
+  })
+})
+
+// 저장소 검사가 답하지 못한 이유마다 안내가 다르다 — git 이 없는데 "느린 공유" 라 하면 사람이 할 일을 잘못 짚는다
+describe('repoUnknownHint', () => {
+  it('names the reason', () => {
+    expect(repoUnknownHint('timeout')).toBe('session.new.worktreeRepoUnknown')
+    expect(repoUnknownHint('no-git')).toBe('session.new.worktreeRepoNoGit')
+    expect(repoUnknownHint('no-folder')).toBe('session.new.worktreeRepoNoFolder')
+    expect(repoUnknownHint('error')).toBe('session.new.worktreeRepoError')
   })
 })

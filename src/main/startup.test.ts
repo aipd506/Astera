@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { startUp, gateOnLoginPath, startingPageUrl, LOGIN_PATH_GATE_MS } from './startup'
+import { startUp, gateOnLoginPath, startingPageUrl, loadInto, LOGIN_PATH_GATE_MS } from './startup'
 
 afterEach(() => {
   vi.useRealTimers()
@@ -113,5 +113,44 @@ describe('startingPageUrl', () => {
     expect(html).toContain('Reading &lt;your&gt; shell…')
     expect(html).toContain('spinner')
     expect(html).toContain('prefers-color-scheme: dark')
+  })
+})
+
+// A window the start-up page or the app is loaded into can be replaced mid-load (loadURL rejects with
+// ERR_ABORTED) or, on Linux, closed during the probe — which quits the app and destroys it.
+describe('loadInto', () => {
+  function fakeWin(opts: { destroyed?: boolean; reject?: boolean }) {
+    const loadURL = vi.fn(() => (opts.reject ? Promise.reject(new Error('ERR_ABORTED')) : Promise.resolve()))
+    const loadFile = vi.fn(() => Promise.resolve())
+    return { isDestroyed: () => opts.destroyed === true, loadURL, loadFile }
+  }
+
+  it('a load that is aborted does not leave an unhandled rejection', async () => {
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    try {
+      loadInto(fakeWin({ reject: true }), { url: 'data:text/html,x' }, () => {})
+      await new Promise((r) => setTimeout(r, 10))
+      expect(unhandled).not.toHaveBeenCalled()
+    } finally {
+      process.off('unhandledRejection', unhandled)
+    }
+  })
+
+  it('a destroyed window is left alone rather than thrown on', () => {
+    const win = fakeWin({ destroyed: true })
+    win.loadURL.mockImplementation(() => {
+      throw new Error('Object has been destroyed')
+    })
+    expect(() => loadInto(win, { url: 'http://localhost' }, () => {})).not.toThrow()
+    expect(win.loadURL).not.toHaveBeenCalled()
+  })
+
+  it('loads a URL or a file as asked', () => {
+    const win = fakeWin({})
+    loadInto(win, { url: 'http://localhost:5173' }, () => {})
+    loadInto(win, { file: '/app/index.html' }, () => {})
+    expect(win.loadURL).toHaveBeenCalledWith('http://localhost:5173')
+    expect(win.loadFile).toHaveBeenCalledWith('/app/index.html')
   })
 })

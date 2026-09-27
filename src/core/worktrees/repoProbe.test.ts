@@ -30,7 +30,7 @@ describe('probeRepoRoot', () => {
 
   it('git 이 기한에 걸리면 unknown — "저장소 아님" 이 아니다', async () => {
     const run = async (): Promise<GitResult> => ({ ok: false, stdout: '', stderr: 'timed out', timedOut: true })
-    expect(await probeRepoRoot('\\\\wsl$\\Ubuntu\\p', run)).toEqual({ kind: 'unknown' })
+    expect(await probeRepoRoot('\\\\wsl$\\Ubuntu\\p', run)).toEqual({ kind: 'unknown', reason: 'timeout' })
   })
 
   it('git 이 죽지 않고 붙잡혀 있어도 기한에 unknown 으로 답한다', async () => {
@@ -41,13 +41,37 @@ describe('probeRepoRoot', () => {
     await vi.advanceTimersByTimeAsync(REPO_PROBE_TIMEOUT_MS - 1)
     expect(answer).toBeNull()
     await vi.advanceTimersByTimeAsync(1)
-    expect(answer).toEqual({ kind: 'unknown' })
+    expect(answer).toEqual({ kind: 'unknown', reason: 'timeout' })
+  })
+
+  // 느린 공유가 아니라 git 을 시작하지 못한 것이면, 안내가 그 이유를 말해야 한다
+  it('git 을 시작하지 못하고 폴더는 있으면 unknown/no-git', async () => {
+    const run = async (): Promise<GitResult> => ({ ok: false, stdout: '', stderr: '', errorCode: 'ENOENT' })
+    expect(await probeRepoRoot('D:/x', run, REPO_PROBE_TIMEOUT_MS, async () => true)).toEqual({
+      kind: 'unknown',
+      reason: 'no-git'
+    })
+  })
+
+  it('폴더가 없어서 시작하지 못했으면 unknown/no-folder', async () => {
+    const run = async (): Promise<GitResult> => ({ ok: false, stdout: '', stderr: '', errorCode: 'ENOENT' })
+    expect(await probeRepoRoot('D:/gone', run, REPO_PROBE_TIMEOUT_MS, async () => false)).toEqual({
+      kind: 'unknown',
+      reason: 'no-folder'
+    })
+  })
+
+  it('실제 git: 없는 폴더는 no-folder', async () => {
+    expect(await probeRepoRoot(path.join(path.resolve('/'), 'astera-no-such-dir-xyz', 'p'))).toEqual({
+      kind: 'unknown',
+      reason: 'no-folder'
+    })
   })
 
   it('run 이 던지면 unknown (거부가 새지 않는다)', async () => {
     const run = async (): Promise<GitResult> => {
       throw new Error('boom')
     }
-    expect(await probeRepoRoot('D:/x', run)).toEqual({ kind: 'unknown' })
+    expect(await probeRepoRoot('D:/x', run)).toEqual({ kind: 'unknown', reason: 'error' })
   })
 })
