@@ -61,15 +61,15 @@ const WINDOWS: DeskWindow[] = [
 class FakeDesk implements Desk {
   name = 'astera-ws-test'
   launches: Array<{ command: string; cwd: string; env: Record<string, string> }> = []
-  kills: number[] = []
+  kills: Array<[number, number]> = []
   keyCalls: Array<{ title: string; text?: string; key?: string }> = []
   shotCalls: Array<{ title?: string; format: 'png' | 'jpeg'; maxWidth?: number }> = []
   async launch(a: { command: string; cwd: string; env: Record<string, string> }) {
     this.launches.push(a)
     return { pid: 500 + this.launches.length, startedAt: 1_000 }
   }
-  async kill(pid: number) {
-    this.kills.push(pid)
+  async kill(pid: number, startedAt: number) {
+    this.kills.push([pid, startedAt])
   }
   async windows() {
     return WINDOWS
@@ -151,12 +151,12 @@ describe('launch', () => {
 })
 
 describe('relaunch and close', () => {
-  it('relaunch kills the tree, drops the old connection, and starts the same spec again', async () => {
+  it('relaunch kills the tree (by pid and launch start time), drops the old connection, and starts the same spec again', async () => {
     const r = rig()
     await r.h.launch({ config: 'dev' })
     const first = r.cdp
     await r.h.relaunch()
-    expect(r.desk.kills).toEqual([501])
+    expect(r.desk.kills).toEqual([[501, 1_000]])
     expect(first.closed).toBe(true)
     expect(r.desk.launches).toHaveLength(2)
     expect(r.state.launched?.pid).toBe(502)

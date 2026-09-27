@@ -80,10 +80,12 @@ public static class AsteraDesk {
   [DllImport("kernel32.dll", SetLastError = true)]
   static extern bool GetProcessTimes(IntPtr h, out long creation, out long exit, out long kernel, out long user);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
 
   const uint GENERIC_ALL = 0x10000000;
   const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
   const uint CREATE_NO_WINDOW = 0x08000000;
+  const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
   const int UOI_FLAGS = 1;
   const int WSF_VISIBLE = 1;
   const uint PW_RENDERFULLCONTENT = 2;
@@ -99,6 +101,18 @@ public static class AsteraDesk {
     int needed = 0;
     if (!GetUserObjectInformation(ws, UOI_FLAGS, ref f, Marshal.SizeOf(f), ref needed)) return false;
     return (f.dwFlags & WSF_VISIBLE) != 0;
+  }
+
+  // The kernel creation time of a live pid in epoch ms, the same clock Launch reports; -1 when no
+  // process has that pid (or it cannot be opened), which the kill op reads as already gone.
+  public static long StartedAtOf(int pid) {
+    IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+    if (h == IntPtr.Zero) return -1;
+    try {
+      long created, exited, kernel, user;
+      if (!GetProcessTimes(h, out created, out exited, out kernel, out user)) return -1;
+      return (long)(DateTime.FromFileTimeUtc(created) - Epoch).TotalMilliseconds;
+    } finally { CloseHandle(h); }
   }
 
   public static long StartedAtMs(int pid) {
@@ -295,6 +309,19 @@ while ($true) {
         $value = @{ pid = $r[0]; startedAt = $r[1] }
       }
       'kill' {
+        # Only the process launched: Windows hands pids out again, so a pid whose creation time is
+        # further than the lifecycle tolerance (START_TIME_TOLERANCE_MS, lifecycle.ts) from the
+        # launch's is someone else's and is left alone. The reply says why nothing was killed.
+        $tolerance = 2000
+        $live = [AsteraDesk]::StartedAtOf([int]$req.pid)
+        if ($live -lt 0) {
+          $value = @{ killed = $false; reason = ('pid ' + [int]$req.pid + ' is not running') }
+          break
+        }
+        if ([Math]::Abs($live - [int64]$req.startedAt) -gt $tolerance) {
+          $value = @{ killed = $false; reason = ('start time mismatch: pid ' + [int]$req.pid + ' started at ' + $live + ', not ' + [int64]$req.startedAt) }
+          break
+        }
         # Through cmd so taskkill's stderr (a process already gone) never becomes a PowerShell error
         # under $ErrorActionPreference = 'Stop'.
         & cmd.exe /c ('taskkill /T /F /PID ' + [int]$req.pid + ' >nul 2>&1')

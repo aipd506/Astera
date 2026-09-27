@@ -26,8 +26,10 @@ export interface Desk {
   readonly name: string
   /** Runs a shell command on this desktop. The implementation turns it into its OS's command line. */
   launch(a: { command: string; cwd: string; env: Record<string, string> }): Promise<DeskLaunched>
-  /** Ends a process and everything it started. */
-  kill(pid: number): Promise<void>
+  /** Ends a process and everything it started, if it is still the one launched: `startedAt` is the
+   *  launch's creation time, and a pid whose process started at another time (a reused number) is left
+   *  alone (START_TIME_TOLERANCE_MS, lifecycle.ts). */
+  kill(pid: number, startedAt: number): Promise<void>
   windows(): Promise<DeskWindow[]>
   shot(a: { title?: string; format: 'png' | 'jpeg'; maxWidth?: number }): Promise<DeskShot>
   keys(a: { title: string; text?: string; key?: string }): Promise<void>
@@ -243,7 +245,7 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
       if (!prev) throw new Error(`relaunch: ${NOTHING_LAUNCHED}`)
       deps.state.cdp?.close()
       deps.state.cdp = null
-      await (await deps.desk()).kill(prev.pid)
+      await (await deps.desk()).kill(prev.pid, prev.startedAt)
       deps.state.launched = null
       deps.recordLaunch(null)
       return start('relaunch', prev.spec, waitOf(opts))

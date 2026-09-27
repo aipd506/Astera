@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { START_TIME_TOLERANCE_MS } from '../../core/workspace/lifecycle'
 import { DESK_PS1 } from './desk'
 
 // The script itself runs only on Windows (Task 3's live test below, and Task 10). These pin the two
@@ -44,6 +45,14 @@ describe('DESK_PS1', () => {
   it('attaches a fresh thread to the desktop, since PowerShell\'s own STA thread owns windows (ERROR_BUSY)', () => {
     expect(DESK_PS1).toContain('static T OnDesk<T>(IntPtr desk, Func<T> f)')
     expect(DESK_PS1).toContain('new Thread(')
+  })
+
+  it('kills only the process launched: a pid whose start time differs by more than the lifecycle tolerance is skipped', () => {
+    expect(DESK_PS1).toContain(`$tolerance = ${String(START_TIME_TOLERANCE_MS)}`)
+    expect(DESK_PS1).toContain('[AsteraDesk]::StartedAtOf([int]$req.pid)')
+    expect(DESK_PS1).toContain('[Math]::Abs($live - [int64]$req.startedAt) -gt $tolerance')
+    expect(DESK_PS1).toContain('start time mismatch')
+    expect(DESK_PS1.indexOf('start time mismatch')).toBeLessThan(DESK_PS1.indexOf('taskkill /T /F /PID'))
   })
 
   it('keeps its escapes as text: no CR byte, and the regex still says \\r\\n', () => {

@@ -10,6 +10,14 @@
 /** How long a helper has to say `ready` (spec, Errors). */
 export const DESK_READY_MS = 5_000
 
+/** How long one request may go unanswered before the helper is taken as hung and ended: a window that
+ *  stopped responding can hold PrintWindow or a window enumeration forever. */
+export const DESK_REQUEST_MS = 15_000
+
+/** The whole of a helper's close, the close request and the wait for its exit together (preflight
+ *  ruling F2). */
+export const DESK_CLOSE_MS = 5_000
+
 export interface DeskWindow {
   hwnd: number
   title: string
@@ -38,7 +46,7 @@ export interface DeskLaunched {
 export type DeskRequestBody =
   | { op: 'create'; name: string }
   | { op: 'launch'; commandLine: string; cwd: string | null; env: Record<string, string> }
-  | { op: 'kill'; pid: number }
+  | { op: 'kill'; pid: number; startedAt: number }
   | { op: 'windows' }
   | { op: 'shot'; title: string | null; format: 'png' | 'jpeg'; maxWidth: number | null }
   | { op: 'keys'; title: string; text: string | null; key: string | null }

@@ -5,6 +5,20 @@ import path from 'node:path'
 import { NOT_INTERACTIVE } from '../../core/workspace/lifecycle'
 import { spawnPowerShell, startDesktopHelper, writeDeskScript, type DeskProcess } from './desktopHelper'
 import { DESK_PS1 } from './desk'
+import { killTree } from './native'
+
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+const until = async (ok: () => boolean, ms: number): Promise<boolean> => {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) if (ok()) return true
+  return ok()
+}
 
 /** A helper process the test answers by hand. `sent` is every request line, parsed. */
 class FakeProc implements DeskProcess {
@@ -201,6 +215,70 @@ describe('startDesktopHelper', () => {
     }
   })
 
+  it('close has one 5 s deadline for the close request and the exit together (preflight ruling F2)', async () => {
+    vi.useFakeTimers()
+    try {
+      const proc = new FakeProc()
+      proc.exitOnKill = false
+      const logs: string[] = []
+      const h = await started(proc, logs)
+      proc.answer = () => null
+      let done = false
+      const closing = h.close().then(() => {
+        done = true
+      })
+      await vi.advanceTimersByTimeAsync(4_900)
+      expect(done).toBe(false)
+      await vi.advanceTimersByTimeAsync(200)
+      await closing
+      expect(proc.killed).toBe(true)
+      expect(logs.some((l) => l.includes('did not exit within 5 s'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('kill sends the pid with its launch start time, and logs when the helper skipped a reused pid', async () => {
+    const proc = new FakeProc()
+    const logs: string[] = []
+    const h = await started(proc, logs)
+    await h.kill(77, 5)
+    expect(proc.sent.at(-1)).toEqual({ op: 'kill', pid: 77, startedAt: 5, id: 2 })
+    expect(logs).toEqual([])
+    proc.answer = (req) => ({ id: req.id, ok: true, value: { killed: false, reason: 'start time mismatch: pid 77 started at 9000, not 5' } })
+    await expect(h.kill(77, 5)).resolves.toBeUndefined()
+    expect(logs.some((l) => l.includes('did not kill pid 77') && l.includes('start time mismatch'))).toBe(true)
+  })
+
+  it('a request unanswered for 15 s rejects, ends the helper, and every later request rejects at once', async () => {
+    vi.useFakeTimers()
+    try {
+      const proc = new FakeProc()
+      proc.exitOnKill = false
+      const h = await started(proc)
+      proc.answer = () => null
+      const heard = vi.fn()
+      h.onExit(heard)
+      const hung = h.windows()
+      const queued = h.keys({ title: 'T', key: 'Enter' })
+      const hungDone = expect(hung).rejects.toThrow('the desktop helper did not answer windows within 15 s')
+      const queuedDone = expect(queued).rejects.toThrow('the desktop helper ended')
+      await vi.advanceTimersByTimeAsync(14_900)
+      expect(proc.killed).toBe(false)
+      await vi.advanceTimersByTimeAsync(200)
+      await hungDone
+      await queuedDone
+      expect(proc.killed).toBe(true)
+      expect(h.alive()).toBe(false)
+      expect(proc.sent.map((r) => r.op)).toEqual(['create', 'windows'])
+      await expect(h.windows()).rejects.toThrow('the desktop helper ended')
+      proc.die('killed')
+      expect(heard).toHaveBeenCalledWith('killed')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('close on a helper that already ended resolves at once and writes nothing', async () => {
     const proc = new FakeProc()
     const h = await started(proc)
@@ -246,8 +324,44 @@ describe('the real helper', () => {
           return
         }
         expect(Array.isArray(await h.windows())).toBe(true)
+        // The kill guard, for real: a start time that does not match leaves the process alone.
+        const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => typeof e[1] === 'string'))
+        const l = await h.launch({ command: 'ping -n 60 127.0.0.1', cwd: os.tmpdir(), env })
+        try {
+          expect(isAlive(l.pid)).toBe(true)
+          await h.kill(l.pid, l.startedAt + 10_000)
+          await new Promise((r) => setTimeout(r, 300))
+          expect(isAlive(l.pid)).toBe(true)
+          await h.kill(l.pid, l.startedAt)
+          expect(await until(() => !isAlive(l.pid), 5_000)).toBe(true)
+        } finally {
+          if (isAlive(l.pid)) await killTree(l.pid)
+        }
         await h.close()
         expect(h.alive()).toBe(false)
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+      }
+    },
+    60_000
+  )
+})
+
+describe('spawnPowerShell', () => {
+  it.runIf(process.platform === 'win32')(
+    'reads every byte the process wrote before it reports the exit, a last line with no newline included',
+    async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-desk-drain-'))
+      try {
+        const file = path.join(dir, 'drain.ps1')
+        const script = ["[Console]::Out.Write(('x' * 3000000) + [char]10)", "[Console]::Out.Write('tail-without-newline')", '[Console]::Out.Flush()', 'exit 0', ''].join('\n')
+        await fs.writeFile(file, script, 'utf8')
+        const proc = spawnPowerShell(file)
+        const lines: string[] = []
+        proc.onLine((l) => lines.push(l))
+        const seen = await new Promise<string[]>((resolve) => proc.onExit(() => resolve([...lines])))
+        expect(seen.map((l) => l.length)).toEqual([3_000_000, 'tail-without-newline'.length])
+        expect(seen[1]).toBe('tail-without-newline')
       } finally {
         await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
       }

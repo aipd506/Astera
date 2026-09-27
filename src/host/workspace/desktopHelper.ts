@@ -1,6 +1,8 @@
 // The Host's side of one desktop helper (agent workspace design, Components 2): starts it, waits for
 // `ready` (5 s, else a clear error), creates the desktop, serialises requests, and rejects every
-// pending request if the process dies. `close` resolves once the process has exited (5 s cap). This is the Windows `Desk` (src/core/workspace/helpers.ts).
+// pending request if the process dies. A request unanswered for 15 s ends the helper (a hung window
+// must not block every later call), and `close` resolves once the process has exited, all within one
+// 5 s deadline. This is the Windows `Desk` (src/core/workspace/helpers.ts).
 //
 // The process is behind `DeskProcess` so the tests answer it by hand; `spawnPowerShell` is the real
 // one, the clipboardFiles.ts route (powershell.exe, windowsHide, no shell).
@@ -8,11 +10,12 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { withTimeout } from '../../core/agentBrowser/script'
 import { shellSpawn } from '../../core/run/shell'
 import { NOT_INTERACTIVE } from '../../core/workspace/lifecycle'
 import {
+  DESK_CLOSE_MS,
   DESK_READY_MS,
+  DESK_REQUEST_MS,
   asLaunched,
   asShot,
   asWindows,
@@ -43,7 +46,6 @@ export interface DesktopHelper extends Desk {
   onExit(cb: (why: string) => void): void
 }
 
-const CLOSE_MS = 5_000
 const messageOf = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 
 /** Plan ruling P5: the embedded script, written under a content name so an older one is never run. */
@@ -90,7 +92,14 @@ export function spawnPowerShell(scriptPath: string): DeskProcess {
     /* a write after the exit; the exit reports it */
   })
   child.on('error', (err) => end(`powershell.exe could not start: ${err.message}`))
-  child.on('exit', (code, signal) => {
+  // 'close', not 'exit': 'exit' can come before stdout has drained, and the last reply (close's) would
+  // be lost. The helper launches with bInheritHandles false, so nothing else holds these pipes open.
+  child.on('close', (code, signal) => {
+    if (buf !== '') {
+      const line = buf
+      buf = ''
+      for (const cb of lineCbs) cb(line)
+    }
     const tail = stderrTail.trim().replace(/\s+/g, ' ')
     end(`exited ${String(signal ?? code)}${tail ? `: ${tail}` : ''}`)
   })
@@ -179,13 +188,32 @@ export async function startDesktopHelper(a: { name: string; spawn: SpawnDesk; re
     throw new Error(NOT_INTERACTIVE)
   }
 
-  /** One request in flight at a time: the helper is one thread attached to one desktop. */
-  const request = (body: DeskRequestBody): Promise<unknown> => {
+  /** One request in flight at a time: the helper is one thread attached to one desktop. One left
+   *  unanswered for `ms` is taken as a hung helper: it rejects, the helper is ended, and every later
+   *  request rejects at once (the exit, when it comes, finds nothing pending). */
+  const request = (body: DeskRequestBody, ms: number = DESK_REQUEST_MS): Promise<unknown> => {
     const run = (): Promise<unknown> =>
       new Promise((resolve, reject) => {
         if (dead !== null) return reject(new Error(`the desktop helper ended (${dead})`))
         const id = nextId++
-        pending.set(id, { resolve, reject })
+        const timer = setTimeout(() => {
+          if (!pending.delete(id)) return
+          const why = `did not answer ${body.op} within ${ms / 1000} s`
+          dead ??= `it ${why}`
+          a.log(`desktop helper ${a.name} ${why}; ending it`)
+          reject(new Error(`the desktop helper ${why}`))
+          proc.kill()
+        }, ms)
+        pending.set(id, {
+          resolve: (v) => {
+            clearTimeout(timer)
+            resolve(v)
+          },
+          reject: (e) => {
+            clearTimeout(timer)
+            reject(e)
+          }
+        })
         proc.write(encodeDeskRequest({ ...body, id } as DeskRequest))
       })
     const p = tail.then(run, run)
@@ -214,8 +242,11 @@ export async function startDesktopHelper(a: { name: string; spawn: SpawnDesk; re
       const s = shellSpawn(command, 'win32')
       return asLaunched(await request({ op: 'launch', commandLine: `${s.file} ${String(s.args)}`, cwd, env }))
     },
-    kill: async (pid) => {
-      await request({ op: 'kill', pid })
+    kill: async (pid, startedAt) => {
+      const v = await request({ op: 'kill', pid, startedAt })
+      // A pid that is gone or was reused is left alone by the helper; that is an answer, not a failure.
+      if (typeof v === 'object' && v !== null && (v as { killed?: unknown }).killed === false)
+        a.log(`desktop helper ${a.name} did not kill pid ${pid}: ${String((v as { reason?: unknown }).reason ?? 'no reason given')}`)
     },
     windows: async () => asWindows(await request({ op: 'windows' })),
     shot: async (o) => asShot(await request({ op: 'shot', title: o.title ?? null, format: o.format, maxWidth: o.maxWidth ?? null })),
@@ -223,19 +254,25 @@ export async function startDesktopHelper(a: { name: string; spawn: SpawnDesk; re
       await request({ op: 'keys', title: o.title, text: o.text ?? null, key: o.key ?? null })
     },
     close: async () => {
-      if (dead === null)
-        await withTimeout(request({ op: 'close' }), CLOSE_MS, 'close').catch((err: unknown) =>
-          a.log(`desktop helper ${a.name} did not close cleanly: ${messageOf(err)}`)
-        )
-      proc.kill()
-      // Preflight ruling F2: resolve only once the process is gone (capped), so a leftover check that
-      // follows a close never sees this helper still running.
+      // Preflight ruling F2: one deadline for the whole close, the request and the exit together, and
+      // resolve only once the process is gone, so a leftover check that follows never sees it running.
       let timer: ReturnType<typeof setTimeout> | undefined
       const late = new Promise<'late'>((resolve) => {
-        timer = setTimeout(() => resolve('late'), CLOSE_MS)
+        timer = setTimeout(() => resolve('late'), DESK_CLOSE_MS)
       })
-      const how = await Promise.race([exited, late]).finally(() => clearTimeout(timer))
-      if (how === 'late') a.log(`desktop helper ${a.name} did not exit within ${CLOSE_MS / 1000} s of close`)
+      try {
+        if (dead === null) {
+          const asked = request({ op: 'close' }, DESK_CLOSE_MS).catch((err: unknown) =>
+            a.log(`desktop helper ${a.name} did not close cleanly: ${messageOf(err)}`)
+          )
+          await Promise.race([asked, late])
+        }
+        proc.kill()
+        if ((await Promise.race([exited, late])) === 'late')
+          a.log(`desktop helper ${a.name} did not exit within ${DESK_CLOSE_MS / 1000} s of close`)
+      } finally {
+        clearTimeout(timer)
+      }
     }
   }
 }
