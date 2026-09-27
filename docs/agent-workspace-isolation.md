@@ -96,6 +96,12 @@ Known limits, beside the spec's:
 - **A closed mirror tab reappears when the Host reconnects while that workspace is still open.** The
   Close in the app ends the tab, not the workspace; a workspace the Host still holds is shown again once
   the app reconnects.
+- **A script runs inside the Host process, which also holds every session's terminal.** A loop that
+  never awaits blocks the Host until the 60 second script deadline cuts it off. A loop that comes after
+  an `await` (for example `await launch(...); while (!ready) {}`) is never cut off: neither the deadline
+  nor Stop can reach it, so the Host and every session's terminal stay frozen until the Host is
+  restarted. Unbounded allocation can take the Host down the same way. The guide tells the agent never
+  to loop without an `await`. Running scripts in a worker the Host can terminate is a possible follow up.
 - An Electron app that is not started with a debugging port gets the native helpers only.
   `snapshot().url` is empty for an address that is not http or https (a `file:` or custom scheme page).
 

@@ -38,6 +38,9 @@ script or close the desktop from there. It works the same when the Astera app is
 - **Cleanup.** Call `close()` when you are done. The desktop is also cleaned up when your session ends
   and after 10 minutes without a script.
 - Every helper is `async` except `log` and `help`; `await` them.
+- **Never loop without an `await`.** Your script runs inside Astera's own background process, beside
+  every session's terminal. A busy loop such as `while (!ready) {}` freezes Astera for every session:
+  after an `await`, neither the 60 second limit nor Stop can end it. Wait with `waitFor()` instead.
 
 ## The pattern
 
@@ -104,7 +107,7 @@ A real key press on the focused element: one character, or `Enter`, `Escape`, `T
 `PageDown`.
 
 ## waitFor(selectorOrMs)
-Waits until the selector matches (up to 30 s), or for that many milliseconds.
+Waits until the selector matches (up to 30 s), or for that many milliseconds (also capped at 30 s).
 
 ## paste()
 A real paste into the focused element, with the person's clipboard (see the rules).
