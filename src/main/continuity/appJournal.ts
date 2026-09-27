@@ -22,6 +22,8 @@ import {
 } from '../../core/continuity/journal'
 import { ContinuityRecorder } from '../../core/continuity/recorder'
 import { JournalReader } from '../../core/continuity/journalReader'
+import { retryBusy } from '../../core/continuity/busyRetry'
+import type { CheckpointHead } from '../../core/orchestration/exec/validation'
 import { journalTimeline } from '../../core/continuity/timelineRows'
 import { JOURNAL_EVENTS_MAX, type JournalOp } from '../../core/continuity/journalOps'
 import { hostSpeaksJournal } from '../host/outdated'
@@ -54,6 +56,10 @@ export interface AppJournalDeps {
   /** How long the writer waits for another process's lock; BUSY_TIMEOUT_MS when left out. The reader
    *  keeps its own short timeout (READER_BUSY_TIMEOUT_MS): it reads on the main thread. */
   busyTimeoutMs?: number
+  /** The pause before a busy journal is asked again (retryBusy); a timer when left out. */
+  sleep?(ms: number): Promise<void>
+  /** Test seam: rows per timeline page; TIMELINE_PAGE when left out. */
+  timelinePage?: number
 }
 
 export interface AppJournal {
@@ -76,8 +82,9 @@ export interface AppJournal {
   /** runDetail's rows (lost, recovery), the newest `pages` pages of them (1 when left out), through the
    *  reader. Never throws: a busy journal answers with the rows last read for that Run and `busy`. */
   timeline(runId: string, state: OrchState, pages?: number): JournalTimeline
-  /** The validation diff base: through the reader. Never throws. */
-  firstCheckpointHead(dispatchId: string): string | null
+  /** The validation diff base: through the reader, a busy journal asked again on the event loop. null when
+   *  there is no checkpoint, 'unknown' when the journal could not say (stage 3 T1 review). Never rejects. */
+  firstCheckpointHead(dispatchId: string): Promise<CheckpointHead>
   /** The toggle turned on while Runs may be active: the baseline here, or `journal-reload` to the Host. */
   turnedOn(state: OrchState): Promise<void>
   /** A setting the Host reads changed (the toggle off, the resume strategy): `journal-reload` when the Host writes. */
@@ -265,8 +272,10 @@ export function createAppJournal(d: AppJournalDeps): AppJournal {
     reconcilerJournal,
     timeline: (runId, state, pages = 1) => {
       const r = readerOf()
-      if (!r) return { events: [], busy: false, older: false }
-      const limit = Math.min(Math.max(1, Math.floor(pages) || 1), TIMELINE_PAGES_MAX) * TIMELINE_PAGE
+      if (!r) return { events: [], busy: false, older: false, capped: false }
+      const asked = Math.max(1, Math.floor(pages) || 1)
+      const atMax = asked >= TIMELINE_PAGES_MAX
+      const limit = Math.min(asked, TIMELINE_PAGES_MAX) * (d.timelinePage ?? TIMELINE_PAGE)
       const lines = (rows: JournalEventRow[]): JobEvent[] => journalTimeline(rows, state, d.lang())
       try {
         // One row past the limit says whether older rows are left, without a second query.
@@ -277,7 +286,7 @@ export function createAppJournal(d: AppJournalDeps): AppJournal {
         if (lastGood.size >= LAST_GOOD_MAX) lastGood.delete(lastGood.keys().next().value as string)
         lastGood.set(runId, { limit, rows, older })
         timelineBusy = false
-        return { events: lines(rows), busy: false, older }
+        return { events: lines(rows), busy: false, older, capped: older && atMax }
       } catch (err) {
         if (isBusyError(err)) {
           // The Host's writer holds the file: what was last read, and the window asks again at the
@@ -285,19 +294,22 @@ export function createAppJournal(d: AppJournalDeps): AppJournal {
           if (!timelineBusy) d.log(`continuity: the journal is busy, run detail shows the rows last read: ${String(err)}`)
           timelineBusy = true
           const hit = lastGood.get(runId)
-          return { events: hit ? lines(hit.rows) : [], busy: true, older: hit?.older ?? false }
+          const older = hit?.older ?? false
+          return { events: hit ? lines(hit.rows) : [], busy: true, older, capped: older && atMax }
         }
         d.log(`continuity: eventsFor ${runId} failed: ${String(err)}`)
-        return { events: [], busy: false, older: false }
+        return { events: [], busy: false, older: false, capped: false }
       }
     },
-    firstCheckpointHead: (dispatchId) => {
-      try {
-        return readerOf()?.firstCheckpointFor(dispatchId)?.gitHead ?? null
-      } catch (err) {
-        d.log(`continuity: firstCheckpointFor ${dispatchId} failed: ${String(err)}`)
-        return null
-      }
+    firstCheckpointHead: async (dispatchId) => {
+      const read = await retryBusy(() => readerOf()?.firstCheckpointFor(dispatchId)?.gitHead ?? null, {
+        sleep: d.sleep,
+        onBusy: (err) => d.log(`continuity: the journal is busy, firstCheckpointFor ${dispatchId} asks again shortly: ${String(err)}`)
+      })
+      if (read.ok) return read.value
+      // A read that failed is not a Dispatch with no checkpoint: a baseline may exist that could not be read.
+      d.log(`continuity: firstCheckpointFor ${dispatchId} failed${read.busy ? ' (still busy)' : ''}: ${String(read.error)}`)
+      return 'unknown'
     },
     turnedOn: async (state) => {
       if (hostWrites()) {

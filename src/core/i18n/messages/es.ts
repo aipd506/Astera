@@ -1232,6 +1232,7 @@ export const es: Catalog = {
   'jobs.detail.hidden': '{count} eventos de otras Tasks — pulsa el nodo otra vez para quitar el filtro',
   'jobs.detail.clearFilter': 'Quitar filtro',
   'jobs.detail.journalOlder': 'Mostrar entradas anteriores del diario',
+  'jobs.detail.journalCapped': 'Las entradas más antiguas del diario no se muestran aquí. Esta ventana muestra solo las más recientes.',
   'jobs.detail.journalBusy': 'El diario está ocupado ahora, así que estas son las últimas entradas leídas. Se actualizarán con la próxima actualización.',
   'jobs.detail.edgeWaiting': 'dependencia pendiente',
   'jobs.detail.edgeResolved': 'dependencia ya resuelta',

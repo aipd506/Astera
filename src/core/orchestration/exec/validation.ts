@@ -45,11 +45,15 @@ export interface ValidationContext {
   /** Fire and forget; the module attaches the terminal catch. */
   startReview(a: { taskId: string }): Promise<void>
   startRepair(a: { dispatchId: string }): Promise<unknown>
-  /** The journal's first checkpoint head for a Dispatch, or null (always null in the Host, R12). */
-  firstCheckpointHead(dispatchId: string): string | null
+  /** The journal's first checkpoint head for a Dispatch, or null (always null in the Host, R12).
+   *  'unknown' when the journal could not answer (busy past its retries, stage 3 T1): a baseline may
+   *  exist, it could not be read. The app's answer is asynchronous, since it waits between retries. */
+  firstCheckpointHead(dispatchId: string): CheckpointHead | Promise<CheckpointHead>
   /** `git diff` for the suspicious-file calculation. */
   diffNames(cwd: string, fromHead: string): Promise<string[] | null>
 }
+/** A git head, null when there is no baseline, 'unknown' when there may be one the journal could not give. */
+export type CheckpointHead = string | null | 'unknown'
 export interface TaskValidation {
   validator: TaskValidator
   /** OrchServerDeps.startValidation's body: enqueue, then the policy stamp and the suspicious files beside it. */
@@ -201,8 +205,12 @@ export function createTaskValidation(c: ValidationContext): TaskValidation {
    *
    *  **Task 의 filesModified 를 쓴다, Dispatch 의 것이 아니다** — Dispatch 에는 그런 칸이 없다. */
   const changedFilesSince = async (first: Dispatch, cwd: string): Promise<string[]> => {
-    const head = c.firstCheckpointHead(first.id)
-    if (head) {
+    const head = await c.firstCheckpointHead(first.id)
+    // 기준점이 있을 수 있는데 저널이 답하지 못했다(stage 3 T1) — 없는 것과 다르므로 로그에 그렇게 남긴다.
+    // 그래도 filesModified 로 물러난다: 건너뛰면 check 파일을 건드렸다는 경고 자체를 잃는다.
+    if (head === 'unknown')
+      c.log(`suspicious files task=${first.taskId}: the baseline head could not be read (journal busy), filesModified stands in`)
+    else if (head) {
       const names = await c.diffNames(cwd, head)
       if (names) return names
     }

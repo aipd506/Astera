@@ -593,6 +593,8 @@ export interface RunDetailJournal {
   busy: boolean
   /** 더 오래된 저널 줄이 남아 있다 — "이전 기록 더 보기" 가 한 쪽을 더 읽는다 */
   older: boolean
+  /** 더 오래된 줄이 남았지만 한 번에 읽을 수 있는 쪽 수의 끝에 닿았다 — 버튼 대신 그렇다고 적는다 */
+  capped: boolean
 }
 
 /** Run 이 끝났는지 — Task 상태에서 계산된다. 저장되지 않는다.

@@ -8,7 +8,8 @@ import { DEFAULT_CONCURRENCY } from '../../core/orchestration/types'
 import type { GitFacts, LostAttempt, RecoveryDecision } from '../../core/recovery/types'
 import { decideRecovery } from '../../core/recovery/decide'
 import type { ContinuityEvent, ContinuityEventType } from '../../core/continuity/events'
-import { isBusyError, type CheckpointRow, type ContinuityJournal, type RecoveryActionRow } from '../../core/continuity/journal'
+import type { CheckpointRow, ContinuityJournal, RecoveryActionRow } from '../../core/continuity/journal'
+import { retryBusy } from '../../core/continuity/busyRetry'
 import type { ExecuteResult } from './execute'
 
 // `candidates` and its seed live in core now (the Host's lost-worker Gate asks the same question, R16).
@@ -37,13 +38,6 @@ export interface ReconcilerDeps {
   sleep?(ms: number): Promise<void>
 }
 
-/** How many times a read that meets a busy journal is asked again, and the pause before each (stage 3
- *  T1). The reader gives up within its short busy timeout (READER_BUSY_TIMEOUT_MS) so main never waits
- *  long in one go; the pauses between are the event loop's, so nothing freezes while the Host's writer
- *  finishes. Past the last one the read is "cannot say", as any failed read is. */
-export const JOURNAL_BUSY_RETRIES = 8
-export const JOURNAL_BUSY_RETRY_MS = 250
-
 /** Recovery is a second door into starting workers, so it obeys the scheduler's concurrency rule too
  *  (the `room` calculation in core/orchestration/schedule.ts's slotsToFill). Several lost Tasks in one
  *  Run would otherwise all restart at once, and in a Run whose Tasks dispatch into the Run root they
@@ -71,37 +65,54 @@ export class RecoveryReconciler {
     }
   }
 
-  /** The two facts recovery reads from the journal about one dispatch (stage 3 T1): whether any row names
-   *  it, and whether its prompt write was confirmed. Each is one indexed read of at most one row, never
-   *  the Run's whole record. The results are checked again here, so a port that ignores the bound still
-   *  answers right. null when the read failed ("cannot say"); a busy journal is asked again first. */
-  private async evidenceFor(runId: string, dispatchId: string): Promise<{ witnessed: boolean; promptConfirmed: boolean } | null> {
+  /** A dispatch whose recovery is under way: a sweep and a live reconcileOne can overlap now that the
+   *  journal reads wait on the event loop (stage 3 T1 review), and only the first acts. */
+  private readonly inFlight = new Set<string>()
+
+  /** What recovery reads from the journal about one dispatch (stage 3 T1): whether any row names it,
+   *  whether its prompt write was confirmed, and its first checkpoint. Each is one indexed read of at
+   *  most one row, never the Run's whole record; the rows are checked again here, so a port that ignores
+   *  the bound still answers right. A busy journal is asked again first (retryBusy). null when any read
+   *  failed: "cannot say", which decide.ts turns into a person's review. **The checkpoint counts too**
+   *  (stage 3 T1 review): read as absent, it drops the base head and the native session, and a worker
+   *  that committed on a clean tree would be restarted with its commits duplicated. */
+  private async evidenceFor(
+    runId: string,
+    dispatchId: string
+  ): Promise<{ witnessed: boolean; promptConfirmed: boolean; checkpoint: CheckpointRow | null } | null> {
     const journal = this.deps.journal
-    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
-    for (let attempt = 0; ; attempt++) {
-      try {
+    const retried = await retryBusy(
+      () => {
         const witnessed = journal.eventsFor(runId, { dispatchId, limit: 1 }).some((e) => e.dispatchId === dispatchId)
-        const promptConfirmed =
-          witnessed &&
-          journal
-            .eventsFor(runId, { dispatchId, types: ['PROMPT_WRITE_CONFIRMED'], limit: 1 })
-            .some((e) => e.type === 'PROMPT_WRITE_CONFIRMED' && e.dispatchId === dispatchId)
-        return { witnessed, promptConfirmed }
-      } catch (err) {
-        if (isBusyError(err) && attempt < JOURNAL_BUSY_RETRIES) {
-          if (attempt === 0) this.deps.log(`recovery: the journal is busy, dispatch ${dispatchId} asks again shortly: ${String(err)}`)
-          await sleep(JOURNAL_BUSY_RETRY_MS)
-          continue
-        }
-        this.deps.log(`recovery: eventsFor failed: ${String(err)}`)
-        return null
+        if (!witnessed) return { witnessed, promptConfirmed: false, checkpoint: null }
+        const promptConfirmed = journal
+          .eventsFor(runId, { dispatchId, types: ['PROMPT_WRITE_CONFIRMED'], limit: 1 })
+          .some((e) => e.type === 'PROMPT_WRITE_CONFIRMED' && e.dispatchId === dispatchId)
+        return { witnessed, promptConfirmed, checkpoint: journal.firstCheckpointFor(dispatchId) }
+      },
+      {
+        sleep: this.deps.sleep,
+        onBusy: (err) => this.deps.log(`recovery: the journal is busy, dispatch ${dispatchId} asks again shortly: ${String(err)}`)
       }
-    }
+    )
+    if (retried.ok) return retried.value
+    this.deps.log(`recovery: eventsFor failed${retried.busy ? ' (still busy)' : ''}: ${String(retried.error)}`)
+    return null
   }
 
   /** Carries one seed all the way through, or returns false having done nothing at all — the caller
    *  counts only what it acted on. */
   private async recoverOne(seed: LostAttemptSeed): Promise<boolean> {
+    if (this.inFlight.has(seed.dispatch.id)) return false
+    this.inFlight.add(seed.dispatch.id)
+    try {
+      return await this.recoverOneNow(seed)
+    } finally {
+      this.inFlight.delete(seed.dispatch.id)
+    }
+  }
+
+  private async recoverOneNow(seed: LostAttemptSeed): Promise<boolean> {
     const { runId, taskId, dispatch } = seed
     const now = this.deps.now()
     const journal = this.deps.journal
@@ -125,9 +136,7 @@ export class RecoveryReconciler {
       return false
     }
 
-    const checkpoint = this.note('firstCheckpointFor', null as CheckpointRow | null, () =>
-      journal.firstCheckpointFor(dispatch.id)
-    )
+    const checkpoint = evidence?.checkpoint ?? null
     const baseHead = checkpoint?.gitHead ?? null
 
     const state = this.deps.getState()
@@ -164,6 +173,18 @@ export class RecoveryReconciler {
     }
 
     const git = await this.deps.readGitFacts(dispatch.cwd)
+    // The reads above waited on the event loop (a busy journal, git). A person may have stopped or
+    // reopened this dispatch meanwhile (stage 3 T1 review): acted on only while it is still a candidate.
+    // Another trigger may also have started a worker in this Run, so the concurrency room is asked again.
+    const after = this.deps.getState()
+    if (!candidates(after).some((c) => c.dispatch.id === dispatch.id)) {
+      this.deps.log(`recovery: dispatch ${dispatch.id} is no longer lost, leaving it alone`)
+      return false
+    }
+    if (!hasRoom(after, runId)) {
+      this.deps.log(`recovery: run ${runId} filled up while dispatch ${dispatch.id}'s evidence was read, left for the next trigger`)
+      return false
+    }
     const decision = decideRecovery({ attempt, git, smartResume: this.deps.smartResume() })
 
     const mk = (type: ContinuityEventType, payload: Record<string, unknown>): ContinuityEvent => ({

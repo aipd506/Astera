@@ -1303,6 +1303,7 @@ export const en: Record<keyof typeof ko, string> = {
   // Stage 3 T1: the journal's rows are read one page at a time, and a journal the Host holds locked shows
   // the rows last read rather than freezing the window
   'jobs.detail.journalOlder': 'Show older journal entries',
+  'jobs.detail.journalCapped': 'Older journal entries are not shown here. This window shows the most recent ones only.',
   'jobs.detail.journalBusy': 'The journal is busy right now, so these entries are the last ones read. They refresh with the next update.',
   // What an edge colour means. Unlike an icon, a line has nowhere to hang a tooltip
   'jobs.detail.edgeWaiting': 'waiting on this dependency',

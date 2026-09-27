@@ -33,6 +33,8 @@ interface RigOpts {
   /** runs.start 가 돌아오기 **전에** 마이크로태스크로 이 exit 코드를 배달한다 — 앱의 Host pty 팩토리가
    *  소켓이 끊긴 채 spawn 할 때(src/main/host/ptyFactory.ts 의 startDead) 하는 그대로다(review I1). */
   exitInMicrotask?: number
+  /** The journal's answer for the first checkpoint head; null (no baseline) when left out. */
+  checkpointHead?: () => string | null | 'unknown' | Promise<string | null | 'unknown'>
 }
 
 function rig(o: RigOpts = {}) {
@@ -123,7 +125,7 @@ function rig(o: RigOpts = {}) {
     isAlive: () => true,
     startReview,
     startRepair,
-    firstCheckpointHead: () => null,
+    firstCheckpointHead: o.checkpointHead ?? (() => null),
     diffNames
   }
   const validation = createTaskValidation(ctx)
@@ -237,6 +239,27 @@ describe('createTaskValidation', () => {
     conv.validation.startValidation({ taskId: conv.taskId, cwd: conv.cwd })
     await vi.waitFor(() => expect(conv.task().suspiciousFiles).toEqual(['vitest.config.ts']))
     expect(conv.diffNames).not.toHaveBeenCalled()
+    await conv.finish()
+  })
+
+  // Stage 3 T1 review: a journal too busy to answer is not "no baseline". The diff cannot run without the
+  // head, so the Task's filesModified still stands in (skipping would drop the warning), and the log says
+  // the baseline was unreadable rather than absent.
+  it('a checkpoint head the journal could not read falls back to filesModified, logged as unreadable', async () => {
+    const conv = rig({ convergence: true, filesModified: ['vitest.config.ts'], checkpointHead: async () => 'unknown' })
+    conv.validation.startValidation({ taskId: conv.taskId, cwd: conv.cwd })
+    await vi.waitFor(() => expect(conv.task().suspiciousFiles).toEqual(['vitest.config.ts']))
+    expect(conv.diffNames).not.toHaveBeenCalled()
+    expect(conv.logs.some((l) => /baseline .*could not be read/.test(l))).toBe(true)
+    await conv.finish()
+  })
+
+  it('an asynchronous checkpoint head is awaited and diffed from', async () => {
+    const conv = rig({ convergence: true, filesModified: ['x.ts'], checkpointHead: async () => 'abc123' })
+    conv.diffNames.mockResolvedValue(['vitest.config.ts'])
+    conv.validation.startValidation({ taskId: conv.taskId, cwd: conv.cwd })
+    await vi.waitFor(() => expect(conv.task().suspiciousFiles).toEqual(['vitest.config.ts']))
+    expect(conv.diffNames).toHaveBeenCalledWith(conv.cwd, 'abc123')
     await conv.finish()
   })
 

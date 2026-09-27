@@ -77,6 +77,14 @@ function harness(
     busyReads?: number
     /** A journal of the test's own in place of the recorded fake. */
     journal?: object
+    /** The first checkpoint the journal holds; `{ gitHead: 'aaa' }` when left out. */
+    checkpoint?: { gitHead: string | null; nativeSessionId?: string | null }
+    /** How many checkpoint reads meet a busy journal before one works; Infinity for every one. */
+    checkpointBusyReads?: number
+    /** Runs while the git facts are read, and returns the state after (a person acting meanwhile). */
+    duringGit?: (s: OrchState) => OrchState
+    /** Held until released, while the git facts are read. */
+    gitGate?: Promise<void>
   } = {}
 ) {
   let current = state()
@@ -87,6 +95,7 @@ function harness(
   const sleeps: number[] = []
   const pages: Array<EventsPage | undefined> = []
   let busyLeft = over.busyReads ?? 0
+  let checkpointBusyLeft = over.checkpointBusyReads ?? 0
   const journal = {
     append: (events: Array<{ type: string }>) => { for (const e of events) appended.push(e.type); return events.length },
     eventsFor: (_runId: string, page?: EventsPage) => {
@@ -98,7 +107,13 @@ function harness(
       }
       return (over.events ?? [{ type: 'PROMPT_WRITE_CONFIRMED', dispatchId: 'dsp_1' }]) as never
     },
-    firstCheckpointFor: () => ({ gitHead: 'aaa' }) as never,
+    firstCheckpointFor: () => {
+      if (checkpointBusyLeft > 0) {
+        checkpointBusyLeft -= 1
+        throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR', errcode: 5 })
+      }
+      return (over.checkpoint ?? { gitHead: 'aaa' }) as never
+    },
     startRecoveryAction: (r: { strategy: string }) => {
       const row = { recoveryActionId: 'rec_1', status: 'selected', ...r }
       actions.push({ id: 'rec_1', strategy: r.strategy, status: 'selected' })
@@ -110,7 +125,11 @@ function harness(
     getState: () => current,
     setState: async (next: OrchState) => { current = next },
     journal: (over.journal ?? journal) as never,
-    readGitFacts: async () => ({ exists: true, head: 'aaa', dirty: false, inProgress: null, conflicts: false, branch: 'main', ...over.git }),
+    readGitFacts: async () => {
+      if (over.gitGate) await over.gitGate
+      if (over.duringGit) current = over.duringGit(current)
+      return { exists: true, head: 'aaa', dirty: false, inProgress: null, conflicts: false, branch: 'main', ...over.git }
+    },
     smartResume: () => false,
     execute: async (a: { attempt: { dispatchId: string }; decision: { strategy: string } }) => {
       executed.push({ dispatchId: a.attempt.dispatchId, strategy: a.decision.strategy })
@@ -316,6 +335,81 @@ describe('RecoveryReconciler, bounded and never stalled by the journal (stage 3 
     expect(h.sleeps.length).toBeLessThanOrEqual(20)
     expect(h.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'review' }])
     expect(h.logs.some((l) => /busy/.test(l))).toBe(true)
+  })
+})
+
+// Stage 3 T1 review, Important: the first checkpoint is evidence too. A busy read of it read as "no
+// checkpoint" dropped the base head and the native session, and a worker that committed on a clean tree
+// was restarted from scratch, its commits duplicated.
+describe('RecoveryReconciler, a busy checkpoint read (stage 3 T1 review)', () => {
+  // The worker committed (HEAD moved from the checkpoint's aaa to bbb) and left a clean tree.
+  const committed = { git: { head: 'bbb', dirty: false } }
+
+  it('a checkpoint read that stays busy asks a person, never restarts the worker', async () => {
+    const h = harness({ ...committed, checkpointBusyReads: Infinity })
+    expect(await h.r.reconcileAll()).toBe(1)
+    expect(h.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'review' }])
+    expect(h.sleeps.length).toBeGreaterThan(0)
+  })
+
+  it('a checkpoint read that is busy once and then answers decides from the checkpoint', async () => {
+    const h = harness({ ...committed, checkpointBusyReads: 1 })
+    expect(await h.r.reconcileAll()).toBe(1)
+    // committedNoCheck: the base head was read, so the commit is seen and a person judges it.
+    expect(h.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'review' }])
+    expect(h.sleeps).toHaveLength(1)
+    const native = harness({ ...committed, checkpointBusyReads: 1, checkpoint: { gitHead: 'aaa', nativeSessionId: 'nat-1' } })
+    await native.r.reconcileAll()
+    expect(native.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'resume-native' }])
+  })
+
+  it('a checkpoint that does not exist is no evidence either way: the rows decide as before', async () => {
+    const h = harness({ checkpoint: { gitHead: null } })
+    await h.r.reconcileAll()
+    expect(h.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'redispatch' }])
+  })
+})
+
+// Stage 3 T1 review, minor 1: the reads now wait on the event loop, so a sweep and a live reconcileOne for
+// the same dispatch can overlap, and a person can close the dispatch meanwhile.
+describe('RecoveryReconciler, overlapping triggers (stage 3 T1 review)', () => {
+  it('a sweep and a live reconcileOne for the same dispatch act once', async () => {
+    let release!: () => void
+    const gitGate = new Promise<void>((r) => (release = r))
+    const h = harness({ gitGate })
+    const all = h.r.reconcileAll()
+    const one = h.r.reconcileOne('dsp_1')
+    release()
+    await Promise.all([all, one])
+    expect(h.executed).toHaveLength(1)
+    expect(h.appended.filter((t) => t === 'RECOVERY_DETECTED')).toHaveLength(1)
+  })
+
+  it('a dispatch a person closes while the evidence is read is left alone, nothing journaled', async () => {
+    const h = harness({
+      duringGit: (s) => ({ ...s, dispatches: s.dispatches.map((d) => (d.id === 'dsp_1' ? { ...d, closedBy: 'stop' as const } : d)) })
+    })
+    expect(await h.r.reconcileAll()).toBe(0)
+    expect(h.executed).toEqual([])
+    expect(h.appended).toEqual([])
+    expect(h.actions).toEqual([])
+  })
+
+  it('a Run that fills up while the evidence is read is left for the next trigger, nothing journaled', async () => {
+    // Other triggers start workers for the Run's other Tasks meanwhile, up to DEFAULT_CONCURRENCY (3).
+    const fill = (s: OrchState): OrchState => ({
+      ...s,
+      tasks: [...s.tasks, ...[7, 8, 9].map((n) => task({ id: `tsk_${n}` }))],
+      dispatches: [
+        ...s.dispatches,
+        ...[7, 8, 9].map((n) => dispatch({ id: `dsp_${n}`, taskId: `tsk_${n}`, sessionId: `sess-${n}`, startedAt: NOW, endedAt: undefined, workerState: 'ready' }))
+      ]
+    })
+    const full = harness({ duringGit: fill })
+    expect(await full.r.reconcileAll()).toBe(0)
+    expect(full.executed).toEqual([])
+    expect(full.appended).toEqual([])
+    expect(full.actions).toEqual([])
   })
 })
 

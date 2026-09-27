@@ -3,7 +3,7 @@ import { existsSync, promises as fs, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createAppJournal, TIMELINE_PAGE, type AppJournal, type AppJournalDeps } from './appJournal'
+import { createAppJournal, TIMELINE_PAGE, TIMELINE_PAGES_MAX, type AppJournal, type AppJournalDeps } from './appJournal'
 import { ContinuityJournal } from '../../core/continuity/journal'
 import { JournalReader } from '../../core/continuity/journalReader'
 import { holdLock, recoveryActionsIn } from '../../core/continuity/sqliteLockFixtures'
@@ -141,7 +141,7 @@ describe('createAppJournal', () => {
     expect(finish[0].id).toBe(row.recoveryActionId)
   })
 
-  it('reads the rows the Host wrote, through a read-only connection', () => {
+  it('reads the rows the Host wrote, through a read-only connection', async () => {
     const host = new ContinuityJournal(file())
     opened.push(host)
     host.append([{ runId: 'run_1', taskId: 'tsk_1', dispatchId: 'dsp_1', type: 'ATTEMPT_LOST', at: NOW, idempotencyKey: 'l1', payload: {}, actor: { surface: 'host' } }])
@@ -153,7 +153,7 @@ describe('createAppJournal', () => {
     })
     expect(j.timeline('run_1', state).events.map((e) => e.kind)).toEqual(['runtime-lost'])
     expect(j.reconcilerJournal.eventsFor('run_1').map((e) => e.actor)).toEqual([{ surface: 'host' }])
-    expect(j.firstCheckpointHead('dsp_1')).toBeNull()
+    expect(await j.firstCheckpointHead('dsp_1')).toBeNull()
   })
 
   // P1 carry-over 3: orch.runDetail scanned the journal twice (once for the lost rows, once for the
@@ -191,7 +191,7 @@ describe('createAppJournal', () => {
   it('off, it reads nothing and sends nothing', async () => {
     const { j, calls } = make(JOURNAL_HOST)
     j.close()
-    expect(j.timeline('run_1', on())).toEqual({ events: [], busy: false, older: false })
+    expect(j.timeline('run_1', on())).toEqual({ events: [], busy: false, older: false, capped: false })
     j.note({ runId: 'run_1', type: 'PROMPT_WRITE_REQUESTED', at: NOW, idempotencyKey: 'p', payload: {} })
     await j.settled()
     expect(calls).toEqual([])
@@ -307,7 +307,7 @@ describe('runDetail’s journal rows on the main thread (stage 3 T1)', () => {
     try {
       const first = j.timeline('run_1', on())
       expect(first.events).toHaveLength(TIMELINE_PAGE)
-      expect(first).toMatchObject({ busy: false, older: true })
+      expect(first).toMatchObject({ busy: false, older: true, capped: false })
       const both = j.timeline('run_1', on(), 2)
       expect(both.events).toHaveLength(TIMELINE_PAGE + 1)
       expect(both.older).toBe(false)
@@ -319,6 +319,19 @@ describe('runDetail’s journal rows on the main thread (stage 3 T1)', () => {
     } finally {
       reads.mockRestore()
     }
+  })
+
+  // Stage 3 T1 review, minor 3: at the most pages a read may ask for, "show older" could do nothing more.
+  it('at the most pages, older rows left are capped rather than offered', () => {
+    const host = new ContinuityJournal(file())
+    opened.push(host)
+    host.append(Array.from({ length: TIMELINE_PAGES_MAX * 2 + 1 }, (_, i) => lost(i)))
+    const { j } = make(JOURNAL_HOST, { timelinePage: 2 })
+    expect(j.timeline('run_1', on(), TIMELINE_PAGES_MAX - 1)).toMatchObject({ older: true, capped: false })
+    const at = j.timeline('run_1', on(), TIMELINE_PAGES_MAX)
+    expect(at.events).toHaveLength(TIMELINE_PAGES_MAX * 2)
+    expect(at).toMatchObject({ older: true, capped: true })
+    expect(j.timeline('run_1', on(), TIMELINE_PAGES_MAX + 5)).toMatchObject({ older: true, capped: true })
   })
 
   it('under a held write lock, answers within about 300 ms, empty with the busy flag, and reads again later', () => {
@@ -335,7 +348,7 @@ describe('runDetail’s journal rows on the main thread (stage 3 T1)', () => {
       lock.release()
     }
     expect(Date.now() - t0).toBeLessThan(300 + 150)
-    expect(t).toEqual({ events: [], busy: true, older: false })
+    expect(t).toEqual({ events: [], busy: true, older: false, capped: false })
     expect(logs.some((l) => /busy/.test(l))).toBe(true)
     expect(j.timeline('run_1', on())).toMatchObject({ busy: false, events: [expect.objectContaining({ kind: 'runtime-lost' })] })
   }, 15_000)
@@ -353,13 +366,38 @@ describe('runDetail’s journal rows on the main thread (stage 3 T1)', () => {
     try {
       expect(j.timeline('run_1', on())).toEqual({ ...good, busy: true })
       expect(j.timeline('run_1', on())).toEqual({ ...good, busy: true })
-      expect(j.timeline('run_2', on())).toEqual({ events: [], busy: true, older: false })
+      expect(j.timeline('run_2', on())).toEqual({ events: [], busy: true, older: false, capped: false })
     } finally {
       reads.mockRestore()
     }
     // A run of busy reads is one log line, not one per snapshot.
     expect(logs.filter((l) => /busy/.test(l))).toHaveLength(1)
     expect(j.timeline('run_1', on()).busy).toBe(false)
+  })
+
+  // Stage 3 T1 review: the validation diff base asks a busy journal again, and one still busy is
+  // 'unknown' (a baseline may exist), never null (there is none).
+  it('the validation diff base asks a busy journal again, and still busy is unknown, not null', async () => {
+    const host = new ContinuityJournal(file())
+    opened.push(host)
+    host.saveCheckpoint({ runId: 'run_1', taskId: 'tsk_1', dispatchId: 'dsp_1', kind: 'attempt-started', at: NOW, state: {} as never, gitHead: 'abc', worktreePath: null, nativeSessionId: null, handoffRef: null })
+    const sleeps: number[] = []
+    const { j } = make(JOURNAL_HOST, { sleep: async (ms) => void sleeps.push(ms) })
+    let busyLeft = 2
+    const real = JournalReader.prototype.firstCheckpointFor
+    const reads = vi.spyOn(JournalReader.prototype, 'firstCheckpointFor').mockImplementation(function (this: JournalReader, id: string) {
+      if (busyLeft-- > 0) throw busyError()
+      return real.call(this, id)
+    })
+    try {
+      expect(await j.firstCheckpointHead('dsp_1')).toBe('abc')
+      expect(sleeps).toHaveLength(2)
+      busyLeft = Infinity
+      expect(await j.firstCheckpointHead('dsp_1')).toBe('unknown')
+    } finally {
+      reads.mockRestore()
+    }
+    expect(await j.firstCheckpointHead('dsp_none')).toBeNull()
   })
 
   it('the reconciler’s reads pass their bound through to the reader', () => {

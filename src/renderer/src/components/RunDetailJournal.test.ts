@@ -15,18 +15,24 @@ vi.mock('../i18n/I18nProvider', () => ({
 // holds locked shows the rows last read instead of freezing the window.
 describe('RunDetail journal notes', () => {
   it('offers "show older" only while older journal rows are left', () => {
-    const html = renderToStaticMarkup(React.createElement(JournalOlder, { journal: { busy: false, older: true }, onShowOlder: () => {} }))
+    const html = renderToStaticMarkup(React.createElement(JournalOlder, { journal: { busy: false, older: true, capped: false }, onShowOlder: () => {} }))
     expect(html).toContain('<button')
     expect(html).toContain('jobs.detail.journalOlder')
-    expect(renderToStaticMarkup(React.createElement(JournalOlder, { journal: { busy: false, older: false }, onShowOlder: () => {} }))).toBe('')
+    expect(renderToStaticMarkup(React.createElement(JournalOlder, { journal: { busy: false, older: false, capped: false }, onShowOlder: () => {} }))).toBe('')
     expect(renderToStaticMarkup(React.createElement(JournalOlder, { journal: undefined, onShowOlder: () => {} }))).toBe('')
   })
 
+  it('at the most pages, says older entries are left instead of offering a button that does nothing', () => {
+    const html = renderToStaticMarkup(React.createElement(JournalOlder, { journal: { busy: false, older: true, capped: true }, onShowOlder: () => {} }))
+    expect(html).not.toContain('<button')
+    expect(html).toContain('jobs.detail.journalCapped')
+  })
+
   it('says the journal is busy only while it is', () => {
-    expect(renderToStaticMarkup(React.createElement(JournalBusy, { journal: { busy: true, older: false } }))).toContain(
+    expect(renderToStaticMarkup(React.createElement(JournalBusy, { journal: { busy: true, older: false, capped: false } }))).toContain(
       'jobs.detail.journalBusy'
     )
-    expect(renderToStaticMarkup(React.createElement(JournalBusy, { journal: { busy: false, older: true } }))).toBe('')
+    expect(renderToStaticMarkup(React.createElement(JournalBusy, { journal: { busy: false, older: true, capped: false } }))).toBe('')
     expect(renderToStaticMarkup(React.createElement(JournalBusy, { journal: undefined }))).toBe('')
   })
 })

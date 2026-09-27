@@ -4348,7 +4348,7 @@ export function registerIpc(
     const events = [...timelineFor(state, detailRunId, (id) => known.has(id)), ...journal.events].sort((a, b) =>
       a.at.localeCompare(b.at)
     )
-    return { events, layers, deps, cyclic, journal: { busy: journal.busy, older: journal.older } }
+    return { events, layers, deps, cyclic, journal: { busy: journal.busy, older: journal.older, capped: journal.capped } }
   })
   /** 한 Task 가 왜 완료 정책을 못 넘었는가 — 화면이 블록을 펼칠 때 한 번 부른다(설계 §2.2).
    *
