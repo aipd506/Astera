@@ -91,7 +91,9 @@ function pastedImageLine(text: string, bytes: number, seed: number): string {
   })
 }
 
-function turnLines(i: number): string[] {
+function turnLines(i: number, opts?: { bash?: boolean }): string[] {
+  // Without Bash the turn still calls a tool (Read), so its result lines are there to be mistaken for one.
+  const tool = opts?.bash === false ? { name: 'Read', input: { file_path: `f${i}.ts` } } : { name: 'Bash', input: { command: `npm test -- ${i}` } }
   const out = [
     line({ type: 'user', message: { role: 'user', content: `요청 ${i} — 이것을 고쳐 주세요` }, timestamp: `t${i}u` }),
     line({
@@ -100,7 +102,7 @@ function turnLines(i: number): string[] {
         role: 'assistant',
         content: [
           { type: 'text', text: `응답 ${i}` },
-          { type: 'tool_use', id: `bash-${i}`, name: 'Bash', input: { command: `npm test -- ${i}` } }
+          { type: 'tool_use', id: `bash-${i}`, ...tool }
         ]
       },
       timestamp: `t${i}a`
@@ -163,6 +165,18 @@ const fixtures: Array<[string, () => string]> = [
         line({ type: 'user', message: { content: `q${i}` } }),
         line({ type: 'assistant', message: { content: [{ type: 'text', text: `a${i} ` + 'y'.repeat(3000) }] } })
       ]).flat()
+    ].join('\n')],
+  // The last Bash call is 25 requests back: every recent turn calls Read instead.
+  ['last Bash long ago', () =>
+    [...transcript(3), ...Array.from({ length: 25 }, (_, i) => turnLines(100 + i, { bash: false })).flat()].join('\n')],
+  // A Bash call whose result lands far after it, behind a later, nearer Bash pair: the far result is
+  // the one that finished last, so it is the last command.
+  ['a Bash result far from its call', () =>
+    [
+      line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'far', name: 'Bash', input: { command: 'npm run long' } }] } }),
+      ...Array.from({ length: 25 }, (_, i) => turnLines(200 + i, { bash: false })).flat(),
+      ...turnLines(300),
+      line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'far', content: 'long done' }] } })
     ].join('\n')],
   ['assistant only', () =>
     Array.from({ length: 5 }, (_, i) => line({ type: 'assistant', message: { content: [{ type: 'text', text: `a${i}` }] } })).join('\n')]
@@ -288,4 +302,54 @@ describe('windowed parse — a big transcript is read only as far as it must be'
     expect(preview.truncated).toBe(true)
     expect(preview.messages[0]).toMatchObject({ role: 'user', text: '요청 99 — 이것을 고쳐 주세요' })
   }, 60_000)
+})
+
+// Where the windowed resume is documented to differ from the whole-file read. Each case states it.
+describe('windowed parse — the documented differences', () => {
+  it('a title past the head cap: the first title in the tail window stands in for the first in the file', async () => {
+    const filler = Array.from({ length: 40 }, (_, i) =>
+      line({ type: 'assistant', message: { content: [{ type: 'text', text: `filler ${i} ` + 'z'.repeat(200) }] } })
+    )
+    const file = await write(
+      'title-past-head.jsonl',
+      [
+        ...filler, // ~9 KB with no title record
+        line({ type: 'ai-title', aiTitle: 'early title' }),
+        ...Array.from({ length: 40 }, (_, i) => turnLines(i)).flat(),
+        line({ type: 'ai-title', aiTitle: 'late title' }),
+        ...Array.from({ length: 25 }, (_, i) => turnLines(100 + i)).flat()
+      ].join('\n')
+    )
+    expect((await referenceParseTranscriptForResume(file)).title).toBe('early title')
+    // Head capped at 4 KB, short of the early title; the tail window never reaches it either.
+    const capped = await parseTranscriptForResume(file, { tailBytes: 1024, headBytes: 1024, maxHeadBytes: 4096 })
+    expect(capped.title).toBe('late title')
+    // With a head cap that reaches it, the answer is the whole-file one again.
+    const reached = await parseTranscriptForResume(file, { tailBytes: 1024, headBytes: 1024 })
+    expect(reached).toEqual(await referenceParseTranscriptForResume(file))
+  })
+
+  it('a line over 4M characters is not parsed: a request that long is left out', async () => {
+    const huge = 'word '.repeat(900_000) // 4.5M characters, no base64 run to empty
+    const file = await write('huge-line.jsonl', [...transcript(2), line({ type: 'user', message: { content: huge } })].join('\n'))
+    const reference = await referenceParseTranscriptForResume(file)
+    expect(reference.requests.at(-1)).toBe(huge)
+    const got = await parseTranscriptForResume(file)
+    expect(got.requests).toEqual(reference.requests.slice(0, -1))
+    expect(got.requests.at(-1)).toBe('요청 1 — 이것을 고쳐 주세요')
+  })
+
+  it('typed text in a line over 256K characters: a value that is all base64 is emptied, base64 inside prose is kept', async () => {
+    const run = base64Of(300_000, 3) // a whole message that is one long base64 token
+    const prose = '이 토큰을 확인해 주세요 ' + base64Of(5_000, 5) + ' ' + 'and more words '.repeat(20_000) // 300K+ characters
+    const file = await write(
+      'typed-base64.jsonl',
+      [...transcript(2), line({ type: 'user', message: { content: run } }), line({ type: 'user', message: { content: prose } })].join('\n')
+    )
+    const reference = await referenceParseTranscriptForResume(file)
+    expect(reference.requests.slice(-2)).toEqual([run, prose])
+    const got = await parseTranscriptForResume(file)
+    // The all-base64 message becomes "" and so is no request; the prose around a token survives whole.
+    expect(got.requests.slice(-2)).toEqual(['요청 1 — 이것을 고쳐 주세요', prose])
+  })
 })

@@ -336,6 +336,8 @@ type ResumeLine =
       kind: 'message'
       role: 'user' | 'assistant'
       bashUses: Array<{ id: string; command: string }>
+      /** 이 줄의 tool_use id 전부(Bash 가 아닌 것도) — 창이 어떤 결과의 호출까지 담았는지 알려고 든다 */
+      toolUseIds: string[]
       toolResults: Array<{ id: string; failed: boolean; excerpt: string }>
       text: string | null
       isMeta: boolean
@@ -365,6 +367,7 @@ function resumeLineOf(obj: Record<string, unknown>): ResumeLine | null {
     kind: 'message',
     role: obj.type,
     bashUses: [],
+    toolUseIds: [],
     toolResults: [],
     text: extractText(obj.message),
     isMeta: isMetaUserRecord(obj),
@@ -378,6 +381,7 @@ function resumeLineOf(obj: Record<string, unknown>): ResumeLine | null {
     for (const b of blocks) {
       if (b === null || typeof b !== 'object') continue
       const item = b as Record<string, unknown>
+      if (obj.type === 'assistant' && item.type === 'tool_use' && typeof item.id === 'string') line.toolUseIds.push(item.id)
       if (obj.type === 'assistant' && item.type === 'tool_use' && item.name === 'Bash') {
         const input = item.input as { command?: unknown } | undefined
         if (typeof item.id === 'string' && typeof input?.command === 'string') {
@@ -445,22 +449,42 @@ function foldResume(lines: readonly ResumeLine[]): TranscriptResumeMaterial {
   return result
 }
 
-/** 창이 이만큼을 담았으면 더 넓혀도 재료가 바뀌지 않는다: 요청과 꼬리가 둘 다 상한까지 찼고(그
- *  앞의 것은 어차피 밀려난다), 손댄 파일 목록의 출처인 가장 최근 snapshot 이 창 안에 있다.
- *  lastCommand 는 조건에 넣지 않는다 — Bash 를 한 번도 쓰지 않은 세션이 매번 상한까지 읽게 되고,
- *  요청 20 개 앞의 명령은 재개 브리핑이 말할 "마지막 명령" 이 아니다. */
+/** 창이 이만큼을 담았으면 더 넓혀도 재료가 바뀌지 않는다:
+ *  - 요청과 꼬리가 둘 다 상한(READ_BUFFER_MAX)까지 찼다 — 그 앞의 것은 어차피 밀려난다.
+ *  - 손댄 파일 목록의 출처인 가장 최근 snapshot 이 창 안에 있다.
+ *  - 완료된 Bash 호출(짝)이 창 안에 있고, **그 뒤의 어떤 tool_result 도 호출이 창 밖에 있지 않다.**
+ *    창 밖에서 시작한 Bash 가 그 뒤에 끝났다면 전체 읽기의 lastCommand 는 그것이다 — 결과가 어느
+ *    도구의 것인지는 호출을 봐야 알 수 있으므로, 호출이 창 밖인 결과가 하나라도 남아 있으면 넓힌다.
+ *    호출은 보통 결과 바로 앞에 있어 한 번 넓히면 풀린다.
+ *  셋 중 무엇이든 끝내 안 차는 파일(Bash 를 한 번도 안 쓴 세션 등)은 상한까지 읽는다 — 그 비용은
+ *  상한이 묶고, 비동기다. */
 function resumeWindowIsEnough(lines: readonly ResumeLine[]): boolean {
   let requests = 0
   let tail = 0
   let snapshot = false
+  const uses = new Set<string>()
+  const pendingBash = new Set<string>()
+  let paired = false
+  let orphanAfterPair = false
   for (const line of lines) {
     if (line.kind === 'snapshot') snapshot = true
-    if (line.kind !== 'message' || line.text === null) continue
+    if (line.kind !== 'message') continue
+    for (const id of line.toolUseIds) uses.add(id)
+    for (const use of line.bashUses) pendingBash.add(use.id)
+    for (const r of line.toolResults) {
+      if (pendingBash.delete(r.id)) {
+        paired = true
+        orphanAfterPair = false
+      } else if (!uses.has(r.id)) {
+        orphanAfterPair = true
+      }
+    }
+    if (line.text === null) continue
     if (line.role === 'user' && (!isRealUserText(line.text) || line.isMeta)) continue
     tail++
     if (line.role === 'user') requests++
   }
-  return snapshot && requests >= READ_BUFFER_MAX && tail >= READ_BUFFER_MAX
+  return snapshot && paired && !orphanAfterPair && requests >= READ_BUFFER_MAX && tail >= READ_BUFFER_MAX
 }
 
 function resumeLinesOf(raw: readonly string[]): ResumeLine[] {
@@ -482,13 +506,23 @@ function resumeLinesOf(raw: readonly string[]): ResumeLine[] {
  *  재료가 다 찰 때까지(resumeWindowIsEnough) 두 배씩 넓히되 TRANSCRIPT_TAIL_BYTES_MAX 에서 멈춘다.
  *  무거운 줄은 parseTranscriptLine 이 base64 를 비우고 파싱한다.
  *
- *  **결과는 전체 읽기와 같다** — 파일 전체가 창에 들어오거나, 창이 재료를 다 담은 경우. 상한에서
- *  멈춘 경우만 다르다: 요청·꼬리가 덜 찬 채로 돌아오고, 창 밖에서 시작해 창 안에서 끝난 Bash
- *  호출은 짝을 못 찾는다.
- *
  *  제목만은 파일의 **첫** 제목 레코드여야 하고 그것은 앞머리에 있다(TRANSCRIPT_HEAD_BYTES 의 실측).
- *  꼬리 창이 파일 처음까지 닿지 않았으면 작은 머리 창을 따로 읽어 찾는다. 머리 창에서도 못 찾으면
- *  꼬리 창에서 처음 만난 제목을 쓴다 — 머리 창이 꼬리 창에 닿았다면 그것이 곧 첫 제목이다. */
+ *  꼬리 창이 파일 처음까지 닿지 않았으면 작은 머리 창(TRANSCRIPT_HEAD_BYTES → _MAX)을 따로 읽어
+ *  찾는다. 머리 창에서 못 찾으면 꼬리 창에서 처음 만난 제목을 쓴다 — 머리 창이 꼬리 창에 닿았다면
+ *  그것이 곧 첫 제목이다.
+ *
+ *  **결과는 전체 읽기와 같다. 다를 수 있는 경우는 정확히 이것뿐이다:**
+ *  1. 꼬리 창이 상한(TRANSCRIPT_TAIL_BYTES_MAX)에 닿고도 재료가 안 찼을 때 — 요청·꼬리가 덜 찬
+ *     채로, 손댄 파일이 창 안의 마지막 snapshot 에서(없으면 빈 채로), lastCommand 가 창 안에서
+ *     짝지은 마지막 호출(없으면 null)로 돌아온다.
+ *  2. 머리 창이 상한(TRANSCRIPT_HEAD_BYTES_MAX)에 닿고도 제목을 못 찾았고 꼬리 창에도 닿지 않았을 때 —
+ *     제목이 꼬리 창의 첫 제목(없으면 null)이 된다.
+ *  3. 줄 하나가 HEAVY_LINE_CHARS 를 넘을 때 — 값 전체가 4096 자 이상의 base64 인 JSON 문자열은
+ *     빈 문자열로 읽힌다(transcriptWindow.ts 의 parseTranscriptLine). 사람이 그런 토큰 하나만을
+ *     메시지로 보냈다면 그 요청은 빠진다. 글 사이에 낀 토큰은 그대로다.
+ *  4. 그러고도 줄 하나가 PARSE_LINE_CHARS_MAX 를 넘을 때 — 그 줄은 파싱하지 않고 건너뛴다.
+ *  1·2 는 창 크기의 문제라 상한을 넘는 파일에서만, 3·4 는 창과 무관하게 그런 줄이 있을 때만
+ *  생긴다. 이 넷은 parserWindow.test.ts 가 하나씩 보여 준다. */
 export async function parseTranscriptForResume(
   filePath: string,
   opts?: TranscriptWindowOptions
@@ -588,7 +622,8 @@ function userCount(messages: readonly TranscriptMessage[]): number {
  *  상한(TRANSCRIPT_TAIL_BYTES_MAX)에서 멈춘 경우만 추정이다: 창 앞에 무엇이 더 있으므로 truncated 는
  *  참이다. 창 안에 user 메시지가 maxTurns 개 있으면 첫 user 메시지 앞의 assistant 응답은 창 밖의
  *  (보여 주지 않을) 턴에 속하므로 떨어뜨리고, 그보다 적으면 그 응답이 속한 턴도 보여 줄 턴이므로
- *  보이는 만큼 남긴다. */
+ *  보이는 만큼 남긴다. 줄 하나가 너무 길 때의 차이(parseTranscriptForResume 문서의 3·4)는 여기서도
+ *  같다. */
 export async function parseTranscriptPreview(
   filePath: string,
   maxTurns = PREVIEW_TURNS,
