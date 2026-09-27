@@ -23,7 +23,13 @@ and the Host announces `workspace` on all three.
   desk closes or its Xvfb exits. The person's session bus, portals, notifications, tray, `wayland-0` and
   audio sockets all live on that bus or in their runtime folder, so the app reaches none of them. The
   tools the desk runs get the same environment. `windows()` and `keys()` use xdotool, `windowShot()` and the frames without CDP use
-  ImageMagick's `import`. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
+  ImageMagick's `import`. Xvfb runs with `-noreset`, and before anything is launched the desk moves
+  the display's pointer to its last pixel, bottom right, out of the centered window an Electron app
+  opens with no window manager: X reports a window mapped, moved or resized under the pointer to the
+  app as a mouse move with no button down, and Chromium lets that end the press `drag()` made over
+  CDP. `keys()` types what the US keyboard has a key for at xdotool's default 12 ms a character, and
+  anything else (Hangul, emoji, accented letters) at 100 ms, since xdotool binds each such character
+  to a spare key just for it and Chromium, reading the binding late, drops some at the default. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
   `app js` is refused, with the install line for the distribution, when Xvfb, xdotool or `import` is
   missing.
 - **macOS** (`src/host/workspace/deskMac.ts`). Nothing is created. The app starts in the person's
@@ -75,7 +81,8 @@ Known limits, beside the spec's:
   tested. A Screen Recording and Accessibility permission mode may come later, as an
   opt-in, to move a window or drive native input (user decision L3a).
 - **Linux:** an app that only speaks Wayland cannot start on Xvfb; Electron apps use X11 through the
-  hint. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The app starts
+  hint. A window that covers the whole screen covers the parked pointer too, so a window mapped over
+  it during `drag()` can still stop that drag from starting. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The app starts
   with no session bus, so none of the person's services reach it, their secret service included: an
   app that keeps secrets with Electron's `safeStorage` gets its `basic_text` backend there, not the
   person's keyring, and a file chooser opens as the toolkit's own dialog on the virtual display, never
