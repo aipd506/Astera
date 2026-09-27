@@ -42,4 +42,9 @@ describe('workspaceDeskStarter', () => {
     const desk = await workspaceDeskStarter({ platform: 'darwin', profileDir: '/unused', hostEnv: {}, log: () => {}, mac })('astera-ws-1-1')
     expect(desk).toMatchObject({ name: 'mac-bg-astera-ws-1-1', pid: null })
   })
+
+  it('on any other platform rejects with the unsupported reason and starts nothing', async () => {
+    const start = workspaceDeskStarter({ platform: 'freebsd', profileDir: '/unused', hostEnv: {}, log: () => {} })
+    await expect(start('astera-ws-1-1')).rejects.toThrow('does not run on freebsd')
+  })
 })

@@ -224,6 +224,11 @@ describe('Linux and macOS', () => {
     expect(linuxTools).not.toHaveBeenCalled()
   })
 
+  it('over SSH on Windows, refuses for SSH even with the setting off, since turning it on would not help', async () => {
+    const { m } = await rig({ platform: 'win32', env: { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' }, enabled: async () => false })
+    expect(await m.run('s1', 'log(1)')).toMatchObject({ status: 409, body: { error: expect.stringContaining('SSH') } })
+  })
+
   it('on macOS, refuses over SSH', async () => {
     const { m } = await rig({ platform: 'darwin', env: { SSH_TTY: '/dev/ttys001' } })
     expect(await m.run('s1', 'log(1)')).toMatchObject({ status: 409, body: { error: expect.stringContaining('SSH') } })

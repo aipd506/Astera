@@ -429,7 +429,11 @@ export function createWorkspaceManager(d: WorkspaceManagerDeps): WorkspaceManage
   return {
     run: async (sessionId, script) => {
       if (disposed) return { status: 409, body: { error: 'the Host is leaving' } }
-      // The setting first: a Host with the workspace off always says so, whatever else is missing.
+      // What no setting can change comes first (the platform, SSH), then the setting, then the Linux
+      // tools: a Host with the workspace off says so before naming tools to install, but never tells the
+      // person to turn on what could not run here anyway.
+      const fixed = workspaceRefusal({ platform: d.platform, env: d.env, linuxTools: null })
+      if (fixed) return { status: 409, body: { error: fixed } }
       let on: boolean
       try {
         on = await d.enabled()
