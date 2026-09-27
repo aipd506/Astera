@@ -7,12 +7,16 @@ import {
   PROBE_DEGRADED_TTL_MS,
   PROBE_STUCK_CEILING_MS,
   PROBE_TIMEOUT_MS,
+  PROBE_STUCK_MAX,
   PathKeyedCache,
+  ProbeBudget,
   createProbePool,
+  processProbeBudget,
   createProber,
   findOnPath,
   rootOf
 } from './pathProbe'
+import { createActionPresenceCheck, createPresenceCheck } from '../worktrees/presence'
 
 /** A promise the test settles by hand — how a hung SMB call and its eventual answer are both played. */
 function deferred<T = void>() {
@@ -86,6 +90,8 @@ function threadpool(deadRoots: string[], present: (p: string) => boolean = () =>
 
 afterEach(() => {
   vi.useRealTimers()
+  // The budget is process-wide: calls a test left hung must not count against the next test.
+  processProbeBudget().reset()
 })
 
 describe('the probe constants', () => {
@@ -312,6 +318,9 @@ describe('the cwd probe', () => {
     const pool = createProbePool()
     const pathProbe = createProber({ access: tp.access, pool, log: () => {} })
     const cwdProbe = createProber({ access: tp.access, pool, log: () => {}, skipQueue: true })
+    // C: has answered before (the app's own folders are on it). With the process-wide budget, a root
+    // never heard from is refused once 3 calls are stuck or in flight on unknown roots; C: is not.
+    expect(await cwdProbe('C:\\Users')).toBe('present')
     // Two dead PATH roots: two calls stuck, two threads left.
     const stuck = [pathProbe('Z:\\bin\\git.exe'), pathProbe('Y:\\bin\\git.exe')]
     await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
@@ -466,5 +475,88 @@ describe('findOnPath', () => {
   it('says where the file is: the first directory, in PATH order, that holds it', async () => {
     const probe = async (p: string) => (p.startsWith('C:\\a') ? ('absent' as const) : ('present' as const))
     expect((await findOnPath('C:\\a;D:\\b;C:\\c', 'pwsh.exe', probe, ';', win32.join)).at).toBe('D:\\b\\pwsh.exe')
+  })
+})
+
+// Review round 2, I1. Every lane used to keep its own stuck calls: the PATH pool, the session folder's
+// lane, the worktree sweep and the worktree action lane. One dead root could then hold a thread in each
+// of them, more than libuv's 4, and each further dead root added more. They now share one budget.
+describe('the process-wide probe budget, across every lane', () => {
+  const lanes = (budget: ProbeBudget, access: (p: string) => Promise<void>) => {
+    const pathPool = createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, budget)
+    return {
+      path: createProber({ access, pool: pathPool, log: () => {} }),
+      cwd: createProber({ access, pool: pathPool, log: () => {}, skipQueue: true }),
+      sweep: createPresenceCheck({ access, pool: createProbePool(1, PROBE_STUCK_CEILING_MS, budget), log: () => {} }),
+      action: createActionPresenceCheck({ access, pool: createProbePool(PROBE_CONCURRENCY, PROBE_STUCK_CEILING_MS, budget), log: () => {} })
+    }
+  }
+
+  it('dead roots across all lanes never hold more than one stuck call per root, nor more than 3 in all', async () => {
+    vi.useFakeTimers()
+    const dead = ['z:\\', 'y:\\', 'x:\\', 'w:\\', 'v:\\']
+    const tp = threadpool(dead)
+    const budget = new ProbeBudget()
+    const l = lanes(budget, tp.access)
+    const asks: Promise<unknown>[] = []
+    for (let round = 0; round < 3; round++) {
+      for (const d of ['Z:', 'Y:', 'X:', 'W:', 'V:']) {
+        asks.push(l.path(`${d}\\bin\\git.exe`), l.cwd(`${d}\\proj`), l.sweep(`${d}\\wt\\a`), l.action(`${d}\\wt\\b`))
+      }
+      for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS / 2)
+    }
+    await Promise.all(asks)
+    expect(tp.peak().perRoot).toBe(1)
+    expect(tp.hung.length).toBeLessThanOrEqual(PROBE_STUCK_MAX)
+    expect(tp.inFlight()).toBeLessThanOrEqual(PROBE_STUCK_MAX)
+    expect(budget.stuckCount()).toBeLessThanOrEqual(PROBE_STUCK_MAX)
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+
+  it('keeps answering a root that answered recently while 3 calls are stuck, and refuses others without a call', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['z:\\', 'y:\\', 'x:\\'])
+    const budget = new ProbeBudget()
+    const l = lanes(budget, tp.access)
+    expect(await l.cwd('C:\\work\\proj')).toBe('present')
+    const stuck = [l.path('Z:\\bin\\git.exe'), l.sweep('Y:\\wt\\a'), l.action('X:\\wt\\b')]
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    await Promise.all(stuck)
+    expect(budget.stuckCount()).toBe(3)
+    const local = [l.cwd('C:\\work\\other'), l.action('C:\\wt\\c'), l.path('C:\\Windows\\cmd.exe')]
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await local[0]).toBe('present')
+    expect(await local[1]).toBe('present')
+    expect(await local[2]).toBe('present')
+    const before = tp.started.length
+    const unknownRoot = l.cwd('Q:\\never')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await unknownRoot).toBe('timeout')
+    expect(tp.started.length).toBe(before)
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+
+  it('a root stuck in one lane answers at once, without a call, in every other lane', async () => {
+    vi.useFakeTimers()
+    const tp = threadpool(['z:\\'])
+    const l = lanes(new ProbeBudget(), tp.access)
+    const first = l.sweep('Z:\\wt\\a')
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    expect(await first).toBe('unreachable')
+    const others = [l.path('Z:\\bin\\git.exe'), l.cwd('Z:\\proj'), l.action('Z:\\wt\\b')]
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await Promise.all(others)).toEqual(['timeout', 'timeout', 'refused'])
+    expect(tp.started).toEqual(['Z:\\wt\\a'])
+    await vi.advanceTimersByTimeAsync(PROBE_STUCK_CEILING_MS)
+  })
+
+  it('the headers state the real budget', async () => {
+    const { readFileSync } = await import('node:fs')
+    const probeSrc = readFileSync(new URL('./pathProbe.ts', import.meta.url), 'utf8')
+    const presenceSrc = readFileSync(new URL('../worktrees/presence.ts', import.meta.url), 'utf8')
+    expect(PROBE_STUCK_MAX).toBe(3)
+    expect(probeSrc).toContain('PROBE_STUCK_MAX (3) stuck calls in the whole process')
+    expect(presenceSrc).toContain('PROBE_STUCK_MAX (3) stuck calls in the whole process')
+    expect(presenceSrc).not.toContain('The thread budget is 2 PATH + 1 worktree')
   })
 })

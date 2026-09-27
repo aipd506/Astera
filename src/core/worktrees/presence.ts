@@ -12,7 +12,13 @@
 //   and the stuck-call ceiling), **outside the PATH cap**: a stuck worktree call holds its own slot,
 //   never one of the two PATH slots. Otherwise one stuck worktree share plus one dead PATH root filled
 //   the PATH cap, the Git Bash probes on C: were refused, and a session spawned without Git Bash.
-//   The thread budget is 2 PATH + 1 worktree + the session folder's probe. It answers `missing` only when the folder is confirmed gone: ENOENT on the folder while
+//   **The thread budget is pathProbe's, shared by every lane** (ProbeBudget): one call per root at a
+//   time across the PATH pool, the session folder's lane and both presence lanes, a root stuck in one
+//   lane is stuck in all, and at most PROBE_STUCK_MAX (3) stuck calls in the whole process, past which
+//   only a root that answered in the last 5 minutes is probed (so C: keeps working). A root the budget
+//   refuses makes no call: the check answers `refused`.
+//
+//   It answers `missing` only when the folder is confirmed gone: ENOENT on the folder while
 //   something that proves the volume is there answers. On Windows that is the drive or share root
 //   (rootOf). On POSIX it is the folder's parent — rootOf there is only the first two segments, and
 //   `/media/u` answers while the USB drive mounted below it is unplugged, as does an empty `nofail`

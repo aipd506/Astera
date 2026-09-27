@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createProbePool, createProber, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
+import { createProbePool, createProber, processProbeBudget, PROBE_STUCK_CEILING_MS, PROBE_TIMEOUT_MS } from '../sessions/pathProbe'
 import { askUntilAnswered, ASK_TRIES, createActionPresenceCheck, createPresenceCheck, PresenceCache, type CheckResult, type Presence } from './presence'
 
 const enoent = (): Error => Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
@@ -7,6 +7,8 @@ const eperm = (): Error => Object.assign(new Error('EPERM: operation not permitt
 
 afterEach(() => {
   vi.useRealTimers()
+  // The budget is process-wide: calls a test left hung must not count against the next test.
+  processProbeBudget().reset()
 })
 
 describe('createPresenceCheck', () => {

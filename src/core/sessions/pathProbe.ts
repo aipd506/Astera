@@ -1,4 +1,4 @@
-// Asynchronous, time-limited file probes for the spawn path.
+// Asynchronous, time-limited file probes for the spawn path, and for every other probe lane.
 //
 // A synchronous `existsSync` on a path that sits on an offline mapped drive or a dead UNC share does
 // not fail fast: Windows waits for the SMB redirector, which can take 20 to 60 seconds, and for that
@@ -10,26 +10,32 @@
 // So a probe here is async and is cut PROBE_TIMEOUT_MS after **its fs call starts**, then counts as
 // `timeout` (absent, for a PATH lookup). But an async fs call still runs on a libuv threadpool thread,
 // and a hung one keeps that thread for as long as SMB takes to give up. The pool has 4 threads by
-// default, and every async fs call in the process shares them — so the rules below are about threads:
+// default, and every async fs call in the process shares them — so the rules below are about threads.
 //
-// - **At most PROBE_CONCURRENCY (2) PATH probe calls exist at once, stuck ones included.** A call that
-//   timed out has answered its caller but still holds its thread, so it keeps counting until it really
-//   settles. Two threads always stay free for the session folder's probe and the rest of the process.
-// - **At most one PATH probe call per root** (drive or UNC share, see rootOf). A second probe on a root
-//   waits for the first; if the first times out, the waiters answer `timeout` at once, without a call.
-// - **Once PROBE_CONCURRENCY calls are stuck, every PATH probe answers `timeout` without a call** until
-//   one settles. So the stuck threads never pass 2, however many dead roots PATH holds. A healthy path
-//   is then reported absent for a while; the caches keep such answers for PROBE_DEGRADED_TTL_MS only.
+// **The budget is process-wide and shared by every lane** (ProbeBudget): the PATH pool, the session
+// folder's lane (`skipQueue`, also the worktree folder maker in worktrees/create.ts), and the worktree
+// presence checks (the sweep's and the action lane's, worktrees/presence.ts). Each lane has its own
+// pool for its own rules, but every pool asks the one budget before it makes a call:
+//
+// - **One call per root at a time, across all lanes.** A probe on a root with a call in flight in any
+//   lane waits for it; if that call timed out, the waiter answers `timeout` at once, without a call.
+//   So a dead root holds at most one stuck call in the whole process.
+// - **A root with a stuck call is stuck for every lane.** Any probe on it answers `timeout` (a
+//   presence check: `refused`) without a call until the call settles or reaches the ceiling.
+// - **At most PROBE_STUCK_MAX (3) stuck calls in the whole process.** Calls on roots not known to be
+//   alive (none answered within PROBE_FRESH_MS, 5 minutes) and the stuck ones never pass 3 together; a
+//   fourth such call waits for one of them. Once 3 calls are stuck, a new call is made only on a root
+//   that answered within PROBE_FRESH_MS — a local drive such as C: keeps working — and every other root
+//   answers `timeout` without a call. So at least one of libuv's
+//   4 threads stays free for roots known to be alive. (A root that answered a moment ago and then dies
+//   can still add a stuck call past 3; that is the price of keeping C: answered.)
+// - **Within that, the PATH pool keeps its own caps.** At most PROBE_CONCURRENCY (2) PATH probe calls
+//   exist at once, stuck ones included; once 2 PATH calls are stuck, every PATH probe answers `timeout`
+//   without a call until one settles; and at most one PATH call per root. A healthy path may then be
+//   reported absent for a while; the caches keep such answers for PROBE_DEGRADED_TTL_MS only.
 // - **The session folder's probe (`skipQueue`) does not wait behind PATH probes**: it is outside the
-//   PATH cap, so a local folder is never judged unreachable because PATH probes hang. It answers
-//   `timeout` without a call when its own root already has a stuck call — a folder on a drive known to
-//   hang is not reachable, and saying so at once is the point.
-// - **At most one session-folder call per root at a time.** Several prepares can ask about one offline
-//   folder within the same 1.5 s (a roll, the Host spawner, a retry); each starting its own call would
-//   hang one thread apiece and, with the 2 stuck PATH calls, fill the pool. So a later probe on that
-//   root waits for the call in flight: the same folder shares its answer; another folder answers
-//   `timeout` if that call timed out, and makes its own call if it answered (the root is alive). So the
-//   stuck session-folder calls number at most one per dead root the user tried.
+//   PATH cap, so a local folder is never judged unreachable because PATH probes hang. Several prepares
+//   asking about one offline folder within the same 1.5 s share one call.
 // - **A stuck call is let go after PROBE_STUCK_CEILING_MS** (a POSIX hard mount may never settle): it
 //   stops counting, its root may be probed again, and that is logged once for the call.
 //
@@ -54,6 +60,10 @@ export const PROBE_CACHE_TTL_MS = 5 * 60_000
 export const PROBE_DEGRADED_TTL_MS = 10_000
 /** After this long a stuck call stops counting against the cap, and its root may be probed again. */
 export const PROBE_STUCK_CEILING_MS = 2 * 60_000
+/** How many stuck calls the whole process allows, every lane together (see the header). */
+export const PROBE_STUCK_MAX = 3
+/** Once PROBE_STUCK_MAX calls are stuck, a root that answered within this long may still be probed. */
+export const PROBE_FRESH_MS = 5 * 60_000
 /** How many timed-out paths a prober remembers having logged; the oldest is forgotten past this. */
 export const LOGGED_PATHS_MAX = 256
 
@@ -100,6 +110,131 @@ interface Waiter {
   resolve: (r: ProbeResult) => void
 }
 
+/** One call on a root, admitted by the budget. Each method acts once; a ticket from before a reset
+ *  touches nothing. */
+export interface ProbeTicket {
+  /** The call answered (present or absent) before its timeout: the root is alive. */
+  answered(): void
+  /** The call gave no answer within its timeout: the root is stuck, for every lane. */
+  timedOut(): void
+  /** A stuck call settled, or reached the ceiling: it no longer counts. */
+  release(): void
+}
+
+/**
+ * The process-wide budget every probe lane shares (see the header): one call per root at a time, a
+ * stuck root is stuck for everyone, and at most PROBE_STUCK_MAX stuck calls, past which only roots
+ * that answered recently are probed.
+ */
+export class ProbeBudget {
+  /** root → the call in flight on it; resolves true when it answered, false when it timed out. */
+  private inflight = new Map<string, Promise<boolean>>()
+  /** Of those, the calls on roots not known to be alive (none answered within PROBE_FRESH_MS). */
+  private risky = new Map<string, Promise<boolean>>()
+  /** root → stuck calls on it (one, by the rule above; a count so a ceiling release stays exact). */
+  private stuck = new Map<string, number>()
+  private stuckTotal = 0
+  /** root → when a call on it last answered in time. */
+  private answeredAt = new Map<string, number>()
+  private generation = 0
+
+  constructor(
+    private maxStuck: number = PROBE_STUCK_MAX,
+    private freshMs: number = PROBE_FRESH_MS,
+    private now: () => number = Date.now
+  ) {}
+
+  stuckCount(): number {
+    return this.stuckTotal
+  }
+
+  isStuck(root: string): boolean {
+    return this.stuck.has(root)
+  }
+
+  /** Forgets everything (tests). Calls admitted before it touch nothing after. */
+  reset(): void {
+    this.generation++
+    this.inflight.clear()
+    this.risky.clear()
+    this.stuck.clear()
+    this.stuckTotal = 0
+    this.answeredAt.clear()
+  }
+
+  /** A ticket for one call on `root`, or why none is given. Waits while another lane's call on the
+   *  root is in flight. Never rejects. */
+  async enter(root: string): Promise<ProbeTicket | string> {
+    for (;;) {
+      if (this.stuck.has(root)) return `${root} has a call that gave no answer yet`
+      const current = this.inflight.get(root)
+      if (current) {
+        if (!(await current)) return `${root} gave no answer to another probe`
+        continue
+      }
+      const at = this.answeredAt.get(root)
+      const fresh = at !== undefined && this.now() - at < this.freshMs
+      if (!fresh) {
+        // A root not known to be alive may become one more stuck call. Those, the stuck ones and the
+        // ones in flight on such roots, never pass PROBE_STUCK_MAX together.
+        if (this.stuckTotal >= this.maxStuck)
+          return `${this.stuckTotal} probe calls are stuck, only a root that answered recently is probed until one ends`
+        if (this.stuckTotal + this.risky.size >= this.maxStuck) {
+          await Promise.race([...this.risky.values()])
+          continue
+        }
+      }
+      return this.admit(root, !fresh)
+    }
+  }
+
+  private admit(root: string, risky: boolean): ProbeTicket {
+    const gen = this.generation
+    let settle!: (answered: boolean) => void
+    const entry = new Promise<boolean>((r) => (settle = r))
+    this.inflight.set(root, entry)
+    if (risky) this.risky.set(root, entry)
+    let state: 'flying' | 'answered' | 'stuck' | 'released' = 'flying'
+    const leave = (answered: boolean): void => {
+      if (gen === this.generation && this.inflight.get(root) === entry) this.inflight.delete(root)
+      if (gen === this.generation && this.risky.get(root) === entry) this.risky.delete(root)
+      settle(answered)
+    }
+    return {
+      answered: () => {
+        if (state !== 'flying') return
+        state = 'answered'
+        if (gen === this.generation) this.answeredAt.set(root, this.now())
+        leave(true)
+      },
+      timedOut: () => {
+        if (state !== 'flying') return
+        state = 'stuck'
+        if (gen === this.generation) {
+          this.stuck.set(root, (this.stuck.get(root) ?? 0) + 1)
+          this.stuckTotal++
+        }
+        leave(false)
+      },
+      release: () => {
+        if (state !== 'stuck') return
+        state = 'released'
+        if (gen !== this.generation) return
+        const n = (this.stuck.get(root) ?? 1) - 1
+        if (n <= 0) this.stuck.delete(root)
+        else this.stuck.set(root, n)
+        this.stuckTotal = Math.max(0, this.stuckTotal - 1)
+      }
+    }
+  }
+}
+
+const sharedBudget = new ProbeBudget()
+/** The one budget every lane in this process shares. */
+export function processProbeBudget(): ProbeBudget {
+  return sharedBudget
+}
+
 /** What every prober of one process shares: the PATH call cap, the per-root rule, the stuck calls. */
 export class ProbePool {
   /** PATH calls that have not settled (nor reached the ceiling), stuck ones included. */
@@ -108,21 +243,20 @@ export class ProbePool {
   private pathStuck = 0
   /** Roots with a PATH call that has not settled. */
   private busy = new Set<string>()
-  /** root → calls on it (PATH or cwd) that timed out and have not settled. */
-  private stuck = new Map<string, number>()
   private queue: Waiter[] = []
   /** root → the session-folder call in flight on it, and the answer it will give. */
   private cwdCalls = new Map<string, { p: string; answer: Promise<ProbeResult> }>()
 
   constructor(
     private max: number = PROBE_CONCURRENCY,
-    private ceilingMs: number = PROBE_STUCK_CEILING_MS
+    private ceilingMs: number = PROBE_STUCK_CEILING_MS,
+    private budget: ProbeBudget = sharedBudget
   ) {}
 
   submit(job: ProbeJob): Promise<ProbeResult> {
     return new Promise<ProbeResult>((resolve) => {
       const root = rootOf(job.p)
-      if (this.stuck.has(root)) {
+      if (this.budget.isStuck(root)) {
         job.note(job.p, `${root} has a call that gave no answer yet`)
         resolve('timeout')
         return
@@ -138,7 +272,7 @@ export class ProbePool {
 
   /** A session-folder probe: one call per root at a time (see the rules at the top of this file). */
   private startCwd(job: ProbeJob, root: string, resolve: (r: ProbeResult) => void): void {
-    if (this.stuck.has(root)) {
+    if (this.budget.isStuck(root)) {
       job.note(job.p, `${root} has a call that gave no answer yet`)
       resolve('timeout')
       return
@@ -161,7 +295,7 @@ export class ProbePool {
       job,
       root,
       (r) => {
-        // Taken down at the answer (or the timeout): after a timeout the stuck map refuses the root.
+        // Taken down at the answer (or the timeout): after a timeout the budget refuses the root.
         if (this.cwdCalls.get(root) === entry) this.cwdCalls.delete(root)
         answered(r)
         resolve(r)
@@ -175,7 +309,7 @@ export class ProbePool {
     for (let i = 0; i < this.queue.length; ) {
       const w = this.queue[i]
       let refuse: string | null = null
-      if (this.stuck.has(w.root)) refuse = `${w.root} has a call that gave no answer yet`
+      if (this.budget.isStuck(w.root)) refuse = `${w.root} has a call that gave no answer yet`
       else if (this.pathStuck >= this.max) refuse = `${this.pathStuck} probe calls are stuck, no more are made until one ends`
       if (refuse !== null) {
         this.queue.splice(i, 1)
@@ -192,11 +326,28 @@ export class ProbePool {
     }
   }
 
+  /** Asks the budget for the call, then makes it — or answers `timeout` without one. */
   private start(job: ProbeJob, root: string, resolve: (r: ProbeResult) => void, counted: boolean): void {
     if (counted) {
       this.pathCalls++
       this.busy.add(root)
     }
+    const refuse = (why: string): void => {
+      job.note(job.p, why)
+      resolve('timeout')
+      if (counted) {
+        this.pathCalls--
+        this.busy.delete(root)
+      }
+      this.pump()
+    }
+    this.budget.enter(root).then(
+      (t) => (typeof t === 'string' ? refuse(t) : this.call(job, root, resolve, counted, t)),
+      (err: unknown) => refuse(`the probe budget failed: ${String(err)}`)
+    )
+  }
+
+  private call(job: ProbeJob, root: string, resolve: (r: ProbeResult) => void, counted: boolean, ticket: ProbeTicket): void {
     let answered = false
     let released = false
     let isStuck = false
@@ -207,9 +358,7 @@ export class ProbePool {
       released = true
       if (ceiling) clearTimeout(ceiling)
       if (isStuck) {
-        const n = (this.stuck.get(root) ?? 1) - 1
-        if (n <= 0) this.stuck.delete(root)
-        else this.stuck.set(root, n)
+        ticket.release()
         if (counted) this.pathStuck--
       }
       if (counted) {
@@ -223,7 +372,7 @@ export class ProbePool {
       if (answered) return
       answered = true
       isStuck = true
-      this.stuck.set(root, (this.stuck.get(root) ?? 0) + 1)
+      ticket.timedOut()
       if (counted) this.pathStuck++
       job.note(job.p, `no answer within ${job.timeoutMs}ms`)
       resolve('timeout')
@@ -242,6 +391,7 @@ export class ProbePool {
       if (!answered) {
         answered = true
         clearTimeout(timer)
+        ticket.answered()
         resolve(r)
       }
       release()
@@ -253,8 +403,13 @@ export class ProbePool {
   }
 }
 
-export function createProbePool(max: number = PROBE_CONCURRENCY, ceilingMs: number = PROBE_STUCK_CEILING_MS): ProbePool {
-  return new ProbePool(max, ceilingMs)
+/** A lane's pool. Every pool asks the process-wide budget unless a test hands it its own. */
+export function createProbePool(
+  max: number = PROBE_CONCURRENCY,
+  ceilingMs: number = PROBE_STUCK_CEILING_MS,
+  budget: ProbeBudget = sharedBudget
+): ProbePool {
+  return new ProbePool(max, ceilingMs, budget)
 }
 
 const sharedPool = createProbePool()
