@@ -1020,38 +1020,29 @@ export async function main(): Promise<void> {
   }
 
   // help has to work without a Host — handle it before working out which one to talk to.
-  /** The skills folder beside this binary, looked up only by the two guide commands below. */
+  /** The skills folder beside this binary, looked up only by the guide commands below. */
   const bundledSkills = (): string | undefined =>
     resolveSkillsDir({ resourcesPath: process.resourcesPath, cliEntry: process.argv[1] ?? '', exists: existsSync })
 
-  if (parsed.cmd === 'help') {
-    const resolved = resolveGuidePath({ args: parsed.args, env: process.env, bundled: bundledSkills() })
+  /** `help`, `browser-help` and `app-help` are all the same shape: resolve the named guide, read it,
+   *  print it, exit 0 — or `fail` through the usual seam when it cannot be found or read. One
+   *  function rather than three copies, so a change to the shape cannot land in only two of them. */
+  const printGuideOrExit = (guide?: 'orchestration' | 'browser' | 'app'): never => {
+    const resolved = resolveGuidePath({ args: parsed.args, env: process.env, bundled: bundledSkills(), guide })
     if (!resolved.ok) fail({ code: 'FAILED', message: resolved.error })
-    const guide = readGuide(resolved.path)
-    if (!guide.ok) fail({ code: 'FAILED', message: guide.error })
-    out(guide.content)
+    const guideFile = readGuide(resolved.path)
+    if (!guideFile.ok) fail({ code: 'FAILED', message: guideFile.error })
+    out(guideFile.content)
     process.exit(0)
   }
+
+  if (parsed.cmd === 'help') printGuideOrExit()
 
   // The browser guide works without a server too — same shape as help above.
-  if (parsed.cmd === 'browser-help') {
-    const resolved = resolveGuidePath({ args: parsed.args, env: process.env, bundled: bundledSkills(), guide: 'browser' })
-    if (!resolved.ok) fail({ code: 'FAILED', message: resolved.error })
-    const guide = readGuide(resolved.path)
-    if (!guide.ok) fail({ code: 'FAILED', message: guide.error })
-    out(guide.content)
-    process.exit(0)
-  }
+  if (parsed.cmd === 'browser-help') printGuideOrExit('browser')
 
   // The app workspace guide works without a server too, the same shape as browser-help above.
-  if (parsed.cmd === 'app-help') {
-    const resolved = resolveGuidePath({ args: parsed.args, env: process.env, bundled: bundledSkills(), guide: 'app' })
-    if (!resolved.ok) fail({ code: 'FAILED', message: resolved.error })
-    const guide = readGuide(resolved.path)
-    if (!guide.ok) fail({ code: 'FAILED', message: guide.error })
-    out(guide.content)
-    process.exit(0)
-  }
+  if (parsed.cmd === 'app-help') printGuideOrExit('app')
 
   // **세션 밖에서도 Host 를 찾는다**(설계 §4). 세션 안이면 앱이 자기 프로필 폴더를 실어 보내고
   // (`ASTERA_PROFILE_DIR`), 주소도 보고 큐도 그 폴더에서 나온다. 주소 하나로는 못 한다 — 주소는 그

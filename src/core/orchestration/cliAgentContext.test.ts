@@ -176,6 +176,7 @@ describe('agent-context: the agent app workspace commands are session commands (
     expect(js).toMatchObject({ public: false, usage: expect.stringMatching(/^astera app js/) })
     expect(js?.flags.map((f) => f.name).sort()).toEqual(['file', 'script'])
     expect(help).toMatchObject({ public: false })
+    expect(help?.flags.map((f) => f.name)).toEqual(['skills-dir'])
   })
 })
 
