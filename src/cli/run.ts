@@ -39,7 +39,9 @@ import {
 import {
   KEEPALIVE_MS,
   KEEPALIVE_PING_MS,
+  MERGE_CLIENT_TIMEOUT_MS,
   keepaliveLine,
+  mergeCommand,
   waitingCommand
 } from '../core/orchestration/cliKeepalive'
 import { agentContext, sessionUsage } from '../core/orchestration/cliAgentContext'
@@ -250,7 +252,11 @@ export function clientTimeoutMs(a: { cmd: string; args: Record<string, unknown> 
           // (ask 의 기본값이 서버보다 짧아서 실제로 그러였다).
           a.cmd === 'jobs-wait' || a.cmd === 'runs-wait' || (a.cmd === 'sessions-send' && a.args.wait === true)
           ? DEFAULT_WAIT_TIMEOUT_MS
-          : DEFAULT_CHECK_TIMEOUT_MS
+          : // 병합은 git 쓰기 하나가 10분까지 간다 — check 의 5분으로 끊으면 Host 가 병합을 끝내고
+            // Run 까지 지우는 사이에 CLI 만 "답이 없다"로 끝난다(MERGE_CLIENT_TIMEOUT_MS).
+            mergeCommand(a)
+            ? MERGE_CLIENT_TIMEOUT_MS
+            : DEFAULT_CHECK_TIMEOUT_MS
   const base = typeof a.args.timeoutMs === 'number' ? a.args.timeoutMs : defaultForCmd
   return base + TIMEOUT_HEADROOM_MS
 }

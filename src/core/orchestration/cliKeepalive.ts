@@ -15,6 +15,7 @@
 //
 // **The line is pure here and the timer is in run.ts**, the same split as cliHuman.ts: what to print
 // is decided without a clock, a socket or a process.
+import { GIT_WRITE_TIMEOUT_MS } from '../worktrees/git'
 import { HOST_UNRESPONSIVE_MS, PING_MS } from '../host/unresponsive'
 import { spelledCommand } from './cliUsage'
 
@@ -52,13 +53,34 @@ export const KEEPALIVE_MS = HOST_UNRESPONSIVE_MS
 export const KEEPALIVE_PING_MS = PING_MS
 
 /**
- * Is this call one that blocks for a person?
+ * How long the CLI waits for a merge command (`run-merge`, `run-delete --merge`) before it says the Host
+ * did not answer.
  *
- * The four that long-poll, and no others. `browser js` has a deadline too and is deliberately not
- * here: it waits for a script in a browser, which finishes in seconds and has no person in it, so a
- * keepalive would be noise on a command whose output is not a wait.
+ * **Longer than the Host can take, or the client gives up on a merge the Host then finishes** — and for
+ * `run-delete` goes on to delete the Run. Each git write in a merge runs under GIT_WRITE_TIMEOUT_MS (10
+ * minutes), and one worktree is up to three of them (the `merge-tree` probe, the merge, and on failure
+ * the abort). The client cannot know how many worktrees a Run has, so this is a fixed, generous value:
+ * six full write ceilings, one hour — two worktrees that each hit the ceiling on every write. A real
+ * merge takes seconds; this only runs out when several writes are truly hung. `--timeout-ms` still wins.
+ */
+export const MERGE_CLIENT_TIMEOUT_MS = 6 * GIT_WRITE_TIMEOUT_MS
+
+/** A call that makes the Host merge worktrees — see MERGE_CLIENT_TIMEOUT_MS. */
+export function mergeCommand(a: { cmd: string; args: Record<string, unknown> }): boolean {
+  return a.cmd === 'run-merge' || (a.cmd === 'run-delete' && a.args.merge === true)
+}
+
+/**
+ * Is this call one that blocks for a person — or for a merge?
+ *
+ * The four that long-poll, plus the merge commands (mergeCommand), and no others. A merge can run for
+ * minutes on a big repository, and a silent stderr for that long looks exactly like a wedged Host.
+ * `browser js` has a deadline too and is deliberately not here: it waits for a script in a browser,
+ * which finishes in seconds and has no person in it, so a keepalive would be noise on a command whose
+ * output is not a wait.
  */
 export function waitingCommand(a: { cmd: string; args: Record<string, unknown> }): boolean {
+  if (mergeCommand(a)) return true
   // `runs follow` prints events on stdout as they land, and between two of them it can be as quiet as
   // a wait. These lines go to stderr, so the event stream on stdout stays exactly one line per event.
   if (a.cmd === 'ask' || a.cmd === 'jobs-wait' || a.cmd === 'runs-wait' || a.cmd === 'runs-follow') return true

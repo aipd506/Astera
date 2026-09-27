@@ -29,6 +29,13 @@ describe('cliKeepalive — 기다리는 명령만', () => {
     expect(waitingCommand({ cmd: 'check', args: {} })).toBe(false)
   })
 
+  // 병합은 몇 분이 걸릴 수 있다 — 그동안 stderr 가 조용하면 멈춘 것과 구별되지 않는다.
+  it('run-merge 와 run-delete --merge 는 기다리는 명령이다 — 병합 없는 run-delete 는 아니다', () => {
+    expect(waitingCommand({ cmd: 'run-merge', args: { run: 'r' } })).toBe(true)
+    expect(waitingCommand({ cmd: 'run-delete', args: { id: 'r', merge: true } })).toBe(true)
+    expect(waitingCommand({ cmd: 'run-delete', args: { id: 'r' } })).toBe(false)
+  })
+
   it('목록과 조회와 브라우저 스크립트는 기다리는 것이 아니다', () => {
     for (const cmd of ['jobs-list', 'jobs-get', 'status', 'browser-js', 'send', 'inbox'])
       expect(waitingCommand({ cmd, args: { wait: true } }), cmd).toBe(false)

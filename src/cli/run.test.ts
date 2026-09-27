@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { GIT_WRITE_TIMEOUT_MS } from '../core/worktrees/git'
+import { MERGE_CLIENT_TIMEOUT_MS } from '../core/orchestration/cliKeepalive'
 import { exitCodeFor } from '../core/orchestration/cliOutput'
 import { promises as fs, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -224,6 +226,17 @@ describe('clientTimeoutMs', () => {
   it('sessions send --wait 는 서버의 기다림 기본 시한보다 크게 기다리고, --wait 없이는 check 의 것이다', () => {
     expect(clientTimeoutMs({ cmd: 'sessions-send', args: { wait: true } })).toBeGreaterThan(DEFAULT_WAIT_TIMEOUT_MS)
     expect(clientTimeoutMs({ cmd: 'sessions-send', args: {} })).toBe(clientTimeoutMs({ cmd: 'check', args: {} }))
+  })
+  // 병합은 git 쓰기 하나가 10분(GIT_WRITE_TIMEOUT_MS)까지 갈 수 있다. check 의 기본 시한(5분)으로
+  // 기다리면 CLI 는 "Host 가 답하지 않았다"로 끝나는데 Host 는 병합을 끝내고 Run 까지 지울 수 있다.
+  it('run-merge 와 run-delete --merge 는 git 쓰기 한도보다 훨씬 길게 기다린다', () => {
+    expect(MERGE_CLIENT_TIMEOUT_MS).toBeGreaterThanOrEqual(6 * GIT_WRITE_TIMEOUT_MS)
+    const headroom = clientTimeoutMs({ cmd: 'check', args: {} }) - DEFAULT_CHECK_TIMEOUT_MS
+    expect(clientTimeoutMs({ cmd: 'run-merge', args: { run: 'r' } })).toBe(MERGE_CLIENT_TIMEOUT_MS + headroom)
+    expect(clientTimeoutMs({ cmd: 'run-delete', args: { id: 'r', merge: true } })).toBe(MERGE_CLIENT_TIMEOUT_MS + headroom)
+  })
+  it('병합하지 않는 run-delete 는 check 의 시한 그대로다', () => {
+    expect(clientTimeoutMs({ cmd: 'run-delete', args: { id: 'r' } })).toBe(clientTimeoutMs({ cmd: 'check', args: {} }))
   })
   it('check 기본값(--timeout-ms 없음)은 서버의 check 기본 시한보다 크다', () => {
     expect(clientTimeoutMs({ cmd: 'check', args: {} })).toBeGreaterThan(DEFAULT_CHECK_TIMEOUT_MS)
