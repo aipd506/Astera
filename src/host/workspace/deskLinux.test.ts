@@ -349,14 +349,16 @@ describe('the Linux desk: fix round 1', () => {
     const r = rig()
     threeWindows(r)
     const desk = await r.desks.start('a')
-    const text = 'a'.repeat(450) + '가'.repeat(250) + '\u{1F600}'.repeat(10)
+    const ascii = 'a'.repeat(450)
+    const text = 'b'.repeat(50) + '가'.repeat(200) + '\u{1F600}'.repeat(10)
+    await desk.keys({ title: 'astera', text: ascii })
     await desk.keys({ title: 'astera', text })
     const typed = r.runs.filter((x) => x.args[2] === 'type').map((x) => x.args)
     const fast = ['windowfocus', '41', 'type', '--']
     const slow = ['windowfocus', '41', 'type', '--delay', '100', '--']
     expect(typed.map((a) => a.slice(0, -1))).toEqual([fast, fast, slow, slow, slow])
     expect(typed.map((a) => Array.from(a.at(-1)!).length)).toEqual([400, 50, 100, 100, 60])
-    expect(typed.map((a) => a.at(-1)).join('')).toBe(text)
+    expect(typed.map((a) => a.at(-1)).join('')).toBe(ascii + text)
     // About 5 s and 10 s a run: within the 15 s a desk request may run.
     expect(TYPE_CHUNK * 12).toBeLessThanOrEqual(10_000)
     expect(REMAP_CHUNK * REMAP_DELAY_MS).toBeLessThanOrEqual(10_000)
@@ -501,8 +503,7 @@ describe('the Linux desk: windows, shots and keys', () => {
     await desk.keys({ title: '픽스처', text: '-hi 안녕' })
     await desk.keys({ title: 'astera', key: 'Enter' })
     expect(r.runs.filter((x) => x.args[0] === 'windowfocus').map((x) => x.args)).toEqual([
-      ['windowfocus', '41', 'type', '--', '-hi '],
-      ['windowfocus', '41', 'type', '--delay', '100', '--', '안녕'],
+      ['windowfocus', '41', 'type', '--delay', '100', '--', '-hi 안녕'],
       ['windowfocus', '41', 'key', '--clearmodifiers', 'Return']
     ])
     await expect(desk.keys({ title: 'nothing like it', text: 'x' })).rejects.toThrow('no window titled "nothing like it"')
@@ -542,18 +543,11 @@ describe('the Linux desk: pure parts', () => {
     expect(r.runs.every((x) => !('WAYLAND_DISPLAY' in x.env) && !('DBUS_SESSION_BUS_ADDRESS' in x.env))).toBe(true)
   })
 
-  it('types what the US keyboard has a key for at the default delay, and anything else slower, in order', () => {
-    expect(typeRuns('hi 한글 입력\n')).toEqual([
-      ['type', '--', 'hi '],
-      ['type', '--delay', String(REMAP_DELAY_MS), '--', '한글'],
-      ['type', '--', ' '],
-      ['type', '--delay', String(REMAP_DELAY_MS), '--', '입력'],
-      ['type', '--', '\n']
-    ])
-    expect(typeRuns('é\u{1F600}\tx')).toEqual([
-      ['type', '--delay', String(REMAP_DELAY_MS), '--', 'é\u{1F600}'],
-      ['type', '--', '\tx']
-    ])
+  it('types text the US keyboard has keys for at the default delay, and text with anything else in it slowly, all of it', () => {
+    expect(typeRuns('echo hi\tthere\n')).toEqual([['type', '--', 'echo hi\tthere\n']])
+    expect(typeRuns('hi 한글 입력\n')).toEqual([['type', '--delay', String(REMAP_DELAY_MS), '--', 'hi 한글 입력\n']])
+    expect(typeRuns('x\u{1F600}')).toEqual([['type', '--delay', String(REMAP_DELAY_MS), '--', 'x\u{1F600}']])
+    expect(typeRuns('café')).toEqual([['type', '--delay', String(REMAP_DELAY_MS), '--', 'café']])
     expect(typeRuns('')).toEqual([])
   })
 

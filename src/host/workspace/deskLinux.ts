@@ -38,10 +38,10 @@ const POLL_MS = 50
 export const TYPE_CHUNK = 400
 /** What Xvfb's US keyboard has a key for: printable ASCII, newline and tab. */
 const KEYBOARD_TEXT = /^[\x20-\x7e\n\t]$/
-/** The per character delay, in ms, for any other character (Hangul, emoji, accented letters). xdotool
- *  types one by binding it to a spare key, pressing that key and unbinding it again, and Chromium,
- *  which reads the new binding only after it is told the keyboard changed, loses the character when
- *  the unbinding comes first. Measured on Xvfb in ubuntu:24.04 with 'hi 한글 입력': at the default 12 ms
+/** The per character delay, in ms, for text with any other character in it (Hangul, emoji, accented
+ *  letters; typeRuns). xdotool types such a character by binding it to a spare key, pressing that key
+ *  and unbinding it again, and Chromium, which reads the new binding only after it is told the
+ *  keyboard changed, loses the character when the unbinding comes first. Measured on Xvfb in ubuntu:24.04 with 'hi 한글 입력': at the default 12 ms
  *  7 of 30 runs lost a character, at 60 ms and at 100 ms none of 30 did. */
 export const REMAP_DELAY_MS = 100
 /** Characters per run at REMAP_DELAY_MS: about 10 s, inside DESK_REQUEST_MS. */
@@ -121,27 +121,18 @@ export function displayEnv(env: Record<string, string | undefined>, display: num
   return out
 }
 
-/** `text` as the `xdotool type` arguments that type it: runs of keyboard text at the default delay and
- *  runs of anything else at REMAP_DELAY_MS, each at most its chunk long, never splitting a surrogate
- *  pair. */
+/** `text` as the `xdotool type` arguments that type it, never splitting a surrogate pair: keyboard text
+ *  at the default delay in runs of TYPE_CHUNK, and text with any other character in it all at
+ *  REMAP_DELAY_MS in runs of REMAP_CHUNK. All of it, not only those characters: typed in runs of their
+ *  own right after keyboard text typed at the default delay, the first of them was still lost now and
+ *  then (1 of 30 runs), and never when the whole text went slowly (0 of 30). */
 export function typeRuns(text: string): string[][] {
+  const chars = Array.from(text)
+  const keyboard = chars.every((ch) => KEYBOARD_TEXT.test(ch))
+  const size = keyboard ? TYPE_CHUNK : REMAP_CHUNK
+  const head = keyboard ? ['type', '--'] : ['type', '--delay', String(REMAP_DELAY_MS), '--']
   const out: string[][] = []
-  let run: string[] = []
-  let keyboard = true
-  const flush = (): void => {
-    if (run.length === 0) return
-    out.push(keyboard ? ['type', '--', run.join('')] : ['type', '--delay', String(REMAP_DELAY_MS), '--', run.join('')])
-    run = []
-  }
-  for (const ch of Array.from(text)) {
-    const k = KEYBOARD_TEXT.test(ch)
-    if (k !== keyboard || run.length === (keyboard ? TYPE_CHUNK : REMAP_CHUNK)) {
-      flush()
-      keyboard = k
-    }
-    run.push(ch)
-  }
-  flush()
+  for (let i = 0; i < chars.length; i += size) out.push([...head, chars.slice(i, i + size).join('')])
   return out
 }
 
