@@ -27,9 +27,10 @@ and the Host announces `workspace` on all three.
   the display's pointer to its last pixel, bottom right, out of the centered window an Electron app
   opens with no window manager: X reports a window mapped, moved or resized under the pointer to the
   app as a mouse move with no button down, and Chromium lets that end the press `drag()` made over
-  CDP. `keys()` types what the US keyboard has a key for at xdotool's default 12 ms a character, and
-  anything else (Hangul, emoji, accented letters) at 100 ms, since xdotool binds each such character
-  to a spare key just for it and Chromium, reading the binding late, drops some at the default. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
+  CDP. `keys()` types text the US keyboard has keys for at xdotool's default 12 ms a character, and
+  text with anything else in it (Hangul, emoji, accented letters) at 100 ms a character, all of it,
+  since xdotool binds each such character to a spare key just for it and Chromium, reading the
+  binding late, drops some at the default. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
   `app js` is refused, with the install line for the distribution, when Xvfb, xdotool or `import` is
   missing.
 - **macOS** (`src/host/workspace/deskMac.ts`). Nothing is created. The app starts in the person's
