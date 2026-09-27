@@ -4933,8 +4933,9 @@ export function registerIpc(
   ipcMain.handle('terminal.close', (_e, id: string) => core.terminal.close(id))
 
   // The live-update watcher: watches the explorer root and refreshes the tree and viewer through
-  // files:changed. The path guard is reused — watching an arbitrary path is refused.
-  const fileWatcher = new FileWatcher((change) => send('files:changed', change))
+  // files:changedBatch — one message per batching window, not one per event. The path guard is reused —
+  // watching an arbitrary path is refused.
+  const fileWatcher = new FileWatcher((batch) => send('files:changedBatch', batch))
   ipcMain.handle('files.watch', async (_e, root: string) => {
     await assertAllowedPath(root)
     await fileWatcher.watch(root)

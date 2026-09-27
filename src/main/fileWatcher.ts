@@ -2,12 +2,9 @@ import chokidar, { type FSWatcher } from 'chokidar'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { buildIgnoreMatcher } from '../core/files/tree'
+import { createChangeBatcher, type ChangeBatcher, type FileChangeBatch, type FileChangeKind } from '../core/files/changeBatch'
 
-export type FileChangeKind = 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir'
-export interface FileChange {
-  path: string
-  kind: FileChangeKind
-}
+export type { FileChange, FileChangeKind } from '../core/files/changeBatch'
 
 /** Recursively watches one explorer root and emits changes. The watch exclusions are language-neutral
  *  (buildIgnoreMatcher).
@@ -16,7 +13,11 @@ export interface FileChange {
  *  startup there because the index only needs to know *that* some .jsonl changed; this has to tell
  *  add/change/unlink/addDir/unlinkDir apart and drop the ignored paths, and a native watcher reports
  *  only rename/change — no file-or-directory distinction, no filtering. The per-file walk that made
- *  chokidar expensive is exactly what lets it answer that, so it stays. */
+ *  chokidar expensive is exactly what lets it answer that, so it stays.
+ *
+ *  Events leave in batches (createChangeBatcher, FILE_CHANGE_BATCH_MS): one IPC message per window
+ *  instead of one per event, so a git checkout or npm install in the watched folder is a handful of
+ *  messages rather than thousands. */
 export class FileWatcher {
   private watcher: FSWatcher | null = null
   private root: string | null = null
@@ -24,10 +25,14 @@ export class FileWatcher {
   // invocation), it stops this.watcher being overwritten and leaking the previous chokidar instance without a close. Same pattern as HistoryIndex.reloading.
   private ops: Promise<void> = Promise.resolve()
 
+  private batcher: ChangeBatcher
+
   constructor(
-    private emit: (change: FileChange) => void,
+    emit: (batch: FileChangeBatch) => void,
     private log: (m: string) => void = () => {}
-  ) {}
+  ) {
+    this.batcher = createChangeBatcher(emit)
+  }
 
   watch(root: string): Promise<void> {
     const p = this.ops.then(() => this.doWatch(root))
@@ -58,11 +63,13 @@ export class FileWatcher {
       ignored: (p: string) => ignored(path.relative(root, p))
     })
     const kinds: FileChangeKind[] = ['add', 'change', 'unlink', 'addDir', 'unlinkDir']
-    for (const kind of kinds) this.watcher.on(kind, (p: string) => this.emit({ path: p, kind }))
+    for (const kind of kinds) this.watcher.on(kind, (p: string) => this.batcher.push({ path: p, kind }))
     this.watcher.on('error', (e) => this.log(`watch error: ${e instanceof Error ? e.message : String(e)}`))
   }
 
   async close(): Promise<void> {
+    // What the closing watcher already saw still goes out — an open buffer must not miss its last change
+    this.batcher.flush()
     await this.watcher?.close().catch(() => {})
     this.watcher = null
     this.root = null

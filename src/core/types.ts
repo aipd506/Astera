@@ -13,6 +13,7 @@ export type { PythonInterpreter } from './run/python'
 // an alias. A deletion snapshot entry (originalPath, deletedAt, size, isDir) merely shares the name
 // with that session history entry; the two types are unrelated.
 import type { HistoryEntry as LocalHistoryEntry } from './files/localHistory'
+import type { FileChangeBatch } from './files/changeBatch'
 export type { HistoryEntry as LocalHistoryEntry } from './files/localHistory'
 import type { Lang, LangPreference, Message } from './i18n'
 import type { ScheduleRule, ScheduleConfig } from './scheduler/rule'
@@ -675,7 +676,9 @@ export interface CoreEvents {
   'accounts:changed': { accounts: Account[] }
   // The unregistered history sources were re-scanned (fires after an account is added or removed)
   'accounts:ghostsChanged': { accounts: Account[] }
-  'files:changed': { path: string; kind: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir' } // watcher
+  'files:changed': { path: string; kind: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir' } // watcher, one event (the older shape — still accepted by the renderer's subscribeFileChanges)
+  /** The watcher's events, one message per FILE_CHANGE_BATCH_MS window (core/files/changeBatch.ts). */
+  'files:changedBatch': FileChangeBatch
   'git:changed': void // index/HEAD changes in the git dir, e.g. a commit from a session terminal — triggers a tree state refresh
   /** One repository's PR snapshot was refreshed (or marked stale by the rate-limit breaker).
    *  The whole snapshot rides along — the renderer replaces, never merges. */

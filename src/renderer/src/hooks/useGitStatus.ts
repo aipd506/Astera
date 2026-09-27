@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { folderCounts, type GitState } from '../../../core/git/status'
+import { onFileChanges } from '../lib/fileChanges'
 
 export interface GitStatusMap {
   fileState: Record<string, GitState>
@@ -86,7 +87,7 @@ export function useGitStatus(root: string | null): GitStatusMap {
     void window.api.git.watch(root)
     void run() // the first query runs without the debounce
 
-    const offFiles = window.api.on('files:changed', () => schedule())
+    const offFiles = onFileChanges(() => schedule())
     const offGit = window.api.on('git:changed', () => schedule())
     const onFocus = (): void => schedule()
     window.addEventListener('focus', onFocus)

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { parentDir } from '../../../core/files/paths'
 import { isSubPath } from '../../../core/files/ops'
 import { flattenVisible } from '../../../core/files/selection'
+import { onFileChanges } from '../lib/fileChanges'
 
 export interface Entry {
   name: string
@@ -97,9 +97,11 @@ export function useFileTree(
     if (!root) return
     void window.api.files.watch(root)
     loadDir(root) // re-query the root level on re-entry to pick up recent changes (deeper expanded folders catch up via later events or a refresh)
-    const off = window.api.on('files:changed', (c) => {
-      if (c.kind === 'change') return // a file content change does not alter the tree structure
-      if (c.kind === 'unlinkDir') {
+    // One message per watcher window (core/files/changeBatch.ts): its unlinkDir changes clean up the cache,
+    // and its parents — already deduplicated, content changes excluded — are the folders to re-query
+    const off = onFileChanges((batch) => {
+      for (const c of batch.changes) {
+        if (c.kind !== 'unlinkDir') continue
         // Clean up the cache and expanded state for the deleted folder itself and everything under
         // it. Without this, (1) a stale ENOENT cache can survive into a recreate under the same name
         // (a separate path from the ENOENT cleanup in loadDir(a) — the deleted folder itself only
@@ -128,8 +130,9 @@ export function useFileTree(
           return changed ? next : prev
         })
       }
-      const parent = parentDir(c.path)
-      if (dirsRef.current[parent]) loadDir(parent) // only refresh cached (expanded) folders — a side effect kept outside the updater
+      for (const parent of batch.parents) {
+        if (dirsRef.current[parent]) loadDir(parent) // only refresh cached (expanded) folders — a side effect kept outside the updater
+      }
     })
     return () => {
       off()

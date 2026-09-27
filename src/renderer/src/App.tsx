@@ -122,6 +122,8 @@ import { displayHostOf, linkDestination, normalizeUrl, previewTargetOf } from '.
 import { isWaitingOnDialog, POST_PASTE_SUBMIT_DELAY_MS } from '../../core/preview/pick/send'
 import { PaneGrid } from './components/PaneGrid'
 import { ContextMenu, type MenuItem } from './components/ContextMenu'
+import { onFileChanges } from './lib/fileChanges'
+import type { FileChange } from '../../core/files/changeBatch'
 import { House, PanelLeft, Settings, X } from 'lucide-react'
 
 sessionBus.init()
@@ -1868,7 +1870,7 @@ export default function App(): React.JSX.Element {
   // cheap (invalidateImageCache's own comment), so nothing here needs to guess whether c.path is actually
   // an image before calling it.
   useEffect(() => {
-    const off = window.api.on('files:changed', (c) => {
+    const onChange = (c: FileChange): void => {
       if (c.kind === 'add' || c.kind === 'change' || c.kind === 'unlink') invalidateImageCache(c.path)
       const id = `file:${c.path}`
       const buf = fileBuffersRef.current[id]
@@ -1896,6 +1898,10 @@ export default function App(): React.JSX.Element {
           // A failed re-read (permissions, a race) is quietly ignored — the next event retries
         }
       )
+    }
+    // One message per watcher window; each path appears once in it, with its latest kind (core/files/changeBatch.ts)
+    const off = onFileChanges((batch) => {
+      for (const c of batch.changes) onChange(c)
     })
     return off
   }, [])
@@ -3354,11 +3360,15 @@ export default function App(): React.JSX.Element {
       'Dockerfile'
     ])
     const norm = (p: string): string => foldPathCase(p.replace(/\\/g, '/'), window.api.platform)
-    const off = window.api.on('files:changed', (c) => {
+    // A batch is one watcher window — seed files touched together (a git checkout) re-read the run list once
+    const off = onFileChanges((batch) => {
       const root = currentProjectRef.current
       if (!root) return
-      const base = c.path.split(/[\\/]/).pop() ?? ''
-      if (!SEED_FILES.has(base) || norm(parentDir(c.path)) !== norm(root)) return
+      const touchesSeed = batch.changes.some((c) => {
+        const base = c.path.split(/[\\/]/).pop() ?? ''
+        return SEED_FILES.has(base) && norm(parentDir(c.path)) === norm(root)
+      })
+      if (!touchesSeed) return
       void window.api.run.list(root).then((r) => {
         setRunConfigs(r.configs)
         setRunIsSpringBoot(r.isSpringBoot)
