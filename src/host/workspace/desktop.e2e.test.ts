@@ -242,10 +242,13 @@ describe.runIf(enabled)('the agent app workspace on a real desktop', () => {
           ? `clipboard before the paste: this process may not open it (${clip.denied}); left alone, and the fixture, started from here, reads it as empty`
           : `clipboard before the paste: formats [${clip.formats.join(', ')}]; ${plain ? 'plain text or empty: a marker is put there and the text restored after' : 'richer content: left alone'}`
       )
-      if (plain) await setClipboardText(marker)
       let second: Awaited<ReturnType<WorkspaceManager['run']>>
       let pastedFrom: string
       try {
+        // Inside the try (final review, T10 minor): a set that fails after the marker landed (a timeout
+        // in PowerShell after SetDataObject) is still put back by the finally, which restores only
+        // while the marker is there.
+        if (plain) await setClipboardText(marker)
         second = await m.run(
           's-e2e',
           [
