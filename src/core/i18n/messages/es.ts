@@ -1334,6 +1334,8 @@ export const es: Catalog = {
     'Una comprobación que ejecutó el agente no pasó — vale la pena revisar el resultado.',
   'hiw.record.reason.checkFailedJob':
     'Una comprobación que ejecutó la aplicación no pasó — vale la pena revisar el resultado.',
+  'hiw.record.reason.evidenceUnreachable':
+    'La carpeta del proyecto no respondió, así que no se pudieron comprobar los archivos que cita este resumen. Vuelve a generarlo cuando la carpeta sea accesible.',
   'hiw.pane.overview': 'Qué hace',
   'hiw.pane.userVisible': 'Qué notarás',
   'hiw.pane.flow': 'Cómo funciona',

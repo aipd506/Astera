@@ -1651,6 +1651,7 @@ export const ko = {
   'hiw.record.reason.interrupted': '이 기록을 만드는 도중 앱이 꺼졌습니다 — 아래 버튼을 눌러 다시 만들어 주세요.',
   'hiw.record.reason.checkFailed': '에이전트가 돌린 검사가 통과하지 못했습니다 — 결과물을 확인해 보세요.',
   'hiw.record.reason.checkFailedJob': '앱이 돌린 검사가 통과하지 못했습니다 — 결과물을 확인해 보세요.',
+  'hiw.record.reason.evidenceUnreachable': '프로젝트 폴더가 답하지 않아 이 설명이 근거로 댄 파일을 확인하지 못했습니다. 폴더에 닿을 수 있게 되면 다시 만들어 보세요.',
   'hiw.pane.overview': '무엇을 하나요',
   'hiw.pane.userVisible': '무엇이 달라졌나요',
   'hiw.pane.flow': '어떻게 동작하나요',

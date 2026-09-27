@@ -1312,6 +1312,7 @@ export const ja: Catalog = {
     'これを書いている途中でアプリが終了しました — 下のボタンを押すともう一度作成します。',
   'hiw.record.reason.checkFailed': 'エージェントが行った検査が通りませんでした — 内容を確認してください。',
   'hiw.record.reason.checkFailedJob': 'アプリが行った検査が通りませんでした — 内容を確認してください。',
+  'hiw.record.reason.evidenceUnreachable': 'プロジェクトのフォルダーが応答しなかったため、この説明が根拠とするファイルを確認できませんでした。フォルダーに到達できるようになってから再生成してください。',
   'hiw.pane.overview': '何をしますか',
   'hiw.pane.userVisible': '何が変わったか',
   'hiw.pane.flow': 'どう動きますか',

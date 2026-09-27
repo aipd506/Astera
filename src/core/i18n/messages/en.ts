@@ -1410,6 +1410,7 @@ export const en: Record<keyof typeof ko, string> = {
     'The app closed while this was being written up — press the button below to try again.',
   'hiw.record.reason.checkFailed': 'A check the agent ran did not pass — the write-up is worth a look.',
   'hiw.record.reason.checkFailedJob': 'A check the app ran did not pass — the write-up is worth a look.',
+  'hiw.record.reason.evidenceUnreachable': 'The project folder did not answer, so the files this write-up cites could not be checked. Regenerate once the folder is reachable.',
   'hiw.pane.overview': 'What it does',
   'hiw.pane.userVisible': 'What you will notice',
   'hiw.pane.flow': 'How it works',

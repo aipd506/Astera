@@ -33,6 +33,8 @@ const REASON_KEY: Record<string, MessageKey> = {
   // A Job's own validation is the app's measurement, not something the agent claimed — a separate
   // code so the sentence attributes the check to the right party (pipeline.ts's `fill`).
   CHECK_FAILED_JOB: 'hiw.record.reason.checkFailedJob',
+  // The cited files could not be checked: the project folder did not answer (pipeline.ts validate)
+  EVIDENCE_UNREACHABLE: 'hiw.record.reason.evidenceUnreachable',
   INTERRUPTED_BY_NEW_TASK: 'hiw.open.reason.newTask',
   INTERRUPTED_BY_SESSION_END: 'hiw.open.reason.sessionEnd',
   INTERRUPTED_BY_APP_RESTART: 'hiw.open.reason.appRestart',
