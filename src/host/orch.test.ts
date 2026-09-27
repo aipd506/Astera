@@ -2490,6 +2490,61 @@ describe('Host-local spawn (S2)', () => {
     expect(validationStop).toHaveBeenCalledTimes(1)
     expect(validationStop).toHaveBeenCalledWith('r1')
   })
+  describe('the agent app workspace (agent workspace design)', () => {
+    const app = { role: 'app' as const, toOthers: () => {} }
+    const cli = { role: 'cli' as const, toOthers: () => {} }
+    const fakeWorkspaces = () => ({
+      run: vi.fn(async (_s: string, _script: string) => ({ status: 200, body: { log: ['ok'] } })),
+      stop: vi.fn((_s: string) => true),
+      close: vi.fn(async (_s: string) => true),
+      list: vi.fn(() => [{ sessionId: 's1', running: false, helper: null, frame: null }])
+    })
+
+    it('answers app-js from the session that asked, and refuses what cannot run', async () => {
+      const workspaces = fakeWorkspaces()
+      const orch = orchOver({ workspaces })
+      expect(await orch.call({ cmd: 'app-js', args: { script: "log('x')" }, sessionId: 's1', from: cli })).toEqual({ status: 200, body: { log: ['ok'] } })
+      expect(workspaces.run).toHaveBeenCalledWith('s1', "log('x')")
+      expect((await orch.call({ cmd: 'app-js', args: {}, sessionId: 's1', from: cli })).status).toBe(400)
+      expect((await orch.call({ cmd: 'app-js', args: { script: '  ' }, sessionId: 's1', from: cli })).status).toBe(400)
+      expect(await orch.call({ cmd: 'app-js', args: { script: 'log(1)' }, sessionId: '', from: cli })).toMatchObject({ status: 400, body: { error: expect.stringContaining('ASTERA_SESSION') } })
+      expect((await orchOver().call({ cmd: 'app-js', args: { script: 'log(1)' }, sessionId: 's1', from: cli })).status).toBe(501)
+    })
+
+    it('a retried request id replays the recorded answer instead of running the script again (ruling P2)', async () => {
+      const workspaces = fakeWorkspaces()
+      const orch = orchOver({ workspaces })
+      const first = await orch.call({ cmd: 'app-js', args: { script: 'await launch({ config: "dev" })' }, sessionId: 's1', from: cli, request: 'req-app-1' })
+      const again = await orch.call({ cmd: 'app-js', args: { script: 'await launch({ config: "dev" })' }, sessionId: 's1', from: cli, request: 'req-app-1' })
+      expect(first.status).toBe(200)
+      expect(again).toMatchObject({ status: 200, body: { log: ['ok'] }, replayed: true })
+      expect(workspaces.run).toHaveBeenCalledTimes(1)
+    })
+
+    it('a refused app-js leaves no receipt, so a retry runs', async () => {
+      const workspaces = fakeWorkspaces()
+      workspaces.run.mockResolvedValueOnce({ status: 409, body: { error: 'agent app workspace is off' } } as never)
+      const orch = orchOver({ workspaces })
+      await orch.call({ cmd: 'app-js', args: { script: 'log(1)' }, sessionId: 's1', from: cli, request: 'req-app-2' })
+      const again = await orch.call({ cmd: 'app-js', args: { script: 'log(1)' }, sessionId: 's1', from: cli, request: 'req-app-2' })
+      expect(again.replayed).toBeUndefined()
+      expect(workspaces.run).toHaveBeenCalledTimes(2)
+    })
+
+    it('answers workspace-list, -stop and -close for the app only, and refuses a request id on them', async () => {
+      const workspaces = fakeWorkspaces()
+      const orch = orchOver({ workspaces })
+      expect((await orch.call({ cmd: 'workspace-list', args: {}, sessionId: '', from: app })).body).toEqual({ workspaces: [{ sessionId: 's1', running: false, helper: null, frame: null }] })
+      expect((await orch.call({ cmd: 'workspace-stop', args: { sessionId: 's1' }, sessionId: '', from: app })).body).toEqual({ stopped: true })
+      expect((await orch.call({ cmd: 'workspace-close', args: { sessionId: 's1' }, sessionId: '', from: app })).body).toEqual({ closed: true })
+      expect(workspaces.close).toHaveBeenCalledWith('s1')
+      expect((await orch.call({ cmd: 'workspace-list', args: {}, sessionId: '', from: cli })).status).toBe(403)
+      expect((await orch.call({ cmd: 'workspace-stop', args: {}, sessionId: '', from: app })).status).toBe(400)
+      expect((await orch.call({ cmd: 'workspace-list', args: {}, sessionId: '', from: app, request: 'q' })).status).toBe(400)
+      expect((await orchOver().call({ cmd: 'workspace-list', args: {}, sessionId: '', from: app })).status).toBe(501)
+    })
+  })
+
   it('answers roll-state and roll-force for the app only (S6 §3.4)', async () => {
     const event = { sessionId: 's1', state: 'waiting' as const, nextRetryAt: '2026-09-25T10:00:00.000Z' }
     const rolling = { unregister: vi.fn(), stateOf: vi.fn((id: string) => (id === 's1' ? event : null)), forceRoll: vi.fn(async (_id: string) => false), has: (id: string) => id === 's1' }

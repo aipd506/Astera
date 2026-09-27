@@ -27,6 +27,7 @@ import type { RollJournal } from './rollJournal'
 import type { HostSlackWiring } from './slackWiring'
 import { WORKTREE_CALLS, type HostWorktrees } from './worktrees'
 import type { HostJournal } from './hostJournal'
+import type { WorkspaceManager } from './workspace/manager'
 import { DESKTOP_ACTOR, HOST_ACTOR, actorOf, type JournalActor } from '../core/continuity/actor'
 import { parseJournalOps } from '../core/continuity/journalOps'
 
@@ -437,6 +438,10 @@ export function createHostOrch(a: {
   /** The Host's Job Journal (hostJournal.ts). Absent: nothing is journaled here, `journal-append` and
    *  `journal-reload` answer 501, and `runs follow` shows no journal rows. */
   journal?: Pick<HostJournal, 'committed' | 'loaded' | 'append' | 'reload' | 'timeline'> | null
+  /** The agent app workspace (agent workspace design): `app-js` below the receipt line (plan ruling
+   *  P2), and the app only `workspace-list`, `workspace-stop` and `workspace-close` above it. Absent: all
+   *  four answer 501. */
+  workspaces?: Pick<WorkspaceManager, 'run' | 'stop' | 'close' | 'list'>
 }): HostOrch {
   const store = new OrchestrationStore(path.join(a.profileDir, 'orchestration.json'))
 
@@ -1074,6 +1079,21 @@ export function createHostOrch(a: {
     return reply
   }
 
+  /** `astera app js` (agent workspace design). Answered by the Host, never by `handleCommand`: the
+   *  workspace lives here whether or not an app is open (W2). A 200 marks one effect, so a retried
+   *  request id replays this answer instead of launching the app twice (plan ruling P2); a refusal
+   *  marks nothing and leaves no receipt. */
+  const appJs = async (args: Record<string, unknown>, sessionId: string, marks: CallMarks): Promise<Reply> => {
+    if (!a.workspaces) return { status: 501, body: { error: 'this Host has no agent app workspace' } }
+    const script = args.script
+    if (typeof script !== 'string' || script.trim() === '') return { status: 400, body: { error: 'script is required' } }
+    if (sessionId === '')
+      return { status: 400, body: { error: 'app js runs inside an agent session Astera started (ASTERA_SESSION is not set)' } }
+    const r = await a.workspaces.run(sessionId, script)
+    if (r.status === 200) marks.effects += 1
+    return r
+  }
+
   /**
    * **The answer to "did my call land?"** (request receipts design §6). Three states, and 200 for all
    * three: not finding a receipt is an answer, not a failure. Notably it is not a 404 — `NOT_FOUND`
@@ -1238,6 +1258,9 @@ export function createHostOrch(a: {
             cmd === 'journal-append' ||
             cmd === 'journal-reload' ||
             cmd === 'coordinator-idle' ||
+            cmd === 'workspace-list' ||
+            cmd === 'workspace-stop' ||
+            cmd === 'workspace-close' ||
             WORKTREE_CALLS.has(cmd)) &&
           request !== undefined
         )
@@ -1335,6 +1358,17 @@ export function createHostOrch(a: {
           if ('error' in parsed) return { status: 400, body: { error: parsed.error } }
           return a.journal.append(parsed.ops)
         }
+        // **Beside journal-append, for its reason (agent workspace design).** The mirror tab's reads and
+        // its two buttons. Never a command layer command, never a receipt.
+        if (cmd === 'workspace-list' || cmd === 'workspace-stop' || cmd === 'workspace-close') {
+          if (from?.role !== 'app') return { status: 403, body: { error: `${cmd} is the app’s to send` } }
+          if (!a.workspaces) return { status: 501, body: { error: 'this Host has no agent app workspace' } }
+          if (cmd === 'workspace-list') return { status: 200, body: { workspaces: a.workspaces.list() } }
+          const target = args.sessionId
+          if (typeof target !== 'string' || target === '') return { status: 400, body: { error: `${cmd} needs a sessionId` } }
+          if (cmd === 'workspace-stop') return { status: 200, body: { stopped: a.workspaces.stop(target) } }
+          return { status: 200, body: { closed: await a.workspaces.close(target) } }
+        }
         // **Request receipts, and still the same synchronous step the call entered in** — nothing
         // above has awaited on this path, so the lookup and the claim cannot be split by a second
         // `orch-call` arriving in between (§7). The three groups above are deliberately on the other
@@ -1354,6 +1388,12 @@ export function createHostOrch(a: {
             observing = { key: held.observe.key, fp: held.observe.fp, recorded: held.observe.recorded }
             runArgs = held.observe.args
           } else claimed = held
+        }
+        // **Answered by the Host, below the receipt line (plan ruling P2).** The CLI puts an id on every
+        // call, so a command above the line would refuse `astera app js` outright.
+        if (cmd === 'app-js') {
+          const answered = await appJs(args, sessionId, marks)
+          return claimed === null ? answered : settleRequest(claimed, cmd, marks, answered)
         }
         // **Answered by the Host, like the two above — but on *this* side of the receipt line.**
         //

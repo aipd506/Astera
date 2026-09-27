@@ -4,7 +4,7 @@
 //
 // Everything it needs arrives in the environment, because it has no `app.getPath('userData')` to ask.
 import childProcess from 'node:child_process'
-import { existsSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -25,7 +25,7 @@ import { attachProcHost } from './procHost'
 import { ProcRegistry } from './procRegistry'
 import { createProcHolders, procHeldBy } from './procHolders'
 import { nodeProcSpawn } from './nodeProc'
-import { HOST_PROTOCOL, HOST_YIELD_JOURNAL, HOST_YIELD_WORKTREES } from '../core/host/protocol'
+import { HOST_PROTOCOL, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_WORKTREES } from '../core/host/protocol'
 import { createHostJournal } from './hostJournal'
 import { createHostOrch } from './orch'
 import { composeHostDriving } from './drivingWiring'
@@ -42,10 +42,21 @@ import { hookEventsDirIn } from '../core/hooks/sessionState'
 import { readAccountEntries } from '../core/accounts/accountsFile'
 import { readAgentPermissionMode } from '../core/settings/agentPermissionMode'
 import { announceChatProc, createHostSessionStarter } from './sessionCreate'
+import { previewShotsDir } from '../core/preview/shotsDir'
+import { hostCliPaths, hostWorkerBaseEnv } from '../core/host/spawn'
+import { readAgentAppEnabled } from '../core/settings/agentAppEnabled'
+import { createWorkspaceManager } from './workspace/manager'
+import { createLaunchResolver } from './workspace/launch'
+import { spawnPowerShell, startDesktopHelper, writeDeskScript } from './workspace/desktopHelper'
+import { connectCdp } from './workspace/cdp'
+import { freePort, killTree, processStartTimes } from './workspace/native'
 
 /** With no client for this long, there is nothing for the Host to be. Slice 2 adds "and no session is
  *  alive" to this, and slice 3 adds "and no Run is in progress" (design §8). */
 const IDLE_MS = 60_000
+
+/** Plan ruling P8: how long after a session pty exits its workspace waits for a roll to reopen the id. */
+const SESSION_GONE_MS = 5_000
 
 /** How long the Host lets its own event loop turn after ending its sessions, before calling exit.
  *  Measured on win32: exit() called in the same turn as the kill never returns and never exits — it
@@ -182,6 +193,9 @@ async function main(): Promise<void> {
     // only if the listen itself failed, and that path exits without coming here.
     server.stopAccepting()
     void (async () => {
+      // The workspaces first (spec, Lifecycle: "when the Host leaves"): each launched tree killed, each
+      // desktop closed, each helper ended, and workspaces.json emptied. Never rejects.
+      await workspaces.dispose().catch((err) => log.write(`the agent workspaces could not be cleaned up: ${String(err)}`))
       // **The spawns this Host already took finish first** (Host S2 design §8.4, R8), and no new one
       // is taken from here on. Bounded by the app's own spawn deadline: past that, the app has given
       // up on the session anyway. `closeAndSettle` never rejects, and the chain below runs whatever
@@ -365,6 +379,61 @@ async function main(): Promise<void> {
     hookEventsDir: hookEventsDirIn(profileDir),
     accounts: () => readAccountEntries(path.join(profileDir, 'accounts.json'))
   })
+  const projectRoots = createHostProjectRoots({ profileDir, repoPaths: () => worktrees.repoPaths() })
+
+  // The agent app workspace (agent workspace design): answered here whether or not an app is open (W2).
+  // `server` is assigned below; `emit` and `hasWatchers` run only inside a script, long after.
+  const skillsDir = ((): string | null => {
+    const p = hostCliPaths(process.env, existsSync)
+    return 'skills' in p ? p.skills : null
+  })()
+  const workspaces = createWorkspaceManager({
+    platform: process.platform,
+    env: process.env,
+    recordFile: path.join(profileDir, 'orch', 'workspaces.json'),
+    shotsDir: previewShotsDir(profileDir),
+    enabled: () => readAgentAppEnabled(path.join(profileDir, 'app-settings.json')),
+    guide: () => {
+      if (!skillsDir) return ''
+      try {
+        return readFileSync(path.join(skillsDir, 'app-guide.md'), 'utf8')
+      } catch {
+        return ''
+      }
+    },
+    sessionCwd: async (id) => (await hostSessions.listSessions()).find((s) => s.id === id && s.alive)?.cwd ?? null,
+    resolveLaunch: createLaunchResolver({
+      runConfigsFile: path.join(profileDir, 'run-configs.json'),
+      platform: process.platform,
+      baseEnv: () => hostWorkerBaseEnv(process.env),
+      projectRoot: projectRoots.resolve
+    }),
+    startDesk: async (name) => {
+      const script = await writeDeskScript(path.join(profileDir, 'host'))
+      return startDesktopHelper({ name, spawn: () => spawnPowerShell(script), log: (m) => log.write(m) })
+    },
+    connectCdp: (port, waitMs) => connectCdp(port, waitMs),
+    freePort,
+    killTree: (pid) => killTree(pid),
+    startTimes: (pids) => processStartTimes(pids),
+    emit: (event) => server.broadcast({ t: 'workspace', event }, (y) => y.has(HOST_YIELD_WORKSPACE)),
+    hasWatchers: () => server.appsYield(HOST_YIELD_WORKSPACE),
+    log: (m) => log.write(m)
+  })
+  // Plan ruling P8: a session's workspace ends with its last live pty or line process. The exited entry
+  // is still listed (alive: false) when the exit fires, which is where its note is read.
+  const watchSessionEnds = (reg: { list(): Array<{ id: string; alive: boolean; meta: { kind: string; id: string } | null }> }) => (id: string): void => {
+    const meta = reg.list().find((e) => e.id === id)?.meta
+    if (!meta || (meta.kind !== 'session' && meta.kind !== 'chat')) return
+    const timer = setTimeout(() => {
+      const live = [...registry.list(), ...procs.list()].some((e) => e.alive && e.meta?.id === meta.id)
+      if (!live) workspaces.sessionEnded(meta.id)
+    }, SESSION_GONE_MS)
+    timer.unref()
+  }
+  registry.onExit(watchSessionEnds(registry))
+  procs.onExit(watchSessionEnds(procs))
+
   const orch = createHostOrch({
     profileDir,
     version: hostVersion,
@@ -423,7 +492,9 @@ async function main(): Promise<void> {
     // app's rule over this Host's worktree registry and the profile's accounts' transcripts, read
     // only. With no spawner the registry is never loaded, so its list is empty and the transcripts
     // alone answer.
-    resolveProjectRoot: createHostProjectRoots({ profileDir, repoPaths: () => worktrees.repoPaths() }).resolve,
+    resolveProjectRoot: projectRoots.resolve,
+    // `app-js` and the mirror tab's three calls (agent workspace design).
+    workspaces,
     ...(wiring?.orchHooks ?? {}),
     // The rolling's hooks (rolling, rolledInto, rekeyRolled): absent with no spawner, and then
     // `unregisterRolling` only forwards to the app and a rolled-from exit closes as before.
@@ -496,7 +567,7 @@ async function main(): Promise<void> {
       // Announced only when there is a spawner, so an app can tell a Host that starts sessions itself,
       // that it also owns worktrees.json (R5: the one decision is `spawner !== null`), that it drives
       // Jobs (R7) and that it rolls its sessions (R17) — the same one fact.
-      features: hostFeatures({ spawns: spawner !== null, slack: slackSdk !== null }),
+      features: hostFeatures({ spawns: spawner !== null, slack: slackSdk !== null, workspace: process.platform === 'win32' }),
       // An app's hello and its socket's close (N1). The server isolates the call too (`tellAppsChanged`).
       ...(wiring?.serverHooks ?? {}),
       // Both hear it: the driver's app-left rule and the rolling's app-gone watch. Each isolates itself.
@@ -543,6 +614,9 @@ async function main(): Promise<void> {
 
   handlePty = attachPtyHost({ registry, broadcast: (m) => server.broadcast(m) })
   handleProc = attachProcHost({ registry: procs, broadcast: (m) => server.broadcast(m) })
+  // The leftovers of a Host that died with workspaces open (spec, Lifecycle): killed when their start
+  // time still matches, then the file is cleared. A launch waits for this. Never rejects.
+  void workspaces.sweepLeftovers().catch((err) => log.write(`workspace leftovers: ${String(err)}`))
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const)
     process.on(signal, () => leave(signal))

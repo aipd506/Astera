@@ -21,23 +21,8 @@ import {
   type WorkspaceRecord
 } from '../../core/workspace/lifecycle'
 import type { DesktopHelper } from './desktopHelper'
-
-// Declared here in Task 5 and moved to src/core/host/protocol.ts in Task 7.
-export interface WorkspaceFrame {
-  jpeg: string
-  width: number
-  height: number
-  at: number
-}
-export type WorkspaceEvent =
-  | { kind: 'state'; sessionId: string; open: boolean; running: boolean; helper: string | null }
-  | { kind: 'frame'; sessionId: string; frame: WorkspaceFrame }
-export interface WorkspaceSummary {
-  sessionId: string
-  running: boolean
-  helper: string | null
-  frame: WorkspaceFrame | null
-}
+import type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary } from '../../core/host/protocol'
+export type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary }
 
 export const FRAME_EVERY_MS = 1_000
 export const FRAME_MAX_WIDTH = 960

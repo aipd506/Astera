@@ -150,6 +150,9 @@ export interface HostServer {
   /** Any attached app — not just the first — has not yielded `duty` (ruling R1): one S3 app among
    *  several is enough to keep the Host from driving that duty. */
   appsKeep(duty: string): boolean
+  /** Whether any greeted app yielded `duty`: the reverse question of `appsKeep`. The agent workspace
+   *  asks it before capturing a frame, since only an app that yields `workspace` reads one. */
+  appsYield(duty: string): boolean
   /** The yields a greeted socket declared in its hello, or null once it is gone or never greeted (S6
    *  R1). By the socket number `onMessage` and `onClientGone` hand out, which is what `exits.holdersOf`
    *  names. Whatever role the socket gave: an app 1.3.25 or older sends no role and still holds ptys,
@@ -569,6 +572,7 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
       return s !== null && !(yields.get(s)?.has(duty) ?? false)
     },
     appsKeep: (duty) => [...greetedSockets].some((s) => isApp(s) && !(yields.get(s)?.has(duty) ?? false)),
+    appsYield: (duty) => [...greetedSockets].some((s) => isApp(s) && (yields.get(s)?.has(duty) ?? false)),
     yieldsOf: (socketNo) => {
       const s = socketByNo.get(socketNo)
       if (!s || s.destroyed || !greetedSockets.has(s)) return null

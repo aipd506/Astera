@@ -957,6 +957,29 @@ describe('startHostServer', () => {
       expect(changed).toEqual(['false', 'true', 'false', 'false'])
     })
 
+    it('says whether any attached app yields a duty, the question the workspace pushes ask (P6)', async () => {
+      const h = await server()
+      const hello = async (extra: Record<string, unknown>): Promise<net.Socket> => {
+        const sock = net.connect(h.address)
+        await new Promise((r) => sock.once('connect', r))
+        const ch = messageChannel(sock)
+        ch.send({ t: 'hello', protocol: HOST_PROTOCOL, app: '1.0.0', ...extra } as ClientMessage)
+        await ch.next()
+        return sock
+      }
+      expect(h.s.appsYield('workspace')).toBe(false)
+      const cli = await hello({ role: 'cli', yields: ['workspace'] })
+      expect(h.s.appsYield('workspace')).toBe(false)
+      const old = await hello({ role: 'app', yields: ['worktrees'] })
+      expect(h.s.appsYield('workspace')).toBe(false)
+      const fresh = await hello({ role: 'app', yields: ['worktrees', 'workspace'] })
+      expect(h.s.appsYield('workspace')).toBe(true)
+      fresh.end()
+      await vi.waitFor(() => expect(h.s.appsYield('workspace')).toBe(false))
+      old.end()
+      cli.end()
+    })
+
     it('does not tell anyone about a CLI coming or going', async () => {
       const onAppsChanged = vi.fn()
       const h = await start({ onAppsChanged })

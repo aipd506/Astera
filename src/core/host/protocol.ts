@@ -129,6 +129,12 @@ export const HOST_FEATURE_SLACK_OWNER = 'slack-owner'
  *  `journal-reload`. Announced by every Host (plan ruling P6). */
 export const HOST_FEATURE_JOURNAL = 'journal'
 
+/** The Host runs agent app workspaces (agent workspace design): it answers `app-js` and the app only
+ *  orch-calls `workspace-list`, `workspace-stop` and `workspace-close`, and pushes `workspace` to the
+ *  apps that yield `workspace`. Announced by a win32 Host only (W1: Windows only in this scope). An app
+ *  sends none of the three calls to a Host without it. Additive, so HOST_PROTOCOL stays 3. */
+export const HOST_FEATURE_WORKSPACE = 'workspace'
+
 /** One entry of the roll journal (D5). `seq` rises across the Host's restarts; `at` is ISO. A `rolled`
  *  entry names the new session in `sessionId` and the one it rolled from in `oldSessionId`, which is how
  *  a reader folds a chain onto its live id. A `state` entry carries the roll state and its fields. */
@@ -179,6 +185,31 @@ export const HOST_YIELD_SLACK = 'slack'
 /** `hello.yields` value: this app writes no journal row while its Host announces `journal`; it reads the
  *  file read-only and sends its reconciler's rows through `journal-append` (J2, J3). */
 export const HOST_YIELD_JOURNAL = 'journal'
+/** `hello.yields` value: this app shows the Host's agent app workspaces in a mirror tab, so the Host
+ *  may push `workspace` to it and captures frames only while one such app is attached. An older app
+ *  sends none and is pushed nothing. */
+export const HOST_YIELD_WORKSPACE = 'workspace'
+
+/** The latest picture of a workspace's app: a scaled JPEG, base64 (plan ruling P12). */
+export interface WorkspaceFrame {
+  jpeg: string
+  width: number
+  height: number
+  at: number
+}
+
+/** What the mirror tab hears. `open: false` means the desktop is gone. */
+export type WorkspaceEvent =
+  | { kind: 'state'; sessionId: string; open: boolean; running: boolean; helper: string | null }
+  | { kind: 'frame'; sessionId: string; frame: WorkspaceFrame }
+
+/** One open workspace, as `workspace-list` answers it for an app that attaches later. */
+export interface WorkspaceSummary {
+  sessionId: string
+  running: boolean
+  helper: string | null
+  frame: WorkspaceFrame | null
+}
 
 /** The `orch-act` a Host sends an attached app before it removes a worktree folder (S3, the ruling
  *  on plan risk 3). Args `[path]`. The app answers the tag of anything **it runs itself, not
@@ -454,3 +485,6 @@ export type HostMessage =
   /** Who drives Jobs and the gate it was computed from (HOST_FEATURE_DRIVER): on every change, to the
    *  greeted apps that yield dispatch, and once to an app right after its hello. Additive. */
   | ({ t: 'driver' } & HostDriverReport)
+  /** An agent app workspace changed (HOST_FEATURE_WORKSPACE): to the greeted apps that yield
+   *  `workspace` only. Additive. */
+  | { t: 'workspace'; event: WorkspaceEvent }
