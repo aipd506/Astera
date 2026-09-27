@@ -6,7 +6,7 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-// 새 세션 대화상자의 저장소 검사. UNC·\wsl$ 자리에서 git 이 30초씩 붙잡혀 시작 버튼이 죽어 있던 것을
+// 새 세션 대화상자의 저장소 검사. UNC·\\wsl$ 자리에서 git 이 30초씩 붙잡혀 시작 버튼이 죽어 있던 것을
 // 짧은 기한으로 끊고, 끊긴 것은 "저장소 아님" 이 아니라 "모름" 으로 답한다.
 describe('probeRepoRoot', () => {
   it('기한은 5초를 넘지 않는다', () => {
@@ -30,14 +30,14 @@ describe('probeRepoRoot', () => {
 
   it('git 이 기한에 걸리면 unknown — "저장소 아님" 이 아니다', async () => {
     const run = async (): Promise<GitResult> => ({ ok: false, stdout: '', stderr: 'timed out', timedOut: true })
-    expect(await probeRepoRoot('\\wsl$\Ubuntu\p', run)).toEqual({ kind: 'unknown' })
+    expect(await probeRepoRoot('\\\\wsl$\\Ubuntu\\p', run)).toEqual({ kind: 'unknown' })
   })
 
   it('git 이 죽지 않고 붙잡혀 있어도 기한에 unknown 으로 답한다', async () => {
     vi.useFakeTimers()
     const run = (): Promise<GitResult> => new Promise(() => {})
     let answer: unknown = null
-    void probeRepoRoot('\\server\share', run).then((a) => (answer = a))
+    void probeRepoRoot('\\\\server\\share', run).then((a) => (answer = a))
     await vi.advanceTimersByTimeAsync(REPO_PROBE_TIMEOUT_MS - 1)
     expect(answer).toBeNull()
     await vi.advanceTimersByTimeAsync(1)

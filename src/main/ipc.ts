@@ -3988,7 +3988,7 @@ export function registerIpc(
     removeWorktree({ id, force: opts?.force === true, registry: core.worktrees, isPathInUse })
   )
   // Short deadline, and `unknown` rather than "not a repo" when git does not answer in time (a UNC or
-  // \wsl$ folder): the dialog keeps Start open then and only holds back the worktree option.
+  // \\wsl$ folder): the dialog keeps Start open then and only holds back the worktree option.
   ipcMain.handle('worktrees.isGitRepo', (_e, dir: string) => probeRepoRoot(dir))
   ipcMain.handle('worktrees.getRoot', () => core.worktrees.getRoot())
   ipcMain.handle('worktrees.setRoot', (_e, root: string | null) => core.worktrees.setRoot(root))

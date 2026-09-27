@@ -167,7 +167,7 @@ export async function repoRoot(dir: string): Promise<string | null> {
 }
 
 /** Deadline for the new-session dialog's repository check. The dialog holds Start while it runs, and on
- *  a UNC share or `\wsl$` path git can sit for the full 30 s default — a dead button with nothing to
+ *  a UNC share or `\\wsl$` path git can sit for the full 30 s default — a dead button with nothing to
  *  say. Five seconds is far past any local answer; past it, the answer is "unknown", not "no". */
 export const REPO_PROBE_TIMEOUT_MS = 5_000
 

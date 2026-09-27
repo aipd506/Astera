@@ -112,7 +112,7 @@ export function NewSessionDialog({
   // folder, or one that died silently inside its own timeout all leave nothing to show)
   const [cliError, setCliError] = useState<{ claude?: string; codex?: string }>({})
   // Result of the git repo check (probeRepoRoot). `unknown` is git not answering within its short
-  // deadline — a UNC or \wsl$ folder — which leaves Start open and holds back only the worktree option.
+  // deadline — a UNC or \\wsl$ folder — which leaves Start open and holds back only the worktree option.
   const [repoProbe, setRepoProbe] = useState<RepoProbe | null>(null)
   const repoRoot = repoProbe?.kind === 'repo' ? repoProbe.root : null
   // Whether the per-folder CLI check below is still running. It does not gate Start (see that effect),
