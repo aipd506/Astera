@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { NAMED_KEYS } from '../../core/workspace/helpers'
-import { DESK_READY_MS, type DeskWindow } from '../../core/workspace/protocol'
-import { XDOTOOL_KEYS, createLinuxDesks, displayEnv, imageSize, parseGeometry, pickWindow, type LinuxDeskDeps } from './deskLinux'
+import { DESK_CLOSE_MS, DESK_READY_MS, type DeskWindow } from '../../core/workspace/protocol'
+import { XDOTOOL_KEYS, createLinuxDesks, displayEnv, imageSize, parseGeometry, pickWindow, realLinuxDeskDeps, type LinuxDeskDeps } from './deskLinux'
 import type { SpawnedProc } from './posixProc'
 
 type Mode = 'ready' | 'exit' | 'hang'
@@ -12,6 +12,9 @@ interface FakeProc extends SpawnedProc {
   env: Record<string, string>
   cwd?: string
   mode: Mode
+  readyFd: boolean
+  /** What it wrote to its -displayfd pipe so far. */
+  reported: string
   signals: string[]
   exit(why: string): void
 }
@@ -42,8 +45,8 @@ const jpeg = (w: number, h: number): Buffer => {
 const exit1 = (): Error => Object.assign(new Error('Command failed'), { code: 1 })
 
 /** Every Xvfb spawned takes the next mode of `plan` (ready when the plan runs out): 'ready' makes its
- *  socket on the first poll, 'exit' exits on the first poll leaving a lock file behind (another Host
- *  holds the number), 'hang' never makes its socket. */
+ *  socket and writes its display number to its -displayfd pipe on the first poll, 'exit' exits on the
+ *  first poll leaving a lock file behind (another Host holds the number), 'hang' never does either. */
 const rig = (plan: Mode[] = []) => {
   const files = new Set<string>()
   const procs: FakeProc[] = []
@@ -51,6 +54,7 @@ const rig = (plan: Mode[] = []) => {
   const starts = new Map<number, number>()
   const groupsKilled: number[] = []
   const log: string[] = []
+  const sleeps: Array<{ ms: number; signal?: AbortSignal }> = []
   const answers: Array<(file: string, args: string[]) => Buffer | Error | undefined> = []
   let clock = 1_000_000
   let nextPid = 700
@@ -68,6 +72,9 @@ const rig = (plan: Mode[] = []) => {
         cwd: o.cwd,
         signals: [],
         mode: file === 'Xvfb' ? (plan[xvfbs++] ?? 'ready') : 'ready',
+        readyFd: o.readyFd === true,
+        reported: '',
+        readyText: () => p.reported,
         pid: nextPid++,
         onExit: (cb) => {
           if (ended !== null) cb(ended)
@@ -105,11 +112,15 @@ const rig = (plan: Mode[] = []) => {
       groupsKilled.push(pid)
       starts.delete(pid)
     },
-    sleep: async (ms) => {
+    sleep: async (ms, signal) => {
+      sleeps.push({ ms, signal })
       clock += ms
       for (const p of procs) {
         if (p.file !== 'Xvfb' || p.signals.length > 0) continue
-        if (p.mode === 'ready') files.add(`/tmp/.X11-unix/X${numberOf(p)}`)
+        if (p.mode === 'ready') {
+          files.add(`/tmp/.X11-unix/X${numberOf(p)}`)
+          if (p.readyFd) p.reported = `${numberOf(p)}\n`
+        }
         if (p.mode === 'exit') {
           files.add(`/tmp/.X${numberOf(p)}-lock`)
           p.exit('exited 1')
@@ -122,7 +133,7 @@ const rig = (plan: Mode[] = []) => {
   const xdo = (fn: (args: string[]) => Buffer | Error | undefined): void => {
     answers.push((file, args) => (file === 'xdotool' ? fn(args) : undefined))
   }
-  return { deps, desks: createLinuxDesks(deps), files, procs, runs, starts, groupsKilled, log, answers, xdo }
+  return { deps, desks: createLinuxDesks(deps), files, procs, runs, starts, groupsKilled, log, sleeps, answers, xdo }
 }
 
 /** Three windows: a Hangul titled one with a pid, one with no _NET_WM_PID, and one that closes
@@ -138,18 +149,31 @@ const threeWindows = (r: ReturnType<typeof rig>): void =>
   })
 
 describe('the Linux desk: Xvfb', () => {
-  it('starts Xvfb on the first free display from 90, waits for its socket, and records its pid and start time', async () => {
+  it('starts Xvfb on the first free display from 90, waits for it to report that display, and records its pid and start time', async () => {
     const r = rig()
     r.files.add('/tmp/.X11-unix/X90')
     r.files.add('/tmp/.X91-lock')
     const desk = await r.desks.start('astera-ws-1-1')
     const x = r.procs[0]
     expect(x.file).toBe('Xvfb')
-    expect(x.args).toEqual([':92', '-screen', '0', '1920x1080x24', '-nolisten', 'tcp'])
+    expect(x.args).toEqual([':92', '-screen', '0', '1920x1080x24', '-nolisten', 'tcp', '-displayfd', '3'])
+    expect(x.readyFd).toBe(true)
     expect(desk.name).toBe('astera-ws-1-1')
     expect(desk.pid).toBe(x.pid)
     expect(desk.startedAt).toBe(1_000_000)
     expect(desk.alive()).toBe(true)
+  })
+
+  it('is not ready on a socket another X server made for its number after the probe (fix round 1)', async () => {
+    const r = rig(['hang'])
+    const spawn = r.deps.spawn
+    r.deps.spawn = (file, args, o) => {
+      // The foreign server's socket appears between the probe and this Xvfb's start.
+      if (file === 'Xvfb') r.files.add(`/tmp/.X11-unix/X${args[0].slice(1)}`)
+      return spawn(file, args, o)
+    }
+    await expect(r.desks.start('a')).rejects.toThrow(`Xvfb :90 did not open its display within ${DESK_READY_MS / 1000} s`)
+    expect(r.procs[0].signals).toEqual(['SIGKILL'])
   })
 
   it('gives two desks that start at the same moment two displays (Review Focus 1)', async () => {
@@ -241,6 +265,64 @@ describe('the Linux desk: start times come from the kernel, never the clock', ()
   })
 })
 
+describe('the Linux desk: fix round 1', () => {
+  it('ends the fresh group and rethrows when the launched start time cannot be read', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    const real = r.deps.startTime
+    r.deps.startTime = async (pid) => (pid === r.procs[0].pid ? real(pid) : Promise.reject(new Error('/proc/stat has no btime line')))
+    await expect(desk.launch({ command: 'app', cwd: '/p', env: {} })).rejects.toThrow('/proc/stat has no btime line')
+    expect(r.groupsKilled).toEqual([r.procs[1].pid])
+  })
+
+  it('still rethrows the start time failure when ending that group fails too, and logs the second failure', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    const real = r.deps.startTime
+    r.deps.startTime = async (pid) => (pid === r.procs[0].pid ? real(pid) : Promise.reject(new Error('no btime')))
+    r.deps.killGroup = async () => {
+      throw new Error('EPERM')
+    }
+    await expect(desk.launch({ command: 'app', cwd: '/p', env: {} })).rejects.toThrow('no btime')
+    expect(r.log.some((l) => l.includes(`pid ${r.procs[1].pid} could not be ended: EPERM`))).toBe(true)
+  })
+
+  it('types long text in pieces, so each xdotool run stays within the request limit at its default delay', async () => {
+    const r = rig()
+    threeWindows(r)
+    const desk = await r.desks.start('a')
+    const text = '가'.repeat(450) + '\u{1F600}'.repeat(10)
+    await desk.keys({ title: 'astera', text })
+    const typed = r.runs.filter((x) => x.args[2] === 'type').map((x) => x.args)
+    expect(typed.map((a) => a.slice(0, 4))).toEqual([
+      ['windowfocus', '41', 'type', '--'],
+      ['windowfocus', '41', 'type', '--']
+    ])
+    expect(typed.map((a) => Array.from(a[4]).length)).toEqual([400, 60])
+    expect(typed.map((a) => a[4]).join('')).toBe(text)
+  })
+
+  it('close cancels its wait for Xvfb once Xvfb has exited', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    await desk.close()
+    const wait = r.sleeps.find((s) => s.ms === DESK_CLOSE_MS)
+    expect(wait?.signal?.aborted).toBe(true)
+  })
+
+  it('close still ends Xvfb and resolves when ending an app group fails, and logs it', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    const one = await desk.launch({ command: 'a', cwd: '/p', env: {} })
+    r.deps.killGroup = async () => {
+      throw new Error('EPERM')
+    }
+    await expect(desk.close()).resolves.toBeUndefined()
+    expect(r.procs[0].signals).toEqual(['SIGTERM'])
+    expect(r.log.some((l) => l.includes(`pid ${one.pid} could not be ended: EPERM`))).toBe(true)
+  })
+})
+
 describe('the Linux desk: launch, kill and close', () => {
   it('runs the command through sh on the display, with no Wayland and the x11 hint, and its start time from /proc', async () => {
     const r = rig()
@@ -252,7 +334,7 @@ describe('the Linux desk: launch, kill and close', () => {
     })
     const app = r.procs[1]
     expect(app.file).toBe('sh')
-    expect(app.args).toEqual(['-c', 'npm run dev'])
+    expect(app.args).toEqual(['-c', 'npm run dev\nwait'])
     expect(app.cwd).toBe('/home/me/proj')
     expect(app.env).toEqual({
       PATH: '/usr/bin',
@@ -260,7 +342,9 @@ describe('the Linux desk: launch, kill and close', () => {
       ASTERA_APP_CDP_PORT: '9333',
       ELECTRON_OZONE_PLATFORM_HINT: 'x11',
       XDG_SESSION_TYPE: 'x11',
-      GDK_BACKEND: 'x11'
+      GDK_BACKEND: 'x11',
+      QT_QPA_PLATFORM: 'xcb',
+      SDL_VIDEODRIVER: 'x11'
     })
     expect(got).toEqual({ pid: app.pid, startedAt: r.starts.get(app.pid!) })
   })
@@ -348,7 +432,7 @@ describe('the Linux desk: windows, shots and keys', () => {
     await desk.keys({ title: '픽스처', text: '-hi 안녕' })
     await desk.keys({ title: 'astera', key: 'Enter' })
     expect(r.runs.filter((x) => x.args[0] === 'windowfocus').map((x) => x.args)).toEqual([
-      ['windowfocus', '41', 'type', '--delay', '0', '--', '-hi 안녕'],
+      ['windowfocus', '41', 'type', '--', '-hi 안녕'],
       ['windowfocus', '41', 'key', '--clearmodifiers', 'Return']
     ])
     await expect(desk.keys({ title: 'nothing like it', text: 'x' })).rejects.toThrow('no window titled "nothing like it"')
@@ -362,12 +446,15 @@ describe('the Linux desk: windows, shots and keys', () => {
 
 describe('the Linux desk: pure parts', () => {
   it('points the env at the display and drops Wayland, so an app started from a Wayland desktop cannot reach its screen (ruling F5)', () => {
-    expect(displayEnv({ A: '1', WAYLAND_DISPLAY: 'w', DISPLAY: ':0', GONE: undefined, XDG_SESSION_TYPE: 'wayland', GDK_BACKEND: 'wayland' }, 93)).toEqual({
+    const wayland = { WAYLAND_DISPLAY: 'w', WAYLAND_SOCKET: '5', XDG_SESSION_TYPE: 'wayland', GDK_BACKEND: 'wayland', QT_QPA_PLATFORM: 'wayland', SDL_VIDEODRIVER: 'wayland' }
+    expect(displayEnv({ A: '1', DISPLAY: ':0', GONE: undefined, ...wayland }, 93)).toEqual({
       A: '1',
       DISPLAY: ':93',
       ELECTRON_OZONE_PLATFORM_HINT: 'x11',
       XDG_SESSION_TYPE: 'x11',
-      GDK_BACKEND: 'x11'
+      GDK_BACKEND: 'x11',
+      QT_QPA_PLATFORM: 'xcb',
+      SDL_VIDEODRIVER: 'x11'
     })
   })
 
@@ -398,5 +485,18 @@ describe('the Linux desk: pure parts', () => {
     expect(pickWindow(list, 'IMPORT')?.hwnd).toBe(2)
     expect(pickWindow(list, 'small')?.hwnd).toBe(1)
     expect(pickWindow(list, 'nope')).toBeNull()
+  })
+})
+
+describe('the Linux desk: real deps', () => {
+  it('ends a real sleep, and clears its timer, when its signal aborts', async () => {
+    const d = realLinuxDeskDeps({ hostEnv: {}, log: () => {} })
+    const stop = new AbortController()
+    const t0 = Date.now()
+    const done = d.sleep(60_000, stop.signal)
+    stop.abort()
+    await done
+    await d.sleep(60_000, stop.signal)
+    expect(Date.now() - t0).toBeLessThan(1_000)
   })
 })

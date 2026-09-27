@@ -4,6 +4,7 @@
 // detached spawn that makes the launched process a group leader; and a tool run to its end.
 import { execFile, spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
+import type { Readable } from 'node:stream'
 import { DESK_REQUEST_MS } from '../../core/workspace/protocol'
 
 export const GROUP_KILL_GRACE_MS = 2_000
@@ -172,17 +173,25 @@ export interface SpawnedProc {
   onExit(cb: (why: string) => void): void
   /** The last of its stderr, one line, when it was spawned with `stderr: true`. */
   stderrTail(): string
+  /** What it wrote to fd 3 so far, when it was spawned with `readyFd: true` (Xvfb's -displayfd). */
+  readyText?(): string
   kill(sig?: NodeJS.Signals): void
 }
 
-export type SpawnDetached = (file: string, args: string[], o: { env: Record<string, string>; cwd?: string; stderr?: boolean }) => SpawnedProc
+export type SpawnDetached = (file: string, args: string[], o: { env: Record<string, string>; cwd?: string; stderr?: boolean; readyFd?: boolean }) => SpawnedProc
 
 /** A process in a new process group (so the group can be ended as one), stdin and stdout ignored,
  *  and not holding the Host's event loop open. */
 export const spawnDetached: SpawnDetached = (file, args, o) => {
-  const child = spawn(file, args, { env: o.env, cwd: o.cwd, detached: true, stdio: ['ignore', 'ignore', o.stderr ? 'pipe' : 'ignore'] })
+  const child = spawn(file, args, {
+    env: o.env,
+    cwd: o.cwd,
+    detached: true,
+    stdio: ['ignore', 'ignore', o.stderr ? 'pipe' : 'ignore', ...(o.readyFd ? (['pipe'] as const) : [])]
+  })
   const cbs: Array<(why: string) => void> = []
   let tail = ''
+  let ready = ''
   let ended: string | null = null
   const end = (why: string): void => {
     if (ended !== null) return
@@ -198,6 +207,16 @@ export const spawnDetached: SpawnDetached = (file, args, o) => {
     // R3: a broken pipe here is not this call's failure; 'close' still judges the exit either way.
     child.stderr.on('error', () => {})
     ;(child.stderr as unknown as { unref?(): void }).unref?.()
+  }
+  const fd3 = o.readyFd ? (child.stdio[3] as Readable | null) : null
+  if (fd3) {
+    fd3.setEncoding('utf8')
+    fd3.on('data', (c: string) => {
+      ready = (ready + c).slice(-200)
+    })
+    // R3, as for stderr.
+    fd3.on('error', () => {})
+    ;(fd3 as unknown as { unref?(): void }).unref?.()
   }
   // R3: a spawn that fails emits 'error', which is an exit here, never an unhandled event.
   child.on('error', (err) => end(`${file} could not start: ${err.message}`))
@@ -215,6 +234,7 @@ export const spawnDetached: SpawnDetached = (file, args, o) => {
       else cbs.push(cb)
     },
     stderrTail: () => tail.trim().replace(/\s+/g, ' '),
+    readyText: () => ready,
     kill: (sig = 'SIGTERM') => {
       if (ended !== null) return
       try {

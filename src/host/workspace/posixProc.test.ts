@@ -184,3 +184,15 @@ describe.runIf(process.platform !== 'win32')('spawnDetached, killGroup and the s
     expect(Math.abs(t! - (Date.now() - process.uptime() * 1000))).toBeLessThan(3_000)
   })
 })
+
+describe('spawnDetached: the ready pipe', () => {
+  it('reads what the process writes to fd 3 when asked for a ready pipe (Xvfb -displayfd), and has none otherwise', async () => {
+    const write = 'require("fs").writeSync(3, "90" + String.fromCharCode(10))'
+    const p = spawnDetached(process.execPath, ['-e', write], { env: { PATH: process.env.PATH ?? '' }, readyFd: true })
+    expect(await new Promise<string>((r) => p.onExit(r))).toBe('exited 0')
+    expect(p.readyText?.()).toBe('90\n')
+    const q = spawnDetached(process.execPath, ['-e', ''], { env: { PATH: process.env.PATH ?? '' } })
+    await new Promise<string>((r) => q.onExit(r))
+    expect(q.readyText?.() ?? '').toBe('')
+  })
+})
