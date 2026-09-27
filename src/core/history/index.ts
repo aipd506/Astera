@@ -6,16 +6,19 @@ import type { Account, HistoryEntry, ProjectSummary, Provider, TranscriptPreview
 import { metaOf } from '../providers/meta'
 import { descriptorOf, makeDescriptors, type ProviderDescriptor } from '../providers/descriptor'
 import type { HistoryIo, HistoryStrategy } from './strategies/types'
-import type { SessionCwdCache } from './sessionCwdCache'
 import {
   cwdMemo,
   jsonlFilesByMtimeDesc,
   mapWithConcurrency,
+  MemoryCwdStore,
   projectSummariesOf,
   resolveProjectCwd,
+  rowMemo,
   signatureOf,
-  subdirs
+  subdirs,
+  type CwdStore
 } from './projects'
+import { ScanProgress, type ScanProgressEvent } from './scanProgress'
 
 // Paths compare through comparablePath (core/files/tree.ts): case folded on win32 and darwin, exact on linux.
 
@@ -100,13 +103,22 @@ export class HistoryIndex {
   private updateDeadline = 0
   private reloading: Promise<void> = Promise.resolve()
   onUpdated?: () => void
+  /** "Scanning Codex history… N/M": the rollout heads the index does not know yet, while they are
+   *  being read (scanProgress.ts). Only codex has such a scan — claude's folder is its project. */
+  onScanProgress?: (e: ScanProgressEvent) => void
+  private readonly scan = new ScanProgress((e) => this.onScanProgress?.(e))
+  // The rollout index (sessionCwdCache.ts). Survives invalidate(): it is keyed on (mtimeMs, size), so
+  // a changed file misses on its own. Absent a persisted one (tests, a caller without userData), it
+  // lives in memory for the life of this object.
+  private readonly store: CwdStore
 
   constructor(
     private getAccounts: () => Account[],
     private descriptors: Record<Provider, ProviderDescriptor> = makeDescriptors(process.platform),
-    // Absent (tests, and any caller that has no userData) simply means every cwd is parsed each pass
-    private cwdCache?: SessionCwdCache
-  ) {}
+    cwdCache?: CwdStore
+  ) {
+    this.store = cwdCache ?? new MemoryCwdStore()
+  }
 
   // The narrow interface handed to a strategy — ownership of the cache and file traversal stays here
   private readonly io: HistoryIo = {
@@ -115,7 +127,9 @@ export class HistoryIndex {
     subdirs: (dir) => subdirs(dir),
     resolveProjectCwd: (dir, files) => resolveProjectCwd(dir, files),
     // The persisted memo, when there is one (see projects.ts's cwdMemo and sessionCwdCache.ts)
-    cwdMemo: (files, parse) => cwdMemo(files, parse, this.cwdCache),
+    cwdMemo: (files, parse, scope) =>
+      cwdMemo(files, parse, this.store, { scope, progress: (misses) => this.scan.begin(misses) }),
+    rowMemo: (files, build) => rowMemo(files, build, this.store),
     samePath: (a, b) => comparablePath(a) === comparablePath(b),
     pathKey: (p) => comparablePath(p),
     cacheDirForProject: (accountId, projectPath, dir) => {
@@ -261,6 +275,14 @@ export class HistoryIndex {
     const accounts = this.getAccounts().filter((a) => !accountId || a.id === accountId)
     const all: HistoryEntry[] = []
     for (const account of accounts) {
+      const forProject = this.strategyFor(account).entriesForProject
+      if (projectPath && forProject) {
+        // codex: the rollout index names the project's files, so the other projects' are not parsed
+        const entries = await forProject(account, projectPath, this.io)
+        for (const e of entries) this.entryById.set(e.id, e)
+        all.push(...entries)
+        continue
+      }
       for (const dir of await this.dirsForProject(account, projectPath)) {
         const entries = await this.parseDir(account, dir)
         all.push(

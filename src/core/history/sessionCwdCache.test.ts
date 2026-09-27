@@ -193,3 +193,95 @@ describe('SessionCwdCache', () => {
     expect(await fs.readFile(filePath(), 'utf8')).toBe('{ this is not json')
   })
 })
+
+// Stage 4 T3 — the same file becomes the codex rollout index: besides the cwd it keeps the row a
+// project expansion shows (sessionId, title, awaitingReply), and it drops files that are gone.
+describe('SessionCwdCache — rollout index', () => {
+  const ROW = { sessionId: 's-1', title: '첫 질문', awaitingReply: true }
+
+  it('setRow 한 행을 같은 (mtime,size)로 되찾고, 그 cwd 도 get 으로 보인다', async () => {
+    const c = new SessionCwdCache(filePath())
+    await c.load()
+    const p = sessionPath('s', 'r1.jsonl')
+    c.setRow(p, 100, 20, CWD_A, ROW)
+    expect(c.getRow(p, 100, 20)).toEqual({ cwd: CWD_A, ...ROW })
+    expect(c.get(p, 100, 20)).toBe(CWD_A)
+    expect(c.getRow(p, 101, 20)).toBeUndefined()
+  })
+
+  it('cwd 만 아는 행은 getRow 에서 miss 다', async () => {
+    const c = new SessionCwdCache(filePath())
+    await c.load()
+    const p = sessionPath('s', 'r1.jsonl')
+    c.set(p, 100, 20, CWD_A)
+    expect(c.getRow(p, 100, 20)).toBeUndefined()
+  })
+
+  it('같은 키·같은 cwd 로 set 해도 이미 있는 행을 지우지 않는다 — 파일이 바뀌면 행도 버린다', async () => {
+    const c = new SessionCwdCache(filePath())
+    await c.load()
+    const p = sessionPath('s', 'r1.jsonl')
+    c.setRow(p, 100, 20, CWD_A, ROW)
+    c.set(p, 100, 20, CWD_A)
+    expect(c.getRow(p, 100, 20)).toEqual({ cwd: CWD_A, ...ROW })
+    c.set(p, 200, 30, CWD_A) // appended: a new key
+    expect(c.getRow(p, 200, 30)).toBeUndefined()
+    expect(c.get(p, 200, 30)).toBe(CWD_A)
+  })
+
+  it('행은 flush 와 load 를 지나도 남고, 옛 3칸 행과 한 파일에 섞여도 읽힌다', async () => {
+    const old = sessionPath('s', 'old.jsonl')
+    const neu = sessionPath('s', 'new.jsonl')
+    await fs.writeFile(filePath(), JSON.stringify({ [keyOf(old)]: [1, 2, CWD_B] }), 'utf8')
+    const first = new SessionCwdCache(filePath())
+    await first.load()
+    first.setRow(neu, 100, 20, CWD_A, ROW)
+    await first.flush()
+    const second = new SessionCwdCache(filePath())
+    await second.load()
+    expect(second.get(old, 1, 2)).toBe(CWD_B)
+    expect(second.getRow(neu, 100, 20)).toEqual({ cwd: CWD_A, ...ROW })
+  })
+
+  it('다른 판(버전)의 행 모양은 cwd 는 살리고 행은 버린다', async () => {
+    const p = sessionPath('s', 'r1.jsonl')
+    await fs.writeFile(filePath(), JSON.stringify({ [keyOf(p)]: [100, 20, CWD_A, 999, 's-1', 't', 1] }), 'utf8')
+    const c = new SessionCwdCache(filePath())
+    await c.load()
+    expect(c.get(p, 100, 20)).toBe(CWD_A)
+    expect(c.getRow(p, 100, 20)).toBeUndefined()
+  })
+
+  it('prune 은 그 뿌리 아래에서 목록에 없는 파일만 지우고, 다른 뿌리는 건드리지 않는다', async () => {
+    const c = new SessionCwdCache(filePath())
+    await c.load()
+    const root = sessionPath('acc1', 'sessions')
+    const kept = path.join(root, '2026', '09', '01', 'a.jsonl')
+    const gone = path.join(root, '2026', '09', '01', 'b.jsonl')
+    const other = sessionPath('acc2', 'sessions', '2026', '09', '01', 'c.jsonl')
+    c.set(kept, 1, 1, CWD_A)
+    c.setRow(gone, 1, 1, CWD_A, ROW)
+    c.set(other, 1, 1, CWD_B)
+    await c.flush()
+    expect(c.prune(root, [kept])).toBe(1)
+    expect(c.get(kept, 1, 1)).toBe(CWD_A)
+    expect(c.get(gone, 1, 1)).toBeUndefined()
+    expect(c.get(other, 1, 1)).toBe(CWD_B)
+    // A prune is a change: it reaches the file
+    await c.flush()
+    const again = new SessionCwdCache(filePath())
+    await again.load()
+    expect(again.get(gone, 1, 1)).toBeUndefined()
+    expect(again.get(kept, 1, 1)).toBe(CWD_A)
+  })
+
+  it('prune 은 이름이 뿌리로 시작할 뿐인 형제 폴더를 뿌리 아래로 보지 않는다', async () => {
+    const c = new SessionCwdCache(filePath())
+    await c.load()
+    const root = sessionPath('acc1', 'sessions')
+    const sibling = sessionPath('acc1', 'sessions-old', 'x.jsonl')
+    c.set(sibling, 1, 1, CWD_A)
+    expect(c.prune(root, [])).toBe(0)
+    expect(c.get(sibling, 1, 1)).toBe(CWD_A)
+  })
+})

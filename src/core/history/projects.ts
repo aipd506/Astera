@@ -19,14 +19,20 @@ import { comparablePath } from '../files/tree'
 import type { Account, ProjectSummary, Provider } from '../types'
 import { parseTranscriptMeta } from './parser'
 import { descriptorOf, type ProviderDescriptor } from '../providers/descriptor'
-import type { HistoryIo } from './strategies/types'
+import type { HistoryIo, IndexedRow, MemoFile } from './strategies/types'
+import type { RolloutRow } from './sessionCwdCache'
+import type { ScanHandle } from './scanProgress'
 
-/** The part of SessionCwdCache (sessionCwdCache.ts) `cwdMemo` uses. The app hands it the persisted
- *  memo; the Host hands it one opened read-only, so the app's file is never written by a second
- *  process. */
+/** The part of SessionCwdCache (sessionCwdCache.ts) `cwdMemo` and `rowMemo` use. The app hands it the
+ *  persisted memo; the Host hands it one opened read-only, so the app's file is never written by a
+ *  second process. */
 export interface CwdStore {
   get(filePath: string, mtimeMs: number, size: number): string | null | undefined
   set(filePath: string, mtimeMs: number, size: number, cwd: string | null): void
+  getRow(filePath: string, mtimeMs: number, size: number): IndexedRow | undefined
+  setRow(filePath: string, mtimeMs: number, size: number, cwd: string, row: RolloutRow): void
+  /** Drops the entries under `root` whose file is not in `livePaths`. */
+  prune(root: string, livePaths: Iterable<string>): number
   flush(): Promise<void>
 }
 
@@ -108,21 +114,64 @@ export async function resolveProjectCwd(dir: string, filesNewestFirst: string[])
  *  is what takes the codex project list off the startup path from the second run on — see
  *  sessionCwdCache.ts for why only codex needs it. Runs at the same concurrency as parseDir. */
 export async function cwdMemo(
-  files: { path: string; mtimeMs: number; size: number }[],
+  files: MemoFile[],
   parse: (filePath: string) => Promise<string | null>,
-  store?: CwdStore
+  store?: CwdStore,
+  opts: {
+    /** `files` is the complete live file set under this root: entries of files gone from it are pruned. */
+    scope?: string
+    /** Told how many files miss the memo before any is parsed, then once per parsed file. */
+    progress?: (misses: number) => ScanHandle
+  } = {}
 ): Promise<(string | null)[]> {
-  const out = await mapWithConcurrency(files, 24, async (f) => {
+  const out = new Array<string | null>(files.length)
+  const misses: number[] = []
+  files.forEach((f, i) => {
     const hit = store?.get(f.path, f.mtimeMs, f.size)
+    if (hit === undefined) misses.push(i)
+    else out[i] = hit
+  })
+  const scan = misses.length > 0 ? opts.progress?.(misses.length) : undefined
+  try {
+    await mapWithConcurrency(misses, 24, async (i) => {
+      const f = files[i]
+      let cwd: string | null = null
+      try {
+        cwd = await parse(f.path)
+      } catch {
+        cwd = null // unreadable or broken = no project, the same rule buildEntry applies
+      }
+      store?.set(f.path, f.mtimeMs, f.size, cwd)
+      out[i] = cwd
+      scan?.tick()
+    })
+  } finally {
+    scan?.end()
+  }
+  if (opts.scope !== undefined) store?.prune(opts.scope, files.map((f) => f.path))
+  await store?.flush()
+  return out
+}
+
+/** The expansion rows of many rollouts at once, through the same index: a hit on (mtimeMs, size)
+ *  skips `build` entirely, a miss builds and remembers. A null build (noise) is not remembered: it is
+ *  rare, and the cwd memo already keeps an exec rollout out of every project. Input order is kept. */
+export async function rowMemo(
+  files: MemoFile[],
+  build: (f: MemoFile) => Promise<IndexedRow | null>,
+  store?: CwdStore
+): Promise<(IndexedRow | null)[]> {
+  const out = await mapWithConcurrency(files, 24, async (f) => {
+    const hit = store?.getRow(f.path, f.mtimeMs, f.size)
     if (hit !== undefined) return hit
-    let cwd: string | null = null
+    let row: IndexedRow | null = null
     try {
-      cwd = await parse(f.path)
+      row = await build(f)
     } catch {
-      cwd = null // unreadable or broken = no project, the same rule buildEntry applies
+      row = null
     }
-    store?.set(f.path, f.mtimeMs, f.size, cwd)
-    return cwd
+    if (row) store?.setRow(f.path, f.mtimeMs, f.size, row.cwd, row)
+    return row
   })
   await store?.flush()
   return out
@@ -137,17 +186,56 @@ export function projectSummariesOf(
   return descriptorOf(descriptors, account).history.projectSummaries(account, io)
 }
 
-/** A `CwdStore` that lives only in memory. What the Host uses when it has no memo file to read. */
+type MemoryEntry = { mtimeMs: number; size: number; cwd: string | null; row?: RolloutRow }
+
+/** A `CwdStore` that lives only in memory. What the Host uses when it has no memo file to read, and
+ *  what HistoryIndex falls back to when it is given no persisted one (tests). */
 export class MemoryCwdStore implements CwdStore {
-  private map = new Map<string, [number, number, string | null]>()
-  get(filePath: string, mtimeMs: number, size: number): string | null | undefined {
+  private map = new Map<string, MemoryEntry>()
+  private hit(filePath: string, mtimeMs: number, size: number): MemoryEntry | undefined {
     const hit = this.map.get(comparablePath(filePath))
-    return hit && hit[0] === mtimeMs && hit[1] === size ? hit[2] : undefined
+    return hit && hit.mtimeMs === mtimeMs && hit.size === size ? hit : undefined
+  }
+  get(filePath: string, mtimeMs: number, size: number): string | null | undefined {
+    return this.hit(filePath, mtimeMs, size)?.cwd
   }
   set(filePath: string, mtimeMs: number, size: number, cwd: string | null): void {
-    this.map.set(comparablePath(filePath), [mtimeMs, size, cwd])
+    const cur = this.hit(filePath, mtimeMs, size)
+    if (cur && cur.cwd === cwd) return // keep a row built for these same bytes
+    this.map.set(comparablePath(filePath), { mtimeMs, size, cwd })
+  }
+  getRow(filePath: string, mtimeMs: number, size: number): IndexedRow | undefined {
+    const hit = this.hit(filePath, mtimeMs, size)
+    return hit?.row && hit.cwd !== null ? { cwd: hit.cwd, ...hit.row } : undefined
+  }
+  setRow(filePath: string, mtimeMs: number, size: number, cwd: string, row: RolloutRow): void {
+    this.map.set(comparablePath(filePath), {
+      mtimeMs,
+      size,
+      cwd,
+      row: { sessionId: row.sessionId, title: row.title, awaitingReply: row.awaitingReply }
+    })
+  }
+  prune(root: string, livePaths: Iterable<string>): number {
+    const base = comparablePath(root)
+    const live = new Set<string>()
+    for (const p of livePaths) live.add(comparablePath(p))
+    let dropped = 0
+    for (const key of [...this.map.keys()]) {
+      if (live.has(key) || !isUnder(key, base)) continue
+      this.map.delete(key)
+      dropped++
+    }
+    return dropped
   }
   async flush(): Promise<void> {}
+}
+
+/** `key` lies strictly inside `base` (both comparablePath'd). A sibling that only shares the prefix
+ *  (`sessions-old` next to `sessions`) does not. */
+function isUnder(key: string, base: string): boolean {
+  if (!key.startsWith(base) || key.length === base.length) return false
+  return base.endsWith('/') || base.endsWith('\\') || key[base.length] === '/' || key[base.length] === '\\'
 }
 
 /**
@@ -200,7 +288,8 @@ export class ProjectPathListing {
       if (sig !== null) this.cwdByDir.set(key, { sig, cwd })
       return cwd
     },
-    cwdMemo: (files, parse) => cwdMemo(files, parse, this.store),
+    cwdMemo: (files, parse, scope) => cwdMemo(files, parse, this.store, { scope }),
+    rowMemo: (files, build) => rowMemo(files, build, this.store),
     samePath: (a, b) => comparablePath(a) === comparablePath(b),
     pathKey: (p) => comparablePath(p),
     cacheDirForProject: () => {}
