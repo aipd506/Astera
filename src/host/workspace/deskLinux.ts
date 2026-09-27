@@ -16,13 +16,36 @@ import { execText, killGroup, linuxStartTimes, realLinuxProcFs, runTool, spawnDe
 export const FIRST_DISPLAY = 90
 export const LAST_DISPLAY = 189
 export const XVFB_SCREEN = '1920x1080x24'
+/** Where the desk puts the display's pointer once Xvfb is up: its last pixel, bottom right. Xvfb
+ *  starts the pointer in the middle of the screen, which is where an Electron window opens with no
+ *  window manager to place it. Left there, the pointer is inside the app's window, and every time
+ *  the window is mapped, moved or resized over it X tells the app the pointer entered or moved, with
+ *  no button down. Chromium passes that to the page as a mouse move without buttons, which ends the
+ *  press CDP made for drag(), and the drag never starts. Measured on Xvfb in ubuntu:24.04: a window
+ *  mapped between the press and the move failed 5 of 5 drags with the pointer in the middle and none
+ *  of 5 with it here; a real pointer move over the window between them failed 5 of 5 too. It is the
+ *  one way found for drag() to fail on Linux only, as it did in CI run 36307554502. Only a window that
+ *  covers the whole screen reaches this corner. */
+export const PARKED_POINTER = ((): { x: number; y: number } => {
+  const [w, h] = XVFB_SCREEN.split('x').map(Number)
+  return { x: w - 1, y: h - 1 }
+})()
 /** How many display numbers one desk tries when Xvfb exits before it reports ready (R4). */
 export const DISPLAY_TRIES = 3
 const POLL_MS = 50
-/** Characters per `xdotool type` run. At xdotool's default 12 ms per character (kept, since with no
- *  delay non US characters such as Hangul can come out wrong), 400 take about 5 s, well inside the
- *  15 s a desk request may run (DESK_REQUEST_MS). */
+/** Characters per `xdotool type` run of keyboard text (KEYBOARD_TEXT). At xdotool's default 12 ms per
+ *  character, 400 take about 5 s, well inside the 15 s a desk request may run (DESK_REQUEST_MS). */
 export const TYPE_CHUNK = 400
+/** What Xvfb's US keyboard has a key for: printable ASCII, newline and tab. */
+const KEYBOARD_TEXT = /^[\x20-\x7e\n\t]$/
+/** The per character delay, in ms, for any other character (Hangul, emoji, accented letters). xdotool
+ *  types one by binding it to a spare key, pressing that key and unbinding it again, and Chromium,
+ *  which reads the new binding only after it is told the keyboard changed, loses the character when
+ *  the unbinding comes first. Measured on Xvfb in ubuntu:24.04 with 'hi 한글 입력': at the default 12 ms
+ *  7 of 30 runs lost a character, at 60 ms and at 100 ms none of 30 did. */
+export const REMAP_DELAY_MS = 100
+/** Characters per run at REMAP_DELAY_MS: about 10 s, inside DESK_REQUEST_MS. */
+export const REMAP_CHUNK = 100
 /** The fd Xvfb reports its display number on once it accepts connections (-displayfd). */
 const READY_FD = 3
 
@@ -98,11 +121,27 @@ export function displayEnv(env: Record<string, string | undefined>, display: num
   return out
 }
 
-/** `text` in runs of at most `size` characters, never splitting a surrogate pair. */
-function chunks(text: string, size: number): string[] {
-  const chars = Array.from(text)
-  const out: string[] = []
-  for (let i = 0; i < chars.length; i += size) out.push(chars.slice(i, i + size).join(''))
+/** `text` as the `xdotool type` arguments that type it: runs of keyboard text at the default delay and
+ *  runs of anything else at REMAP_DELAY_MS, each at most its chunk long, never splitting a surrogate
+ *  pair. */
+export function typeRuns(text: string): string[][] {
+  const out: string[][] = []
+  let run: string[] = []
+  let keyboard = true
+  const flush = (): void => {
+    if (run.length === 0) return
+    out.push(keyboard ? ['type', '--', run.join('')] : ['type', '--delay', String(REMAP_DELAY_MS), '--', run.join('')])
+    run = []
+  }
+  for (const ch of Array.from(text)) {
+    const k = KEYBOARD_TEXT.test(ch)
+    if (k !== keyboard || run.length === (keyboard ? TYPE_CHUNK : REMAP_CHUNK)) {
+      flush()
+      keyboard = k
+    }
+    run.push(ch)
+  }
+  flush()
   return out
 }
 
@@ -166,9 +205,11 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
   /** One Xvfb on :n, ready once it writes n to its -displayfd pipe, which only this Xvfb can do: a
    *  socket file for :n proves nothing, since another X server may have made it between the probe and
    *  this spawn (fix round 1). `taken` when it exits first (the number went to someone else); a throw
-   *  when it never reports within the ready limit. */
+   *  when it never reports within the ready limit. -noreset keeps what the desk set up when the last
+   *  client leaves: without it Xvfb resets then, and the pointer the desk parked (PARKED_POINTER) is
+   *  back in the middle of the screen before the app connects, and again after every relaunch. */
   const startXvfb = async (n: number): Promise<{ proc: SpawnedProc } | { taken: string }> => {
-    const proc = d.spawn('Xvfb', [`:${n}`, '-screen', '0', XVFB_SCREEN, '-nolisten', 'tcp', '-displayfd', String(READY_FD)], {
+    const proc = d.spawn('Xvfb', [`:${n}`, '-screen', '0', XVFB_SCREEN, '-nolisten', 'tcp', '-noreset', '-displayfd', String(READY_FD)], {
       env: stringEnv(d.hostEnv),
       stderr: true,
       readyFd: true
@@ -271,6 +312,11 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
     }
     const xdotool = (args: string[]): Promise<Buffer> => d.run('xdotool', args, env)
     const line = (b: Buffer): string => b.toString('utf8').replace(/\n$/, '')
+    // Before anything is launched, so no window is ever mapped under it (PARKED_POINTER). A desk
+    // whose pointer could not be moved still works; only drag() may then be cut short.
+    await xdotool(['mousemove', String(PARKED_POINTER.x), String(PARKED_POINTER.y)]).catch((err: unknown) =>
+      d.log(`desktop ${name}: the pointer could not be moved out of the way: ${messageOf(err)}`)
+    )
 
     const windows = async (): Promise<DeskWindow[]> => {
       live()
@@ -373,7 +419,7 @@ export function createLinuxDesks(d: LinuxDeskDeps): { start(name: string): Promi
           if (!sym) throw new Error(`unknown key ${o.key}`)
           await xdotool(['windowfocus', id, 'key', '--clearmodifiers', sym])
         }
-        if (o.text !== undefined) for (const piece of chunks(o.text, TYPE_CHUNK)) await xdotool(['windowfocus', id, 'type', '--', piece])
+        if (o.text !== undefined) for (const run of typeRuns(o.text)) await xdotool(['windowfocus', id, ...run])
       },
       close: async () => {
         for (const [p, at] of [...launched]) await kill(p, at).catch((err) => d.log(`desktop ${name}: pid ${p} could not be ended: ${messageOf(err)}`))

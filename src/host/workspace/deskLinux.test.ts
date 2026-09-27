@@ -4,7 +4,21 @@ import os from 'node:os'
 import path from 'node:path'
 import { NAMED_KEYS } from '../../core/workspace/helpers'
 import { DESK_CLOSE_MS, DESK_READY_MS, type DeskWindow } from '../../core/workspace/protocol'
-import { XDOTOOL_KEYS, createLinuxDesks, displayEnv, imageSize, parseGeometry, pickWindow, realLinuxDeskDeps, type LinuxDeskDeps } from './deskLinux'
+import {
+  PARKED_POINTER,
+  REMAP_CHUNK,
+  REMAP_DELAY_MS,
+  TYPE_CHUNK,
+  XDOTOOL_KEYS,
+  createLinuxDesks,
+  displayEnv,
+  imageSize,
+  parseGeometry,
+  pickWindow,
+  realLinuxDeskDeps,
+  typeRuns,
+  type LinuxDeskDeps
+} from './deskLinux'
 import type { SpawnedProc } from './posixProc'
 
 type Mode = 'ready' | 'exit' | 'hang'
@@ -178,7 +192,7 @@ describe('the Linux desk: Xvfb', () => {
     const desk = await r.desks.start('astera-ws-1-1')
     const x = r.procs[0]
     expect(x.file).toBe('Xvfb')
-    expect(x.args).toEqual([':92', '-screen', '0', '1920x1080x24', '-nolisten', 'tcp', '-displayfd', '3'])
+    expect(x.args).toEqual([':92', '-screen', '0', '1920x1080x24', '-nolisten', 'tcp', '-noreset', '-displayfd', '3'])
     expect(x.readyFd).toBe(true)
     expect(desk.name).toBe('astera-ws-1-1')
     expect(desk.pid).toBe(x.pid)
@@ -236,6 +250,28 @@ describe('the Linux desk: Xvfb', () => {
     expect(why).toEqual(['exited SIGKILL'])
     expect(desk.alive()).toBe(false)
     await expect(desk.launch({ command: 'app', cwd: '/p', env: {} })).rejects.toThrow('the virtual display ended (exited SIGKILL)')
+  })
+})
+
+describe('the Linux desk: the pointer', () => {
+  it('moves the pointer to the last pixel of the screen once Xvfb is ready, before anything is launched', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    expect(PARKED_POINTER).toEqual({ x: 1919, y: 1079 })
+    expect(r.runs).toHaveLength(1)
+    expect(r.runs[0]).toMatchObject({ file: 'xdotool', args: ['mousemove', '1919', '1079'] })
+    expect(r.runs[0].env).toMatchObject({ DISPLAY: ':90', XDG_SESSION_TYPE: 'x11' })
+    expect(r.runs[0].env.WAYLAND_DISPLAY).toBeUndefined()
+    await desk.launch({ command: 'app', cwd: '/p', env: {} })
+    expect(r.runs).toHaveLength(1)
+  })
+
+  it('still starts, and logs, when the pointer cannot be moved', async () => {
+    const r = rig()
+    r.xdo((args) => (args[0] === 'mousemove' ? new Error("Can't open display") : undefined))
+    const desk = await r.desks.start('a')
+    expect(desk.alive()).toBe(true)
+    expect(r.log.some((l) => l.includes("desktop a: the pointer could not be moved out of the way: Can't open display"))).toBe(true)
   })
 })
 
@@ -309,19 +345,21 @@ describe('the Linux desk: fix round 1', () => {
     expect(r.log.some((l) => l.includes(`pid ${r.procs[1].pid} could not be ended: EPERM`))).toBe(true)
   })
 
-  it('types long text in pieces, so each xdotool run stays within the request limit at its default delay', async () => {
+  it('types long text in pieces, so each xdotool run stays within the request limit at its delay', async () => {
     const r = rig()
     threeWindows(r)
     const desk = await r.desks.start('a')
-    const text = '가'.repeat(450) + '\u{1F600}'.repeat(10)
+    const text = 'a'.repeat(450) + '가'.repeat(250) + '\u{1F600}'.repeat(10)
     await desk.keys({ title: 'astera', text })
     const typed = r.runs.filter((x) => x.args[2] === 'type').map((x) => x.args)
-    expect(typed.map((a) => a.slice(0, 4))).toEqual([
-      ['windowfocus', '41', 'type', '--'],
-      ['windowfocus', '41', 'type', '--']
-    ])
-    expect(typed.map((a) => Array.from(a[4]).length)).toEqual([400, 60])
-    expect(typed.map((a) => a[4]).join('')).toBe(text)
+    const fast = ['windowfocus', '41', 'type', '--']
+    const slow = ['windowfocus', '41', 'type', '--delay', '100', '--']
+    expect(typed.map((a) => a.slice(0, -1))).toEqual([fast, fast, slow, slow, slow])
+    expect(typed.map((a) => Array.from(a.at(-1)!).length)).toEqual([400, 50, 100, 100, 60])
+    expect(typed.map((a) => a.at(-1)).join('')).toBe(text)
+    // About 5 s and 10 s a run: within the 15 s a desk request may run.
+    expect(TYPE_CHUNK * 12).toBeLessThanOrEqual(10_000)
+    expect(REMAP_CHUNK * REMAP_DELAY_MS).toBeLessThanOrEqual(10_000)
   })
 
   it('close cancels its wait for Xvfb once Xvfb has exited', async () => {
@@ -427,7 +465,7 @@ describe('the Linux desk: windows, shots and keys', () => {
       { hwnd: 41, title: 'Astera 픽스처 창', className: '', pid: 4242, width: 900, height: 700, visible: true },
       { hwnd: 42, title: 'no pid', className: '', pid: 0, width: 200, height: 100, visible: true }
     ])
-    expect(r.runs[0]).toMatchObject({ file: 'xdotool', args: ['search', '--onlyvisible', '--name', ''] })
+    expect(r.runs.find((x) => x.args[0] === 'search')).toMatchObject({ file: 'xdotool', args: ['search', '--onlyvisible', '--name', ''] })
     expect(r.runs.every((x) => x.env.DISPLAY === ':90' && x.env.WAYLAND_DISPLAY === undefined)).toBe(true)
   })
 
@@ -463,7 +501,8 @@ describe('the Linux desk: windows, shots and keys', () => {
     await desk.keys({ title: '픽스처', text: '-hi 안녕' })
     await desk.keys({ title: 'astera', key: 'Enter' })
     expect(r.runs.filter((x) => x.args[0] === 'windowfocus').map((x) => x.args)).toEqual([
-      ['windowfocus', '41', 'type', '--', '-hi 안녕'],
+      ['windowfocus', '41', 'type', '--', '-hi '],
+      ['windowfocus', '41', 'type', '--delay', '100', '--', '안녕'],
       ['windowfocus', '41', 'key', '--clearmodifiers', 'Return']
     ])
     await expect(desk.keys({ title: 'nothing like it', text: 'x' })).rejects.toThrow('no window titled "nothing like it"')
@@ -501,6 +540,21 @@ describe('the Linux desk: pure parts', () => {
     expect(r.runs.length).toBeGreaterThan(0)
     for (const x of r.runs) expect(x.env).toMatchObject({ DISPLAY: ':90', XDG_SESSION_TYPE: 'x11', GDK_BACKEND: 'x11', XDG_RUNTIME_DIR: '/tmp/astera-xrt-1' })
     expect(r.runs.every((x) => !('WAYLAND_DISPLAY' in x.env) && !('DBUS_SESSION_BUS_ADDRESS' in x.env))).toBe(true)
+  })
+
+  it('types what the US keyboard has a key for at the default delay, and anything else slower, in order', () => {
+    expect(typeRuns('hi 한글 입력\n')).toEqual([
+      ['type', '--', 'hi '],
+      ['type', '--delay', String(REMAP_DELAY_MS), '--', '한글'],
+      ['type', '--', ' '],
+      ['type', '--delay', String(REMAP_DELAY_MS), '--', '입력'],
+      ['type', '--', '\n']
+    ])
+    expect(typeRuns('é\u{1F600}\tx')).toEqual([
+      ['type', '--delay', String(REMAP_DELAY_MS), '--', 'é\u{1F600}'],
+      ['type', '--', '\tx']
+    ])
+    expect(typeRuns('')).toEqual([])
   })
 
   it('reads geometry, and image sizes from PNG and JPEG headers', () => {
