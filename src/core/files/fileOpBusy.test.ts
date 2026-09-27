@@ -25,7 +25,7 @@ describe('createFileOpBusy', () => {
     vi.advanceTimersByTime(OP_STATUS_DELAY_MS - ROW_SPINNER_DELAY_MS - 1)
     expect(last().status).toBeNull()
     vi.advanceTimersByTime(1)
-    expect(last().status).toEqual({ kind: 'delete', stage: null, count: 0 })
+    expect(last().status).toEqual({ kind: 'delete', stage: null, count: null }) // "0개" 가 아니라 수 없이
     b.end()
   })
 
@@ -72,6 +72,21 @@ describe('createFileOpBusy', () => {
     expect(last().rows.has('D:\\p\\a')).toBe(false)
     vi.advanceTimersByTime(ROW_SPINNER_DELAY_MS)
     expect([...last().rows]).toEqual(['D:\\p\\b'])
+    b.end()
+  })
+
+  // 묶음의 다음 항목은 새 호출이다 — 앞 항목의 수를 그대로 보이면 멈춘 것처럼 읽힌다. 첫 알림 전까지는 수 없이 보인다.
+  it('다음 항목으로 넘어가면 앞 항목의 수를 지우고 수 없이 보인다', () => {
+    const b = createFileOpBusy((v) => views.push(v))
+    b.begin('delete')
+    b.rows(['D:\p\a'])
+    b.progress({ stage: 'delete', count: 800 })
+    vi.advanceTimersByTime(OP_STATUS_DELAY_MS)
+    expect(last().status).toEqual({ kind: 'delete', stage: 'delete', count: 800 })
+    b.rows(['D:\p\b'])
+    expect(last().status).toEqual({ kind: 'delete', stage: null, count: null })
+    b.progress({ stage: 'snapshot', count: 3 })
+    expect(last().status).toEqual({ kind: 'delete', stage: 'snapshot', count: 3 })
     b.end()
   })
 

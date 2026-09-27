@@ -15,8 +15,9 @@ export interface FileOpStatus {
   kind: FileOpKind
   /** The stage main last reported (null until the first report arrives). */
   stage: FileOpStage | null
-  /** Entries done in that stage so far. */
-  count: number
+  /** Entries done in that stage so far — null until the call now running has reported, so the line
+   *  never shows "0 items" at the start or the previous item's number while the next one is measured. */
+  count: number | null
 }
 
 export interface FileOpBusyView {
@@ -29,7 +30,8 @@ export interface FileOpBusyView {
 export interface FileOpBusy {
   /** An operation (a whole batch — one confirm, one paste) starts. */
   begin(kind: FileOpKind): void
-  /** The rows the operation is working on right now. */
+  /** The next call of the batch starts, on these rows. The previous call's stage and count are
+   *  dropped: they described another item. */
   rows(paths: Iterable<string>): void
   /** A progress report from main for the call now running. */
   progress(p: FileOpProgress): void
@@ -62,7 +64,7 @@ export function createFileOpBusy(
   return {
     begin(kind) {
       stopTimer()
-      status = { kind, stage: null, count: 0 }
+      status = { kind, stage: null, count: null }
       statusShown = false
       statusTimer = setTimeout(() => {
         statusTimer = null
@@ -71,6 +73,10 @@ export function createFileOpBusy(
       }, statusDelayMs)
     },
     rows(paths) {
+      if (status && (status.stage !== null || status.count !== null)) {
+        status = { ...status, stage: null, count: null }
+        if (statusShown) report()
+      }
       delayed.update(new Set(paths))
     },
     progress(p) {

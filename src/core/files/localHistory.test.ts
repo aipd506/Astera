@@ -7,12 +7,14 @@ import {
   selectEvictions,
   snapshotId,
   tooLarge,
-  tooManyEntries,
   TOO_MANY_ENTRIES,
-  TOO_LARGE_BYTES,
   snapshotSkipNotices,
   type HistoryEntry
 } from './localHistory'
+import { ko } from '../i18n/messages/ko'
+import { en } from '../i18n/messages/en'
+import { ja } from '../i18n/messages/ja'
+import { es } from '../i18n/messages/es'
 
 const E = (id: string, deletedAt: number, size: number): HistoryEntry => ({
   id,
@@ -84,28 +86,41 @@ describe('tooLarge', () => {
   })
 })
 
-describe('tooManyEntries — 스냅샷의 파일 수 상한', () => {
+describe('TOO_MANY_ENTRIES — 스냅샷의 항목 수 상한', () => {
   it('상한은 5,000개다', () => {
     expect(TOO_MANY_ENTRIES).toBe(5000)
   })
+})
 
-  it('상한까지는 스냅샷하고, 넘으면 하지 않는다', () => {
-    expect(tooManyEntries(5000)).toBe(false)
-    expect(tooManyEntries(5001)).toBe(true)
-  })
+// 세는 것은 파일만이 아니라 항목(파일·폴더·링크)이다 — 문구도 "항목"이라 말하고, 수는 undoHint 와
+// 같이 자릿수 구분(5,000 / es 5.000)으로 적는다. 알림은 같은 문구를 삭제·되돌리기·확인 안내에 쓴다.
+describe('스냅샷 상한 문구', () => {
+  const keys = ['files.delete.skippedTooLarge', 'files.undo.permanentTooLarge', 'files.delete.undoHint'] as const
+  const expected: [string, Record<string, string | undefined>, string][] = [
+    ['ko', ko, '5,000개 항목'],
+    ['en', en, '5,000 items'],
+    ['ja', ja as Record<string, string | undefined>, '5,000 項目'],
+    ['es', es as Record<string, string | undefined>, '5.000 elementos']
+  ]
+  for (const [lang, cat, phrase] of expected) {
+    it(`${lang}: 세 문구 모두 "${phrase}" 를 말하고 "파일" 이라 하지 않는다`, () => {
+      for (const k of keys) {
+        const v = cat[k] ?? ''
+        expect(v, `${lang}:${k}`).toContain(phrase)
+        expect(v, `${lang}:${k}`).not.toMatch(/files|파일|ファイル|archivos|{maxFiles}/)
+      }
+    })
+  }
 })
 
 // 스냅샷을 남기지 못한 삭제는 사람에게 알린다 — 크기든 파일 수든 같은 "너무 커서" 알림이고, 문구가
 // 두 상한을 함께 말한다(파일 수 때문에 빠졌는데 50MB 만 말하면 사람이 이유를 알 수 없다).
 describe('snapshotSkipNotices', () => {
-  it('삭제에서 too-large 는 두 상한을 담은 skippedTooLarge 를 알린다', () => {
+  it('삭제에서 too-large 는 skippedTooLarge 를 알린다(문구가 두 상한을 적는다)', () => {
     expect(snapshotSkipNotices({ tooLarge: true, failed: false }, 'delete')).toEqual([
       {
         level: 'info',
-        message: {
-          key: 'files.delete.skippedTooLarge',
-          params: { maxMb: TOO_LARGE_BYTES / 1024 / 1024, maxFiles: TOO_MANY_ENTRIES }
-        }
+        message: { key: 'files.delete.skippedTooLarge' }
       }
     ])
   })
@@ -116,7 +131,6 @@ describe('snapshotSkipNotices', () => {
       ['error', 'files.undo.permanentTooLarge'],
       ['error', 'files.undo.permanentSnapshotFailed']
     ])
-    expect(n[0].message.params).toEqual({ maxMb: 50, maxFiles: 5000 })
   })
 
   it('건너뛴 것이 없으면 알리지 않는다', () => {

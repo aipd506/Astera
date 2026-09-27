@@ -67,10 +67,18 @@ describe('FileOpStatusLine', () => {
     expect(html).toContain('files.op.snapshotting')
   })
 
-  it('첫 알림 전에는 작업 종류로 말한다(복사 중… 0)', () => {
+  it('첫 알림 전에는 수 없이 작업 종류만 말한다 — "0개" 를 보이지 않는다', () => {
     const html = renderToStaticMarkup(
-      React.createElement(FileOpStatusLine, { status: { kind: 'copy', stage: null, count: 0 } })
+      React.createElement(FileOpStatusLine, { status: { kind: 'copy', stage: null, count: null } })
     )
-    expect(html).toContain('files.op.copying')
+    expect(html).toContain('files.op.copyingNoCount')
+    expect(html).not.toContain('count')
+  })
+
+  it('삭제도 첫 알림 전에는 수 없이 말한다', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(FileOpStatusLine, { status: { kind: 'delete', stage: null, count: null } })
+    )
+    expect(html).toContain('files.op.deletingNoCount')
   })
 })

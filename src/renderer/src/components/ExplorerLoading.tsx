@@ -30,19 +30,19 @@ const STAGE_TEXT: Record<FileOpStage, MessageKey> = {
 
 /** The status line of a delete or paste that has run past OP_STATUS_DELAY_MS (useFileOps' opStatus is
  *  null until then): what it is doing and how many entries so far, with the spinner. Before main's
- *  first report it names the operation itself. */
+ *  first report of each call it names the operation alone, without a number. */
 export function FileOpStatusLine({ status }: { status: FileOpStatus | null }): React.JSX.Element | null {
   const { t } = useI18n()
   if (!status) return null
-  const key: MessageKey = status.stage
-    ? STAGE_TEXT[status.stage]
-    : status.kind === 'delete'
-      ? 'files.op.deleting'
-      : 'files.op.copying'
+  // No count yet (the call now running has not reported): the operation's name alone, never "0 items"
+  const text =
+    status.count === null || status.stage === null
+      ? t(status.kind === 'delete' ? 'files.op.deletingNoCount' : 'files.op.copyingNoCount')
+      : t(STAGE_TEXT[status.stage], { count: status.count })
   return (
     <div className="fx-note fx-reading fx-op-status" role="status">
       <span className="loading-spinner small" aria-hidden="true" />
-      {t(key, { count: status.count })}
+      {text}
     </div>
   )
 }

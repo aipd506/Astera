@@ -22,8 +22,39 @@ const tick = (onEntry: (() => void) | undefined): void => {
   }
 }
 
-async function removeChildren(dir: string, onEntry: (() => void) | undefined): Promise<void> {
-  const list = await fs.readdir(dir, { withFileTypes: true })
+/** The single-entry removal removeTree uses — fs.rm; replaceable so a test can make one entry fail. */
+export interface RemoveTreeDeps {
+  rm: typeof fs.rm
+}
+
+/** The first failure of a removal. Kept rather than thrown so the walk goes on to the siblings. */
+interface FirstError {
+  failed: boolean
+  error?: unknown
+}
+const note = (f: FirstError, error: unknown): void => {
+  if (f.failed) return
+  f.failed = true
+  f.error = error
+}
+
+/** Removes everything under dir. Like fs.rm(recursive), a failing entry (a locked file, a permission
+ *  error) does not stop the rest: every sibling and every other sub-folder is still tried, and the
+ *  first failure is recorded in f for the caller to throw once the walk is over. A folder whose
+ *  children did not all go is left in place (removing it would fail anyway). */
+async function removeChildren(
+  dir: string,
+  onEntry: (() => void) | undefined,
+  d: RemoveTreeDeps,
+  f: FirstError
+): Promise<void> {
+  let list
+  try {
+    list = await fs.readdir(dir, { withFileTypes: true })
+  } catch (err) {
+    note(f, err)
+    return
+  }
   const leaves: string[] = []
   for (const e of list) {
     const child = path.join(dir, e.name)
@@ -31,29 +62,45 @@ async function removeChildren(dir: string, onEntry: (() => void) | undefined): P
     // not isDirectory() on its dirent, so it lands with the leaves and only the link itself is
     // removed — the same rule as fs.rm, which never deletes through a link.
     if (e.isDirectory()) {
-      await removeChildren(child, onEntry)
-      await fs.rm(child, { recursive: true })
-      tick(onEntry)
+      const sub: FirstError = { failed: false }
+      await removeChildren(child, onEntry, d, sub)
+      if (sub.failed) {
+        note(f, sub.error)
+        continue
+      }
+      try {
+        await d.rm(child, { recursive: true })
+        tick(onEntry)
+      } catch (err) {
+        note(f, err)
+      }
     } else leaves.push(child)
   }
   for (let i = 0; i < leaves.length; i += REMOVE_CHUNK) {
     const results = await Promise.allSettled(
-      leaves.slice(i, i + REMOVE_CHUNK).map((p) => fs.rm(p, { recursive: true }).then(() => tick(onEntry)))
+      leaves.slice(i, i + REMOVE_CHUNK).map((p) => d.rm(p, { recursive: true }).then(() => tick(onEntry)))
     )
-    // Stops at the first failure like fs.rm(recursive) does, after the rest of its chunk has settled —
-    // every rejection is consumed here, only the first is reported.
-    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
-    if (failed) throw failed.reason
+    // Every rejection is consumed here; only the first is kept to report.
+    for (const r of results) if (r.status === 'rejected') note(f, r.reason)
   }
 }
 
 /** fs.rm(target, { recursive: true }), reporting every entry it removes (the target itself last).
  *  Each single removal is still fs.rm, so its Windows handling (a read-only file, a directory link)
- *  is exactly what it was. A missing target rejects with ENOENT, as fs.rm does. */
-export async function removeTree(target: string, onEntry?: () => void): Promise<void> {
+ *  is exactly what it was. A missing target rejects with ENOENT, as fs.rm does. When some entries
+ *  cannot be removed, everything else still is, and the first failure is thrown at the end. */
+export async function removeTree(
+  target: string,
+  onEntry?: () => void,
+  deps: RemoveTreeDeps = { rm: fs.rm }
+): Promise<void> {
   const st = await fs.lstat(target)
-  if (st.isDirectory()) await removeChildren(target, onEntry)
-  await fs.rm(target, { recursive: true })
+  if (st.isDirectory()) {
+    const f: FirstError = { failed: false }
+    await removeChildren(target, onEntry, deps, f)
+    if (f.failed) throw f.error
+  }
+  await deps.rm(target, { recursive: true })
   tick(onEntry)
 }
 

@@ -81,6 +81,28 @@ describe('removeTree', () => {
     expect(await fs.readFile(path.join(outside, 'keep.txt'), 'utf8')).toBe('keep')
   })
 
+  // fs.rm(recursive) 처럼 한 항목이 실패해도(잠긴 파일 등) 나머지 형제는 끝까지 지우고, 첫 오류를
+  // 마지막에 던진다 — a/ 의 잠긴 파일 하나 때문에 b/·c/ 가 남지 않는다.
+  it('한 항목이 실패해도 형제들은 지우고, 끝에 첫 오류를 던진다', async () => {
+    const root = await tmp('astera-rmtree-partial-')
+    const target = path.join(root, 't')
+    for (const d of ['a', 'b', 'c']) {
+      await fs.mkdir(path.join(target, d), { recursive: true })
+      await fs.writeFile(path.join(target, d, 'f.txt'), d)
+    }
+    await fs.writeFile(path.join(target, 'top.txt'), 'top')
+    const locked = path.join(target, 'a', 'f.txt')
+    const rm: typeof fs.rm = async (p, o) => {
+      if (String(p) === locked) throw Object.assign(new Error('EBUSY: locked'), { code: 'EBUSY' })
+      return fs.rm(p, o)
+    }
+    await expect(removeTree(target, undefined, { rm })).rejects.toMatchObject({ code: 'EBUSY' })
+    expect(await exists(locked)).toBe(true)
+    expect(await exists(path.join(target, 'b'))).toBe(false)
+    expect(await exists(path.join(target, 'c'))).toBe(false)
+    expect(await exists(path.join(target, 'top.txt'))).toBe(false)
+  })
+
   it('없는 대상은 거절한다(fs.rm 과 같은 ENOENT)', async () => {
     const root = await tmp('astera-rmtree-missing-')
     await expect(removeTree(path.join(root, 'nope'))).rejects.toMatchObject({ code: 'ENOENT' })
