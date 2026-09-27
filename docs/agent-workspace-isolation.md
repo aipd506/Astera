@@ -142,11 +142,24 @@ port. The script drives the page over CDP (`snapshot`, `click`, `fill`, `press`,
 Rulings the implementation plan made where the spec was silent, adjusted below where the real desktop
 changed one of them:
 
-- **P1. The script deadline and the launch wait.** The script stays at 60 s. `launch()` waits
-  `min(waitMs, time left in the script minus 2 s)` for the debugging port, so a port that never opens is
+- **P1. The script deadline and the launch wait (amended 2026-09-28).** The script stays at 60 s, but
+  the time `launch()` and `relaunch()` spend waiting for the app's debugging port and page does not
+  count against it, up to `LAUNCH_WAIT_MAX_MS` (5 minutes) of such waiting over the whole script. A first
+  dev build of an Electron or webpack app can take longer than 60 s, and before this amendment such an app
+  could never be launched, since the script ended first. `waitMs` defaults to 60 s and is honoured up to
+  5 minutes. The wait for the port is `min(waitMs, what the launch wait may last minus 2 s)`, where what
+  it may last is the rest of the 5 minutes plus the script's own time left, so a port that never opens is
   reported by `launch` with the `--remote-debugging-port` hint rather than as `at: "timeout"`. It then
-  waits up to 10 s more (`PAGE_READY_MS`) for the page to finish parsing past `about:blank`, and still
-  succeeds if the page never settles by then, since the page helpers speak for themselves after that.
+  waits up to 10 s more (`PAGE_READY_MS`), inside the same launch wait, for the page to finish parsing
+  past `about:blank`, and still succeeds if the page never settles by then, since the page helpers speak
+  for themselves after that. The Host's runner keeps the deadline (`ScriptDeadline` in
+  `src/core/workspace/script.ts`, driven by `src/host/workspace/scriptWorker.ts`), and the helpers run on
+  the Host's thread, so it knows exactly when a launch wait is in flight. A busy loop is still cut at 60 s
+  of time outside launch waits, a wait past the 5 minutes counts against the script again, Stop ends the
+  script at once whatever it is waiting for, and the memory limits are unchanged. While a launch waits,
+  the mirror tab shows "Starting the app… Ns", from the `launching` seconds on the Host's state event,
+  said again every second. The agent's `astera app js` waits for 60 s plus the 5 minutes plus its usual
+  headroom before it gives up (`clientTimeoutMs` in `src/cli/run.ts`).
 - **P2. Where `app js` is answered.** Above the command layer and below the request receipt line beside
   `requests-show`, because the CLI mints a request id for every call and a command above the line refuses
   one. A retried id replays the recorded result instead of launching twice.
@@ -187,7 +200,7 @@ changed one of them:
   flight; only the latest frame is kept.
 - **P13. Each script in a worker of its own (amended 2026-09-27).** The Host runs every `app js` script
   in a worker thread, with the helpers left on its own thread behind the same gate, and ends the worker at
-  the 60 second deadline or on Stop. A busy loop, before or after an `await`, is cut off and no longer
+  the 60 second deadline (which launch waits do not count, P1) or on Stop. A busy loop, before or after an `await`, is cut off and no longer
   freezes the Host or any session's terminal (`src/host/workspace/scriptWorker.ts`).
 - **P14. Each script in a process of its own (amended 2026-09-27).** The Host starts one child process
   per `app js` script, from its own runtime with an environment built from nothing, and the worker of P13

@@ -43,8 +43,10 @@ stop your script or close the desktop from there. It works the same when the Ast
   desktop wide screenshot on this desktop.
 - **`log(value)` is the only output.** There is no `console`. A thrown error ends the script; what was
   logged before it is kept, and the report names the helper that was running (`error.at`).
-- **60 seconds per script, 30 per wait.** A script cut off reports `at: "timeout"`. `launch()` waits for
-  the port for at most what is left of the script, so keep the first round to launching and one look.
+- **60 seconds per script, 30 per wait.** A script cut off reports `at: "timeout"`. The time `launch()`
+  and `relaunch()` spend waiting for the app to start does not count against those 60 seconds, up to
+  5 minutes of such waiting per script. An app whose first build is slow can take the time it needs:
+  pass a longer `waitMs`. Keep the first round to launching and one look.
 - **Stopped by the person.** When they press Stop, your script ends with `at: "stopped"` and the app
   keeps running. When they press Close, the desktop is gone and the next `launch()` starts afresh.
 - **One script at a time** per session. A second `astera app js` while one runs is refused.
@@ -87,13 +89,19 @@ await close()
 Starts the app on this session's desktop, creating the desktop the first time. `spec` is either
 `{ config: '<name or id>' }`, a Run configuration of this project as Astera's Run panel shows it, or
 `{ command: '<shell command>', cwd?: '<folder>' }`, run in this session's folder or in `cwd` relative
-to it. `options.waitMs` bounds the wait for the debugging port (default 60000, and never longer than
-the script has left). Resolves with `{ pid, port }` once a page answers on the port. Refused when
-something is already launched; use `relaunch()`.
+to it. `options.waitMs` bounds the wait for the debugging port: 60000 by default, and up to 300000
+(5 minutes) when you ask for more, for an app whose first dev build is slow, such as an Electron or
+webpack app. The wait does not count against the script's 60 seconds, and the person's mirror tab
+shows how long the app has been starting. Resolves with `{ pid, port }` once a page answers on the port.
+Refused when something is already launched; use `relaunch()`.
+
+```js
+await launch({ config: 'Electron dev' }, { waitMs: 180000 })
+```
 
 ## relaunch(options?)
 Ends the launched app and everything it started, then starts the same spec again. Use it after you
-changed the app's source.
+changed the app's source. `options.waitMs` is the same as `launch()`'s.
 
 ## close()
 Ends the launched app and everything it started, closes the desktop and ends its helper.
