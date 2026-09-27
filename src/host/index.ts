@@ -45,7 +45,7 @@ import { announceChatProc, createHostSessionStarter } from './sessionCreate'
 import { previewShotsDir } from '../core/preview/shotsDir'
 import { hostCliPaths, hostWorkerBaseEnv } from '../core/host/spawn'
 import { readAgentAppEnabled } from '../core/settings/agentAppEnabled'
-import { createWorkspaceManager } from './workspace/manager'
+import { DISPOSE_CAP_MS, createWorkspaceManager, disposeWithin } from './workspace/manager'
 import { createLaunchResolver } from './workspace/launch'
 import { spawnPowerShell, startDesktopHelper, writeDeskScript } from './workspace/desktopHelper'
 import { connectCdp } from './workspace/cdp'
@@ -194,8 +194,15 @@ async function main(): Promise<void> {
     server.stopAccepting()
     void (async () => {
       // The workspaces first (spec, Lifecycle: "when the Host leaves"): each launched tree killed, each
-      // desktop closed, each helper ended, and workspaces.json emptied. Never rejects.
-      await workspaces.dispose().catch((err) => log.write(`the agent workspaces could not be cleaned up: ${String(err)}`))
+      // desktop closed, each helper ended, and workspaces.json emptied. Never rejects. Capped (final
+      // review Important 2): a hung helper must not hold the way out, and the server's listener with it,
+      // for tens of seconds. Past the cap the cleanup goes on in the background and this Host moves on;
+      // the next Host's leftover sweep ends whatever it had not reached.
+      await disposeWithin(
+        workspaces.dispose().catch((err) => log.write(`the agent workspaces could not be cleaned up: ${String(err)}`)),
+        DISPOSE_CAP_MS,
+        () => log.write(`the agent workspaces were still cleaning up after ${DISPOSE_CAP_MS / 1000} s; leaving anyway, the next Host sweeps what is left`)
+      )
       // **The spawns this Host already took finish first** (Host S2 design §8.4, R8), and no new one
       // is taken from here on. Bounded by the app's own spawn deadline: past that, the app has given
       // up on the session anyway. `closeAndSettle` never rejects, and the chain below runs whatever

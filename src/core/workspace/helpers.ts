@@ -246,6 +246,14 @@ export function workspaceHelpers(deps: HelperDeps, ctx: RunContext): Record<stri
     deps.recordLaunch(launched)
     const budget = Math.max(0, Math.min(waitMs, deps.deadline() - deps.now() - LAUNCH_MARGIN_MS))
     const cdp = await deps.connectCdp(port, budget)
+    // A stopped launch keeps waiting on the port. If a newer script relaunched (or closed and launched)
+    // meanwhile, the state is no longer this launch's: its late result must not overwrite the newer
+    // connection. An identity check, not stopped(): a stopped launch that still owns the app keeps its
+    // connection, because the next script wants it (final review Important 1).
+    if (deps.state.launched !== launched) {
+      cdp?.close()
+      throw new Error(`${at}: stopped`)
+    }
     deps.state.cdp = cdp
     deps.changed()
     if (!cdp)

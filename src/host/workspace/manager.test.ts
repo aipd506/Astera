@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { promises as fs } from 'node:fs'
+import { promises as fs, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Cdp } from '../../core/workspace/helpers'
 import type { DeskShot, DeskWindow } from '../../core/workspace/protocol'
 import type { DesktopHelper } from './desktopHelper'
-import { createWorkspaceManager, type WorkspaceEvent, type WorkspaceManager, type WorkspaceManagerDeps } from './manager'
+import { DISPOSE_CAP_MS, createWorkspaceManager, disposeWithin, type WorkspaceEvent, type WorkspaceManager, type WorkspaceManagerDeps } from './manager'
 
 class FakeDesk implements DesktopHelper {
   static made: FakeDesk[] = []
@@ -424,6 +425,51 @@ describe('Stop, Close, the session, the helper, idleness', () => {
     expect(events.filter((e) => e.kind === 'state' && !e.open)).toHaveLength(1)
   })
 
+  // Final review Important 1: script 1's launch is stopped while it waits for the port; script 2
+  // relaunches; script 1's wait then gives up. The connection script 2 made must survive for script 3.
+  it('a stopped launch whose port wait ends after a newer relaunch leaves the newer connection in place', async () => {
+    let giveUp!: (c: Cdp | null) => void
+    const page = (): ReturnType<typeof fakeCdp> => {
+      const c = fakeCdp()
+      const send = c.send
+      c.send = async (method: string) => (method === 'Runtime.evaluate' ? { result: { value: 'http://app/' } } : send(method))
+      return c
+    }
+    const made: Array<ReturnType<typeof fakeCdp>> = []
+    const connectCdp = vi.fn(async () => {
+      if (connectCdp.mock.calls.length === 1) return new Promise<Cdp | null>((r) => (giveUp = r))
+      const c = page()
+      made.push(c)
+      return c
+    })
+    const { m, settle } = await rig({ connectCdp })
+    const first = m.run('s1', "await launch({ command: 'app.exe' })")
+    await vi.waitFor(() => expect(giveUp).toBeTypeOf('function'))
+    expect(m.stop('s1')).toBe(true)
+    expect(body(await first).error?.at).toBe('stopped')
+    const second = await m.run('s1', 'await relaunch()')
+    expect(body(second).error).toBeUndefined()
+    giveUp(null)
+    await settle()
+    const third = await m.run('s1', 'log(await url())')
+    expect(body(third).error).toBeUndefined()
+    expect(body(third).log).toEqual(['http://app/'])
+    expect(made).toHaveLength(1)
+    expect(made[0].closed).toBe(false)
+  })
+
+  // Task 5 deferred minor: the normal path, an app launched by one script and used by the next.
+  it('an app launched by one script is used by the next script, which can list its windows and relaunch it', async () => {
+    const { m } = await rig()
+    expect(body(await m.run('s1', "await launch({ command: 'app.exe' })")).error).toBeUndefined()
+    const r = await m.run('s1', 'log((await windows()).length); log(await relaunch())')
+    expect(body(r).error).toBeUndefined()
+    expect(body(r).log).toEqual(['0', '{"pid":502,"port":9302}'])
+    expect(FakeDesk.made).toHaveLength(1)
+    expect(FakeDesk.made[0].kills).toEqual([501])
+    expect(m.list()).toMatchObject([{ sessionId: 's1', running: false }])
+  })
+
   it('a stale Stop does not close the desktop a newer script is starting on (review minor 3)', async () => {
     let started!: () => void
     const { m } = await rig({
@@ -639,5 +685,49 @@ describe('sweepLeftovers', () => {
     await sweep
     await run
     await vi.waitFor(async () => expect(((await file()) as { workspaces: Array<{ sessionId: string }> }).workspaces.map((w) => w.sessionId)).toEqual(['s1']))
+  })
+})
+
+// Final review Important 2: the Host's way out waits for the workspaces no longer than a cap, then goes
+// on; the next Host's leftover sweep ends whatever a capped dispose left behind.
+describe('disposeWithin (the Host leaving)', () => {
+  it('returns when the dispose finishes, and says nothing', async () => {
+    const onCap = vi.fn()
+    await disposeWithin(Promise.resolve(), 50, onCap)
+    await new Promise((r) => setTimeout(r, 80))
+    expect(onCap).not.toHaveBeenCalled()
+  })
+
+  it('returns at the cap when the dispose hangs, and says the cap fired', async () => {
+    vi.useFakeTimers()
+    try {
+      const onCap = vi.fn()
+      let done = false
+      const p = disposeWithin(new Promise<void>(() => {}), DISPOSE_CAP_MS, onCap).then(() => (done = true))
+      await vi.advanceTimersByTimeAsync(DISPOSE_CAP_MS - 1)
+      expect(done).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await p
+      expect(done).toBe(true)
+      expect(onCap).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('the cap is 10 s', () => {
+    expect(DISPOSE_CAP_MS).toBe(10_000)
+  })
+
+  // index.ts starts the Host when imported, so its leave() cannot run under a test; this pins the
+  // wiring the way driving.integration.test.ts pins the rest of leave().
+  it('index.ts leave() waits for the workspaces through disposeWithin, before the spawn settle', () => {
+    const src = readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'index.ts'), 'utf8')
+    const leave = src.slice(src.indexOf('const leave = '))
+    const at = leave.indexOf('await disposeWithin(')
+    expect(at).toBeGreaterThan(-1)
+    expect(leave.slice(at, leave.indexOf('spawner.closeAndSettle'))).toMatch(/workspaces\.dispose\(\)[\s\S]*DISPOSE_CAP_MS/)
+    expect(at).toBeLessThan(leave.indexOf('spawner.closeAndSettle'))
+    expect(leave).not.toMatch(/await workspaces\.dispose\(\)/)
   })
 })

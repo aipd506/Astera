@@ -27,7 +27,26 @@ export type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary }
 export const FRAME_EVERY_MS = 1_000
 export const FRAME_MAX_WIDTH = 960
 export const IDLE_TICK_MS = 30_000
+/** How long the Host's way out waits for `dispose()` (final review Important 2). A hung helper can
+ *  hold a cleanup for tens of seconds, and the server keeps its listener until the Host closes it, so a
+ *  replacing Host would wait behind it. Past the cap the Host goes on; the next Host's `sweepLeftovers`
+ *  ends what is left (spec, Lifecycle). */
+export const DISPOSE_CAP_MS = 10_000
 const FRAME_QUALITY = 55
+
+/** Settles when `work` does or when `ms` passes, whichever is first, and calls `onCap` if the cap came
+ *  first. `work` keeps running past the cap; the caller gives it its own `.catch` (R3). */
+export function disposeWithin(work: Promise<void>, ms: number, onCap: () => void): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const cap = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      onCap()
+      resolve()
+    }, ms)
+    timer.unref?.()
+  })
+  return Promise.race([work, cap]).finally(() => clearTimeout(timer))
+}
 
 export interface WorkspaceReply {
   status: number

@@ -220,6 +220,29 @@ describe('relaunch and close', () => {
     expect(r.deps.recordLaunch).toHaveBeenCalledWith(null)
   })
 
+  // Final review Important 1: a stopped launch still waiting on the port must not overwrite the
+  // connection a later relaunch (or close then launch) set, and must not leak it.
+  for (const late of ['null', 'a stale socket'] as const) {
+    it(`a launch whose app was replaced while it waited for the port drops its late result (${late}) and fails as stopped`, async () => {
+      let resolveWait!: (c: Cdp | null) => void
+      const r = rig({ connectCdp: vi.fn(() => new Promise<Cdp | null>((res) => (resolveWait = res))) })
+      const first = r.h.launch({ command: 'app.exe' })
+      await vi.waitFor(() => expect(resolveWait).toBeTypeOf('function'))
+      // A newer script relaunched: the manager's state now holds another app and its connection.
+      const newer = new FakeCdp()
+      const replacement = { pid: 777, startedAt: 5_000, port: 9444, spec: { command: 'app.exe' } }
+      r.state.launched = replacement
+      r.state.cdp = newer
+      const stale = new FakeCdp()
+      resolveWait(late === 'null' ? null : stale)
+      await expect(first).rejects.toThrow('launch: stopped')
+      expect(r.state.cdp).toBe(newer)
+      expect(r.state.launched).toBe(replacement)
+      expect(newer.closed).toBe(false)
+      if (late === 'a stale socket') expect(stale.closed).toBe(true)
+    })
+  }
+
   it('relaunch before launch is refused', async () => {
     await expect(rig().h.relaunch()).rejects.toThrow('call launch() first')
   })
