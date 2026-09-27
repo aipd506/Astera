@@ -5,6 +5,7 @@ import path from 'node:path'
 import { PtyRegistry, type RegistryPty } from './registry'
 import { ProcRegistry } from './procRegistry'
 import { composeHostSlack, hostSlackLog, HOST_SLACK_START_GRACE_MS } from './slackWiring'
+import { flushAllLogsSync } from '../core/log/logWriter'
 import type { HostSlackSdk } from './slackSdk'
 import type { SlackConfig } from '../core/slack/config'
 import type { Account } from '../core/types'
@@ -419,8 +420,13 @@ describe('composeHostSlack (Slack in the Host Task 5, S1, S2, S4)', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'astera-host-slack-'))
     try {
       hostSlackLog(dir)('hello')
+      // Buffered by the shared writer (stage 3, task 3); on disk once flushed.
+      flushAllLogsSync()
       expect(readFileSync(path.join(dir, 'slack.log'), 'utf8')).toMatch(/^\S+ \[host\] hello\n$/)
       expect(() => hostSlackLog(path.join(dir, 'missing', 'deeper'))('x')).not.toThrow()
+      const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+      expect(() => flushAllLogsSync()).not.toThrow()
+      err.mockRestore()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

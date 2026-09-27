@@ -1,7 +1,8 @@
 import path from 'node:path'
 import os from 'node:os'
 import { execFile } from 'node:child_process'
-import { appendFileSync, existsSync } from 'node:fs'
+import { existsSync } from 'node:fs'
+import { lineLog } from '../core/log/logWriter'
 import { app, net } from 'electron'
 import { AccountRegistry } from '../core/accounts/registry'
 import { PROVIDERS, providerOf } from '../core/providers/meta'
@@ -220,25 +221,11 @@ export async function createCore(userDataDir: string, osLocale: string): Promise
   // other long-running subsystem in main follows. A chat session's failures are protocol failures and
   // there is no terminal to print them on, so this file is the only place they are recorded.
   // Never throws: a log that cannot be written must not take a chat session down with it.
-  const chatLogFile = path.join(userDataDir, 'chat.log')
-  const chatLog = (m: string): void => {
-    try {
-      appendFileSync(chatLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a failed log write blocks nothing */
-    }
-  }
+  const chatLog = lineLog(path.join(userDataDir, 'chat.log'))
   // The spawn path's own file, by the same convention: a path probe that timed out (an offline drive
   // on PATH, or a session folder on one) and a spawn that had to fall back to a sync check are told
   // here. Set as the probe log too, so the terminal's shell lookup writes to the same place.
-  const sessionsLogFile = path.join(userDataDir, 'sessions.log')
-  const sessionsLog = (m: string): void => {
-    try {
-      appendFileSync(sessionsLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a failed log write blocks nothing */
-    }
-  }
+  const sessionsLog = lineLog(path.join(userDataDir, 'sessions.log'))
   setProbeLog(sessionsLog)
   // descriptors is injected explicitly — left unspecified, each of them calls makeDescriptors(process.platform)
   // again, so every instance gets its own table (plus two command builders SessionManager never uses).
@@ -295,13 +282,7 @@ export async function createCore(userDataDir: string, osLocale: string): Promise
     defaultWorktreeRoot(os.homedir()),
     // A recovery at load, a write refused over a damaged file and a throwing listener are recorded in
     // their own file, as chat.log is; nothing else would show them. Never throws.
-    (m) => {
-      try {
-        appendFileSync(path.join(userDataDir, 'worktrees.log'), `${new Date().toISOString()} ${m}\n`)
-      } catch {
-        /* a failed log write blocks nothing */
-      }
-    }
+    lineLog(path.join(userDataDir, 'worktrees.log'))
   )
   await worktrees.load()
   const localHistory = new LocalHistoryStore(path.join(userDataDir, 'local-history'))

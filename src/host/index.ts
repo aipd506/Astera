@@ -18,6 +18,7 @@ import { SPAWN_DEADLINE_MS } from '../core/host/unresponsive'
 import { hideForkedConsoleWindows } from './childWindows'
 import { trustSystemCa } from './systemCa'
 import { openHostLog, logUnhandledRejections } from './log'
+import { flushAllLogsSync } from '../core/log/logWriter'
 import { startHostServer, ADDRESS_TAKEN } from './server'
 import { PtyRegistry } from './registry'
 import { createConhostReaper, reapWindowsConsoleHosts } from './conhostReaper'
@@ -222,6 +223,9 @@ async function main(): Promise<void> {
           hostJournal.close()
           registry.killAll()
           procs.killAll()
+          // Every buffered log line on disk before the exits below are armed (stage 3, task 3). The
+          // process's exit hook flushes once more for anything written after this. Never throws.
+          flushAllLogsSync()
           // Both deferred, and both unref'd: see EXIT_SETTLE_MS. Unref'd so that a Host whose loop
           // empties on its own is not held open by its own way out. Armed after the settle, so the
           // hammer never lands while a spawn is still being waited for.

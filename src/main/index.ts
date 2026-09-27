@@ -14,12 +14,13 @@ import {
 } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { appendFileSync, existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import type { AppUpdater } from 'electron-updater'
 import iconAsset from '../../resources/icon.png?asset'
 import trayAsset from '../../resources/tray.png?asset'
 import { createCore, type Core } from './core'
 import { clearAppRunning, markAppRunning } from '../core/host/pidFile'
+import { flushAllLogsSync, lineLog } from '../core/log/logWriter'
 import { applyLoginPath } from './loginPath'
 import { startUp, startingPageUrl, loadInto } from './startup'
 import { pickInitialLang } from '../core/i18n/locale'
@@ -463,14 +464,7 @@ app.whenReady().then(async () => {
   // Webhook or a Slack bot (chat.postMessage) — SlackNotifier abstracts both behind a transport, so
   // the wiring here does not know which path is in play. Logs go to userData/slack.log (same pattern
   // as rolling.log) — the webhook URL and bot token are never recorded.
-  const slackLogFile = path.join(app.getPath('userData'), 'slack.log')
-  const slackLog = (m: string): void => {
-    try {
-      appendFileSync(slackLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not block the notification */
-    }
-  }
+  const slackLog = lineLog(path.join(app.getPath('userData'), 'slack.log'))
   const slackStore = new SlackConfigStore(path.join(app.getPath('userData'), 'slack.json'))
   const slack = new SlackNotifier({
     getAccount: (id) => {
@@ -675,24 +669,12 @@ app.whenReady().then(async () => {
   hookWatcher.start()
 
   // Account rolling: progress logs go to userData/rolling.log (same pattern as updater.log)
-  const rollLog = path.join(app.getPath('userData'), 'rolling.log')
   // Both coordinators' `log` dep, and the one their chat routing below writes its own refusals to — a
   // named function rather than the two inline copies it replaces, because that routing is in the dep
-  // literal and cannot reach the `log` it is declaring.
-  const rollingLog = (m: string): void => {
-    try {
-      appendFileSync(rollLog, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not block rolling */
-    }
-  }
-  const schedLog = (m: string): void => {
-    try {
-      appendFileSync(rollLog, `${new Date().toISOString()} [sched] ${m}\n`)
-    } catch {
-      /* a logging failure must not block the schedule */
-    }
-  }
+  // literal and cannot reach the `log` it is declaring. The schedule writes the same file, `[sched]`
+  // marked, through the same writer, so the two keep one order.
+  const rollingLog = lineLog(path.join(app.getPath('userData'), 'rolling.log'))
+  const schedLog = (m: string): void => rollingLog(`[sched] ${m}`)
   // Reports the per-entry validation result for scheduler.json — createCore has no logger, so it is
   // logged here instead. The normal path (recovered=false, dropped=0, pruned=0) stays quiet.
   {
@@ -1148,25 +1130,12 @@ app.whenReady().then(async () => {
   // other subsystem: a log file (userData/orchestration.log, same pattern as rolling.log and
   // slack.log) and shutdown cleanup.
   const orchLogFile = path.join(app.getPath('userData'), 'orchestration.log')
-  const orchLog = (m: string): void => {
-    try {
-      appendFileSync(orchLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not block orchestration */
-    }
-  }
+  const orchLog = lineLog(orchLogFile)
   // The app's side of the Astera Host channel. Its own file, beside rolling.log, slack.log and
   // orchestration.log — one per subsystem. The Host writes host/host.log from its end; this is the
   // other end of the same conversation, and somebody asking why Settings says Not connected has to
   // find it under a name that says Host rather than buried in an unrelated subsystem's log.
-  const hostLogFile = path.join(app.getPath('userData'), 'host-client.log')
-  const hostLog = (m: string): void => {
-    try {
-      appendFileSync(hostLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not take the Host client down */
-    }
-  }
+  const hostLog = lineLog(path.join(app.getPath('userData'), 'host-client.log'))
   registerIpc(
     core,
     win,
@@ -1254,14 +1223,7 @@ app.whenReady().then(async () => {
   // Auto-update: pulled from public GitHub Releases with no credentials. Progress is surfaced both
   // to a file log (userData/updater.log) and to the renderer (shown in the title bar).
   if (app.isPackaged) {
-    const logFile = path.join(app.getPath('userData'), 'updater.log')
-    const flog = (m: string): void => {
-      try {
-        appendFileSync(logFile, `${new Date().toISOString()} ${m}\n`)
-      } catch {
-        /* a logging failure must not block the update */
-      }
-    }
+    const flog = lineLog(path.join(app.getPath('userData'), 'updater.log'))
     // The last state pushed, so a check that runs out of time knows what the screen is showing
     // (afterCheckTimeout).
     const updateStates = createUpdateStateTracker()
@@ -1513,6 +1475,9 @@ app.on('before-quit', () => {
   slackOwnershipRef = null
   void slackInboxControllerRef?.stop() // Slack inbound socket cleanup — a failure must not block quit
   slackInboxControllerRef = null
+  // What the logs hold so far, written now (stage 3, task 3): a quit that never reaches will-quit (a
+  // crash in a window's teardown) still leaves them on disk. Synchronous, once — acceptable at quit.
+  flushAllLogsSync()
 })
 // win32 quits once every window is closed. macOS has the opposite convention, and it genuinely fits
 // this app — sessions keep running in the background, and rolling and Slack notifications need to
@@ -1600,4 +1565,10 @@ app.on('will-quit', () => {
   } catch {
     /* shutdown cleanup failures are ignored */
   }
+})
+// Registered after the cleanup above, so it runs after it: the lines that cleanup writes are on disk
+// too before the process ends (stage 3, task 3). Separate so the cleanup's early return (no core yet)
+// cannot skip it. The process's own `exit` hook (logWriter.ts) flushes once more for anything later.
+app.on('will-quit', () => {
+  flushAllLogsSync()
 })

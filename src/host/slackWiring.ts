@@ -23,7 +23,7 @@
 // so it is a function, read at the call, and nothing is opened until `start()`.
 //
 // Imports only core modules, node builtins and this folder: this bundles into the Host.
-import { appendFileSync } from 'node:fs'
+import { lineLog } from '../core/log/logWriter'
 import path from 'node:path'
 import { HOST_YIELD_SLACK } from '../core/host/protocol'
 import { SlackConfigReader, type SlackConfig } from '../core/slack/config'
@@ -70,14 +70,8 @@ export interface HostSlackWiring {
 /** The Host's Slack log: `<profile>/slack.log`, the file the app's Slack writes too, each line marked
  *  `[host]` (P16), so one file tells what happened to a session whichever process posted. Never throws. */
 export function hostSlackLog(profileDir: string): (m: string) => void {
-  const file = path.join(profileDir, 'slack.log')
-  return (m) => {
-    try {
-      appendFileSync(file, `${new Date().toISOString()} [host] ${m}\n`)
-    } catch {
-      /* a log line never costs a notice */
-    }
-  }
+  const log = lineLog(path.join(profileDir, 'slack.log'))
+  return (m) => log(`[host] ${m}`)
 }
 
 function defaultAfter(ms: number, fn: () => void): () => void {

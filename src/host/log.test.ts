@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { promises as fs, readFileSync, writeFileSync } from 'node:fs'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { promises as fs, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { openHostLog, logUnhandledRejections } from './log'
@@ -33,15 +33,29 @@ describe('openHostLog', () => {
     expect(readFileSync(p, 'utf8').split('\n').filter(Boolean)).toHaveLength(2)
   })
 
-  // A Host that runs for weeks must not fill the disk with its own diary.
-  it('starts the file over once it passes the cap', () => {
+  // A Host that runs for weeks must not fill the disk with its own diary. Past the cap the file is
+  // rotated to host.log.1 (stage 3, task 3), so two files at most, each within the cap.
+  it('rotates the file once it passes the cap, keeping one old file', () => {
     const p = path.join(dir, 'host.log')
     const log = openHostLog({ path: p, maxBytes: 200 })
-    for (let i = 0; i < 20; i++) log.write(`line ${i} ${'x'.repeat(20)}`)
-    log.close()
+    for (let i = 0; i < 20; i++) {
+      log.write(`line ${i} ${'x'.repeat(20)}`)
+      log.close()
+    }
     const text = readFileSync(p, 'utf8')
-    expect(text.length).toBeLessThan(600)
+    expect(text.length).toBeLessThanOrEqual(200)
     expect(text).toContain('line 19')
+    expect(readFileSync(p + '.1', 'utf8').length).toBeLessThanOrEqual(200)
+    expect(readdirSync(dir).sort()).toEqual(['host.log', 'host.log.1'])
+  })
+
+  it('touches no file on a write: lines are on disk once flushed', () => {
+    const p = path.join(dir, 'lazy.log')
+    const log = openHostLog({ path: p })
+    log.write('buffered')
+    expect(existsSync(p)).toBe(false)
+    log.close()
+    expect(readFileSync(p, 'utf8')).toMatch(/ buffered\n$/)
   })
 
   // The Host must not die because its log could not be written. A regular file where a directory has
@@ -51,8 +65,10 @@ describe('openHostLog', () => {
     const blocker = path.join(dir, 'blocker')
     writeFileSync(blocker, 'not a directory')
     const log = openHostLog({ path: path.join(blocker, 'nested', 'host.log') })
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
     expect(() => log.write('still fine')).not.toThrow()
     expect(() => log.close()).not.toThrow()
+    err.mockRestore()
   })
 })
 
