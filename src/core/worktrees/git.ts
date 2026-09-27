@@ -10,6 +10,19 @@ export interface GitResult {
 
 const DEFAULT_TIMEOUT_MS = 30_000
 
+/** Output ceiling for one git call. Node's execFile default is 1 MiB, and a big repository passes that
+ *  easily (`status --untracked-files=all`, `for-each-ref` over thousands of branches, a diff range after
+ *  a large pull) — execFile then fails the call outright, and the callers used to read that failure as
+ *  "nothing there". 64 MiB is far past any realistic listing while still bounding a runaway. */
+export const GIT_MAX_BUFFER_BYTES = 64 * 1024 * 1024
+
+/** Deadline for a git call that **changes** the repository (merge, worktree remove, branch delete …).
+ *  Killing such a call part-way can leave the repository half-done — a merge with MERGE_HEAD and a
+ *  conflicted index, a worktree folder half deleted — which is worse than waiting. So writes get a long
+ *  ceiling that only catches a truly hung process, never a slow one; a UI reason is never a reason to
+ *  cut one short. */
+export const GIT_WRITE_TIMEOUT_MS = 10 * 60 * 1000
+
 /** A failure of the spawn itself, before git ever ran. On Windows, under heavy parallel spawning,
  *  CreateProcess is refused now and then with EPERM (or EBUSY) and works a moment later — the whole
  *  test suite hit it about one run in ten, in whichever test happened to spawn git at that moment.
@@ -37,7 +50,12 @@ export function git(
         execFile(
           'git',
           args,
-          { cwd: opts?.cwd, timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS, windowsHide: true },
+          {
+            cwd: opts?.cwd,
+            timeout: opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            windowsHide: true,
+            maxBuffer: GIT_MAX_BUFFER_BYTES
+          },
           (err, stdout, stderr) => resolve({ err, stdout: stdout ?? '', stderr: stderr ?? '' })
         )
       } catch (err) {
@@ -166,10 +184,13 @@ export async function isCleanWorktree(
  * refs/remotes/<remote>/HEAD is dropped: it is a symref pointing at the default branch, not a branch of its
  * own, and offering it would let someone create a worktree based on the literal name 'origin/HEAD'.
  *
- * A failure returns [] rather than throwing — the picker is an aid, and not being able to list branches is
- * no reason to block starting a session (the caller falls back to detectBaseRef).
+ * A failure (git error, timeout, output limit) returns **null** — "could not check" — never []. An empty
+ * list is a real answer (a repository with no commits yet has no branches), and handing the picker []
+ * for a failure made a repository with thousands of branches look like one with none. It still does not
+ * throw: the picker is an aid, and not being able to list branches is no reason to block starting a
+ * session (the caller falls back to detectBaseRef and says the list is unavailable).
  */
-export async function listBranches(repo: string): Promise<BranchRef[]> {
+export async function listBranches(repo: string): Promise<BranchRef[] | null> {
   const r = await git(
     [
       'for-each-ref',
@@ -180,7 +201,8 @@ export async function listBranches(repo: string): Promise<BranchRef[]> {
     ],
     { cwd: repo }
   )
-  if (!r.ok || r.stdout === '') return []
+  if (!r.ok) return null
+  if (r.stdout === '') return []
   // Empty on a detached HEAD, which is why no branch comes back marked current there
   const head = await git(['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: repo })
   const current = head.ok ? head.stdout : null

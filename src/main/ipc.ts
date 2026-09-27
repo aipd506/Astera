@@ -3957,6 +3957,7 @@ export function registerIpc(
   )
   // Base-branch candidates for the new-session worktree picker. detected rides along so the select can
   // preselect what the automatic path would have chosen — a separate IPC would mean a second round trip.
+  // branches is null when git did not answer; the dialogs say "could not check" rather than show [].
   ipcMain.handle('worktrees.listBranches', async (_e, repoPath: string) => ({
     branches: await listBranches(repoPath),
     detected: await detectBaseRef(repoPath)

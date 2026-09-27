@@ -591,6 +591,8 @@ export const ja: Catalog = {
   'session.new.useWorktree': 'worktree に分離して開始',
   'session.new.worktreeNoBase':
     'このリポジトリには基準にできるブランチがないため worktree を作成できません。コミットを1つ作成してから再試行してください。',
+  'session.new.worktreeBranchesUnavailable': 'ブランチ一覧を確認できませんでした（git が応答しません）。基準ブランチは自動で決まります。',
+  'pr.create.branchesUnavailable': 'ブランチ一覧を確認できませんでした（git が応答しません）。',
   'session.new.worktreeBaseRef': '基準ブランチ',
   'session.new.worktreeBaseCurrent': '(現在のブランチ)',
   'session.new.worktreeBaseRemote': 'リモート',

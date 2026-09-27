@@ -98,7 +98,7 @@ describe('git 어댑터', () => {
   it('listBranches: 로컬과 원격을 모두 짧은 이름으로 돌려주고 origin/HEAD는 제외한다', async () => {
     await addOrigin(repo) // origin/main + origin/HEAD(symref)를 만든다
     execFileSync('git', ['branch', 'feature/x'], { cwd: repo, windowsHide: true })
-    const names = (await listBranches(repo)).map((b) => b.name)
+    const names = (await listBranches(repo))!.map((b) => b.name)
     expect(names).toContain('main')
     expect(names).toContain('feature/x')
     expect(names).toContain('origin/main')
@@ -108,7 +108,7 @@ describe('git 어댑터', () => {
 
   it('listBranches: remote 플래그로 원격과 로컬을 구분한다', async () => {
     await addOrigin(repo)
-    const byName = new Map((await listBranches(repo)).map((b) => [b.name, b]))
+    const byName = new Map((await listBranches(repo))!.map((b) => [b.name, b]))
     expect(byName.get('main')?.remote).toBe(false)
     expect(byName.get('origin/main')?.remote).toBe(true)
   })
@@ -125,26 +125,39 @@ describe('git 어댑터', () => {
       windowsHide: true,
       env: { ...process.env, GIT_COMMITTER_DATE: '2030-01-01T00:00:00', GIT_AUTHOR_DATE: '2030-01-01T00:00:00' }
     })
-    const locals = (await listBranches(repo)).filter((b) => !b.remote).map((b) => b.name)
+    const locals = (await listBranches(repo))!.filter((b) => !b.remote).map((b) => b.name)
     expect(locals.indexOf('zzz-newer')).toBeLessThan(locals.indexOf('main'))
   })
 
   it('listBranches: 현재 브랜치에만 current가 붙는다', async () => {
     execFileSync('git', ['branch', 'other'], { cwd: repo, windowsHide: true })
-    const list = await listBranches(repo)
+    const list = (await listBranches(repo))!
     expect(list.filter((b) => b.current).map((b) => b.name)).toEqual(['main'])
+  })
+
+  // "모른다"는 "없다"가 아니다. 저장소가 아닌 곳(= git 이 실패한 곳)에서 빈 목록을 주면 피커는
+  // 브랜치가 하나도 없는 저장소와 구별할 수 없다 — null 이 그 둘을 가른다.
+  it('listBranches: git 이 실패하면 빈 목록이 아니라 null(모름)을 준다', async () => {
+    const out = await tempDir('astera-wt-nobranch-')
+    expect(await listBranches(out)).toBeNull()
+  })
+
+  it('listBranches: 커밋이 없는 저장소는 null 이 아니라 빈 목록이다', async () => {
+    const empty = await tempDir('astera-wt-emptyrepo-')
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: empty, windowsHide: true })
+    expect(await listBranches(empty)).toEqual([])
   })
 
   it('listBranches: detached HEAD면 current인 항목이 없다', async () => {
     const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, windowsHide: true, encoding: 'utf8' }).trim()
     execFileSync('git', ['checkout', '-q', head], { cwd: repo, windowsHide: true })
-    const list = await listBranches(repo)
+    const list = (await listBranches(repo))!
     expect(list.length).toBeGreaterThan(0)
     expect(list.some((b) => b.current)).toBe(false)
   })
 
   it('listBranches: updatedAt이 파싱 가능한 날짜다', async () => {
-    const list = await listBranches(repo)
+    const list = (await listBranches(repo))!
     expect(Number.isNaN(Date.parse(list[0].updatedAt))).toBe(false)
   })
 

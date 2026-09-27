@@ -769,6 +769,8 @@ export const ko = {
   'session.new.pickFolder': '선택…',
   'session.new.useWorktree': 'worktree로 분리해서 시작',
   'session.new.worktreeNoBase': '이 저장소에는 기준으로 삼을 브랜치가 없어 worktree 를 만들 수 없습니다. 커밋을 하나 만든 뒤 다시 시도하세요.',
+  'session.new.worktreeBranchesUnavailable': '브랜치 목록을 확인하지 못했습니다(git 이 응답하지 않음). 기준 브랜치는 자동으로 정합니다.',
+  'pr.create.branchesUnavailable': '브랜치 목록을 확인하지 못했습니다(git 이 응답하지 않음).',
   'session.new.worktreeBaseRef': '기준 브랜치',
   'session.new.worktreeBaseCurrent': '(현재 브랜치)',
   'session.new.worktreeBaseRemote': '원격',

@@ -6,7 +6,7 @@ import { rollChainCandidates } from '../../../core/resume'
 import { isSlackReady } from '../../../core/slack/ready'
 import { useChatAvailability } from '../hooks/useChatAvailability'
 import { useAccountStatus } from '../hooks/useAccountStatus'
-import { orderBranchesForPicker, reconcileBaseRef } from '../../../core/worktrees/base'
+import { branchPickerState, orderBranchesForPicker } from '../../../core/worktrees/base'
 import { isWaitingReason, startBlockedBy, type StartBlocked } from '../../../core/sessions/startBlocked'
 import type { MessageKey } from '../../../core/i18n'
 import { toast } from '../lib/toast'
@@ -101,6 +101,8 @@ export function NewSessionDialog({
   // Base-branch candidates. null = not loaded yet (or the lookup failed) — the select stays hidden then and
   // creation falls back to the automatic detection, exactly as before this picker existed.
   const [branches, setBranches] = useState<BranchRef[] | null>(null)
+  // git did not answer the branch-list question — shown as "could not check", never as an empty list
+  const [branchesUnavailable, setBranchesUnavailable] = useState(false)
   const [wtBaseRef, setWtBaseRef] = useState('')
   // The effect below reads the current pick but must not re-run when it changes, or picking a branch would
   // immediately refetch the list. Same ref-mirror idiom as HistoryBrowser's accountFilterRef.
@@ -134,9 +136,11 @@ export function NewSessionDialog({
   useEffect(() => {
     // Loaded when the checkbox is ticked, not on every modal open — there is no reason to run git until the
     // user actually wants a worktree. A failure leaves branches null, which hides the select and lets
-    // createWorktree detect the base as it always has.
+    // createWorktree detect the base as it always has — and when git did not answer, the dialog says the
+    // list could not be checked instead of quietly showing nothing.
     if (!useWorktree || !repoRoot) return
     let cancelled = false
+    setBranchesUnavailable(false)
     void window.api.worktrees
       .listBranches(repoRoot)
       .then(({ branches: list, detected }) => {
@@ -144,8 +148,15 @@ export function NewSessionDialog({
         // Reconcile rather than overwrite: the pick survives toggling the checkbox, but a pick left over
         // from a previous project folder does not — it is not in this repo's list, and keeping it left the
         // picker on its "nothing selected" placeholder
-        const base = reconcileBaseRef({ branches: list, detected, current: wtBaseRefRef.current })
-        if (base === null) {
+        const picker = branchPickerState({ branches: list, detected, current: wtBaseRefRef.current })
+        if (picker.kind === 'unavailable') {
+          // Not "no branches": git did not answer. The worktree option stays on and creation detects the
+          // base automatically, but the person is told the list could not be checked.
+          setBranches(null)
+          setBranchesUnavailable(true)
+          return
+        }
+        if (picker.kind === 'noBase') {
           // Nothing to fork from (a repo with no commits yet). Refusing here beats letting the start
           // button run: the loading overlay is opaque and covers the Cancel button, and outside-click
           // close is disabled while starting, so a failure mid-flight leaves no way out of the modal.
@@ -154,11 +165,13 @@ export function NewSessionDialog({
           setBranches(null)
           return
         }
-        setBranches(list)
-        setWtBaseRef(base)
+        setBranches(picker.branches)
+        setWtBaseRef(picker.base)
       })
       .catch(() => {
-        if (!cancelled) setBranches(null)
+        if (cancelled) return
+        setBranches(null)
+        setBranchesUnavailable(true)
       })
     return () => {
       cancelled = true
@@ -196,6 +209,7 @@ export function NewSessionDialog({
     // Drop the branch list the moment the folder changes. It belongs to the previous repository, and until
     // the new fetch lands the picker would be offering branches that are not in this repo at all.
     setBranches(null)
+    setBranchesUnavailable(false)
     void (async () => {
       let root: string | null
       try {
@@ -460,6 +474,9 @@ export function NewSessionDialog({
                       ariaLabel={t('session.new.worktreeBaseRef')}
                     />
                   </div>
+                )}
+                {branchesUnavailable && (
+                  <span className="modal-hint">{t('session.new.worktreeBranchesUnavailable')}</span>
                 )}
               </div>
             )}

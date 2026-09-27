@@ -959,8 +959,10 @@ export interface CoreApi {
       baseRef?: string // the branch to fork from, short form. Absent falls back to automatic detection
     }): Promise<{ info: WorktreeInfo; warnings: Message[] }>
     /** Base-branch candidates for the picker, newest commit first. `detected` is what the automatic path
-     *  would have chosen, so the select can preselect it and leave behaviour unchanged when untouched. */
-    listBranches(repoPath: string): Promise<{ branches: BranchRef[]; detected: string | null }>
+     *  would have chosen, so the select can preselect it and leave behaviour unchanged when untouched.
+     *  `branches` is null when git could not be asked (error, timeout, output limit) — "could not
+     *  check", which the picker must not show as an empty list. */
+    listBranches(repoPath: string): Promise<{ branches: BranchRef[] | null; detected: string | null }>
     remove(id: string, opts?: { force?: boolean }): Promise<WorktreeRemoveResult>
     isGitRepo(dir: string): Promise<string | null> // returns the repo root, or null
     getRoot(): Promise<string>

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { execFile } from 'node:child_process'
-import { git } from './git'
+import { git, listBranches, GIT_MAX_BUFFER_BYTES, GIT_WRITE_TIMEOUT_MS } from './git'
 
 // The adapter's own tests (git.test.ts) run real git. What they cannot produce is a spawn that fails
 // before git runs — on Windows, under heavy parallel spawning, CreateProcess is refused with EPERM
@@ -59,5 +59,43 @@ describe('git adapter, spawn failures', () => {
     const r = await git(['status'])
     expect(r).toEqual({ ok: false, stdout: '', stderr: 'fatal: not a git repository' })
     expect(mocked.mock.calls.length).toBe(1)
+  })
+})
+
+const optsOf = (call: unknown[]): { maxBuffer?: number; timeout?: number } => call[2] as { maxBuffer?: number; timeout?: number }
+
+describe('git adapter, output limit', () => {
+  // Node's default is 1 MiB. `status --untracked-files=all` or `for-each-ref` on a big repo passes
+  // that easily, and execFile then fails the call — which every caller used to read as "empty".
+  it('passes a 64 MiB maxBuffer to execFile, not the 1 MiB default', async () => {
+    succeed()
+    await git(['status'])
+    expect(GIT_MAX_BUFFER_BYTES).toBe(64 * 1024 * 1024)
+    expect(optsOf(mocked.mock.calls[0]).maxBuffer).toBe(GIT_MAX_BUFFER_BYTES)
+  })
+
+  it('the write timeout is ten minutes and is passed through as given', async () => {
+    succeed()
+    await git(['merge', '--no-edit', 'x'], { timeoutMs: GIT_WRITE_TIMEOUT_MS })
+    expect(GIT_WRITE_TIMEOUT_MS).toBe(10 * 60 * 1000)
+    expect(optsOf(mocked.mock.calls[0]).timeout).toBe(GIT_WRITE_TIMEOUT_MS)
+  })
+})
+
+describe('listBranches, unknown is not empty', () => {
+  it('a timed-out for-each-ref gives null, not []', async () => {
+    mocked.mockImplementationOnce((...a) => {
+      callback(a)(Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }), '', '')
+      return {}
+    })
+    expect(await listBranches('/repo')).toBeNull()
+  })
+
+  it('an output-limit failure gives null, not []', async () => {
+    mocked.mockImplementationOnce((...a) => {
+      callback(a)(Object.assign(new Error('maxBuffer'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }), '', '')
+      return {}
+    })
+    expect(await listBranches('/repo')).toBeNull()
   })
 })

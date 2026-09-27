@@ -597,6 +597,8 @@ export const es: Catalog = {
   'session.new.useWorktree': 'Iniciar en un worktree aparte',
   'session.new.worktreeNoBase':
     'Este repositorio no tiene ninguna rama que sirva de base, así que no se puede crear el worktree. Cree un commit y vuelva a intentarlo.',
+  'session.new.worktreeBranchesUnavailable': 'No se pudo comprobar la lista de ramas (git no respondió). La rama base se detectará automáticamente.',
+  'pr.create.branchesUnavailable': 'No se pudo comprobar la lista de ramas (git no respondió).',
   'session.new.worktreeBaseRef': 'Rama base',
   'session.new.worktreeBaseCurrent': '(rama actual)',
   'session.new.worktreeBaseRemote': 'Remotas',

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import type { BranchRef } from '../types'
-import { orderBranchesForPicker, reconcileBaseRef, resolveInitialBase, workerBaseFailure } from './base'
+import { branchPickerState, orderBranchesForPicker, reconcileBaseRef, resolveInitialBase, workerBaseFailure } from './base'
 
 const b = (name: string, over: Partial<BranchRef> = {}): BranchRef => ({
   name,
@@ -152,5 +152,28 @@ describe('workerBaseFailure', () => {
 
   it('브랜치 위에 있으면 실패가 없다', () => {
     expect(workerBaseFailure({ repoPath: 'C:/repo', repoReachable: true, onBranch: true })).toBeNull()
+  })
+})
+
+describe('branchPickerState', () => {
+  const b = (name: string): BranchRef => ({ name, remote: false, current: false, updatedAt: '' })
+
+  // listBranches 의 null 은 "git 이 답하지 않았다"이다. 그것을 "브랜치가 없다"로 읽으면 대화상자는
+  // 커밋이 없는 저장소라고 거짓으로 말하고 worktree 선택을 꺼 버린다.
+  it('모르는 목록(null)은 unavailable 이다 — noBase 가 아니다', () => {
+    expect(branchPickerState({ branches: null, detected: null, current: '' })).toEqual({ kind: 'unavailable' })
+    expect(branchPickerState({ branches: null, detected: 'main', current: '' })).toEqual({ kind: 'unavailable' })
+  })
+
+  it('빈 목록에 감지된 것도 없으면 noBase 다', () => {
+    expect(branchPickerState({ branches: [], detected: null, current: '' })).toEqual({ kind: 'noBase' })
+  })
+
+  it('목록이 있으면 reconcileBaseRef 가 고른 base 로 ready 다', () => {
+    expect(branchPickerState({ branches: [b('develop')], detected: null, current: '' })).toEqual({
+      kind: 'ready',
+      branches: [b('develop')],
+      base: 'develop'
+    })
   })
 })

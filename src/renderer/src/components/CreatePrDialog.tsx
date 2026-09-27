@@ -33,6 +33,7 @@ export function CreatePrDialog({
   // targets is worse than none.
   const [behindCount, setBehindCount] = useState<number | null>(null)
   const [branches, setBranches] = useState<BranchRef[]>([])
+  const [branchesUnavailable, setBranchesUnavailable] = useState(false)
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<Failure | null>(null)
   // Set once the person edits title or body. Same idiom as NewSessionDialog's touched: it stops a
@@ -64,7 +65,23 @@ export function CreatePrDialog({
   }, [worktree.path, worktree.branch, base])
 
   useEffect(() => {
-    void window.api.worktrees.listBranches(worktree.repoPath).then((r) => setBranches(r.branches))
+    // null is "git did not answer", not "no branches" — the base stays as given and the row says the
+    // list could not be checked (branchesUnavailable) rather than offering an empty picker.
+    let cancelled = false
+    setBranchesUnavailable(false)
+    void window.api.worktrees
+      .listBranches(worktree.repoPath)
+      .then((r) => {
+        if (cancelled) return
+        setBranches(r.branches ?? [])
+        setBranchesUnavailable(r.branches === null)
+      })
+      .catch(() => {
+        if (!cancelled) setBranchesUnavailable(true)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [worktree.repoPath])
 
   // createFailedPushed tells the person the retry skips the push, so it has to. needsPush is fixed
@@ -123,6 +140,7 @@ export function CreatePrDialog({
             ariaLabel={t('pr.create.base')}
           />
         </div>
+        {branchesUnavailable && <span className="modal-hint">{t('pr.create.branchesUnavailable')}</span>}
         <div className="field">
           <label>{t('pr.create.prTitle')}</label>
           <input
