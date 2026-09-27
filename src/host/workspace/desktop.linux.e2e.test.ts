@@ -11,6 +11,7 @@
 // runner has none of them, so without them the check that the app never reaches the person's session
 // would pass for want of a session to reach.
 import { describe, it, expect, afterAll, vi } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -177,6 +178,15 @@ describe.runIf(enabled)('the agent app workspace on a real Linux virtual display
       expect(xvfbArgs).toContain('-displayfd')
       const display = xvfbArgs.find((a) => /^:\d+$/.test(a))!
       expect(Number(display.slice(1))).toBeGreaterThanOrEqual(90)
+      // The pointer waits in the screen's far corner, outside the fixture's window, so nothing X reports
+      // about it can end the press drag() makes below (PARKED_POINTER, deskLinux.ts).
+      const xdo = (...args: string[]): string => execFileSync('xdotool', args, { env: { ...process.env, DISPLAY: display }, encoding: 'utf8' })
+      const shell = (text: string): Record<string, number> => Object.fromEntries(text.trim().split('\n').map((l) => [l.split('=')[0], Number(l.split('=')[1])]))
+      const pointer = shell(xdo('getmouselocation', '--shell'))
+      expect(pointer).toMatchObject({ X: 1919, Y: 1079 })
+      const geo = await vi.waitFor(() => shell(xdo('getwindowgeometry', '--shell', xdo('search', '--onlyvisible', '--name', TITLE).trim().split('\n')[0])))
+      const inside = geo.X <= pointer.X && pointer.X < geo.X + geo.WIDTH && geo.Y <= pointer.Y && pointer.Y < geo.Y + geo.HEIGHT
+      expect(inside, JSON.stringify({ pointer, geo })).toBe(false)
 
       // The app is on the workspace's display, and nothing in its environment points it at the person's
       // X display, Wayland compositor, session bus or runtime folder.
