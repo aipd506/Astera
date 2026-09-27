@@ -368,6 +368,8 @@ function formatResetHud(resetsAt: string | null | undefined): string | null {
  *  asking is the Host replacing itself, which happens the first moment it holds nothing, and a notice
  *  that clears within half a minute of that is prompt enough for something nobody is waiting on. */
 const HOST_STATUS_POLL_MS = 30_000
+/** 저널이 바빠 상세가 마지막으로 읽은 줄을 받았을 때, 다시 묻기까지 기다리는 시간(stage 3 T1) */
+const DETAIL_BUSY_RETRY_MS = 2_000
 
 /** "7m", "2h" — a coarse uptime is all this row needs; it is a sign of life, not a metric, which is
  *  also why the unit is not translated. */
@@ -2299,6 +2301,12 @@ export default function App(): React.JSX.Element {
   /** 그 Run 의 이벤트와 의존 그래프. null 은 아직 도착하지 않았다는 뜻이고 빈 배열과 다르다 — 모달은
    *  전자에 아무것도 그리지 않고 후자에만 빈 상태를 그린다. 읽는 효과는 currentProject 선언 아래에 있다. */
   const [detail, setDetail] = useState<RunDetailData | null>(null)
+  /** 상세 창이 저널 줄을 몇 쪽까지 읽는가(stage 3 T1) — "이전 저널 기록 더 보기" 가 한 쪽씩 늘린다.
+   *  runId 와 함께 든다: 다른 Run 을 열면 따로 되돌리지 않아도 1 쪽에서 시작한다. */
+  const [journalPagesFor, setJournalPagesFor] = useState<{ runId: string; pages: number } | null>(null)
+  /** 저널이 바빠 마지막으로 읽은 줄을 받았을 때 다시 묻는 횟수 — 바뀔 때마다 아래 효과가 상세를 다시
+   *  부른다. 스냅샷이 움직이지 않는 Run 이면 그것 말고는 다시 물을 계기가 없다. */
+  const [detailRetry, setDetailRetry] = useState(0)
   /** 홈 디렉터리 — 프로젝트가 없을 때 아래쪽 패널의 터미널이 열릴 자리. 프로세스 수명 동안 바뀌지
    *  않으므로 한 번만 읽는다. 도착하기 전에는 null 이고, 그동안 패널은 그려지지 않는다. */
   const [homeDir, setHomeDir] = useState<string | null>(null)
@@ -2488,7 +2496,8 @@ export default function App(): React.JSX.Element {
     let cancelled = false
     // 거부 팔을 반드시 둔다 — 위의 가드가 걸러도 main 은 저장소를 읽다 던질 수 있고, 그러면
     // DevTools 에 Uncaught (in promise) 가 뜬다. 빈 모양으로 접으면 모달은 빈 상태를 그린다.
-    void window.api.orch.runDetail(openRun.projectPath, openRun.runId).then(
+    const journalPages = journalPagesFor?.runId === openRun.runId ? journalPagesFor.pages : 1
+    void window.api.orch.runDetail(openRun.projectPath, openRun.runId, { journalPages }).then(
       (d) => {
         if (!cancelled) setDetail(d)
       },
@@ -2499,7 +2508,14 @@ export default function App(): React.JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [openRun, currentProject, orchSnapshot])
+  }, [openRun, currentProject, orchSnapshot, journalPagesFor, detailRetry])
+  // 저널이 바빴다(stage 3 T1) — main 은 기다리지 않고 마지막으로 읽은 줄을 줬다. 잠시 뒤에 다시 묻는다.
+  // 답이 여전히 바쁘면 다음 답이 또 한 번을 잡는다. 창을 닫거나 답이 바뀌면 타이머를 걷는다.
+  useEffect(() => {
+    if (!detail?.journal?.busy) return
+    const timer = setTimeout(() => setDetailRetry((n) => n + 1), DETAIL_BUSY_RETRY_MS)
+    return () => clearTimeout(timer)
+  }, [detail])
   // 프로젝트가 바뀌면 닫는다 — 다른 프로젝트의 Run 을 열어 둔 채로 둘 이유가 없다
   useEffect(() => {
     setOpenRun(null)
@@ -5123,6 +5139,12 @@ export default function App(): React.JSX.Element {
             setOpenRun(null) // 탭으로 가면서 닫는다
             selectWorkbenchTab(sessionTab(sessionId))
           }}
+          onShowOlderJournal={() =>
+            setJournalPagesFor((prev) => ({
+              runId: openRun.runId,
+              pages: (prev?.runId === openRun.runId ? prev.pages : 1) + 1
+            }))
+          }
           onClose={() => setOpenRun(null)}
         />
       )}

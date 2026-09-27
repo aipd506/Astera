@@ -6,7 +6,7 @@
 //
 // orchestration.json stays the source of "what is the state now"; this file answers "what happened".
 // Lives in core/continuity since the Host journal (Task 1), so the Host writes with the same code the app did.
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { randomUUID } from 'node:crypto'
 import { closeSync, existsSync, openSync, readSync, renameSync } from 'node:fs'
 import type { ContinuityEvent, ContinuityEventType } from './events'
@@ -80,9 +80,10 @@ export interface ContinuityJournalDeps {
   busyTimeoutMs?: number
 }
 
-/** How long a connection waits for another's lock (final review I2). Since the Host journal two processes
- *  open this file, the Host's writer and the app's reader, and one can meet the other's lock for a moment
- *  (WAL recovery, a checkpoint). Waiting is the answer; failing at once made a lock look like a broken file. */
+/** How long the writer waits for another connection's lock (final review I2). Since the Host journal two
+ *  processes open this file, the Host's writer and the app's reader, and one can meet the other's lock for
+ *  a moment (WAL recovery, a checkpoint). Waiting is the answer; failing at once made a lock look like a
+ *  broken file. The reader keeps a much shorter one (READER_BUSY_TIMEOUT_MS, design doc A141). */
 export const BUSY_TIMEOUT_MS = 5000
 
 /** Sets the busy timeout on a connection: the first statement on every connection to this file. */
@@ -166,7 +167,11 @@ CREATE TABLE IF NOT EXISTS recovery_actions (
   details_json TEXT
 );
 CREATE INDEX IF NOT EXISTS recovery_actions_run ON recovery_actions(run_id);
+CREATE INDEX IF NOT EXISTS journal_events_dispatch ON journal_events(dispatch_id);
 `
+// journal_events_dispatch (stage 3 T1) is last so a v1 file whose schema step fails midway gains
+// nothing new before it fails. It is an index, not a change of shape: IF NOT EXISTS adds it to a v3
+// file at the writer's next open, an older build reads the file as before, and the version stays 3.
 
 /** Whether `table` has `column`. PRAGMA table_info answers on any file, a v2 one included. */
 export const hasColumn = (db: DatabaseSync, table: string, column: string): boolean =>
@@ -187,7 +192,8 @@ function open(filePath: string, busyTimeoutMs?: number): OpenResult {
     // First, before anything reads the file: a lock another process holds for a moment is waited out.
     setBusyTimeout(db, busyTimeoutMs)
     // FULL, not NORMAL: writes happen once per state transition and the durability of an intent
-    // record is the point (spec §6.1). WAL keeps readers (P1's reconciler) off the writer's lock.
+    // record is the point (spec §6.1, and case D: power loss). Weighed again against the fsync cost on
+    // slow disks and kept (design doc A143). WAL keeps readers (P1's reconciler) off the writer's lock.
     db.exec('PRAGMA journal_mode = WAL')
     db.exec('PRAGMA synchronous = FULL')
     db.exec('PRAGMA foreign_keys = ON')
@@ -450,15 +456,10 @@ export class ContinuityJournal {
     }
   }
 
-  eventsFor(runId: string): JournalEventRow[] {
-    return (
-      this.db
-        .prepare(`${selectEvents(this.withActor)} WHERE run_id = ? ORDER BY rowid`)
-        // .all()'s typed return (Record<string, SQLOutputValue>[]) doesn't structurally overlap
-        // RawEvent[] enough for a direct assertion (TS2352) the way the single-row .get() casts
-        // below do; route through `unknown`, same as tsc's own suggestion.
-        .all(runId) as unknown as RawEvent[]
-    ).map(rowToEvent)
+  /** A Run's rows, oldest first. With `page`, only the newest `page.limit` of those that match it
+   *  (EventsPage); without, every row, which only the Host's own bounded reads still ask for. */
+  eventsFor(runId: string, page?: EventsPage): JournalEventRow[] {
+    return readEvents(this.db, selectEvents(this.withActor), runId, page)
   }
 
   lastEvent(): JournalEventRow | null {
@@ -534,6 +535,42 @@ export class ContinuityJournal {
   close(): void {
     this.db.close()
   }
+}
+
+/** A bounded read of one Run's rows (stage 3 T1): the newest `limit` rows that match, returned oldest
+ *  first. `before` is the cursor for the next older page: the `sequence` of the oldest row a page
+ *  returned. `types` and `dispatchId` narrow the rows before the limit is applied. */
+export interface EventsPage {
+  limit: number
+  before?: number
+  types?: readonly ContinuityEventType[]
+  dispatchId?: string
+}
+
+/** The one events query both connections run, bounded when a page is given. */
+export function readEvents(db: DatabaseSync, select: string, runId: string, page?: EventsPage): JournalEventRow[] {
+  if (!page)
+    // .all()'s typed return (Record<string, SQLOutputValue>[]) doesn't structurally overlap RawEvent[]
+    // enough for a direct assertion (TS2352); route through `unknown`, same as tsc's own suggestion.
+    return (db.prepare(`${select} WHERE run_id = ? ORDER BY rowid`).all(runId) as unknown as RawEvent[]).map(rowToEvent)
+  const where = ['run_id = ?']
+  const params: SQLInputValue[] = [runId]
+  if (page.dispatchId !== undefined) {
+    where.push('dispatch_id = ?')
+    params.push(page.dispatchId)
+  }
+  if (page.types !== undefined) {
+    if (page.types.length === 0) return []
+    where.push(`event_type IN (${page.types.map(() => '?').join(', ')})`)
+    params.push(...page.types)
+  }
+  if (page.before !== undefined) {
+    where.push('rowid < ?')
+    params.push(page.before)
+  }
+  params.push(Math.max(0, Math.floor(page.limit)))
+  const raw = db.prepare(`${select} WHERE ${where.join(' AND ')} ORDER BY rowid DESC LIMIT ?`).all(...params) as unknown as RawEvent[]
+  return raw.reverse().map(rowToEvent)
 }
 
 const SELECT_EVENT_COLUMNS =

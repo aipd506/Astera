@@ -6,15 +6,23 @@ import { DatabaseSync } from 'node:sqlite'
 import {
   SELECT_CHECKPOINT,
   hasColumn,
+  readEvents,
   rowToCheckpoint,
   rowToEvent,
   selectEvents,
   setBusyTimeout,
   type CheckpointRow,
+  type EventsPage,
   type JournalEventRow,
   type RawCheckpoint,
   type RawEvent
 } from './journal'
+
+/** How long the reader waits for another connection's lock (stage 3 T1). The app reads on Electron's
+ *  main thread and `node:sqlite` is synchronous, so a wait here is a frozen window: the writer's 5 s
+ *  (BUSY_TIMEOUT_MS) would be one. A moment's lock (WAL recovery, a checkpoint) is still waited out;
+ *  a longer one throws SQLITE_BUSY at once, and the caller shows what it last read and asks again. */
+export const READER_BUSY_TIMEOUT_MS = 250
 
 export class JournalReader {
   private db: DatabaseSync | null = null
@@ -22,6 +30,7 @@ export class JournalReader {
   private opens = 0
   constructor(
     private readonly filePath: string,
+    /** busyTimeoutMs: READER_BUSY_TIMEOUT_MS when left out. */
     private readonly deps: { busyTimeoutMs?: number } = {}
   ) {}
 
@@ -33,7 +42,7 @@ export class JournalReader {
     // A lock the writer holds for a moment is waited out (final review I2); one held past the timeout is a
     // failed read, which throws (P13). Nothing here ever moves the file.
     try {
-      setBusyTimeout(db, this.deps.busyTimeoutMs)
+      setBusyTimeout(db, this.deps.busyTimeoutMs ?? READER_BUSY_TIMEOUT_MS)
     } catch (err) {
       db.close()
       throw err
@@ -48,13 +57,13 @@ export class JournalReader {
     return selectEvents(hasColumn(db, 'journal_events', 'actor_json'))
   }
 
-  /** [] while the file does not exist; throws on a failed read (the reconciler reads a throw as "cannot say"). */
-  eventsFor(runId: string): JournalEventRow[] {
+  /** [] while the file does not exist; throws on a failed read (the reconciler reads a throw as "cannot
+   *  say"), SQLITE_BUSY within READER_BUSY_TIMEOUT_MS when the writer holds the file. With `page`, only
+   *  the newest rows that match it (EventsPage); the app's reads always give one. */
+  eventsFor(runId: string, page?: EventsPage): JournalEventRow[] {
     const db = this.handle()
     if (!db) return []
-    return (db.prepare(`${this.events(db)} WHERE run_id = ? ORDER BY rowid`).all(runId) as unknown as RawEvent[]).map(
-      rowToEvent
-    )
+    return readEvents(db, this.events(db), runId, page)
   }
 
   lastEvent(): JournalEventRow | null {

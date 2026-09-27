@@ -581,6 +581,18 @@ export interface RunDetail {
   deps: Record<string, string[]>
   /** 깊이를 정할 수 없는 Task — deps 에 순환이 있다 */
   cyclic: string[]
+  /** 이벤트 가운데 Job Journal 에서 온 줄(잃은 시도, 복구 결정)에 대한 것. 저널이 꺼져 있거나 아직
+   *  읽지 않았으면 없다. */
+  journal?: RunDetailJournal
+}
+
+/** 상세 창이 저널 줄에 대해 알아야 하는 두 가지(stage 3 T1). 저널은 메인 스레드에서 읽으므로 한 번에
+ *  가장 최근 한 쪽만 읽고, Host 가 파일을 잡고 있으면 기다리지 않고 마지막으로 읽은 줄을 준다. */
+export interface RunDetailJournal {
+  /** Host 가 파일을 잡고 있어 이번에는 읽지 못했다 — 줄은 마지막으로 읽은 것이다. 다음 갱신 때 다시 읽는다 */
+  busy: boolean
+  /** 더 오래된 저널 줄이 남아 있다 — "이전 기록 더 보기" 가 한 쪽을 더 읽는다 */
+  older: boolean
 }
 
 /** Run 이 끝났는지 — Task 상태에서 계산된다. 저장되지 않는다.
@@ -1604,8 +1616,9 @@ export interface OrchApi {
    *  `'orch:host'`. */
   hostGate(): Promise<OrchHostGate | null>
   /** 한 Run 의 이벤트와 의존 그래프. 스냅샷과 달리 **요청할 때만** 온다 — Message.body 에는
-   *  검증 출력 꼬리가 실리므로 매 쓰기마다 밀 수 있는 크기가 아니다. */
-  runDetail(projectPath: string, runId: string): Promise<RunDetail>
+   *  검증 출력 꼬리가 실리므로 매 쓰기마다 밀 수 있는 크기가 아니다. `journalPages` 는 저널 줄을
+   *  가장 최근 몇 쪽까지 읽을지다(없으면 1, "이전 기록 더 보기" 가 하나씩 늘린다). */
+  runDetail(projectPath: string, runId: string, opts?: { journalPages?: number }): Promise<RunDetail>
   /** 한 Task 가 왜 완료 정책을 못 넘었는가 — 실패한 검사의 출력 꼬리, 막는 리뷰 이슈, 의심
    *  파일. 이것도 **펼칠 때만** 온다: 스냅숏이 이 셋을 싣지 않는 이유(변경마다 푸시된다)가
    *  한 번 가져가는 이 호출에는 걸리지 않는다(UI 2조각 설계 W1).

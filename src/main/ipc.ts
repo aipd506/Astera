@@ -4319,7 +4319,7 @@ export function registerIpc(
   })
   // 스냅샷에 태우지 않고 따로 읽는 이유는 크기다 — Message.body 에는 검증 출력 꼬리가 실리므로
   // 프로젝트의 모든 Run 의 모든 이벤트를 매 쓰기마다 미는 것은 불가능하다. 모달이 열릴 때만 온다.
-  ipcMain.handle('orch.runDetail', async (_e, projectPath: string, runId: string) => {
+  ipcMain.handle('orch.runDetail', async (_e, projectPath: string, runId: string, opts?: { journalPages?: unknown }) => {
     // orch.list 와 같은 가드, 같은 이유 — 경로가 어느 Run 을 볼 수 있는지를 정한다
     await assertAllowedPath(projectPath)
     if (!orch) return { events: [], layers: [], deps: {}, cyclic: [] }
@@ -4341,11 +4341,14 @@ export function registerIpc(
     const { layers, deps, cyclic } = layersOf(state, detailRunId)
     // The journal's losses are merged in rather than derived: an attempt the restart could not find
     // leaves nothing in the projection to read it back from — only the journal remembers it happened.
-    const events = [
-      ...timelineFor(state, detailRunId, (id) => known.has(id)),
-      ...appJournal.timeline(detailRunId, state)
-    ].sort((a, b) => a.at.localeCompare(b.at))
-    return { events, layers, deps, cyclic }
+    // Stage 3 T1: the newest `journalPages` pages of those rows only, and a journal the Host holds
+    // locked answers at once with the rows last read (`journal.busy`); appJournal clamps the count.
+    const journalPages = typeof opts?.journalPages === 'number' ? opts.journalPages : 1
+    const journal = appJournal.timeline(detailRunId, state, journalPages)
+    const events = [...timelineFor(state, detailRunId, (id) => known.has(id)), ...journal.events].sort((a, b) =>
+      a.at.localeCompare(b.at)
+    )
+    return { events, layers, deps, cyclic, journal: { busy: journal.busy, older: journal.older } }
   })
   /** 한 Task 가 왜 완료 정책을 못 넘었는가 — 화면이 블록을 펼칠 때 한 번 부른다(설계 §2.2).
    *

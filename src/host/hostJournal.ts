@@ -33,7 +33,8 @@ export interface HostJournalDeps {
   git?: GitSummaryDeps['git']
   /** A monotonic clock in milliseconds, for the slow-write warning; defaults to `performance.now()`. */
   clockMs?(): number
-  /** How long the writer and the reader wait for another process's lock; BUSY_TIMEOUT_MS when left out. */
+  /** How long the writer waits for another process's lock, BUSY_TIMEOUT_MS when left out; the reader too when
+   *  given, else it keeps its own short READER_BUSY_TIMEOUT_MS. */
   busyTimeoutMs?: number
 }
 export interface HostJournal {

@@ -1300,6 +1300,10 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.detail.cycle': 'Their dependencies point at each other, so there is no order to draw — these Tasks will never start',
   'jobs.detail.hidden': '{count} events from other Tasks — click the node again to clear',
   'jobs.detail.clearFilter': 'Clear filter',
+  // Stage 3 T1: the journal's rows are read one page at a time, and a journal the Host holds locked shows
+  // the rows last read rather than freezing the window
+  'jobs.detail.journalOlder': 'Show older journal entries',
+  'jobs.detail.journalBusy': 'The journal is busy right now, so these entries are the last ones read. They refresh with the next update.',
   // What an edge colour means. Unlike an icon, a line has nowhere to hang a tooltip
   'jobs.detail.edgeWaiting': 'waiting on this dependency',
   'jobs.detail.edgeResolved': 'dependency already met',

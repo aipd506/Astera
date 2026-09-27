@@ -3,7 +3,7 @@ import { existsSync, promises as fs, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createAppJournal, type AppJournal, type AppJournalDeps } from './appJournal'
+import { createAppJournal, TIMELINE_PAGE, type AppJournal, type AppJournalDeps } from './appJournal'
 import { ContinuityJournal } from '../../core/continuity/journal'
 import { JournalReader } from '../../core/continuity/journalReader'
 import { holdLock, recoveryActionsIn } from '../../core/continuity/sqliteLockFixtures'
@@ -151,7 +151,7 @@ describe('createAppJournal', () => {
       tasks: [{ id: 'tsk_1', runId: 'run_1', title: 't', spec: 's', deps: [], status: 'dispatched', consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW }],
       dispatches: []
     })
-    expect(j.timeline('run_1', state).map((e) => e.kind)).toEqual(['runtime-lost'])
+    expect(j.timeline('run_1', state).events.map((e) => e.kind)).toEqual(['runtime-lost'])
     expect(j.reconcilerJournal.eventsFor('run_1').map((e) => e.actor)).toEqual([{ surface: 'host' }])
     expect(j.firstCheckpointHead('dsp_1')).toBeNull()
   })
@@ -168,7 +168,7 @@ describe('createAppJournal', () => {
     const { j } = make(JOURNAL_HOST)
     const reads = vi.spyOn(JournalReader.prototype, 'eventsFor')
     try {
-      expect(j.timeline('run_1', on()).map((e) => e.kind)).toEqual(['runtime-lost', 'recovery'])
+      expect(j.timeline('run_1', on()).events.map((e) => e.kind)).toEqual(['runtime-lost', 'recovery'])
       expect(reads).toHaveBeenCalledTimes(1)
     } finally {
       reads.mockRestore()
@@ -191,7 +191,7 @@ describe('createAppJournal', () => {
   it('off, it reads nothing and sends nothing', async () => {
     const { j, calls } = make(JOURNAL_HOST)
     j.close()
-    expect(j.timeline('run_1', on())).toEqual([])
+    expect(j.timeline('run_1', on())).toEqual({ events: [], busy: false, older: false })
     j.note({ runId: 'run_1', type: 'PROMPT_WRITE_REQUESTED', at: NOW, idempotencyKey: 'p', payload: {} })
     await j.settled()
     expect(calls).toEqual([])
@@ -290,6 +290,87 @@ describe('createAppJournal', () => {
   })
 })
 
+// Stage 3 T1: the run-detail read happens on Electron's main thread, at every snapshot change while the
+// window is open. It is bounded, and a journal the Host holds locked never stalls it.
+describe('runDetail’s journal rows on the main thread (stage 3 T1)', () => {
+  const lost = (i: number, type: 'ATTEMPT_LOST' | 'TASK_STARTED' = 'ATTEMPT_LOST') => ({
+    runId: 'run_1', taskId: 'tsk_1', dispatchId: 'dsp_1', type, at: NOW, idempotencyKey: `${type}:${i}`, payload: { i }
+  })
+  const busyError = (): Error => Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR', errcode: 5 })
+
+  it('reads only the newest page of timeline rows, and says when older ones are left', () => {
+    const host = new ContinuityJournal(file())
+    opened.push(host)
+    host.append([...Array.from({ length: TIMELINE_PAGE + 1 }, (_, i) => lost(i)), ...Array.from({ length: 50 }, (_, i) => lost(i, 'TASK_STARTED'))])
+    const { j } = make(JOURNAL_HOST)
+    const reads = vi.spyOn(JournalReader.prototype, 'eventsFor')
+    try {
+      const first = j.timeline('run_1', on())
+      expect(first.events).toHaveLength(TIMELINE_PAGE)
+      expect(first).toMatchObject({ busy: false, older: true })
+      const both = j.timeline('run_1', on(), 2)
+      expect(both.events).toHaveLength(TIMELINE_PAGE + 1)
+      expect(both.older).toBe(false)
+      for (const call of reads.mock.calls) {
+        const page = call[1]
+        expect(page?.limit).toBeLessThanOrEqual(2 * TIMELINE_PAGE + 1)
+        expect(page?.types).toEqual(['ATTEMPT_LOST', 'RECOVERY_STRATEGY_SELECTED'])
+      }
+    } finally {
+      reads.mockRestore()
+    }
+  })
+
+  it('under a held write lock, answers within about 300 ms, empty with the busy flag, and reads again later', () => {
+    const host = new ContinuityJournal(file())
+    host.append([lost(0)])
+    host.close()
+    const { j, logs } = make(JOURNAL_HOST)
+    const lock = holdLock(file())
+    let t: ReturnType<AppJournal['timeline']>
+    const t0 = Date.now()
+    try {
+      t = j.timeline('run_1', on())
+    } finally {
+      lock.release()
+    }
+    expect(Date.now() - t0).toBeLessThan(300 + 150)
+    expect(t).toEqual({ events: [], busy: true, older: false })
+    expect(logs.some((l) => /busy/.test(l))).toBe(true)
+    expect(j.timeline('run_1', on())).toMatchObject({ busy: false, events: [expect.objectContaining({ kind: 'runtime-lost' })] })
+  }, 15_000)
+
+  it('a busy read shows the rows it last read for that Run, with the busy flag, and never throws', () => {
+    const host = new ContinuityJournal(file())
+    opened.push(host)
+    host.append([lost(0)])
+    const { j, logs } = make(JOURNAL_HOST)
+    const good = j.timeline('run_1', on())
+    expect(good.events).toHaveLength(1)
+    const reads = vi.spyOn(JournalReader.prototype, 'eventsFor').mockImplementation(() => {
+      throw busyError()
+    })
+    try {
+      expect(j.timeline('run_1', on())).toEqual({ ...good, busy: true })
+      expect(j.timeline('run_1', on())).toEqual({ ...good, busy: true })
+      expect(j.timeline('run_2', on())).toEqual({ events: [], busy: true, older: false })
+    } finally {
+      reads.mockRestore()
+    }
+    // A run of busy reads is one log line, not one per snapshot.
+    expect(logs.filter((l) => /busy/.test(l))).toHaveLength(1)
+    expect(j.timeline('run_1', on()).busy).toBe(false)
+  })
+
+  it('the reconciler’s reads pass their bound through to the reader', () => {
+    const host = new ContinuityJournal(file())
+    opened.push(host)
+    host.append([lost(0), lost(1), lost(2)])
+    const { j } = make(JOURNAL_HOST)
+    expect(j.reconcilerJournal.eventsFor('run_1', { limit: 1, dispatchId: 'dsp_1' }).map((e) => e.payload.i)).toEqual([2])
+  })
+})
+
 // Global Constraint 12. Mutation that fails it: putting `new ContinuityJournal(continuityFile` back in
 // openContinuity, which reopens the app's own writer in front of a journal Host; or dropping the
 // `appJournal.settingsChanged()` after closeContinuity, which leaves the Host journaling after toggle-off.
@@ -307,7 +388,7 @@ describe('ipc.ts journals through appJournal only (Host journal Task 7)', () => 
     expect(src).toMatch(/checkpoint: \(events, next\) => appJournal\.checkpoint\(events, next\)/)
     expect(src).toMatch(/onPromptWrite: \(e\) => appJournal\.note\(promptWriteEventOf\(/)
     expect(src).toMatch(/firstCheckpointHead: \(dispatchId\) => appJournal\.firstCheckpointHead\(dispatchId\)/)
-    expect(src).toMatch(/\.\.\.appJournal\.timeline\(detailRunId, state\)/)
+    expect(src).toMatch(/appJournal\.timeline\(detailRunId, state, journalPages\)/)
     expect(src).toMatch(/void appJournal\.turnedOn\(orch\.deps\.getState\(\)\)/)
     expect(src).not.toMatch(/continuityJournal|\bcontinuity\??\.[a-z]+\(/)
     // The toggle reaches the Host both ways (off in its handler, and the resume strategy), and after

@@ -8,7 +8,7 @@ import { DEFAULT_CONCURRENCY } from '../../core/orchestration/types'
 import type { GitFacts, LostAttempt, RecoveryDecision } from '../../core/recovery/types'
 import { decideRecovery } from '../../core/recovery/decide'
 import type { ContinuityEvent, ContinuityEventType } from '../../core/continuity/events'
-import type { CheckpointRow, ContinuityJournal, JournalEventRow, RecoveryActionRow } from '../../core/continuity/journal'
+import { isBusyError, type CheckpointRow, type ContinuityJournal, type RecoveryActionRow } from '../../core/continuity/journal'
 import type { ExecuteResult } from './execute'
 
 // `candidates` and its seed live in core now (the Host's lost-worker Gate asks the same question, R16).
@@ -33,7 +33,16 @@ export interface ReconcilerDeps {
   log(m: string): void
   /** ISO clock. The journal holds no clock of its own — every write takes its time from the caller. */
   now(): string
+  /** The pause before a busy journal is asked again; a timer when left out. Tests pass one that does not wait. */
+  sleep?(ms: number): Promise<void>
 }
+
+/** How many times a read that meets a busy journal is asked again, and the pause before each (stage 3
+ *  T1). The reader gives up within its short busy timeout (READER_BUSY_TIMEOUT_MS) so main never waits
+ *  long in one go; the pauses between are the event loop's, so nothing freezes while the Host's writer
+ *  finishes. Past the last one the read is "cannot say", as any failed read is. */
+export const JOURNAL_BUSY_RETRIES = 8
+export const JOURNAL_BUSY_RETRY_MS = 250
 
 /** Recovery is a second door into starting workers, so it obeys the scheduler's concurrency rule too
  *  (the `room` calculation in core/orchestration/schedule.ts's slotsToFill). Several lost Tasks in one
@@ -62,6 +71,34 @@ export class RecoveryReconciler {
     }
   }
 
+  /** The two facts recovery reads from the journal about one dispatch (stage 3 T1): whether any row names
+   *  it, and whether its prompt write was confirmed. Each is one indexed read of at most one row, never
+   *  the Run's whole record. The results are checked again here, so a port that ignores the bound still
+   *  answers right. null when the read failed ("cannot say"); a busy journal is asked again first. */
+  private async evidenceFor(runId: string, dispatchId: string): Promise<{ witnessed: boolean; promptConfirmed: boolean } | null> {
+    const journal = this.deps.journal
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const witnessed = journal.eventsFor(runId, { dispatchId, limit: 1 }).some((e) => e.dispatchId === dispatchId)
+        const promptConfirmed =
+          witnessed &&
+          journal
+            .eventsFor(runId, { dispatchId, types: ['PROMPT_WRITE_CONFIRMED'], limit: 1 })
+            .some((e) => e.type === 'PROMPT_WRITE_CONFIRMED' && e.dispatchId === dispatchId)
+        return { witnessed, promptConfirmed }
+      } catch (err) {
+        if (isBusyError(err) && attempt < JOURNAL_BUSY_RETRIES) {
+          if (attempt === 0) this.deps.log(`recovery: the journal is busy, dispatch ${dispatchId} asks again shortly: ${String(err)}`)
+          await sleep(JOURNAL_BUSY_RETRY_MS)
+          continue
+        }
+        this.deps.log(`recovery: eventsFor failed: ${String(err)}`)
+        return null
+      }
+    }
+  }
+
   /** Carries one seed all the way through, or returns false having done nothing at all — the caller
    *  counts only what it acted on. */
   private async recoverOne(seed: LostAttemptSeed): Promise<boolean> {
@@ -69,13 +106,10 @@ export class RecoveryReconciler {
     const now = this.deps.now()
     const journal = this.deps.journal
 
-    // null, not [] — a read that failed is not a read that found nothing. decide.ts reads a `false`
+    // null, not false — a read that failed is not a read that found nothing. decide.ts reads a `false`
     // here as positive evidence that the prompt never left the app; null is "we cannot say".
-    const events = this.note('eventsFor', null as JournalEventRow[] | null, () => journal.eventsFor(runId))
-    const promptConfirmed =
-      events === null
-        ? null
-        : events.some((e) => e.type === 'PROMPT_WRITE_CONFIRMED' && e.dispatchId === dispatch.id)
+    const evidence = await this.evidenceFor(runId, dispatch.id)
+    const promptConfirmed = evidence === null ? null : evidence.promptConfirmed
 
     // The journal witnesses every attempt it was on for (ATTEMPT_START_REQUESTED at the very least),
     // so rows that name this dispatch are the evidence recovery reasons from. None of them, on a read
@@ -84,7 +118,7 @@ export class RecoveryReconciler {
     // This is what bounds the first sweep after the toggle is switched on: store.load()'s restart
     // cleanup closes every open Dispatch as outcome_unknown, so without it every Task any past crash
     // ever stranded inside the 30-day TTL would be decided from an empty record.
-    if (events !== null && !events.some((e) => e.dispatchId === dispatch.id)) {
+    if (evidence !== null && !evidence.witnessed) {
       this.deps.log(
         `recovery: no journal rows for dispatch ${dispatch.id} — the attempt predates this journal, leaving it alone`
       )

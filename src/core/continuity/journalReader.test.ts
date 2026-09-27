@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { existsSync, promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { ContinuityJournal } from './journal'
-import { JournalReader } from './journalReader'
+import { BUSY_TIMEOUT_MS, ContinuityJournal, isBusyError } from './journal'
+import { JournalReader, READER_BUSY_TIMEOUT_MS } from './journalReader'
 import { holdLock, holdLockFor, schemaVersionIn } from './sqliteLockFixtures'
 import type { ContinuityEvent } from './events'
 
@@ -87,7 +87,8 @@ describe('JournalReader (P13)', () => {
     const w = new ContinuityJournal(file())
     w.append([ev('a')])
     w.close()
-    const held = await holdLockFor(file(), 300)
+    // Shorter than the reader's own timeout (READER_BUSY_TIMEOUT_MS), which the reader waits out.
+    const held = await holdLockFor(file(), 100)
     const r = reader()
     expect(r.eventsFor('run_1')).toHaveLength(1)
     await held.done
@@ -110,6 +111,73 @@ describe('JournalReader (P13)', () => {
     }
     expect(r.eventsFor('run_1')).toHaveLength(1)
     expect(existsSync(file())).toBe(true)
+  })
+})
+
+// Stage 3 T1: the app reads on Electron's main thread, so a lock the Host's writer holds must never
+// stall it for the writer's 5 s. The reader's own timeout is short; a lock past it throws busy at once.
+describe('JournalReader on the main thread (stage 3 T1)', () => {
+  it('has a busy timeout far shorter than the writer’s', () => {
+    expect(READER_BUSY_TIMEOUT_MS).toBeLessThanOrEqual(250)
+    expect(READER_BUSY_TIMEOUT_MS).toBeLessThan(BUSY_TIMEOUT_MS)
+  })
+
+  it('under a held write lock, a read gives up busy within about 300 ms, not the writer’s 5 s', () => {
+    const w = new ContinuityJournal(file())
+    w.append([ev('a')])
+    w.close()
+    const r = reader()
+    const lock = holdLock(file())
+    let caught: unknown = null
+    const t0 = Date.now()
+    try {
+      r.eventsFor('run_1')
+    } catch (err) {
+      caught = err
+    } finally {
+      lock.release()
+    }
+    const took = Date.now() - t0
+    expect(isBusyError(caught)).toBe(true)
+    expect(took).toBeLessThan(300 + 150)
+    expect(r.eventsFor('run_1')).toHaveLength(1)
+  }, 15_000)
+})
+
+describe('JournalReader.eventsFor, bounded (stage 3 T1)', () => {
+  const at = (i: number, over: Partial<ContinuityEvent> = {}): ContinuityEvent => ({
+    ...ev(`k${i}`),
+    at: `2026-09-26T10:00:${String(i).padStart(2, '0')}.000Z`,
+    payload: { i },
+    ...over
+  })
+  it('returns the newest rows up to the limit, oldest first, and pages older ones with the cursor', () => {
+    writer().append(Array.from({ length: 7 }, (_, i) => at(i)))
+    const r = reader()
+    const newest = r.eventsFor('run_1', { limit: 3 })
+    expect(newest.map((e) => e.payload.i)).toEqual([4, 5, 6])
+    const older = r.eventsFor('run_1', { limit: 3, before: newest[0].sequence })
+    expect(older.map((e) => e.payload.i)).toEqual([1, 2, 3])
+    const oldest = r.eventsFor('run_1', { limit: 3, before: older[0].sequence })
+    expect(oldest.map((e) => e.payload.i)).toEqual([0])
+    expect(r.eventsFor('run_1', { limit: 3, before: oldest[0].sequence })).toEqual([])
+    // No page: every row, as before (the Host's own reads).
+    expect(r.eventsFor('run_1')).toHaveLength(7)
+  })
+
+  it('narrows by type and by dispatch before the limit is applied', () => {
+    writer().append([
+      at(0, { type: 'ATTEMPT_LOST' }),
+      at(1, { dispatchId: 'dsp_2', type: 'PROMPT_WRITE_CONFIRMED' }),
+      at(2),
+      at(3),
+      at(4, { type: 'RECOVERY_STRATEGY_SELECTED' })
+    ])
+    const r = reader()
+    expect(r.eventsFor('run_1', { limit: 10, types: ['ATTEMPT_LOST', 'RECOVERY_STRATEGY_SELECTED'] }).map((e) => e.payload.i)).toEqual([0, 4])
+    expect(r.eventsFor('run_1', { limit: 1, types: ['ATTEMPT_LOST', 'RECOVERY_STRATEGY_SELECTED'] }).map((e) => e.payload.i)).toEqual([4])
+    expect(r.eventsFor('run_1', { limit: 5, dispatchId: 'dsp_2' }).map((e) => e.payload.i)).toEqual([1])
+    expect(r.eventsFor('run_1', { limit: 5, dispatchId: 'dsp_1', types: ['PROMPT_WRITE_CONFIRMED'] })).toEqual([])
   })
 })
 

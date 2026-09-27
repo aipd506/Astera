@@ -35,6 +35,7 @@ import {
   UnlockIcon
 } from './JobIcons'
 import { NewTaskModal } from './NewTaskModal'
+import { JournalBusy, JournalOlder } from './RunDetailJournal'
 import { ArrowUpRight, Play, Square, WrenchOff, X } from 'lucide-react'
 
 /** 종류 배지의 문구. message 는 messageType 이 정한다.
@@ -222,6 +223,7 @@ export function RunDetail({
   runId,
   canOpenSession,
   onOpenSession,
+  onShowOlderJournal,
   onClose
 }: {
   /** 스냅샷에 있는 그 Run. 노드의 제목·상태·세션은 전부 여기서 온다(detail 은 id 만 준다).
@@ -236,6 +238,8 @@ export function RunDetail({
   runId: string
   canOpenSession: (sessionId: string) => boolean
   onOpenSession: (sessionId: string) => void
+  /** "이전 저널 기록 더 보기" — 저널 줄을 한 쪽 더 읽게 한다(stage 3 T1). 쪽 수는 App.tsx 가 든다 */
+  onShowOlderJournal: () => void
   onClose: () => void
 }): React.JSX.Element {
   const { t } = useI18n()
@@ -1067,7 +1071,10 @@ export function RunDetail({
                 {selectedTask && (
                   <CompletionBlock projectPath={projectPath} runId={runId} taskId={selectedTask.id} />
                 )}
+                <JournalBusy journal={detail?.journal} />
                 <div className="detail-list">
+                  {/* 목록은 오래된 것이 위다 — 더 오래된 저널 줄을 부르는 자리도 맨 위다 */}
+                  <JournalOlder journal={detail?.journal} onShowOlder={onShowOlderJournal} />
                   {events !== null && shown.length === 0 && (
                     <p className="modal-hint">{t('jobs.timeline.empty')}</p>
                   )}

@@ -390,6 +390,59 @@ describe('ContinuityJournal v3 (Host journal J4)', () => {
 })
 
 // Review 4-5: one journal-append call is one transaction (one fsync), each of its ops isolated inside it.
+// Stage 3 T1: a read names its bound, and the reconciler's per-dispatch question has an index to answer on.
+describe('ContinuityJournal, bounded reads and the dispatch index (stage 3 T1)', () => {
+  it('eventsFor takes a limit and a cursor: the newest rows oldest first, then older pages', () => {
+    const j = new ContinuityJournal(file())
+    j.append(Array.from({ length: 5 }, (_, i) => ({ ...ev('TASK_STARTED', `k${i}`), payload: { i } })))
+    const newest = j.eventsFor('run_1', { limit: 2 })
+    expect(newest.map((e) => e.payload.i)).toEqual([3, 4])
+    expect(j.eventsFor('run_1', { limit: 2, before: newest[0].sequence }).map((e) => e.payload.i)).toEqual([1, 2])
+    expect(j.eventsFor('run_1', { limit: 2, dispatchId: 'dsp_1', types: ['TASK_STARTED'] })).toHaveLength(2)
+    expect(j.eventsFor('run_1')).toHaveLength(5)
+    j.close()
+  })
+
+  const indexesOf = async (): Promise<string[]> => {
+    const { DatabaseSync } = await import('node:sqlite')
+    const raw = new DatabaseSync(file(), { readOnly: true })
+    try {
+      return (raw.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'journal_events'").all() as { name: string }[]).map((r) => r.name)
+    } finally {
+      raw.close()
+    }
+  }
+
+  it('a v3 file from before the index gains it at the writer’s open, and stays at version 3', async () => {
+    new ContinuityJournal(file()).close()
+    const { DatabaseSync } = await import('node:sqlite')
+    const raw = new DatabaseSync(file())
+    raw.exec('DROP INDEX IF EXISTS journal_events_dispatch')
+    raw.close()
+    expect(await indexesOf()).not.toContain('journal_events_dispatch')
+    const j = new ContinuityJournal(file())
+    j.close()
+    expect(await indexesOf()).toContain('journal_events_dispatch')
+    expect(schemaVersionIn(file())).toBe(3)
+  })
+
+  it('the per-dispatch read uses the dispatch index', async () => {
+    new ContinuityJournal(file()).close()
+    const { DatabaseSync } = await import('node:sqlite')
+    const raw = new DatabaseSync(file(), { readOnly: true })
+    try {
+      const plan = (
+        raw
+          .prepare('EXPLAIN QUERY PLAN SELECT rowid FROM journal_events WHERE run_id = ? AND dispatch_id = ? ORDER BY rowid DESC LIMIT 1')
+          .all('run_1', 'dsp_1') as { detail: string }[]
+      ).map((r) => r.detail)
+      expect(plan.join(' | ')).toMatch(/journal_events_dispatch/)
+    } finally {
+      raw.close()
+    }
+  })
+})
+
 describe('ContinuityJournal.transaction', () => {
   it('commits every write inside it at once: another connection sees none of them before the end', () => {
     const j = new ContinuityJournal(file())

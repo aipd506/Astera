@@ -5,6 +5,7 @@ import type { Dispatch, Task } from '../../core/orchestration/types'
 import type { GitFacts, LostAttempt } from '../../core/recovery/types'
 import { stateFromLegacy } from '../../core/orchestration/legacyState'
 import type { LegacyRun } from '../../core/orchestration/legacy'
+import type { EventsPage, JournalEventRow } from '../../core/continuity/journal'
 
 const NOW = '2026-09-09T10:00:00.000Z'
 const EARLIER = '2026-09-09T09:00:00.000Z'
@@ -72,6 +73,10 @@ function harness(
     executeThrows?: boolean
     eventsThrow?: boolean
     events?: Array<{ type: string; dispatchId: string }>
+    /** How many reads meet a busy journal (SQLITE_BUSY) before one works; Infinity for every one. */
+    busyReads?: number
+    /** A journal of the test's own in place of the recorded fake. */
+    journal?: object
   } = {}
 ) {
   let current = state()
@@ -79,10 +84,18 @@ function harness(
   const actions: Array<{ id: string; strategy: string; status: string }> = []
   const executed: Array<{ dispatchId: string; strategy: string }> = []
   const logs: string[] = []
+  const sleeps: number[] = []
+  const pages: Array<EventsPage | undefined> = []
+  let busyLeft = over.busyReads ?? 0
   const journal = {
     append: (events: Array<{ type: string }>) => { for (const e of events) appended.push(e.type); return events.length },
-    eventsFor: () => {
+    eventsFor: (_runId: string, page?: EventsPage) => {
+      pages.push(page)
       if (over.eventsThrow) throw new Error('journal locked')
+      if (busyLeft > 0) {
+        busyLeft -= 1
+        throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR', errcode: 5 })
+      }
       return (over.events ?? [{ type: 'PROMPT_WRITE_CONFIRMED', dispatchId: 'dsp_1' }]) as never
     },
     firstCheckpointFor: () => ({ gitHead: 'aaa' }) as never,
@@ -96,7 +109,7 @@ function harness(
   const r = new RecoveryReconciler({
     getState: () => current,
     setState: async (next: OrchState) => { current = next },
-    journal: journal as never,
+    journal: (over.journal ?? journal) as never,
     readGitFacts: async () => ({ exists: true, head: 'aaa', dirty: false, inProgress: null, conflicts: false, branch: 'main', ...over.git }),
     smartResume: () => false,
     execute: async (a: { attempt: { dispatchId: string }; decision: { strategy: string } }) => {
@@ -108,9 +121,10 @@ function harness(
       return { ok: true as const, newDispatchId: 'dsp_2' }
     },
     log: (m: string) => logs.push(m),
-    now: () => NOW
+    now: () => NOW,
+    sleep: async (ms: number) => { sleeps.push(ms) }
   } as never)
-  return { r, appended, actions, executed, logs, get state() { return current } }
+  return { r, appended, actions, executed, logs, sleeps, pages, get state() { return current } }
 }
 
 describe('RecoveryReconciler', () => {
@@ -247,6 +261,61 @@ describe('RecoveryReconciler', () => {
     } as never)
     expect(await r.reconcileAll()).toBe(0)
     expect(executed).toEqual([])
+  })
+})
+
+// Stage 3 T1: the reconciler reads the journal on Electron's main thread. It asks only what it decides
+// on (whether the journal witnessed this dispatch, and whether its prompt was confirmed), each question a
+// bounded read, and a busy journal is asked again after a pause rather than waited on.
+describe('RecoveryReconciler, bounded and never stalled by the journal (stage 3 T1)', () => {
+  it('asks only bounded, per-dispatch reads, and reads a handful of rows however long the Run’s record is', async () => {
+    // A long record: thousands of rows for this dispatch, its prompt confirmed early on.
+    const rows = [
+      { type: 'PROMPT_WRITE_CONFIRMED', dispatchId: 'dsp_1' },
+      ...Array.from({ length: 5000 }, () => ({ type: 'TASK_STARTED', dispatchId: 'dsp_1' })),
+      ...Array.from({ length: 5000 }, () => ({ type: 'TASK_STARTED', dispatchId: 'dsp_other' }))
+    ]
+    let returned = 0
+    const pages: Array<EventsPage | undefined> = []
+    const journal = {
+      append: () => 0,
+      eventsFor: (_runId: string, page?: EventsPage) => {
+        pages.push(page)
+        const match = rows.filter(
+          (e) => (!page?.dispatchId || e.dispatchId === page.dispatchId) && (!page?.types || page.types.includes(e.type as never))
+        )
+        const out = page ? match.slice(-page.limit) : match
+        returned += out.length
+        return out as unknown as JournalEventRow[]
+      },
+      firstCheckpointFor: () => null,
+      startRecoveryAction: () => ({ recoveryActionId: 'rec_1' }) as never,
+      finishRecoveryAction: () => {}
+    }
+    const h = harness({ journal })
+    expect(await h.r.reconcileAll()).toBe(1)
+    expect(pages.length).toBeGreaterThan(0)
+    for (const page of pages) expect(page).toMatchObject({ dispatchId: 'dsp_1', limit: 1 })
+    expect(returned).toBeLessThanOrEqual(2)
+    // The prompt row was found: not the "cannot say" path, which asks a person.
+    expect(h.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'redispatch' }])
+  })
+
+  it('a busy journal is asked again after a pause, and the read that works decides', async () => {
+    const h = harness({ busyReads: 2 })
+    expect(await h.r.reconcileAll()).toBe(1)
+    expect(h.sleeps).toHaveLength(2)
+    expect(h.sleeps.every((ms) => ms > 0 && ms <= 1000)).toBe(true)
+    expect(h.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'redispatch' }])
+  })
+
+  it('a journal busy past every retry reads as "cannot say", never as "no rows"', async () => {
+    const h = harness({ busyReads: Infinity })
+    expect(await h.r.reconcileAll()).toBe(1)
+    expect(h.sleeps.length).toBeGreaterThan(0)
+    expect(h.sleeps.length).toBeLessThanOrEqual(20)
+    expect(h.executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'review' }])
+    expect(h.logs.some((l) => /busy/.test(l))).toBe(true)
   })
 })
 

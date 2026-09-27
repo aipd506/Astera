@@ -1525,6 +1525,8 @@ export const ko = {
   'jobs.detail.cycle': '의존이 서로를 가리켜 순서를 정할 수 없습니다 — 이 Task 들은 영원히 시작되지 않습니다',
   'jobs.detail.hidden': '다른 Task 의 이벤트 {count}개 — 노드를 다시 눌러 해제',
   'jobs.detail.clearFilter': '필터 해제',
+  'jobs.detail.journalOlder': '이전 저널 기록 더 보기',
+  'jobs.detail.journalBusy': '지금은 저널이 사용 중이라 마지막으로 읽은 기록을 보여 줍니다. 다음 갱신 때 다시 읽습니다.',
   // 선 색의 뜻. 아이콘과 달리 선에는 툴팁을 달 곳이 없어 그래프 아래에 두 줄로 적는다
   'jobs.detail.edgeWaiting': '기다리는 중인 의존',
   'jobs.detail.edgeResolved': '이미 풀린 의존',

@@ -1216,6 +1216,8 @@ export const ja: Catalog = {
   'jobs.detail.cycle': '依存が互いを指しているため順序を決められません — これらの Task は永久に始まりません',
   'jobs.detail.hidden': '他の Task のイベント {count} 件 — ノードをもう一度押すと解除',
   'jobs.detail.clearFilter': 'フィルターを解除',
+  'jobs.detail.journalOlder': '以前のジャーナル記録をさらに表示',
+  'jobs.detail.journalBusy': 'ジャーナルが使用中のため、最後に読み込んだ記録を表示しています。次の更新で再度読み込みます。',
   'jobs.detail.edgeWaiting': '待っている依存',
   'jobs.detail.edgeResolved': 'すでに解けた依存',
   'jobs.detail.layer': '{n} 層',

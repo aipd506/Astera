@@ -9,17 +9,39 @@
 // Host that is still running and writing. So the last answer read while a Host was there is kept.
 import { randomUUID } from 'node:crypto'
 import type { Lang } from '../../core/i18n'
-import type { JobEvent } from '../../core/types'
+import type { JobEvent, RunDetailJournal } from '../../core/types'
 import type { OrchState } from '../../core/orchestration/state'
 import type { HandoffLookup } from '../../core/handoff/types'
 import type { ContinuityEvent } from '../../core/continuity/events'
-import { ContinuityJournal, isBusyError, type NewRecoveryActionRow, type RecoveryActionRow } from '../../core/continuity/journal'
+import {
+  ContinuityJournal,
+  isBusyError,
+  type JournalEventRow,
+  type NewRecoveryActionRow,
+  type RecoveryActionRow
+} from '../../core/continuity/journal'
 import { ContinuityRecorder } from '../../core/continuity/recorder'
 import { JournalReader } from '../../core/continuity/journalReader'
 import { journalTimeline } from '../../core/continuity/timelineRows'
 import { JOURNAL_EVENTS_MAX, type JournalOp } from '../../core/continuity/journalOps'
 import { hostSpeaksJournal } from '../host/outdated'
 import type { ReconcilerJournal } from '../recovery/reconciler'
+
+/** How many timeline rows one page of the run-detail read holds (stage 3 T1). The read runs on Electron's
+ *  main thread at every snapshot change while the window is open, so it reads the newest page only;
+ *  "show older" asks for one more page at a time. */
+export const TIMELINE_PAGE = 500
+/** The most pages one read may ask for, whatever the renderer sends. */
+export const TIMELINE_PAGES_MAX = 100
+/** The only rows the timeline shows (timelineRows.ts): the rest of a Run's rows are never read for it. */
+const TIMELINE_TYPES = ['ATTEMPT_LOST', 'RECOVERY_STRATEGY_SELECTED'] as const
+/** How many Runs keep their last good rows, for a read that meets a busy journal. */
+const LAST_GOOD_MAX = 8
+
+/** runDetail's journal lines, and what the window says about them (RunDetailJournal). */
+export interface JournalTimeline extends RunDetailJournal {
+  events: JobEvent[]
+}
 
 export interface AppJournalDeps {
   file: string
@@ -29,7 +51,8 @@ export interface AppJournalDeps {
   lang(): Lang
   smartResume(): boolean
   handoffLookup(sessionId: string): HandoffLookup
-  /** How long the writer and the reader wait for another process's lock; BUSY_TIMEOUT_MS when left out. */
+  /** How long the writer waits for another process's lock; BUSY_TIMEOUT_MS when left out. The reader
+   *  keeps its own short timeout (READER_BUSY_TIMEOUT_MS): it reads on the main thread. */
   busyTimeoutMs?: number
 }
 
@@ -50,8 +73,10 @@ export interface AppJournal {
   bootCleanup(before: OrchState | null, state: OrchState): void
   /** The reconciler's journal: reads through the reader, writes local or through `journal-append` (J3). */
   reconcilerJournal: ReconcilerJournal
-  /** runDetail's rows (lost, recovery), and the validation diff base: through the reader. Never throw. */
-  timeline(runId: string, state: OrchState): JobEvent[]
+  /** runDetail's rows (lost, recovery), the newest `pages` pages of them (1 when left out), through the
+   *  reader. Never throws: a busy journal answers with the rows last read for that Run and `busy`. */
+  timeline(runId: string, state: OrchState, pages?: number): JournalTimeline
+  /** The validation diff base: through the reader. Never throws. */
   firstCheckpointHead(dispatchId: string): string | null
   /** The toggle turned on while Runs may be active: the baseline here, or `journal-reload` to the Host. */
   turnedOn(state: OrchState): Promise<void>
@@ -123,7 +148,12 @@ export function createAppJournal(d: AppJournalDeps): AppJournal {
     return local
   }
   let reader: JournalReader | null = null
-  const readerOf = (): JournalReader | null => (on ? (reader ??= new JournalReader(d.file, { busyTimeoutMs: d.busyTimeoutMs })) : null)
+  // The reader's own short busy timeout, never the writer's (stage 3 T1): it runs on the main thread.
+  const readerOf = (): JournalReader | null => (on ? (reader ??= new JournalReader(d.file)) : null)
+  /** Each Run's rows as last read, for a read that meets a busy journal (stage 3 T1). */
+  const lastGood = new Map<string, { limit: number; rows: JournalEventRow[]; older: boolean }>()
+  /** Whether the last timeline read met a busy journal: a run of them is one log line. */
+  let timelineBusy = false
   /** The Host's half (J3): one call per op, in order, never rejecting (Global Constraint 5). */
   let tail: Promise<void> = Promise.resolve()
   const send = (cmd: 'journal-append' | 'journal-reload', args: Record<string, unknown>): void => {
@@ -162,10 +192,10 @@ export function createAppJournal(d: AppJournalDeps): AppJournal {
   // `app:` keys differ, so a row sent both ways would land twice.
   const reconcilerJournal: ReconcilerJournal = {
     // A failed read throws (P13): the reconciler reads that as "cannot say".
-    eventsFor: (runId) => {
+    eventsFor: (runId, page) => {
       const r = readerOf()
       if (!r) throw new Error('Job Continuity is off')
-      return r.eventsFor(runId)
+      return r.eventsFor(runId, page)
     },
     firstCheckpointFor: (dispatchId) => readerOf()?.firstCheckpointFor(dispatchId) ?? null,
     append: (events) => {
@@ -203,6 +233,7 @@ export function createAppJournal(d: AppJournalDeps): AppJournal {
         d.log(`continuity: journal reader close failed: ${String(err)}`)
       }
       reader = null
+      lastGood.clear()
     },
     enabled: () => on,
     appWrites: () => on && !hostWrites(),
@@ -232,13 +263,32 @@ export function createAppJournal(d: AppJournalDeps): AppJournal {
       }
     },
     reconcilerJournal,
-    timeline: (runId, state) => {
+    timeline: (runId, state, pages = 1) => {
+      const r = readerOf()
+      if (!r) return { events: [], busy: false, older: false }
+      const limit = Math.min(Math.max(1, Math.floor(pages) || 1), TIMELINE_PAGES_MAX) * TIMELINE_PAGE
+      const lines = (rows: JournalEventRow[]): JobEvent[] => journalTimeline(rows, state, d.lang())
       try {
-        const r = readerOf()
-        return r ? journalTimeline(r.eventsFor(runId), state, d.lang()) : []
+        // One row past the limit says whether older rows are left, without a second query.
+        const read = r.eventsFor(runId, { limit: limit + 1, types: TIMELINE_TYPES })
+        const older = read.length > limit
+        const rows = older ? read.slice(read.length - limit) : read
+        lastGood.delete(runId)
+        if (lastGood.size >= LAST_GOOD_MAX) lastGood.delete(lastGood.keys().next().value as string)
+        lastGood.set(runId, { limit, rows, older })
+        timelineBusy = false
+        return { events: lines(rows), busy: false, older }
       } catch (err) {
+        if (isBusyError(err)) {
+          // The Host's writer holds the file: what was last read, and the window asks again at the
+          // next snapshot. The reader gave up within its short timeout, so main never waited long.
+          if (!timelineBusy) d.log(`continuity: the journal is busy, run detail shows the rows last read: ${String(err)}`)
+          timelineBusy = true
+          const hit = lastGood.get(runId)
+          return { events: hit ? lines(hit.rows) : [], busy: true, older: hit?.older ?? false }
+        }
         d.log(`continuity: eventsFor ${runId} failed: ${String(err)}`)
-        return []
+        return { events: [], busy: false, older: false }
       }
     },
     firstCheckpointHead: (dispatchId) => {
