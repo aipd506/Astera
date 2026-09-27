@@ -328,7 +328,7 @@ describe('copyWorktreeInclude — 링크를 통해 쓰지 않는다', () => {
     const wt = await tempDir('astera-wt-inc-dlink-dest-')
     await fs.symlink(outside, path.join(wt, 'a'), 'junction')
     const warnings = await copyWorktreeInclude(repo, wt)
-    expect(warnings).toEqual([{ key: 'worktree.include.unsafeDest', params: { entry: 'a/x.txt' } }])
+    expect(warnings).toEqual([{ key: 'worktree.include.unsafeDest', params: { entry: 'a/x.txt', path: 'a' } }])
     expect(await fs.readdir(outside)).toEqual([])
   })
 
@@ -356,5 +356,57 @@ describe('collapseIncludeEntries', () => {
     expect(collapseIncludeEntries(['a/x/y', 'a', 'b', 'ab', 'a/z', 'b'], 'linux')).toEqual(['a', 'b', 'ab'])
     expect(collapseIncludeEntries(['A/x', 'a'], 'win32')).toEqual(['a'])
     expect(collapseIncludeEntries(['A/x', 'a'], 'linux')).toEqual(['A/x', 'a'])
+  })
+})
+
+// 재검토 2: 항목 뿌리만 보면 모자란다. 체크아웃이 gitignore 된 진짜 폴더 a 아래에 추적되는 링크
+// a/lib 를 두었으면, a 를 복사하면서 a/lib 아래 폴더를 만들고 파일을 쓰는 일이 그 링크를 타고
+// 밖으로 나간다. 모든 목적지 폴더와 파일의 부모를 뿌리부터 따라 내려가며 확인한다.
+describe('copyWorktreeInclude — 깊은 자리의 링크', () => {
+  it('항목 아래 깊은 자리에 링크가 있으면 그 아래만 건너뛰고, 밖의 내용·mtime 은 그대로다', async () => {
+    const outside = await tempDir('astera-wt-inc-deep-out-')
+    await fs.writeFile(path.join(outside, 'keep.txt'), 'K', 'utf8')
+    const before = { list: await fs.readdir(outside), mtime: (await fs.stat(path.join(outside, 'keep.txt'))).mtimeMs }
+    const repo = await includeRepo('astera-wt-inc-deep-', ['a/'], ['a'])
+    await fs.mkdir(path.join(repo, 'a', 'lib', 'sub'), { recursive: true })
+    await fs.writeFile(path.join(repo, 'a', 'top.txt'), 't', 'utf8')
+    await fs.writeFile(path.join(repo, 'a', 'lib', 'big.bin'), 'B'.repeat(5 * 1024 * 1024), 'utf8')
+    await fs.writeFile(path.join(repo, 'a', 'lib', 'sub', 's.txt'), 's', 'utf8')
+    const wt = await tempDir('astera-wt-inc-deep-dest-')
+    // 체크아웃이 둔 것처럼: 진짜 폴더 a 와, 그 안에서 밖을 가리키는 링크 a/lib
+    await fs.mkdir(path.join(wt, 'a'))
+    await fs.symlink(outside, path.join(wt, 'a', 'lib'), 'junction')
+    const seen: Array<Record<string, number | undefined>> = []
+    const warnings = await copyWorktreeInclude(repo, wt, { onProgress: (p) => seen.push({ ...p }) })
+    expect(warnings).toEqual([
+      { key: 'worktree.include.unsafeDest', params: { entry: 'a', path: 'a/lib' } }
+    ])
+    expect(await fs.readdir(outside)).toEqual(before.list)
+    expect((await fs.stat(path.join(outside, 'keep.txt'))).mtimeMs).toBe(before.mtime)
+    expect(await fs.readFile(path.join(wt, 'a', 'top.txt'), 'utf8')).toBe('t') // 나머지는 복사된다
+    expect((await fs.lstat(path.join(wt, 'a', 'lib'))).isSymbolicLink()).toBe(true) // 체크아웃의 링크는 그대로
+    expect(seen[seen.length - 1]).toEqual({ bytesCopied: 1, bytesTotal: 1, filesCopied: 1, filesTotal: 1 })
+  })
+
+  it('목적지 파일 자체가 링크면 그 파일만 건너뛴다 — 링크를 따라 쓰지 않는다', async () => {
+    const outside = await tempDir('astera-wt-inc-flink-out-')
+    await fs.writeFile(path.join(outside, 'target.txt'), 'ORIGINAL', 'utf8')
+    const repo = await includeRepo('astera-wt-inc-flink-', ['a/'], ['a'])
+    await fs.mkdir(path.join(repo, 'a'))
+    await fs.writeFile(path.join(repo, 'a', 'cfg.txt'), 'NEW', 'utf8')
+    await fs.writeFile(path.join(repo, 'a', 'other.txt'), 'o', 'utf8')
+    const wt = await tempDir('astera-wt-inc-flink-dest-')
+    await fs.mkdir(path.join(wt, 'a'))
+    try {
+      await fs.symlink(path.join(outside, 'target.txt'), path.join(wt, 'a', 'cfg.txt'), 'file')
+    } catch {
+      return // 파일 링크를 만들 수 없는 환경 — 전제를 세울 수 없다
+    }
+    const warnings = await copyWorktreeInclude(repo, wt)
+    expect(warnings).toEqual([
+      { key: 'worktree.include.unsafeDest', params: { entry: 'a', path: 'a/cfg.txt' } }
+    ])
+    expect(await fs.readFile(path.join(outside, 'target.txt'), 'utf8')).toBe('ORIGINAL')
+    expect(await fs.readFile(path.join(wt, 'a', 'other.txt'), 'utf8')).toBe('o')
   })
 })

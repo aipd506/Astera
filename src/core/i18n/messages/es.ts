@@ -98,7 +98,7 @@ export const es: Catalog = {
   'worktree.include.sizeFailed': 'No se pudo calcular el tamaño: {entry} ({detail})',
   'worktree.include.overLimit': 'Omitido, supera el límite de copia (200 MB): {entry}',
   'worktree.include.linkFailed': 'Omitido, no se pudo recrear un enlace: {entry} ({detail})',
-  'worktree.include.unsafeDest': 'Omitido, un enlace en la ruta escribiría fuera del worktree: {entry}',
+  'worktree.include.unsafeDest': 'No se copió bajo {path}: es un enlace y escribir a través de él saldría del worktree ({entry})',
   'worktree.include.overFileCount': 'Omitido, más de {max} elementos: {entry}',
   'worktree.include.copyFailed': 'Error al copiar: {entry} ({detail})',
   'worktree.create.fetchFailed':

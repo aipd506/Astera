@@ -2,7 +2,7 @@ import { promises as fs, createReadStream, createWriteStream } from 'node:fs'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { git } from './git'
-import { isPathWithin } from '../files/tree'
+import { comparablePath, isPathWithin } from '../files/tree'
 import { createProber } from '../sessions/pathProbe'
 import { cancelledError, isCancelledError, throwIfCancelled } from './cancel'
 import type { Message } from '../i18n'
@@ -79,28 +79,49 @@ export function collapseIncludeEntries(entries: string[], platform: string = pro
   return out
 }
 
-/** Whether writing at `dest` stays inside `root`: every component from the root down to `dest` that
- *  already exists must be a real folder (lstat) — never a link or a junction, which would carry the
- *  write outside the worktree, usually onto the source itself. `dest` itself may be absent; if present
- *  it must not be a link. Components that do not exist yet are fine: they are made as real folders. */
-async function destIsSafe(root: string, dest: string): Promise<boolean> {
-  const rel = path.relative(root, dest)
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return false
-  const segs = rel.split(path.sep)
-  let at = root
-  for (let i = 0; i < segs.length; i++) {
-    at = path.join(at, segs[i])
-    let st
-    try {
-      st = await fs.lstat(at)
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true // the rest will be made here
-      return false
+/** Writes inside the worktree only through real folders.
+ *
+ *  Before anything is written — a folder, a file, a link — its folder is walked from the worktree root
+ *  down with lstat, never following a link: every component must be a real folder, and a missing one is
+ *  made (non-recursively) as a real folder. A link or junction on the way — one the checkout placed (a
+ *  tracked symlink), or one an earlier entry recreated — would carry the write outside the worktree,
+ *  usually onto the source itself; the first such component is returned instead, and nothing is made
+ *  past it. A component that is a file throws (mkdir would), which the copy reports as copyFailed.
+ *
+ *  Verified folders are remembered for the whole copy, so each is checked once. Folders this call made
+ *  are appended to `made`, for the caller's cleanup. */
+function createSafeDirs(root: string): { ensure(dir: string, made: string[]): Promise<string | null> } {
+  const verified = new Set<string>()
+  return {
+    async ensure(dir, made) {
+      const rel = path.relative(root, dir)
+      if (rel === '') return null
+      if (rel.startsWith('..') || path.isAbsolute(rel)) return dir
+      let at = root
+      for (const seg of rel.split(path.sep)) {
+        at = path.join(at, seg)
+        const key = comparablePath(at)
+        if (verified.has(key)) continue
+        let st
+        try {
+          st = await fs.lstat(at)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+          try {
+            await fs.mkdir(at)
+            made.push(at)
+          } catch (mkErr) {
+            if ((mkErr as NodeJS.ErrnoException).code !== 'EEXIST') throw mkErr
+          }
+          st = await fs.lstat(at) // made here, or by someone else a moment ago: checked the same way
+        }
+        if (st.isSymbolicLink()) return at
+        if (!st.isDirectory()) throw Object.assign(new Error(`ENOTDIR: not a folder: ${at}`), { code: 'ENOTDIR' })
+        verified.add(key)
+      }
+      return null
     }
-    if (st.isSymbolicLink()) return false
-    if (i < segs.length - 1 && !st.isDirectory()) return true // mkdir fails on it — reported as a copy failure
   }
-  return true
 }
 
 /** A link found in a walk: where it sits, what it says (readlink, as written), and whether it leads to a
@@ -369,32 +390,61 @@ export async function copyWorktreeInclude(
     filesTotal: planned.reduce((n, p) => n + p.plan.files.length, 0)
   }
   const report = (): void => onProgress?.({ ...progress })
-  const removeProbe = createProber({
-    access: (d) => fs.rm(d, { recursive: true, force: true }),
+  // The cleanup after a failed link: what this call made of the entry, newest first — files and links
+  // unlinked, folders removed only when empty. Never a recursive delete: the checkout's own files can
+  // share those folders. One time-limited call for the lot.
+  let undo: string[] = []
+  const cleanupProbe = createProber({
+    access: async () => {
+      for (const x of [...undo].reverse()) {
+        const st = await fs.lstat(x).catch(() => null)
+        if (!st) continue
+        if (st.isDirectory()) await fs.rmdir(x).catch(() => {})
+        else await fs.unlink(x).catch(() => {})
+      }
+    },
     skipQueue: true
   })
+  const safeDirs = createSafeDirs(worktreePath)
   report()
-  const dropTotals = (p: PlannedEntry): void => {
-    progress.bytesTotal -= p.plan.bytes
-    progress.filesTotal -= p.plan.files.length
-    report()
-  }
   for (const p of planned) {
     throwIfCancelled(signal)
-    const at = { bytes: progress.bytesCopied, files: progress.filesCopied }
-    // Checked right before this entry writes anything: an earlier entry, or the checkout, may have put a
-    // link on the way, and writing through it would land outside the worktree.
-    if (!(await destIsSafe(worktreePath, p.dest))) {
-      dropTotals(p)
-      warnings.push({ key: 'worktree.include.unsafeDest', params: { entry: p.entry } })
-      continue
+    const at = {
+      bytes: progress.bytesCopied,
+      files: progress.filesCopied,
+      bytesTotal: progress.bytesTotal,
+      filesTotal: progress.filesTotal
+    }
+    const made: string[] = []
+    undo = made
+    /** Links found on the way (absolute), each reported once; everything under one is skipped. */
+    const blocked: string[] = []
+    const warnBlocked = (bad: string): void => {
+      blocked.push(bad)
+      warnings.push({
+        key: 'worktree.include.unsafeDest',
+        params: { entry: p.entry, path: path.relative(worktreePath, bad).split(path.sep).join('/') }
+      })
+    }
+    const reach = async (dir: string): Promise<boolean> => {
+      if (blocked.some((b) => isPathWithin(b, dir))) return false
+      const bad = await safeDirs.ensure(dir, made)
+      if (bad === null) return true
+      if (!blocked.some((b) => isPathWithin(b, bad))) warnBlocked(bad)
+      return false
+    }
+    /** The file itself must not be a link: copying onto one writes to its target. */
+    const fileIsSafe = async (to: string): Promise<boolean> => {
+      const st = await fs.lstat(to).catch(() => null)
+      if (!st?.isSymbolicLink()) return true
+      warnBlocked(to)
+      return false
     }
     try {
       if (p.kind === 'dir') {
-        await fs.mkdir(p.dest, { recursive: true })
-        for (const d of p.plan.dirs) await fs.mkdir(path.join(p.dest, d), { recursive: true })
+        if (await reach(p.dest)) for (const d of p.plan.dirs) await reach(path.join(p.dest, d))
       } else {
-        await fs.mkdir(path.dirname(p.dest), { recursive: true })
+        await reach(path.dirname(p.dest))
       }
       if (p.plan.links.length > 0) {
         // An entry that is itself a link has nothing "inside" it — its target keeps pointing where it did
@@ -403,18 +453,22 @@ export async function copyWorktreeInclude(
           throwIfCancelled(signal)
           const linkAbs = l.rel === '' ? p.src : path.join(p.src, l.rel)
           const linkDest = l.rel === '' ? p.dest : path.join(p.dest, l.rel)
+          if (!(await reach(path.dirname(linkDest)))) continue
           const { target, type } = linkTargetFor({
             srcRoot: p.src, srcRootReal, destRoot: p.dest, linkAbs, raw: l.raw, isDir: l.isDir
           })
           try {
             await makeLink(target, linkDest, type)
+            made.push(linkDest)
           } catch (err) {
             // A file link the user lacks the privilege for (EPERM: Windows without Developer Mode) is
             // copied as the file instead. That one file is outside the byte budget and the progress
             // totals, which count links as 0 — it is one file, not a walk.
             if (type === 'file' && (err as NodeJS.ErrnoException).code === 'EPERM') {
+              if (!(await fileIsSafe(linkDest))) continue
               try {
                 await fs.copyFile(linkAbs, linkDest)
+                made.push(linkDest)
                 continue
               } catch (copyErr) {
                 throw new LinkFailed(copyErr instanceof Error ? copyErr.message : String(copyErr))
@@ -428,7 +482,15 @@ export async function copyWorktreeInclude(
         throwIfCancelled(signal)
         const from = p.kind === 'dir' ? path.join(p.src, f.rel) : p.src
         const to = p.kind === 'dir' ? path.join(p.dest, f.rel) : p.dest
+        if (!(await reach(path.dirname(to))) || !(await fileIsSafe(to))) {
+          // not written: out of the totals, so the bar still ends full
+          progress.bytesTotal -= f.size
+          progress.filesTotal--
+          report()
+          continue
+        }
         let seen = 0
+        made.push(to)
         await copyOneFile(from, to, f.size, signal, (n) => {
           // a file that grew since it was measured must not push the count past the total
           const add = Math.max(0, Math.min(n, f.size - seen))
@@ -443,12 +505,14 @@ export async function copyWorktreeInclude(
     } catch (err) {
       if (isCancelledError(err)) throw err
       if (err instanceof LinkFailed) {
-        // take out what was made of this entry, and its share of the totals — no half-copied entry
-        // time-limited: a root that stopped answering costs the probe limit, not a hang
-        await removeProbe(p.dest)
+        // take out what this call made of the entry, and its share of the totals — no half-copied entry.
+        // Time-limited: a root that stopped answering costs the probe limit, not a hang.
+        await cleanupProbe(p.dest)
         progress.bytesCopied = at.bytes
         progress.filesCopied = at.files
-        dropTotals(p)
+        progress.bytesTotal = at.bytesTotal - p.plan.bytes
+        progress.filesTotal = at.filesTotal - p.plan.files.length
+        report()
         warnings.push({ key: 'worktree.include.linkFailed', params: { entry: p.entry, detail: err.message } })
         continue
       }

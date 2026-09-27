@@ -97,7 +97,7 @@ export const ja: Catalog = {
   'worktree.include.sizeFailed': '容量の計算に失敗しました: {entry} ({detail})',
   'worktree.include.overLimit': 'コピー上限 (200MB) を超えたためスキップしました: {entry}',
   'worktree.include.linkFailed': 'リンクを再作成できなかったためスキップしました: {entry} ({detail})',
-  'worktree.include.unsafeDest': 'コピー先の途中にリンクがあり、worktree の外に書き込むためスキップしました: {entry}',
+  'worktree.include.unsafeDest': '{path} はリンクのため、その下はコピーしませんでした (worktree の外に書き込むため): {entry}',
   'worktree.include.overFileCount': '項目数が {max} を超えたためスキップしました: {entry}',
   'worktree.include.copyFailed': 'コピーに失敗しました: {entry} ({detail})',
   'worktree.create.fetchFailed':
