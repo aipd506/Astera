@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { findGitBash } from './gitBash'
+import { createGitBashResolver, findGitBash, findGitBashAsync } from './gitBash'
+import type { ProbeResult } from './pathProbe'
 
 /** A probe that says yes only for the listed absolute paths. */
 const only = (...paths: string[]) => (p: string): boolean => paths.includes(p)
@@ -80,5 +81,118 @@ describe('findGitBash', () => {
       'E:\\programs\\Git\\bin\\bash.exe'
     )
     expect(findGitBash({}, () => true)).toBeNull()
+  })
+})
+
+/** The async twin of `only`: present for the listed paths, absent for the rest. */
+const onlyAsync =
+  (...paths: string[]) =>
+  async (p: string): Promise<ProbeResult> =>
+    paths.includes(p) ? 'present' : 'absent'
+
+describe('findGitBashAsync', () => {
+  // The same fixtures the sync search is pinned by: with everything reachable, the answer must not move.
+  const cases: { name: string; env: Record<string, string>; present: string[] }[] = [
+    { name: 'git on PATH', env: { PATH: 'C:\\Windows\\System32;E:\\programs\\Git\\cmd' }, present: ['E:\\programs\\Git\\cmd\\git.exe', 'E:\\programs\\Git\\bin\\bash.exe'] },
+    { name: 'bin entry', env: { PATH: 'E:\\programs\\Git\\bin' }, present: ['E:\\programs\\Git\\bin\\bash.exe'] },
+    { name: 'install root', env: { PATH: 'C:\\Windows\\System32' }, present: ['C:\\Program Files\\Git\\bin\\bash.exe'] },
+    {
+      name: 'Git before an earlier Cygwin bash',
+      env: { PATH: 'C:\\cygwin64\\bin;E:\\programs\\Git\\cmd' },
+      present: ['C:\\cygwin64\\bin\\bash.exe', 'E:\\programs\\Git\\cmd\\git.exe', 'E:\\programs\\Git\\bin\\bash.exe']
+    },
+    { name: 'plain bash last', env: { PATH: 'C:\\cygwin64\\bin' }, present: ['C:\\cygwin64\\bin\\bash.exe'] },
+    {
+      name: 'WSL launchers skipped',
+      env: { PATH: 'C:\\Windows\\System32;C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps' },
+      present: ['C:\\Windows\\System32\\bash.exe', 'C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe']
+    },
+    { name: 'nothing', env: { PATH: 'C:\\nothing' }, present: [] }
+  ]
+  for (const c of cases) {
+    it(`answers what the sync search answers: ${c.name}`, async () => {
+      expect(await findGitBashAsync(c.env, onlyAsync(...c.present))).toBe(findGitBash(c.env, only(...c.present)))
+    })
+  }
+
+  it('keeps a value the user already set, without probing', async () => {
+    let probed = 0
+    const found = await findGitBashAsync({ CLAUDE_CODE_GIT_BASH_PATH: 'E:/x', PATH: 'C:\\a' }, async () => {
+      probed++
+      return 'present'
+    })
+    expect(found).toBeNull()
+    expect(probed).toBe(0)
+  })
+
+  it('starts every probe before any has answered, and never probes a WSL launcher', async () => {
+    const asked: string[] = []
+    const gates: (() => void)[] = []
+    const probe = (p: string) => {
+      asked.push(p)
+      return new Promise<ProbeResult>((res) => gates.push(() => res('absent')))
+    }
+    const env = { PATH: 'Z:\\offline\\bin;C:\\Windows\\System32;E:\\Git\\cmd' }
+    const pending = findGitBashAsync(env, probe)
+    await Promise.resolve()
+    expect(asked).toHaveLength(gates.length)
+    expect(asked).toContain('Z:\\offline\\bin\\git.exe')
+    expect(asked).toContain('E:\\Git\\cmd\\git.exe')
+    expect(asked).toContain('C:\\Program Files\\Git\\bin\\bash.exe')
+    expect(asked).toContain('Z:\\offline\\bin\\bash.exe')
+    expect(asked.some((p) => /system32\\bash\.exe$/i.test(p))).toBe(false)
+    gates.forEach((g) => g())
+    expect(await pending).toBeNull()
+  })
+
+  it('a PATH entry that times out counts as absent and the search goes on past it', async () => {
+    const env = { PATH: 'Z:\\offline\\bin;E:\\Git\\cmd' }
+    const probe = async (p: string): Promise<ProbeResult> =>
+      p.startsWith('Z:') ? 'timeout' : ['E:\\Git\\cmd\\git.exe', 'E:\\Git\\bin\\bash.exe'].includes(p) ? 'present' : 'absent'
+    expect(await findGitBashAsync(env, probe)).toBe('E:\\Git\\bin\\bash.exe')
+  })
+})
+
+describe('createGitBashResolver', () => {
+  it('probes once per PATH string: the second spawn is a cache hit and costs no probe', async () => {
+    let probes = 0
+    const probe = async (p: string): Promise<ProbeResult> => {
+      probes++
+      return p === 'C:\\Program Files\\Git\\bin\\bash.exe' ? 'present' : 'absent'
+    }
+    const r = createGitBashResolver(probe)
+    const env = { PATH: 'Z:\\offline;C:\\a' }
+    expect(r.peek(env)).toBeUndefined()
+    expect(await r.resolve(env)).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+    const first = probes
+    expect(await r.resolve({ ...env })).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+    expect(probes).toBe(first)
+    expect(r.peek(env)).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+  })
+
+  it('probes again when the PATH string changes', async () => {
+    let probes = 0
+    const r = createGitBashResolver(async () => {
+      probes++
+      return 'absent'
+    })
+    await r.resolve({ PATH: 'C:\\a' })
+    const first = probes
+    await r.resolve({ Path: 'C:\\b' })
+    expect(probes).toBeGreaterThan(first)
+    expect(r.peek({ PATH: 'C:\\a' })).toBeUndefined()
+    expect(r.peek({ Path: 'C:\\b' })).toBeNull()
+  })
+
+  it('answers null for a user-set value, in peek too, without probing or caching', async () => {
+    let probes = 0
+    const r = createGitBashResolver(async () => {
+      probes++
+      return 'present'
+    })
+    const env = { PATH: 'C:\\a', CLAUDE_CODE_GIT_BASH_PATH: 'E:/x' }
+    expect(r.peek(env)).toBeNull()
+    expect(await r.resolve(env)).toBeNull()
+    expect(probes).toBe(0)
   })
 })

@@ -12,6 +12,7 @@
 // The plain 'node:path' takes the host's semantics, which turned these tests red on the macOS and
 // Linux legs of the CI matrix while passing on a Windows developer machine.
 import { win32 as path } from 'node:path'
+import { PathKeyedCache, type ProbeResult } from './pathProbe'
 
 /** Where a Git for Windows install keeps the bash that hooks need, relative to the install root. */
 const BIN_BASH = path.join('bin', 'bash.exe')
@@ -68,4 +69,67 @@ export function findGitBash(
     if (probe(c)) return c
   }
   return null
+}
+
+/** Every path `findGitBash` could ask about for this env, WSL launchers left out: each PATH entry's
+ *  git.exe and the bash beside its install root (for a `cmd` or `bin` entry), the install roots, and
+ *  each PATH entry's own bash.exe. Knowing them up front is what lets them be probed together. */
+function gitBashProbePaths(env: Record<string, string | undefined>): string[] {
+  const hasPath = Object.keys(env).some((k) => k.toUpperCase() === 'PATH')
+  const entries = pathEntries(env)
+  const out: string[] = []
+  for (const entry of entries) {
+    const dir = path.basename(entry).toLowerCase()
+    if (dir === 'cmd' || dir === 'bin') {
+      out.push(path.join(entry, 'git.exe'), path.join(path.dirname(entry), BIN_BASH))
+    }
+  }
+  if (hasPath) for (const root of ROOTS) out.push(path.join(root, BIN_BASH))
+  for (const entry of entries) out.push(path.join(entry, 'bash.exe'))
+  return [...new Set(out)].filter((p) => !isWslBash(p))
+}
+
+/**
+ * `findGitBash` over an async probe: every candidate is probed at once (the probe's own limiter bounds
+ * how many are in flight), then the same search runs over the answers, so the order it prefers — Git
+ * for Windows, then a plain bash, never a WSL launcher — is exactly the sync one. A probe that timed out
+ * counts as absent. Pure apart from `probe`.
+ */
+export async function findGitBashAsync(
+  env: Record<string, string | undefined>,
+  probe: (p: string) => Promise<ProbeResult>
+): Promise<string | null> {
+  if (env.CLAUDE_CODE_GIT_BASH_PATH) return null
+  const paths = gitBashProbePaths(env)
+  const results = await Promise.all(paths.map((p) => probe(p)))
+  const present = new Set(paths.filter((_, i) => results[i] === 'present'))
+  return findGitBash(env, (p) => present.has(p))
+}
+
+export interface GitBashResolver {
+  /** The Git Bash for this env, probed at most once per PATH string while the cache holds it. */
+  resolve(env: Record<string, string | undefined>): Promise<string | null>
+  /** What `resolve` last found for this env's PATH string, if it is still fresh; undefined otherwise. */
+  peek(env: Record<string, string | undefined>): string | null | undefined
+}
+
+const pathValueOf = (env: Record<string, string | undefined>): string => {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH')
+  return (key ? env[key] : undefined) ?? ''
+}
+
+/** A per-process cache over `findGitBashAsync`, keyed by the PATH string: an offline drive on PATH
+ *  costs its probe timeout once, not on every spawn. A user-set CLAUDE_CODE_GIT_BASH_PATH is answered
+ *  (null, nothing to add) without probing or caching. */
+export function createGitBashResolver(
+  probe: (p: string) => Promise<ProbeResult>,
+  cache: PathKeyedCache<string | null> = new PathKeyedCache()
+): GitBashResolver {
+  return {
+    resolve: (env) =>
+      env.CLAUDE_CODE_GIT_BASH_PATH
+        ? Promise.resolve(null)
+        : cache.get(pathValueOf(env), 'gitBash', () => findGitBashAsync(env, probe)),
+    peek: (env) => (env.CLAUDE_CODE_GIT_BASH_PATH ? null : cache.peek(pathValueOf(env), 'gitBash'))
+  }
 }
