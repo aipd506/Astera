@@ -39,11 +39,17 @@ export function parseLstart(text: string): number | null {
 
 export type ExecText = (file: string, args: string[]) => Promise<string>
 
-/** Runs a program to its end for its text; a failure carries its exit `code` and its `stdout`. */
-export const execText: ExecText = (file, args) =>
-  new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: 30_000 }, (err, stdout) => (err ? reject(Object.assign(err, { stdout: String(stdout) })) : resolve(String(stdout))))
-  })
+/** Runs a program to its end for its text, killed after `timeoutMs`; a failure carries its exit `code`
+ *  and its `stdout`. */
+export const execTextWithin =
+  (timeoutMs: number): ExecText =>
+  (file, args) =>
+    new Promise((resolve, reject) => {
+      execFile(file, args, { timeout: timeoutMs }, (err, stdout) => (err ? reject(Object.assign(err, { stdout: String(stdout) })) : resolve(String(stdout))))
+    })
+
+/** execTextWithin with the 30 s every tool gets unless it has a reason for less. */
+export const execText: ExecText = execTextWithin(30_000)
 
 export interface LinuxProcFs {
   readFile(p: string): Promise<string>

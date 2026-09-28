@@ -311,6 +311,22 @@ describe('the macOS desk: start times, failures and close', () => {
     expect(r.procs[0].stderr).toBe(true)
   })
 
+  it('fails at once when open fails: no further ps, no late sweep, no wait for the ready limit (stage 4 T6)', async () => {
+    const r = rig()
+    const desk = await r.desks.start('a')
+    let clock = r.now()
+    r.deps.now = () => clock
+    r.deps.sleep = async (ms) => {
+      r.sleeps.push({ ms })
+      clock += ms
+      r.procs[0].exit('exited 1')
+    }
+    await expect(desk.launch({ command: '/Applications/Broken.app', cwd: '/', env: {} })).rejects.toThrow('launch: open could not start')
+    // One poll before open's exit was seen, and nothing after it.
+    expect(r.execs).toHaveLength(1)
+    expect(r.sleeps).toHaveLength(1)
+  })
+
   it("reports open's own failure, not a missing process, when it fails in the same poll the limit passes (review M1)", async () => {
     const r = rig()
     const desk = await r.desks.start('a')

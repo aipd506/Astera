@@ -13,11 +13,19 @@ import path from 'node:path'
 import type { DeskHandle } from '../../core/workspace/helpers'
 import { START_TIME_TOLERANCE_MS } from '../../core/workspace/lifecycle'
 import { DESK_READY_MS, type DeskLaunched } from '../../core/workspace/protocol'
-import { execText, killGroup, macStartTimes, parseLstart, spawnDetached, type ExecText, type SpawnDetached } from './posixProc'
+import { execText, execTextWithin, killGroup, macStartTimes, parseLstart, spawnDetached, type ExecText, type SpawnDetached } from './posixProc'
 
 export const MAC_BACKGROUND_FLAGS =
   '--disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-background-timer-throttling'
 const POLL_MS = 200
+
+/**
+ * How long each ps of a bundle launch poll may take (stage 4 T6). A poll is two ps calls, and a failing
+ * one is tried once more, so with execText's 30 s a hung ps held one poll for up to two minutes while the
+ * launch said nothing. A healthy ps answers in milliseconds; five seconds is room to spare, and a ps
+ * that runs out fails the launch with its reason instead.
+ */
+export const MAC_PS_TIMEOUT_MS = 5_000
 
 export const macRefusal = (helper: 'windows' | 'windowShot' | 'keys'): string =>
   `${helper}: not available on macOS (the app runs in the background and only its page can be driven)`
@@ -275,7 +283,7 @@ export function createMacDesks(d: MacDeskDeps): { start(name: string): Promise<D
 export function realMacDeskDeps(a: { log(m: string): void }): MacDeskDeps {
   return {
     spawn: spawnDetached,
-    exec: execText,
+    exec: execTextWithin(MAC_PS_TIMEOUT_MS),
     startTime: async (pid) => (await macStartTimes([pid], execText)).get(pid) ?? null,
     killGroup: (pid) => killGroup(pid),
     sleep: (ms, signal) =>
