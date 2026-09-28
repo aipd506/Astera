@@ -4,7 +4,7 @@
 //
 // Everything it needs arrives in the environment, because it has no `app.getPath('userData')` to ask.
 import childProcess from 'node:child_process'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { defaultCwdProbe, setProbeLog } from '../core/sessions/pathProbe'
 import { createRequire } from 'node:module'
 import os from 'node:os'
@@ -13,7 +13,7 @@ import tls from 'node:tls'
 import * as pty from 'node-pty'
 import { hostAddress } from './address'
 import { nodePtyMissing } from './nodePtyCheck'
-import { hostPidFilePath, serializeHostPidFile } from '../core/host/pidFile'
+import { hostPidFilePath, writeHostPidFile } from '../core/host/pidFile'
 import { SPAWN_DEADLINE_MS } from '../core/host/unresponsive'
 import { hideForkedConsoleWindows } from './childWindows'
 import { trustSystemCa } from './systemCa'
@@ -622,10 +622,7 @@ async function main(): Promise<void> {
   // file is a convenience for the one case the handshake cannot cover (design F3), and a Host that
   // could not write it still serves every session perfectly well.
   try {
-    writeFileSync(
-      hostPidFilePath(profileDir),
-      serializeHostPidFile({ pid: process.pid, startedAt: server.startedAt, exe: process.execPath })
-    )
+    writeHostPidFile(profileDir, { pid: process.pid, startedAt: server.startedAt, exe: process.execPath })
   } catch (err) {
     log.write(`could not record which process this Host is: ${String(err)}`)
   }

@@ -22,13 +22,22 @@ export interface HostPidFile {
   exe: string
 }
 
-/** Beside `host.log`, in the profile the Host serves — the directory the log has already made. */
+/** Beside `host.log`, in the profile the Host serves. */
 export function hostPidFilePath(profileDir: string): string {
   return path.join(profileDir, 'host', 'host.pid')
 }
 
 export function serializeHostPidFile(v: HostPidFile): string {
   return JSON.stringify(v)
+}
+
+/** Makes the folder itself. The log used to have made it by now, but since it writes asynchronously
+ *  (stage 3) its folder does not exist yet at this point on a first start. Throws what the write
+ *  throws; the Host's caller decides that it is not fatal. */
+export function writeHostPidFile(profileDir: string, v: HostPidFile): void {
+  const file = hostPidFilePath(profileDir)
+  mkdirSync(path.dirname(file), { recursive: true })
+  writeFileSync(file, serializeHostPidFile(v))
 }
 
 /**

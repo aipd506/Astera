@@ -11,7 +11,8 @@ import {
   liveAppPid,
   markAppRunning,
   parseHostPidFile,
-  serializeHostPidFile
+  serializeHostPidFile,
+  writeHostPidFile
 } from './pidFile'
 
 describe('hostPidFilePath', () => {
@@ -60,6 +61,19 @@ describe('parseHostPidFile', () => {
       startedAt: 't',
       exe: 'e'
     })
+  })
+})
+
+describe('writeHostPidFile', () => {
+  // Measured 2026-09-28 on a fresh profile: the Host log became an async writer in stage 3, so at the
+  // moment the pid is written its `host` folder does not exist yet, and the write failed with ENOENT on
+  // every first start. The folder is this function's to make, not the log's.
+  it('writes into a profile whose host folder does not exist yet', async () => {
+    const dir = await tempDir('astera-hostpid-')
+    const rec = { pid: 4242, startedAt: '2026-09-28T12:50:00.198Z', exe: process.execPath }
+    expect(existsSync(path.join(dir, 'host'))).toBe(false)
+    writeHostPidFile(dir, rec)
+    expect(parseHostPidFile(readFileSync(hostPidFilePath(dir), 'utf8'))).toEqual(rec)
   })
 })
 
