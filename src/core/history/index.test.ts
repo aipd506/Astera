@@ -218,9 +218,10 @@ describe('HistoryIndex (lazy)', () => {
       index!.onUpdated = (): void => {
         hits += 1
       }
-      // 조용함의 기준을 넉넉히 잡는다 — 100ms×5 = 0.5초 동안 새 통지가 없어야 재생이 끝난 것으로
-      // 본다. 상한은 라운드 수로 센다(최대 6초): 넘으면 기다림이 부족한 것이 아니라 다른 일이다.
-      for (let quiet = 0, round = 0; quiet < 5 && round < 60; round += 1) {
+      // 조용함의 기준을 넉넉히 잡는다 — 100ms×15 = 1.5초 동안 새 통지가 없어야 재생이 끝난 것으로
+      // 본다(macOS FSEvents 는 부하 아래 0.5초 뒤에도 앞 폴더의 생성 통지를 늦게 재생했다). 상한은
+      // 라운드 수로 센다(최대 15초): 넘으면 기다림이 부족한 것이 아니라 다른 일이다.
+      for (let quiet = 0, round = 0; quiet < 15 && round < 150; round += 1) {
         const before = hits
         await new Promise((r) => setTimeout(r, 100))
         quiet = hits === before ? quiet + 1 : 0
