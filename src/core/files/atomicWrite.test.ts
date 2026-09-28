@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { OUTSIDE_ROOT, writeWithinRoot } from './atomicWrite'
+import { OUTSIDE_ROOT, TMP_TAKEN, writeWithinRoot } from './atomicWrite'
 
 const mk = async (): Promise<{ root: string; outside: string }> => {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-atomicwrite-'))
@@ -45,7 +45,8 @@ describe('writeWithinRoot', () => {
     const file = path.join(root, 'notes.sh')
     await fs.writeFile(file, 'payload')
     await fs.symlink(path.join(outside, 'gone'), `${file}.cmtmp`)
-    await expect(writeWithinRoot(root, file, 'x', { tmpName: (p) => `${p}.cmtmp` })).rejects.toThrow()
+    // Refused before open on every platform: Windows follows a dangling link even under O_EXCL
+    await expect(writeWithinRoot(root, file, 'x', { tmpName: (p) => `${p}.cmtmp` })).rejects.toThrow(TMP_TAKEN)
     expect(await fs.readFile(file, 'utf8')).toBe('payload')
     await expect(fs.stat(path.join(outside, 'gone'))).rejects.toThrow()
   })
