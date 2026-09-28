@@ -17,10 +17,7 @@
 ## 중지된 것: dev 앱 화면 검증
 - 검증 에이전트를 사용자 요청으로 중지했다. **보고서(verify-report.md)는 쓰이지 않았고 항목별 결과는 알 수 없다.**
   작업 흔적상 6번(app js 미러)까지 진행 중이었던 것으로 보인다(`verify-9471/app*.js`).
-- **아직 떠 있는 검증용 dev 앱**: 디버그 포트 `--remote-debugging-port=9471`, 프로필
-  `C:/Users/anipen/AppData/Local/Temp/claude/D--parsingk-astera/6451a7ed-6e8e-4f6d-96a2-2f2bcb245a99/scratchpad/verify-prof-dev`.
-  종료 시 반드시 그 플래그 전문 + 프로세스 이름(node.exe/electron.exe)으로 PID 를 골라 `Stop-Process -Id` 로
-  하나씩(트리 킬 금지). 사용자 설치본·사용자 dev 앱은 절대 건드리지 않는다.
+- 검증용 dev 앱(포트 9471)과 그 Host·데스크·app js 창은 2026-09-28 에 PID 로 하나씩 모두 종료했다. 다음 검증은 새 프로필로 새로 띄운다.
 - 스크래치: `.../scratchpad/verify-9471/` (1만 파일 폴더, 150MB 저장소 bigrepo, 픽스처 등). 재사용하거나 지운다.
 
 ### 다음 세션에서 할 검증 (우선순위, 실제 DOM 조작 + 스크린샷)
