@@ -1605,3 +1605,15 @@ describe('startKeepalive — 기다리는 동안 내는 줄', () => {
     })
   })
 })
+
+// Stage 4 T6: `host start` and `host stop` print a waiting notice on stderr, and `--no-keepalive` has to
+// reach them. runHostCommand is called in one place, so that place carries the flag.
+describe('run.ts — host commands hear --no-keepalive (stage 4 T6)', () => {
+  it('passes the parsed flag to runHostCommand', () => {
+    const src = readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'run.ts'), 'utf8')
+    const at = src.indexOf('await runHostCommand({')
+    expect(at).toBeGreaterThan(0)
+    const call = src.slice(at, src.indexOf('})', at))
+    expect(call).toMatch(/noKeepalive:\s*parsed\.noKeepalive/)
+  })
+})

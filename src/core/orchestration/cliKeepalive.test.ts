@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { HOST_UNRESPONSIVE_MS } from '../host/unresponsive'
-import { KEEPALIVE_MS, SLOW_ANSWER_NOTICE_MS, elapsedWord, keepaliveLine, slowAnswerLine, waitingCommand } from './cliKeepalive'
+import { HOST_WAIT_EVERY_MS, HOST_WAIT_NOTICE_MS, KEEPALIVE_MS, SLOW_ANSWER_NOTICE_MS, elapsedWord, hostWaitLine, keepaliveLine, slowAnswerLine, waitingCommand } from './cliKeepalive'
 
 describe('cliKeepalive — 간격', () => {
   // 두 곳에 적으면 갈라진다. 이 CLI 와 앱이 같은 Host 를 두고 "언제부터 안 답하는 것인가" 를
@@ -97,5 +97,27 @@ describe('cliKeepalive — sessions send --wait waits', () => {
   it('only with --wait', () => {
     expect(waitingCommand({ cmd: 'sessions-send', args: { id: 's', text: 't', wait: true } })).toBe(true)
     expect(waitingCommand({ cmd: 'sessions-send', args: { id: 's', text: 't' } })).toBe(false)
+  })
+})
+
+// Stage 4 T6: `host start` and `host stop` wait on the Host itself, with nothing on stdout until it is
+// over. The user's rule is that nothing may look frozen, so they say what they are waiting for.
+describe('hostWaitLine (stage 4 T6)', () => {
+  it('says the Host is starting, with how long so far', () => {
+    expect(hostWaitLine({ cmd: 'host-start', elapsedMs: 1_000 })).toBe('Starting the Astera Host... (1s so far)')
+    expect(hostWaitLine({ cmd: 'host-start', elapsedMs: 66_000 })).toBe('Starting the Astera Host... (1m 6s so far)')
+  })
+
+  it('says it is waiting for the Host to leave', () => {
+    expect(hostWaitLine({ cmd: 'host-stop', elapsedMs: 6_000 })).toBe('Waiting for the Host to leave... (6s so far)')
+  })
+
+  it('says nothing for host status, which answers from one connect', () => {
+    expect(hostWaitLine({ cmd: 'host-status', elapsedMs: 1_000 })).toBeNull()
+  })
+
+  it('first speaks after a second, then every five', () => {
+    expect(HOST_WAIT_NOTICE_MS).toBe(1_000)
+    expect(HOST_WAIT_EVERY_MS).toBe(5_000)
   })
 })

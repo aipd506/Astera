@@ -1225,7 +1225,10 @@ export async function main(): Promise<void> {
       cmd: parsed.cmd,
       env: process.env,
       platform: process.platform,
-      home: homedir()
+      home: homedir(),
+      // `host start` and `host stop` say on stderr that they are still waiting (stage 4 T6), and
+      // `--no-keepalive` silences that the same way it silences every other keepalive.
+      noKeepalive: parsed.noKeepalive
     })
     // A failure is a `CliError` and goes out like every other one (review I1): `ok: false`, its code,
     // its nextSteps, and the `error:` sentence under `--human`. `host stop`'s refusal keeps its counts

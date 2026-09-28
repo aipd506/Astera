@@ -177,3 +177,28 @@ export function slowAnswerLine(a: {
     return `${head}; the Host has not answered a ping for ${elapsedWord(a.silentMs)}`
   return `${head}; the Host is still working (it answered a ping ${elapsedWord(a.silentMs)} ago)`
 }
+
+/**
+ * When `host start` and `host stop` first say they are still waiting, and how often after that (stage 4 T6).
+ *
+ * **Slow is acceptable; looking frozen is not**, the same rule as SLOW_ANSWER_NOTICE_MS, but these two
+ * have no Host to ping: `start` is waiting for one to exist, and `stop` for one to be gone. A first
+ * start can take several seconds (the runtime checks, the journal opening), and a stop waits out the
+ * Host's own settle, with the workspaces capped at 10 s and the log flush at 1 s. One second is past
+ * the time either takes when nothing is in the way, so a quick start or stop prints nothing; five
+ * seconds after that is often enough that a person never wonders whether it hung.
+ */
+export const HOST_WAIT_NOTICE_MS = 1_000
+export const HOST_WAIT_EVERY_MS = 5_000
+
+/**
+ * The line `host start` or `host stop` prints on stderr while it waits, or `null` for a `host-*`
+ * command that does not wait (`host status` is one connect). Plain ASCII dots rather than an ellipsis
+ * character, so an older Windows console code page cannot mangle it.
+ */
+export function hostWaitLine(a: { cmd: string; elapsedMs: number }): string | null {
+  const so = `(${elapsedWord(a.elapsedMs)} so far)`
+  if (a.cmd === 'host-start') return `Starting the Astera Host... ${so}`
+  if (a.cmd === 'host-stop') return `Waiting for the Host to leave... ${so}`
+  return null
+}

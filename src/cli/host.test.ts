@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { promises as fs } from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
@@ -10,7 +10,8 @@ import {
   hostStartTargets,
   otherProtocolHost,
   preparedRuntimeEntry,
-  runHostCommand
+  runHostCommand,
+  startHostNotice
 } from './host'
 import { userDataDir } from '../core/orchestration/cliDiscovery'
 import { pendingReportsDirIn } from '../core/orchestration/pendingReports'
@@ -642,5 +643,173 @@ describe('preparedRuntimeEntry', () => {
     })
     expect(entry).toBeUndefined()
     expect(readAttempted).toBe(false)
+  })
+})
+
+// Stage 4 T6: a first `host start` can take seconds (runtime checks, the journal opening) and `host stop`
+// waits for the Host to leave, and until now both printed nothing meanwhile. The notice goes to stderr
+// only, after a second and then every five, and `--no-keepalive` turns it off like every other one.
+describe('startHostNotice (stage 4 T6)', () => {
+  it('says nothing for the first second, then speaks every five seconds until stopped', () => {
+    vi.useFakeTimers()
+    try {
+      const lines: string[] = []
+      const n = startHostNotice({ cmd: 'host-start', enabled: true, write: (l) => lines.push(l) })
+      vi.advanceTimersByTime(999)
+      expect(lines).toEqual([])
+      vi.advanceTimersByTime(1)
+      expect(lines).toEqual(['Starting the Astera Host... (1s so far)'])
+      vi.advanceTimersByTime(5_000)
+      expect(lines).toEqual(['Starting the Astera Host... (1s so far)', 'Starting the Astera Host... (6s so far)'])
+      vi.advanceTimersByTime(5_000)
+      expect(lines.at(-1)).toBe('Starting the Astera Host... (11s so far)')
+      n.stop()
+      vi.advanceTimersByTime(60_000)
+      expect(lines).toHaveLength(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('says it is waiting for the Host to leave on host stop', () => {
+    vi.useFakeTimers()
+    try {
+      const lines: string[] = []
+      const n = startHostNotice({ cmd: 'host-stop', enabled: true, write: (l) => lines.push(l) })
+      vi.advanceTimersByTime(6_000)
+      n.stop()
+      expect(lines).toEqual(['Waiting for the Host to leave... (1s so far)', 'Waiting for the Host to leave... (6s so far)'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('says nothing at all under --no-keepalive, and nothing for host status', () => {
+    vi.useFakeTimers()
+    try {
+      const lines: string[] = []
+      const off = startHostNotice({ cmd: 'host-start', enabled: false, write: (l) => lines.push(l) })
+      const status = startHostNotice({ cmd: 'host-status', enabled: true, write: (l) => lines.push(l) })
+      vi.advanceTimersByTime(60_000)
+      off.stop()
+      status.stop()
+      expect(lines).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('an answer inside the first second prints nothing', () => {
+    vi.useFakeTimers()
+    try {
+      const lines: string[] = []
+      const n = startHostNotice({ cmd: 'host-stop', enabled: true, write: (l) => lines.push(l) })
+      vi.advanceTimersByTime(500)
+      n.stop()
+      vi.advanceTimersByTime(60_000)
+      expect(lines).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('runHostCommand says it is waiting (stage 4 T6)', () => {
+  /** A Host at this profile's own address that takes `helloAfterMs` to say hello, and after that
+   *  answers nothing: slow to start, and never leaving on `retire`. */
+  const slowHost = async (helloAfterMs: number): Promise<{ home: string; env: NodeJS.ProcessEnv; close(): Promise<void> }> => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-cli-home-'))
+    const env = {} as NodeJS.ProcessEnv
+    const profileDir = userDataDir({ platform: process.platform, env, home })
+    await fs.mkdir(profileDir, { recursive: true })
+    const addr = hostAddress({ profileDir, platform: process.platform, tmpDir: os.tmpdir(), protocol: HOST_PROTOCOL })
+    if (addr.dirToPrepare) await fs.mkdir(addr.dirToPrepare, { recursive: true, mode: 0o700 })
+    const socks = new Set<net.Socket>()
+    const server = net.createServer((sock) => {
+      socks.add(sock)
+      sock.on('error', () => {})
+      sock.on('close', () => socks.delete(sock))
+      let helloed = false
+      sock.on('data', () => {
+        if (helloed) return
+        helloed = true
+        setTimeout(() => {
+          if (!sock.destroyed)
+            sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '9.9.9', pid: 1, startedAt: 'T', features: [] }))
+        }, helloAfterMs)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(addr.address, resolve))
+    return {
+      home,
+      env,
+      close: async () => {
+        for (const s of socks) s.destroy()
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+        await fs.rm(home, { recursive: true, force: true })
+      }
+    }
+  }
+
+  it('host start says the Host is starting while it waits for its answer, on stderr only', async () => {
+    const host = await slowHost(300)
+    try {
+      const lines: string[] = []
+      const r = await runHostCommand({
+        cmd: 'host-start',
+        env: host.env,
+        platform: process.platform,
+        home: host.home,
+        notice: { firstMs: 20, everyMs: 1_000, write: (l) => lines.push(l) }
+      })
+      expect(r).toMatchObject({ ok: true, body: { running: true } })
+      expect(lines.length).toBeGreaterThan(0)
+      expect(lines[0]).toMatch(/^Starting the Astera Host\.\.\. \(\d+s so far\)$/)
+    } finally {
+      await host.close()
+    }
+  })
+
+  it('host stop says it is waiting for the Host to leave, and the ending is unchanged', async () => {
+    const host = await slowHost(0)
+    try {
+      const lines: string[] = []
+      const r = await runHostCommand({
+        cmd: 'host-stop',
+        env: host.env,
+        platform: process.platform,
+        home: host.home,
+        stopTimeoutMs: 300,
+        notice: { firstMs: 20, everyMs: 50, write: (l) => lines.push(l) }
+      })
+      expect(failed(r, 'host-stop')).toMatchObject({ code: 'TIMEOUT' })
+      expect(lines.length).toBeGreaterThan(1)
+      expect(lines.every((l) => l.startsWith('Waiting for the Host to leave... ('))).toBe(true)
+    } finally {
+      await host.close()
+    }
+  })
+
+  it('--no-keepalive keeps both silent', async () => {
+    const host = await slowHost(300)
+    try {
+      const lines: string[] = []
+      const notice = { firstMs: 20, everyMs: 50, write: (l: string) => lines.push(l) }
+      const started = await runHostCommand({ cmd: 'host-start', env: host.env, platform: process.platform, home: host.home, noKeepalive: true, notice })
+      expect(started).toMatchObject({ ok: true })
+      const stopped = await runHostCommand({
+        cmd: 'host-stop',
+        env: host.env,
+        platform: process.platform,
+        home: host.home,
+        stopTimeoutMs: 300,
+        noKeepalive: true,
+        notice
+      })
+      expect(failed(stopped, 'host-stop')).toMatchObject({ code: 'TIMEOUT' })
+      expect(lines).toEqual([])
+    } finally {
+      await host.close()
+    }
   })
 })

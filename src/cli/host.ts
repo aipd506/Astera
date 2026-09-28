@@ -17,6 +17,7 @@ import { answers, LEGACY_APP_NOTICE } from '../host/server'
 import { resolveSkillsDir } from './skills'
 import { nativePath, userDataDir } from '../core/orchestration/cliDiscovery'
 import type { CliError } from '../core/orchestration/cliOutput'
+import { HOST_WAIT_EVERY_MS, HOST_WAIT_NOTICE_MS, hostWaitLine } from '../core/orchestration/cliKeepalive'
 
 /** What `astera host status` reports. **Answers without a Host**: the content says what is there and
  *  the exit code says whether the Host is running, which is the pair a script needs (spec §8). */
@@ -332,8 +333,52 @@ const START_POLL_MS = 200
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
-/** Runs a `host-*` command and hands back what happened, without printing anything (see the note at
- *  the top of this file) — `run.ts` renders `body` and exits with `code`. */
+/**
+ * Says on **stderr** that `host start` or `host stop` is still waiting (stage 4 T6): nothing for
+ * `HOST_WAIT_NOTICE_MS`, then `hostWaitLine` every `HOST_WAIT_EVERY_MS` until stopped.
+ *
+ * run.ts's `startKeepalive` cannot serve here: it pings a Host over a connection, and these two wait
+ * for a Host that is not there yet or is on its way out. So this is a bare timer, and the line says
+ * only what the CLI knows, which is what it is waiting for and for how long. stdout is never touched,
+ * so the envelope and the exit code are what they were. `--no-keepalive` (`enabled: false`) prints
+ * nothing, like every other keepalive.
+ */
+export function startHostNotice(a: {
+  cmd: string
+  enabled: boolean
+  firstMs?: number
+  everyMs?: number
+  now?: () => number
+  write?: (line: string) => void
+}): { stop: () => void } {
+  if (!a.enabled || hostWaitLine({ cmd: a.cmd, elapsedMs: 0 }) === null) return { stop: () => {} }
+  const now = a.now ?? Date.now
+  const write = a.write ?? logToStderr
+  const startedAt = now()
+  const say = (): void => {
+    const line = hostWaitLine({ cmd: a.cmd, elapsedMs: now() - startedAt })
+    if (line !== null) write(line)
+  }
+  let every: ReturnType<typeof setInterval> | null = null
+  const first = setTimeout(() => {
+    say()
+    every = setInterval(say, a.everyMs ?? HOST_WAIT_EVERY_MS)
+    // The command's own sockets and timers keep the process up for exactly as long as it waits.
+    every.unref?.()
+  }, a.firstMs ?? HOST_WAIT_NOTICE_MS)
+  first.unref?.()
+  return {
+    stop: () => {
+      clearTimeout(first)
+      if (every !== null) clearInterval(every)
+      every = null
+    }
+  }
+}
+
+/** Runs a `host-*` command and hands back what happened, without printing anything on stdout (see
+ *  the note at the top of this file) — `run.ts` renders `body` and exits with `code`. `host start` and
+ *  `host stop` say on stderr that they are still waiting (startHostNotice). */
 export async function runHostCommand(a: {
   cmd: string
   env: NodeJS.ProcessEnv
@@ -342,6 +387,25 @@ export async function runHostCommand(a: {
   /** Overrides `HOST_STOP_WAIT_MS` for `host-stop`'s wait. Test injection only, the same way
    *  `HostServerDeps`'s `idleMs`/`helloMs` and `HostClientDeps`'s `pingMs` are — nothing waits out a
    *  real 35s to prove a silent Host resolves rather than hangs. */
+  stopTimeoutMs?: number
+  /** `--no-keepalive`: nothing on stderr while `host start` or `host stop` waits. */
+  noKeepalive?: boolean
+  /** The notice's timing and its writer. Test injection only. */
+  notice?: { firstMs?: number; everyMs?: number; write?: (line: string) => void }
+}): Promise<HostCommandResult> {
+  const notice = startHostNotice({ cmd: a.cmd, enabled: a.noKeepalive !== true, ...a.notice })
+  try {
+    return await runHostCommandNow(a)
+  } finally {
+    notice.stop()
+  }
+}
+
+async function runHostCommandNow(a: {
+  cmd: string
+  env: NodeJS.ProcessEnv
+  platform: NodeJS.Platform
+  home: string
   stopTimeoutMs?: number
 }): Promise<HostCommandResult> {
   if (a.cmd !== 'host-status' && a.cmd !== 'host-start' && a.cmd !== 'host-stop')
