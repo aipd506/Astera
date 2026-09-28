@@ -15,7 +15,7 @@ import { git as realGit, gitDir, gitVersionAtLeast, listGitWorktrees, GIT_WRITE_
 import { removeWorktree } from '../../worktrees/remove'
 import { askUntilAnswered, defaultActionPresenceCheck, type CheckResult, type PresenceCheck } from '../../worktrees/presence'
 import type { WorktreeStore } from '../../worktrees/registry'
-import { defaultCwdProbe, type Probe } from '../../sessions/pathProbe'
+import { defaultGateProbe, type Probe } from '../../sessions/pathProbe'
 
 /** 프로젝트 폴더가 **서 있는 브랜치**에서 워크트리를 하나 만들고 그 경로를 낸다.
  *
@@ -62,7 +62,10 @@ export async function forkWorktree(
   // git 을 띄우면 Windows 는 그 폴더를 부르는 스레드 — Host 의 하나뿐인 스레드 — 에서 동기로
   // 들여다보고, 그동안 그 스레드가 쥔 모든 pty 가 멈춘다. 답이 없으면 "닿지 않는다"이지 "저장소가
   // 사라졌다"(NO_REPO)가 아니다.
-  const at = await (ctx.probe ?? defaultCwdProbe)(a.repoPath)
+  // **상한을 넘어서 묻는다**(defaultGateProbe) — createWorktree 가 같은 폴더를 묻는 방식과 같다. 사람이
+  // 워커의 워크트리를 기다리고 있으므로, 다른 곳의 죽은 드라이브가 살아 있는 로컬 저장소를 막으면
+  // 안 된다(stage 4 최종 리뷰). 그 폴더 자신이 멎어 있으면 여전히 거절된다.
+  const at = await (ctx.probe ?? defaultGateProbe)(a.repoPath)
   if (at === 'timeout') throw new Error(`REPO_UNREACHABLE: folder not reachable: ${a.repoPath}`)
   if (at === 'absent')
     throw new Error(workerBaseFailure({ repoPath: a.repoPath, repoReachable: false, onBranch: false, stderr: 'the folder is not there' }) ?? '')
