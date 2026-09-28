@@ -392,6 +392,24 @@ describe('createWorktree — 진행과 취소', () => {
     ).rejects.toThrow(/WORKTREE_CANCELLED/)
     expect(copiedWhenCancelled).toBe(2)
     await expectRolledBack('incopy')
+    // 이 호출이 만든 저장소 폴더도 되돌린다 — 2026-09-28 화면 검증에서 빈 채로 남아 있었다
+    expect(existsSync(path.join(root, path.basename(repo)))).toBe(false)
+  })
+
+  it('취소해도 다른 워크트리가 든 저장소 폴더는 남긴다', async () => {
+    await withInclude(5)
+    await createWorktree({ repoPath: repo, name: 'sibling', registry: reg })
+    const ac = new AbortController()
+    await expect(
+      createWorktree({
+        repoPath: repo, name: 'incopy2', registry: reg, signal: ac.signal,
+        onProgress: (p) => {
+          if (p.stage === 'copy-includes' && p.filesCopied === 2 && !ac.signal.aborted) ac.abort()
+        }
+      })
+    ).rejects.toThrow(/WORKTREE_CANCELLED/)
+    expect(existsSync(wtDir('incopy2'))).toBe(false)
+    expect(existsSync(wtDir('sibling'))).toBe(true)
   })
 
   it('신호도 진행도 주지 않는 기존 호출은 그대로 동작한다', async () => {

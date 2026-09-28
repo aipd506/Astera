@@ -277,6 +277,22 @@ export async function createWorktree(args: {
   if (made === 'timeout') throw new Error(`WORKTREE_ROOT_UNREACHABLE: folder not reachable: ${parent}`)
   if (made !== 'present' && made !== 'created')
     throw new Error(`WORKTREE_ROOT_UNREACHABLE: cannot create the folder ${parent}`)
+  // Takes the repo's folder back — but only when **this call made it** (never one that was there
+  // before, a link or a junction included), and only when the root is still answering: that is asked
+  // first with a time-limited probe inside the process-wide budget. The rmdir itself is mutating work
+  // and runs outside the budget with its own deadline, so a slow one never marks the drive stuck.
+  // rmdir is not recursive, so a sibling worktree keeps the folder. What the cleanup answers changes
+  // nothing.
+  const takeBackRepoDir = async (): Promise<void> => {
+    if (made !== 'created') return
+    const there = await createProber({
+      access: (d) => fs.lstat(d).then(() => undefined),
+      skipQueue: true,
+      ...(args.cleanupPool ? { pool: args.cleanupPool } : {})
+    })(parent)
+    if (there === 'present')
+      await runFsWork(() => (args.removeDirAccess ?? removeOwnEmptyDir)(parent), args.fsWorkTimeoutMs)
+  }
   let slug: string | null = null
   /** The reservation of the picked name, held until its `worktree add` has finished. */
   let held: string[] = []
@@ -326,21 +342,8 @@ export async function createWorktree(args: {
       break
     }
   } finally {
-    // The repo's folder was made before a name was picked. When none was, it is taken back — but only
-    // when **this call made it** (never one that was there before, a link or a junction included), and
-    // only when the root is still answering: that is asked first with a time-limited probe inside the
-    // process-wide budget. The rmdir itself is mutating work and runs outside the budget with its own
-    // deadline, so a slow one never marks the drive stuck. rmdir is not recursive, so a sibling worktree
-    // keeps the folder. What the cleanup answers changes nothing.
-    if (!slug && !unreachable && made === 'created') {
-      const there = await createProber({
-        access: (d) => fs.lstat(d).then(() => undefined),
-        skipQueue: true,
-        ...(args.cleanupPool ? { pool: args.cleanupPool } : {})
-      })(parent)
-      if (there === 'present')
-        await runFsWork(() => (args.removeDirAccess ?? removeOwnEmptyDir)(parent), args.fsWorkTimeoutMs)
-    }
+    // The repo's folder was made before a name was picked. When none was, it is taken back.
+    if (!slug && !unreachable) await takeBackRepoDir()
   }
   if (!slug) throw new Error(`NAME_EXHAUSTED: no name starting with '${baseSlug}' is available (20 attempts)`)
 
@@ -348,6 +351,13 @@ export async function createWorktree(args: {
     args.cleanupPool,
     args.fsWorkTimeoutMs !== undefined ? { fsWorkTimeoutMs: args.fsWorkTimeoutMs } : {}
   )
+  /** Undoes the add, and once nothing of it is left, the repo's folder too when this call made it —
+   *  a cancelled creation left it behind empty (screen check, 2026-09-28). */
+  const rollBack = async (cause: unknown): Promise<Error> => {
+    const remains = await rollbackAdd(repo, wtPath, branch, rfs)
+    if (remains.length === 0) await takeBackRepoDir()
+    return afterRollback(cause, remains, wtPath, branch)
+  }
   try {
     throwIfCancelled(signal)
     report({ stage: 'checkout' })
@@ -360,12 +370,12 @@ export async function createWorktree(args: {
     // git's record and the branch may each be there or not, and whatever of it is this call's goes.
     // (git() has already killed the process tree.) The name stays reserved until that is done.
     if (add.cancelled)
-      throw afterRollback(cancelledError(), await rollbackAdd(repo, wtPath, branch, rfs), wtPath, branch)
+      throw await rollBack(cancelledError())
     if (!add.ok && add.exitCode === undefined) {
       const cause = new Error(
         `GIT_ADD_FAILED: git worktree add ${add.timedOut ? 'timed out' : 'did not answer'} (${add.stderr || add.stdout})`
       )
-      throw afterRollback(cause, await rollbackAdd(repo, wtPath, branch, rfs), wtPath, branch)
+      throw await rollBack(cause)
     }
     // git answered with an error (the folder already exists, say): what is there is not this call's
     // to take, so nothing is rolled back.
@@ -406,6 +416,6 @@ export async function createWorktree(args: {
   } catch (err) {
     // rollback: do not leave behind the worktree and branch that were just created — and say so when
     // some of it could not be taken back
-    throw afterRollback(err, await rollbackAdd(repo, wtPath, branch, rfs), wtPath, branch)
+    throw await rollBack(err)
   }
 }
