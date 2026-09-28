@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { startUp, gateOnLoginPath, startingPageUrl, loadInto, LOGIN_PATH_GATE_MS } from './startup'
+import { startUp, gateOnLoginPath, startingPageUrl, loadInto, storedTheme, LOGIN_PATH_GATE_MS } from './startup'
+import { DEFAULT_THEME_ID, themeById } from '../core/theme/themes'
 
 afterEach(() => {
   vi.useRealTimers()
@@ -112,7 +113,39 @@ describe('startingPageUrl', () => {
     const html = decodeURIComponent(url.slice('data:text/html;charset=utf-8,'.length))
     expect(html).toContain('Reading &lt;your&gt; shell…')
     expect(html).toContain('spinner')
-    expect(html).toContain('prefers-color-scheme: dark')
+  })
+
+  // Measured 2026-09-29 on macOS in light mode: the page followed the OS and stood white for as long
+  // as the login shell took (up to six seconds), then the app came up dark — every theme the app has
+  // is dark. The page now wears the app's theme, whatever the OS says.
+  it('wears the theme it is given, and never switches to a light page with the OS', () => {
+    const orion = themeById('orion')
+    const html = decodeURIComponent(startingPageUrl('x', orion).slice('data:text/html;charset=utf-8,'.length))
+    expect(html).toContain(orion.colors.bg)
+    expect(html).toContain(orion.colors.text)
+    expect(html).not.toContain('prefers-color-scheme')
+    expect(html).not.toContain('#ffffff')
+    expect(html).toContain('color-scheme:dark')
+  })
+
+  it('wears the default theme when given none', () => {
+    const html = decodeURIComponent(startingPageUrl('x').slice('data:text/html;charset=utf-8,'.length))
+    expect(html).toContain(themeById(DEFAULT_THEME_ID).colors.bg)
+  })
+})
+
+describe('storedTheme', () => {
+  it('reads the theme app-settings.json names', async () => {
+    expect((await storedTheme(async () => JSON.stringify({ theme: 'orion' }))).id).toBe('orion')
+  })
+  it('falls back to the default for a missing file, a damaged one or an unknown theme', async () => {
+    for (const read of [
+      async () => { throw Object.assign(new Error('nope'), { code: 'ENOENT' }) },
+      async () => '{not json',
+      async () => JSON.stringify({ theme: 'nebula' }),
+      async () => JSON.stringify([])
+    ])
+      expect((await storedTheme(read)).id).toBe(DEFAULT_THEME_ID)
   })
 })
 

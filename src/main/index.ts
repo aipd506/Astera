@@ -14,7 +14,7 @@ import {
 } from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, promises as fsp } from 'node:fs'
 import type { AppUpdater } from 'electron-updater'
 import iconAsset from '../../resources/icon.png?asset'
 import trayAsset from '../../resources/tray.png?asset'
@@ -22,7 +22,8 @@ import { createCore, type Core } from './core'
 import { clearAppRunning, markAppRunning } from '../core/host/pidFile'
 import { flushAllLogsSync, lineLog } from '../core/log/logWriter'
 import { applyLoginPath } from './loginPath'
-import { startUp, startingPageUrl, loadInto } from './startup'
+import { startUp, startingPageUrl, loadInto, storedTheme } from './startup'
+import type { Theme } from '../core/theme/themes'
 import { pickInitialLang } from '../core/i18n/locale'
 import { shouldForceWaylandOzone } from './ozone'
 import { registerIpc, parseAllowedExternalUrl, type OrchHandle } from './ipc'
@@ -233,11 +234,14 @@ function loadApp(win: BrowserWindow): void {
 
 /** `startingText` null loads the app at once (win32, exactly as before); otherwise the window shows
  *  that text on a start-up page, and the caller loads the app with loadApp once core is ready. */
-function createWindow(startingText: string | null = null): BrowserWindow {
+function createWindow(startingText: string | null = null, theme?: Theme): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
     title: 'Astera',
+    // The theme's background from the first frame, before any page paints: the default is white, and
+    // every theme the app has is dark (startup.ts startingPageUrl says what that looked like).
+    ...(theme ? { backgroundColor: theme.colors.bg } : {}),
     icon: APP_ICON, // window/taskbar icon (electron-builder win.icon only changes the installed exe icon)
     titleBarStyle: 'hidden',
     // macOS: titleBarStyle:'hidden' leaves the traffic-light buttons floating in the top-left. The
@@ -268,7 +272,7 @@ function createWindow(startingText: string | null = null): BrowserWindow {
     webPreferences: { preload: path.join(__dirname, '../preload/index.js'), sandbox: false, webviewTag: true }
   })
   if (startingText === null) loadApp(win)
-  else loadInto(win, { url: startingPageUrl(startingText) }, (m) => console.log(m))
+  else loadInto(win, { url: startingPageUrl(startingText, theme) }, (m) => console.log(m))
   win.maximize()
 
   // DevTools in development. Its usual accelerators (Ctrl/Cmd+Shift+I, F12) come from Electron's
@@ -439,14 +443,17 @@ app.whenReady().then(async () => {
   // (= StatusLineManager.init, account detection) — and so before any session spawns, which all come
   // after core. The window no longer waits for it: on macOS/Linux it opens first with a start-up page
   // saying what is being waited on, and the wait is bounded (startup.ts). Windows is unchanged.
+  // The theme the person picked, so the window and the start-up page wear it from the first frame.
+  // One small local file; anything wrong with it reads as the default (storedTheme).
+  const theme = await storedTheme(() => fsp.readFile(path.join(app.getPath('userData'), 'app-settings.json'), 'utf8'))
   const started = await startUp({
     platform: process.platform,
     probeLoginPath: () => applyLoginPath((m) => console.log(m)),
     openWindow: () => {
       const w =
         process.platform === 'win32'
-          ? createWindow()
-          : createWindow(t(pickInitialLang(app.getLocale()), 'startup.readingShellEnv'))
+          ? createWindow(null, theme)
+          : createWindow(t(pickInitialLang(app.getLocale()), 'startup.readingShellEnv'), theme)
       mainWindow = w
       return w
     },
