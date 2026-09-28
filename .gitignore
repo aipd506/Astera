@@ -26,6 +26,9 @@ docs/*
 # it describes is picked up in another session and often another worktree, where an ignored file does
 # not exist. It says on its face that nothing in it is decided yet.
 !docs/agent-workspace-isolation.md
+# Published deliberately: where the freeze and slowness work stopped, so the next session (possibly on
+# another machine, where the ignored ledgers do not exist) can pick it up.
+!docs/2026-09-28-next-session-handoff.md
 # Published deliberately, for the same reason as the file above: the completion convergence loop is
 # built from this design in another worktree, where an ignored file does not exist.
 !docs/2026-09-19-completion-convergence-design.md
