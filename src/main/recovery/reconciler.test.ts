@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { candidates, RecoveryReconciler } from './reconciler'
+import { candidates, RECOVERY_PASS_BUDGET_MS, RecoveryReconciler } from './reconciler'
 import { emptyState, type OrchState } from '../../core/orchestration/state'
 import type { Dispatch, Task } from '../../core/orchestration/types'
 import type { GitFacts, LostAttempt } from '../../core/recovery/types'
@@ -507,5 +507,135 @@ describe('the seam with the real store', () => {
     await store.load()
     expect(candidates(store.get()).map((c) => c.dispatch.id)).toEqual(['dsp_1'])
     await fs.promises.rm(dir, { recursive: true, force: true })
+  })
+})
+
+// Stage 4 T6: a sweep reads the journal on Electron's main thread, and each busy try holds it for the
+// reader's busy timeout. So the sweep lets the event loop turn between dispatches, and one pass spends at
+// most RECOVERY_PASS_BUDGET_MS asking a busy journal; past it the rest cannot be said, and go to a person.
+describe('RecoveryReconciler, a sweep that never holds the thread for long (stage 4 T6)', () => {
+  /** Three lost dispatches, one per Run, so the concurrency limit never holds one back. */
+  const three = (): OrchState =>
+    state({
+      runs: [run(), run({ id: 'run_2' }), run({ id: 'run_3' })],
+      tasks: [task(), task({ id: 'tsk_2', runId: 'run_2' }), task({ id: 'tsk_3', runId: 'run_3' })],
+      dispatches: [dispatch(), dispatch({ id: 'dsp_2', taskId: 'tsk_2', sessionId: 'sess-2' }), dispatch({ id: 'dsp_3', taskId: 'tsk_3', sessionId: 'sess-3' })]
+    })
+  const busyError = (): Error => Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR', errcode: 5 })
+
+  it('lets the event loop turn between two dispatches', async () => {
+    const turns: string[] = []
+    let turned = 0
+    const journal = {
+      append: () => 0,
+      eventsFor: (_runId: string, page?: EventsPage) => {
+        turns.push(`${page?.dispatchId}:${turned}`)
+        return [{ type: 'PROMPT_WRITE_CONFIRMED', dispatchId: page?.dispatchId }] as never
+      },
+      firstCheckpointFor: () => null,
+      startRecoveryAction: () => ({ recoveryActionId: 'rec_1' }) as never,
+      finishRecoveryAction: () => {}
+    }
+    const r = new RecoveryReconciler({
+      getState: () => three(),
+      setState: async () => {},
+      journal: journal as never,
+      readGitFacts: async () => ({ exists: true, head: 'aaa', dirty: false, inProgress: null, conflicts: false, branch: 'main' }),
+      smartResume: () => false,
+      execute: async () => ({ ok: true as const }),
+      log: () => {},
+      now: () => NOW
+    } as never)
+    // Everything above answers in microtasks, so without a real yield this never runs until the end.
+    const tick = (): void => {
+      turned += 1
+      if (turned < 10) setImmediate(tick)
+    }
+    setImmediate(tick)
+    await r.reconcileAll()
+    const firstReadOf = (id: string): number => Number(turns.find((t) => t.startsWith(`${id}:`))?.split(':')[1])
+    expect(firstReadOf('dsp_2')).toBeGreaterThan(firstReadOf('dsp_1'))
+    expect(firstReadOf('dsp_3')).toBeGreaterThan(firstReadOf('dsp_2'))
+  })
+
+  it('stops asking a busy journal once the pass budget is spent, and the rest go to a person unread', async () => {
+    let clock = 0
+    const reads: string[] = []
+    const executed: Array<{ dispatchId: string; strategy: string }> = []
+    const logs: string[] = []
+    const journal = {
+      append: () => 0,
+      eventsFor: (_runId: string, page?: EventsPage) => {
+        reads.push(String(page?.dispatchId))
+        // A busy try holds the thread for about 370 ms on Windows.
+        clock += 370
+        throw busyError()
+      },
+      firstCheckpointFor: () => null,
+      startRecoveryAction: () => ({ recoveryActionId: 'rec_1' }) as never,
+      finishRecoveryAction: () => {}
+    }
+    const r = new RecoveryReconciler({
+      getState: () => three(),
+      setState: async () => {},
+      journal: journal as never,
+      readGitFacts: async () => ({ exists: true, head: 'aaa', dirty: false, inProgress: null, conflicts: false, branch: 'main' }),
+      smartResume: () => false,
+      execute: async (a: { attempt: { dispatchId: string }; decision: { strategy: string } }) => {
+        executed.push({ dispatchId: a.attempt.dispatchId, strategy: a.decision.strategy })
+        return { ok: true as const }
+      },
+      log: (m: string) => logs.push(m),
+      now: () => NOW,
+      sleep: async (ms: number) => {
+        clock += ms
+      },
+      clock: () => clock
+    } as never)
+    expect(await r.reconcileAll()).toBe(3)
+    expect(executed.map((e) => e.strategy)).toEqual(['review', 'review', 'review'])
+    // The first dispatch had its whole retry; the second stopped at the budget; the third was not read.
+    expect(reads.filter((d) => d === 'dsp_1').length).toBeGreaterThan(1)
+    expect(reads).not.toContain('dsp_3')
+    // One try may start just before the budget runs out, never a pause after it.
+    expect(clock).toBeLessThanOrEqual(RECOVERY_PASS_BUDGET_MS + 370)
+    expect(logs.some((l) => /budget/.test(l) && l.includes('dsp_3'))).toBe(true)
+  })
+
+  it('a pass budget is per pass: the next sweep reads the journal again', async () => {
+    let clock = 0
+    let reads = 0
+    let busy = true
+    const journal = {
+      append: () => 0,
+      eventsFor: (_runId: string, page?: EventsPage) => {
+        reads += 1
+        clock += 370
+        if (busy) throw busyError()
+        return [{ type: 'PROMPT_WRITE_CONFIRMED', dispatchId: page?.dispatchId }] as never
+      },
+      firstCheckpointFor: () => null,
+      startRecoveryAction: () => ({ recoveryActionId: 'rec_1' }) as never,
+      finishRecoveryAction: () => {}
+    }
+    const r = new RecoveryReconciler({
+      getState: () => three(),
+      setState: async () => {},
+      journal: journal as never,
+      readGitFacts: async () => ({ exists: true, head: 'aaa', dirty: false, inProgress: null, conflicts: false, branch: 'main' }),
+      smartResume: () => false,
+      execute: async () => ({ ok: true as const }),
+      log: () => {},
+      now: () => NOW,
+      sleep: async (ms: number) => {
+        clock += ms
+      },
+      clock: () => clock
+    } as never)
+    await r.reconcileAll()
+    busy = false
+    reads = 0
+    await r.reconcileAll()
+    expect(reads).toBeGreaterThanOrEqual(3)
   })
 })

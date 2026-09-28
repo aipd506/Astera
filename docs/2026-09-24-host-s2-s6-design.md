@@ -2909,8 +2909,16 @@ Each was left as it is when A141 to A144 bounded the app's journal reads.
 - **A busy read on main still blocks for up to 250 ms** (A141). `node:sqlite` has no asynchronous read,
   so the short timeout bounds the stall rather than removing it. In WAL mode a reader meets a lock only
   in rare moments, such as WAL recovery.
-- **A journal busy for the whole retry makes recovery ask a person** (A144). About 4 s of busy answers
-  is "cannot say", so a worker that could have resumed on its own waits for a review.
+- **A journal busy for the whole retry makes recovery ask a person** (A144). One dispatch is asked up
+  to nine times with a 250 ms pause between tries. Each busy try holds the main thread for the reader's
+  busy timeout, 250 ms by the setting and about 370 ms measured on Windows, so the worst case is about
+  3.3 s of held thread in chunks of about 370 ms, and about 5.3 s in all. Past that the answer is
+  "cannot say", so a worker that could have resumed on its own waits for a review. Since stage 4 T6 a
+  sweep lets the event loop turn between dispatches, so the window paints between those chunks, and one
+  `reconcileAll` pass asks the journal for at most 10 s from its start (`RECOVERY_PASS_BUDGET_MS`). A
+  retry stops at that point, and every dispatch after it goes to review without another read. A long
+  busy spell at boot therefore sends more workers to review than it used to, in exchange for a window
+  that is never held for more than one try at a time.
 - **Every commit still waits for an fsync** (A143). On OneDrive or a slow disk that is the Host's
   thread, or main in front of an older Host.
 

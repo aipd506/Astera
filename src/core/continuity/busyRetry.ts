@@ -18,6 +18,9 @@ export async function retryBusy<T>(
     sleep?(ms: number): Promise<void>
     /** Called once, at the first busy answer: a spell of them is one log line. */
     onBusy?(err: unknown): void
+    /** Asked after a busy answer, before the pause: true ends the retry there, as still busy. A caller
+     *  with a budget of its own (the recovery sweep's pass budget) stops asking once it is spent. */
+    stop?(): boolean
   } = {}
 ): Promise<Retried<T>> {
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
@@ -26,7 +29,7 @@ export async function retryBusy<T>(
       return { ok: true, value: read() }
     } catch (err) {
       const busy = isBusyError(err)
-      if (!busy || attempt >= JOURNAL_BUSY_RETRIES) return { ok: false, busy, error: err }
+      if (!busy || attempt >= JOURNAL_BUSY_RETRIES || o.stop?.() === true) return { ok: false, busy, error: err }
       if (attempt === 0) o.onBusy?.(err)
       await sleep(JOURNAL_BUSY_RETRY_MS)
     }

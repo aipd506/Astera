@@ -40,4 +40,19 @@ describe('retryBusy (stage 3 T1)', () => {
     expect(broken).toMatchObject({ ok: false, busy: false })
     expect(sleeps).toEqual([])
   })
+
+  it('stops at once, still busy, when its caller says to stop before a pause (stage 4 T6)', async () => {
+    const sleeps: number[] = []
+    let tries = 0
+    const r = await retryBusy(
+      () => {
+        tries += 1
+        throw busy()
+      },
+      { sleep: async (ms) => void sleeps.push(ms), stop: () => tries >= 3 }
+    )
+    expect(r).toMatchObject({ ok: false, busy: true })
+    expect(tries).toBe(3)
+    expect(sleeps).toHaveLength(2)
+  })
 })
