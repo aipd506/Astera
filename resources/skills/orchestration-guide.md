@@ -1171,7 +1171,9 @@ Claude Code session:
   next screen's default, which starts a login** and tries to open a browser to sign in.
 - **At a permission prompt, your text is the answer to the permission.**
 
-If the screen shows any of these, do not send. Tell the person what the session is waiting on.
+If the screen shows any of these, do not send. Tell the person what the session is waiting on. A
+send into a terminal session at a permission prompt or a question is refused with 6 anyway, before
+anything is typed, and the message names the `sessions read` to run.
 
 **Keep what you send short.** Measured on the same Claude Code session: a one-line send is submitted,
 and `state` goes from `unknown` to `working` to `waiting` as that turn runs; text with a line break in

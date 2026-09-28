@@ -3795,6 +3795,26 @@ export async function handleCommand(
        */
       const since = Date.now()
       const resuming = wait && args.resumeWait === true
+      /**
+       * **An agent does not answer another session's prompt** (security review 2026-09-28). Text typed
+       * into a terminal session that holds a permission prompt or a question is the answer to it, and
+       * the orchestration guide tells agents not to send there; this makes it a refusal instead of a
+       * rule, before anything is typed, as a chat session's open card already refuses a send (R4.3).
+       * **An accident guard, not a boundary**: the caller is who its environment says it is, and an
+       * agent that clears ASTERA_SESSION reads as a shell, as with every role check in this CLI
+       * (docs/cli.md). It keeps an agent — or text injected into one — from answering by accident.
+       * The person in a shell, the app and the Host still answer. A session whose state is not known
+       * (a Codex terminal, one typed into since its last event) is not refused: nothing says it is
+       * at a prompt. An observed replay types nothing and is not checked.
+       */
+      const fromAgent = caller.sessionId !== '' && caller.sessionId !== APP_CALLER && caller.sessionId !== HOST_CALLER
+      if (session.kind === 'terminal' && fromAgent && !resuming && deps.sessionTurn) {
+        const now = await deps.sessionTurn(id)
+        if (now !== null && now.alive && now.state === 'waiting' && now.prompt !== null)
+          return conflict(
+            `${id} is waiting on ${now.prompt === 'permission' ? 'a permission prompt' : 'a question'}, and text sent from an agent session would answer it; nothing was sent. Read it with \`astera sessions read --id ${id}\` and tell the person what it is waiting on`
+          )
+      }
       let waitFor: (() => Promise<TurnEnding | null>) | null = null
       if (wait) {
         const timeoutWord = 'send it without --wait and read the session instead'

@@ -63,9 +63,10 @@ renderer·오케스트레이션·기록)으로 나눠 읽고, 후보 6건을 각
 **결정이 필요한 것:**
 - Windows 명명 파이프 선점(Medium): 파이프에는 검사할 폴더가 없다. Host `hello` 에 프로필별 비밀값을 넣거나
   `GetNamedPipeServerProcessId` 로 서버 프로세스 소유자를 확인해야 하며, 프로토콜 변경이다.
-- 위 두 설계 항목을 실수 방지 수준으로 좁힐지: 에이전트 세션의 `sessions send` 가 권한 확인 중인 터미널 세션을
-  향하면 거부하고 `sessions read` 를 안내(대화 세션 쪽 검사와 짝). 환경변수를 지우면 우회되므로 경계는 아니다.
-  진짜 경계는 Host 가 소켓 상대의 프로세스(`SO_PEERCRED`/`GetNamedPipeClientProcessId`)를 확인하는 것.
+- (2026-09-29 반영) 위 두 설계 항목 중 `sessions send` 는 실수 방지 수준으로 좁혔다: 에이전트 세션에서 보낸
+  send 가 권한 확인·질문 중인 터미널 세션을 향하면 아무것도 치지 않고 6 으로 거부하고 `sessions read` 를 안내한다
+  (대화 세션 쪽 검사와 짝). 환경변수를 지우면 우회되므로 경계는 아니다. 진짜 경계가 필요하면 Host 가 소켓 상대의
+  프로세스(`SO_PEERCRED`/`GetNamedPipeClientProcessId`)를 확인해야 한다 — 남은 결정.
 - `hello` 의 `role` 은 인증이 아니라서 같은 계정의 프로세스가 `role:'app'` 으로 붙으면 `COORDINATOR_ONLY` 를 우회할
   수 있다(설계와 일치, 문서화됨). 워커를 가두는 보안 장치로 기대한다면 세션별 토큰이 필요하다.
 

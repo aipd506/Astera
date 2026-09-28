@@ -859,7 +859,11 @@ text to the session. Two sends to one session are typed one after the other, nev
 `--text -` reads the text from standard input and drops one trailing newline, so a heredoc is typed
 once and Enter is pressed once. **It types into whatever the session is showing**: if the agent is
 waiting at a permission prompt or a menu, the text and the Enter answer that prompt. Read the screen
-first. A session that has ended is a 6. With `--request-id`, a retried `sessions send` is replayed
+first. Sent from inside an agent session, a send into a terminal session whose hook events say it is
+at a permission prompt or a question is refused with 6 before anything is typed, so that an agent does
+not answer one by accident; from a shell it goes through, because that is you answering. Like
+`chats answer`'s check below, this reads the caller's environment and is not a boundary. A session
+that has ended is a 6. With `--request-id`, a retried `sessions send` is replayed
 rather than typed a second time.
 
 **To a chat session, `sessions send` is one turn**, and it answers `{"id":…,"sent":true}`.

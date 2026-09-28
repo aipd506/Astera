@@ -4,6 +4,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { handleCommand, type HostSession, type OrchServerDeps } from './command'
 import { emptyState, type OrchState } from './state'
+import { APP_CALLER, HOST_CALLER } from '../host/driver'
 
 const NOW = '2026-09-26T00:00:00.000Z'
 
@@ -347,5 +348,60 @@ describe('sessions create — refused to a worker session', () => {
     for (const sessionId of ['', 'sess_plain'])
       expect((await handleCommand(deps, { sessionId }, 'sessions-create', { account: 'acc_c', cwd: 'D:/p' })).status, sessionId).toBe(200)
     // sessions send stays open to the worker.
+  })
+})
+
+// Security review 2026-09-28, the accident guard: text an agent sends into a terminal session that is
+// holding a permission prompt or a question answers it (orchestration-guide.md says so and tells agents
+// not to). A send from inside an agent session is now refused there, before anything is typed, the way a
+// chat session's open card already refuses one. It is not a boundary — an agent that clears
+// ASTERA_SESSION reads as a shell, as with every role check in this CLI (docs/cli.md) — it keeps an
+// agent, or text injected into one, from answering by accident. The person, the app and the Host still can.
+describe('sessions send — an agent does not answer another session\'s prompt', () => {
+  const terminal: HostSession = { id: 't1', kind: 'terminal', title: 't', accountId: 'acc_c', cwd: 'D:/p', alive: true, state: 'waiting' }
+  type Turn = { alive: boolean; state: 'working' | 'waiting' | 'unknown'; prompt: 'permission' | 'question' | null }
+  const rig = (turn: Turn) => {
+    const sendSession = vi.fn(async () => {})
+    const deps = makeDeps({
+      listSessions: async () => [terminal],
+      readSession: async () => ({ cols: 80, rows: 24, screen: [], scrollback: [] }),
+      sendSession,
+      readChat: async () => [],
+      chatSend: vi.fn(async () => ({ sent: true as const })),
+      sessionTurn: vi.fn(async () => turn)
+    } as Partial<OrchServerDeps>)
+    return { deps, sendSession }
+  }
+  const send = (deps: OrchServerDeps, sessionId: string) =>
+    handleCommand(deps, { sessionId }, 'sessions-send', { id: 't1', text: '1' })
+
+  it('refuses an agent session\'s send into a terminal session at a permission prompt or a question, typing nothing', async () => {
+    for (const prompt of ['permission', 'question'] as const) {
+      const h = rig({ alive: true, state: 'waiting', prompt })
+      const r = await send(h.deps, 'sess_agent')
+      expect(r.status, prompt).toBe(409)
+      expect(error(r), prompt).toContain(`sessions read --id t1`)
+      expect(h.sendSession, prompt).not.toHaveBeenCalled()
+    }
+  })
+
+  it('lets the person (a shell), the app and the Host answer it', async () => {
+    for (const sessionId of ['', APP_CALLER, HOST_CALLER]) {
+      const h = rig({ alive: true, state: 'waiting', prompt: 'permission' })
+      expect((await send(h.deps, sessionId)).status, sessionId).toBe(200)
+      expect(h.sendSession, sessionId).toHaveBeenCalledTimes(1)
+    }
+  })
+
+  it('still lets an agent send into a session at its own input prompt, or one whose state is not known', async () => {
+    for (const turn of [
+      { alive: true, state: 'waiting', prompt: null },
+      { alive: true, state: 'unknown', prompt: null },
+      { alive: true, state: 'working', prompt: null }
+    ] as Turn[]) {
+      const h = rig(turn)
+      expect((await send(h.deps, 'sess_agent')).status, JSON.stringify(turn)).toBe(200)
+      expect(h.sendSession).toHaveBeenCalledTimes(1)
+    }
   })
 })
