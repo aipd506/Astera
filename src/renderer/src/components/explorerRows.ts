@@ -41,7 +41,10 @@ export function buildTreeRows(
   root: string,
   dirs: Record<string, DirState>,
   expanded: ReadonlySet<string>,
-  editing: Editing
+  editing: Editing,
+  /** Whether the root's first read has been out longer than ROOT_SLOW_MS. Before that RootReading draws
+   *  nothing, so no row is reserved for it either (a blank 22px line at the top would be all it showed). */
+  opts: { rootSlow?: boolean } = {}
 ): TreeRow[] {
   const rows: TreeRow[] = []
   const walk = (dirPath: string, depth: number): void => {
@@ -49,7 +52,9 @@ export function buildTreeRows(
       rows.push({ kind: 'edit', key: createRowKey(dirPath), depth, isDir: editing.isDir })
     const state = dirs[dirPath]
     if (!state) {
-      if (dirPath === root) rows.push({ kind: 'rootReading', key: 'rootReading:', depth })
+      if (dirPath === root) {
+        if (opts.rootSlow) rows.push({ kind: 'rootReading', key: 'rootReading:', depth })
+      }
       else rows.push({ kind: 'note', key: `note:${dirPath}`, depth, note: 'loading' })
       return
     }
@@ -183,4 +188,38 @@ export function drawnRows(range: { start: number; end: number }, pinned: readonl
   }
   while (pi < outside.length) out.push(outside[pi++])
   return out
+}
+
+/** A reveal waiting for its row: the row's key, and the time (ms) after which it is given up */
+export interface PendingReveal {
+  key: string
+  until: number
+}
+
+/** What to do with a pending reveal after a render. Expiry is checked first: a reveal whose row turns up
+ *  only after the wait (a paste into a collapsed folder, expanded much later) must not jump the view,
+ *  so it is dropped without scrolling. Otherwise the row's index to scroll to (done), or keep waiting. */
+export function resolveReveal(
+  rows: readonly TreeRow[],
+  reveal: PendingReveal,
+  now: number
+): { index: number; done: boolean } {
+  if (now > reveal.until) return { index: -1, done: true }
+  const index = rows.findIndex((r) => r.key === reveal.key)
+  return index >= 0 ? { index, done: true } : { index: -1, done: false }
+}
+
+/** The row a keyboard move starts from: the moving end of the last keyboard move while it is still
+ *  selected, else the anchor while it is still listed, else the last selected path in tree order.
+ *  null when nothing is selected — the move then starts at the first row (moveCursor). */
+export function cursorOrigin(
+  paths: readonly string[],
+  selection: ReadonlySet<string>,
+  anchor: string | null,
+  cursor: string | null
+): string | null {
+  if (cursor !== null && selection.has(cursor) && paths.includes(cursor)) return cursor
+  if (anchor !== null && paths.includes(anchor)) return anchor
+  for (let i = paths.length - 1; i >= 0; i--) if (selection.has(paths[i])) return paths[i]
+  return null
 }

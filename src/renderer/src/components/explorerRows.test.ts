@@ -9,6 +9,8 @@ import {
   indexOfPath,
   entryPaths,
   drawnRows,
+  resolveReveal,
+  cursorOrigin,
   ROW_H,
   EDIT_H,
   EDIT_REASON_H,
@@ -71,7 +73,15 @@ describe('buildTreeRows — 펼친 트리를 행 목록으로 편다', () => {
   })
 
   it('루트를 아직 못 읽었으면 루트 읽는 중 행 하나다', () => {
-    expect(buildTreeRows(ROOT, {}, new Set(), null).map((r) => r.kind)).toEqual(['rootReading'])
+    expect(buildTreeRows(ROOT, {}, new Set(), null, { rootSlow: true }).map((r) => r.kind)).toEqual(['rootReading'])
+  })
+
+  // 느리다고 판정되기 전에는 RootReading 이 아무것도 그리지 않으므로, 빈 22px 행도 두지 않는다
+  it('루트 읽기가 아직 느리지 않으면 행이 없다', () => {
+    expect(buildTreeRows(ROOT, {}, new Set(), null)).toEqual([])
+    expect(
+      buildTreeRows(ROOT, {}, new Set(), { kind: 'create', parentDir: ROOT, isDir: false }).map((r) => r.kind)
+    ).toEqual(['edit'])
   })
 
   it('만들기 편집 행은 그 폴더의 자식 맨 위에, 이름 바꾸기 편집 행은 그 항목 자리에 선다', () => {
@@ -235,5 +245,42 @@ describe('drawnRows — 창 밖이어도 그려 둘 행', () => {
   it('창 안의 고정 행과 중복은 한 번만', () => {
     expect(drawnRows({ start: 10, end: 13 }, [11, 500, 500])).toEqual([10, 11, 12, 500])
     expect(drawnRows({ start: 0, end: 0 }, [])).toEqual([])
+  })
+})
+
+describe('resolveReveal — 기다리는 드러내기', () => {
+  const rows = buildTreeRows(ROOT, { [ROOT]: { entries: [file(ROOT, 'a'), file(ROOT, 'b')] } }, new Set(), null)
+
+  it('행이 있으면 그 자리를 알려 주고 끝낸다', () => {
+    expect(resolveReveal(rows, { key: `${ROOT}/b`, until: 1000 }, 500)).toEqual({ index: 1, done: true })
+  })
+
+  it('아직 행이 없고 기한 전이면 계속 기다린다', () => {
+    expect(resolveReveal(rows, { key: `${ROOT}/c`, until: 1000 }, 500)).toEqual({ index: -1, done: false })
+  })
+
+  // 접힌 폴더에 붙여넣고 한참 뒤 그 폴더를 펼쳤을 때 화면이 튀지 않아야 한다 — 기한이 지난 드러내기는
+  // 행이 이제 막 나타났더라도 스크롤하지 않고 버린다
+  it('기한이 지나면 행이 있어도 스크롤하지 않고 버린다', () => {
+    expect(resolveReveal(rows, { key: `${ROOT}/b`, until: 1000 }, 1001)).toEqual({ index: -1, done: true })
+  })
+})
+
+describe('cursorOrigin — 키보드 이동이 시작하는 행', () => {
+  const paths = ['/p0', '/p1', '/p2', '/p3', '/p4']
+
+  it('움직이던 커서가 선택 안에 있으면 거기서', () => {
+    expect(cursorOrigin(paths, new Set(['/p1', '/p2', '/p3']), '/p1', '/p3')).toBe('/p3')
+  })
+
+  it('커서가 없으면 앵커에서', () => {
+    expect(cursorOrigin(paths, new Set(['/p1', '/p2']), '/p2', null)).toBe('/p2')
+    // 앵커가 선택 밖이어도(Ctrl 클릭으로 뺐다) 목록에 있으면 앵커에서
+    expect(cursorOrigin(paths, new Set(['/p0']), '/p3', null)).toBe('/p3')
+  })
+
+  it('앵커도 사라졌으면 트리 순서로 마지막에 선택된 행에서', () => {
+    expect(cursorOrigin(paths, new Set(['/p3', '/p1']), '/gone', null)).toBe('/p3')
+    expect(cursorOrigin(paths, new Set(), null, null)).toBe(null)
   })
 })

@@ -16,6 +16,9 @@ import {
   entryPaths,
   editRowKey,
   drawnRows,
+  resolveReveal,
+  cursorOrigin,
+  type PendingReveal,
   ROW_H,
   OVERSCAN,
   DEFAULT_VIEWPORT_H,
@@ -158,7 +161,7 @@ export function FileExplorer({
   // A row to bring into view once it exists: what an operation just selected (create, rename,
   // duplicate, paste, drop, a Local History restore) and the row being edited. The tree is virtualized,
   // so that row may be far outside the drawn window — or not listed yet, while its folder is re-read.
-  const [reveal, setReveal] = useState<{ key: string; until: number } | null>(null)
+  const [reveal, setReveal] = useState<PendingReveal | null>(null)
   const requestReveal = (key: string): void => setReveal({ key, until: Date.now() + REVEAL_WAIT_MS })
   /** The selection as the file operations see it: the same, except that a selection an operation sets
    *  is also revealed */
@@ -166,7 +169,10 @@ export function FileExplorer({
     ...sel,
     dispatch: (action) => {
       sel.dispatch(action)
-      if (action.type === 'selectionSet' && action.paths.length > 0) requestReveal(action.paths[0])
+      // The last path — the one the reducer makes the anchor, so the row scrolled to is the row a
+      // following Shift click or keyboard move starts from
+      if (action.type === 'selectionSet' && action.paths.length > 0)
+        requestReveal(action.paths[action.paths.length - 1])
     }
   }
 
@@ -591,8 +597,8 @@ export function FileExplorer({
   // together, so the scrollbar still measures the whole tree. The rows are rebuilt only when the tree
   // or the edit target changes, never on scroll.
   const rows = useMemo(
-    () => (root ? buildTreeRows(root, dirs, expanded, editing) : []),
-    [root, dirs, expanded, editing]
+    () => (root ? buildTreeRows(root, dirs, expanded, editing, { rootSlow }) : []),
+    [root, dirs, expanded, editing, rootSlow]
   )
   // The edit row grows by a line while it shows why the name is invalid — the same test editRow uses
   const editTall = !!editing && editValue !== '' && !!tm(validateName(editValue.trim()))
@@ -635,15 +641,14 @@ export function FileExplorer({
     syncViewport()
   }
 
-  // A pending reveal is resolved after each render: once its row exists it is scrolled to; a row that
-  // never turns up (the folder failed to read, the file went away) is given up after REVEAL_WAIT_MS
+  // A pending reveal is resolved after each render: once its row exists it is scrolled to. Past
+  // REVEAL_WAIT_MS it is dropped without scrolling even if the row has just appeared — a paste into a
+  // collapsed folder that is expanded much later must not jump the view (resolveReveal).
   useLayoutEffect(() => {
     if (!reveal) return
-    const i = rows.findIndex((r) => r.key === reveal.key)
-    if (i >= 0) {
-      scrollToRow(i)
-      setReveal(null)
-    } else if (Date.now() > reveal.until) setReveal(null)
+    const { index, done } = resolveReveal(rows, reveal, Date.now())
+    if (index >= 0) scrollToRow(index)
+    if (done) setReveal(null)
   })
 
   // The row being edited is brought into view when editing starts — F2 on a selected row the user has
@@ -654,15 +659,24 @@ export function FileExplorer({
     if (editKey) requestReveal(editKey)
   }, [editKey])
 
-  /** Arrow keys, Home/End and PageUp/PageDown move the single selection over the entry rows. The target
-   *  may be outside the drawn window: it is selected by path, then scrolled into view. */
-  const moveSelection = (key: CursorKey): void => {
-    const current =
-      sel.anchor !== null && sel.selection.has(sel.anchor) ? sel.anchor : ([...sel.selection][0] ?? null)
+  /** The moving end of the last keyboard move — with Shift the anchor stays put and this end moves.
+   *  A click or right-click forgets it (the anchor is then where the next move starts). */
+  const keyCursorRef = useRef<string | null>(null)
+
+  /** Arrow keys, Home/End and PageUp/PageDown move the selection over the entry rows; with Shift they
+   *  extend the range from the anchor, like a Shift click. The target may be outside the drawn window:
+   *  it is selected by path, then scrolled into view. */
+  const moveSelection = (key: CursorKey, extend: boolean): void => {
+    const paths = entryPaths(rows)
+    const from = cursorOrigin(paths, sel.selection, sel.anchor, keyCursorRef.current)
     const pageSize = Math.max(1, Math.floor(layoutRef.current.h / ROW_H) - 1)
-    const next = moveCursor(entryPaths(rows), current, key, pageSize)
+    const next = moveCursor(paths, from, key, pageSize)
     if (next === null) return
-    sel.dispatch({ type: 'selectionSet', paths: [next] })
+    keyCursorRef.current = next
+    // The reducer's Shift click: the range from the anchor to next, anchor kept (with no anchor it
+    // selects next alone and makes it the anchor)
+    if (extend) sel.dispatch({ type: 'rowClicked', path: next, mods: { ctrl: false, shift: true }, flat: paths })
+    else sel.dispatch({ type: 'selectionSet', paths: [next] })
     scrollToRow(rows.findIndex((r) => r.key === next))
   }
 
@@ -671,6 +685,7 @@ export function FileExplorer({
   const rowActionsRef = useRef<RowActions | null>(null)
   rowActionsRef.current = {
     click: (entry, ev) => {
+      keyCursorRef.current = null
       // A folder expands on a single-selection click; a file only selects (it opens on the double click)
       if (sel.applyClickSelection(entry.path, ev) && entry.isDir) toggleDir(entry.path)
     },
@@ -683,6 +698,7 @@ export function FileExplorer({
     },
     contextMenu: (entry, ev) => {
       ev.preventDefault()
+      keyCursorRef.current = null
       sel.applyContextSelection(entry.path)
       setMenu({ x: ev.clientX, y: ev.clientY, entry })
     },
@@ -912,9 +928,9 @@ export function FileExplorer({
             return
           }
           const cursorKey = CURSOR_KEYS[ev.key]
-          if (cursorKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey) {
+          if (cursorKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
             ev.preventDefault() // the tree's own scrolling is replaced by moving the selection
-            moveSelection(cursorKey)
+            moveSelection(cursorKey, ev.shiftKey)
             return
           }
           if (ev.key === 'F2') {
