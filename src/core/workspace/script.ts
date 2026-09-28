@@ -42,6 +42,7 @@ export class ScriptDeadline implements ScriptClock {
   private waits = 0
   private timer: ReturnType<typeof setTimeout> | undefined
   private over = false
+  private constructing = true
   private readonly now: () => number
 
   constructor(private readonly o: { timeoutMs: number; launchMaxMs?: number; onExpire(): void; now?: () => number }) {
@@ -50,6 +51,7 @@ export class ScriptDeadline implements ScriptClock {
     this.launchLeft = o.launchMaxMs ?? LAUNCH_WAIT_MAX_MS
     this.since = this.now()
     this.arm()
+    this.constructing = false
   }
 
   /** Charges the time since the last settle: to the launch cap while a wait holds the deadline, and
@@ -72,6 +74,16 @@ export class ScriptDeadline implements ScriptClock {
     if (this.over) return
     const held = this.waits > 0 && this.launchLeft > 0
     if (!held && this.left <= 0) {
+      // Never inside the constructor: a timeoutMs of 0 or less expired there, before the caller had
+      // wired what expiry does (scriptWorker.ts sets its `expire` after), so such a script never timed
+      // out (stage 4 final review). From the constructor it is a timer of its own, a turn later.
+      if (this.constructing) {
+        this.timer = setTimeout(() => {
+          this.timer = undefined
+          this.arm()
+        }, 0)
+        return
+      }
       this.over = true
       this.o.onExpire()
       return

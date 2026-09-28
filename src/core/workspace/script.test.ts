@@ -116,6 +116,32 @@ describe('ScriptDeadline', () => {
     return { clock, expired }
   }
 
+  // Stage 4 final review: with timeoutMs <= 0 it expired inside the constructor, before the caller had
+  // wired what expiry should do (scriptWorker.ts sets `expire` after), so the script never timed out.
+  it('with a timeout of 0 or less, expires on the next turn, after the caller has wired it', () => {
+    for (const timeoutMs of [0, -5]) {
+      vi.useFakeTimers()
+      let expire = (): void => {}
+      const hit = vi.fn()
+      const clock = new ScriptDeadline({ timeoutMs, onExpire: () => expire() })
+      expire = hit
+      expect(hit).not.toHaveBeenCalled()
+      vi.advanceTimersByTime(0)
+      expect(hit).toHaveBeenCalledTimes(1)
+      vi.advanceTimersByTime(600_000)
+      expect(hit).toHaveBeenCalledTimes(1)
+      clock.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('a deadline disposed before that turn never expires', () => {
+    const { clock, expired } = make(0)
+    clock.dispose()
+    vi.advanceTimersByTime(1_000)
+    expect(expired).not.toHaveBeenCalled()
+  })
+
   it('the cap on launch waits is five minutes, and a launch may ask for all of it', () => {
     expect(LAUNCH_WAIT_MAX_MS).toBe(300_000)
   })
