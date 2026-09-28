@@ -1430,7 +1430,9 @@ The boundary is your machine and your operating system account.
 - The address is derived from the profile folder, so each profile has its own Host and two profiles
   on one machine never meet.
 - On macOS and Linux the socket sits in a directory created with mode 0700 before the socket is
-  bound, so it is never briefly reachable by another account.
+  bound, so it is never briefly reachable by another account. The Host refuses to serve from that
+  directory unless it is this user's alone, and the app and `astera` refuse to connect to a socket
+  there unless it is — a directory another account made first is read as no Host, on both sides.
 - On Windows a named pipe's default security descriptor does grant read access to other local
   accounts. Measured, it cannot be narrowed from Node. Read access alone cannot complete the
   handshake, and the Host sends only to peers that completed it, so another account on the machine

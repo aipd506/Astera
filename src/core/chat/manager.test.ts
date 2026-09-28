@@ -209,8 +209,10 @@ describe('ChatSessionManager.spawn', () => {
     const info = manager.spawn({ account: codexAccount, cwd: 'D:/proj' })
 
     expect(spawned).toHaveLength(1)
-    expect(spawned[0].file).toBe('cmd.exe')
-    expect(spawned[0].args).toEqual(['/c', 'codex', 'app-server'])
+    // win32 spawns the CLI by where PATH says it is; this machine's PATH does not know codex, so it is
+    // the bare name with no cmd.exe in between (windowsExecutable.ts)
+    expect(spawned[0].file).toBe('codex')
+    expect(spawned[0].args).toEqual(['app-server'])
     expect(spawned[0].opts.env.CODEX_HOME).toBe(codexAccount.configDir)
     expect(spawned[0].opts.meta).toEqual({
       kind: 'chat',
@@ -242,8 +244,8 @@ describe('ChatSessionManager.spawn', () => {
     const info = manager.spawn({ account: claudeAccount, cwd: 'D:/proj' })
 
     expect(spawned).toHaveLength(1)
-    expect(spawned[0].file).toBe('cmd.exe')
-    expect(spawned[0].args).toEqual(['/c', 'claude', ...claudeLaunchArgs({ resumeSessionId: undefined, bypass: false })])
+    expect(spawned[0].file).toBe('claude')
+    expect(spawned[0].args).toEqual(claudeLaunchArgs({ resumeSessionId: undefined, bypass: false }))
     expect(spawned[0].opts.env.CLAUDE_CONFIG_DIR).toBe(claudeAccount.configDir)
     expect(spawned[0].opts.meta).toEqual({
       kind: 'chat',
@@ -274,11 +276,7 @@ describe('ChatSessionManager.spawn', () => {
   it('launches with the model it is given, so a roll can carry the one that was picked', () => {
     const { spawned, manager } = setup('win32')
     manager.spawn({ account: claudeAccount, cwd: 'D:/proj', model: 'opus' })
-    expect(spawned[0].args).toEqual([
-      '/c',
-      'claude',
-      ...claudeLaunchArgs({ resumeSessionId: undefined, bypass: false, model: 'opus' })
-    ])
+    expect(spawned[0].args).toEqual(claudeLaunchArgs({ resumeSessionId: undefined, bypass: false, model: 'opus' }))
   })
 
   // What the roll reads when it respawns. It is the person's choice, not the model in use: the CLI can
