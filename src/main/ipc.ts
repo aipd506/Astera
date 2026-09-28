@@ -189,6 +189,7 @@ import { listSlashCommands, listCodexMentions } from './slashCommands'
 import { createFileIndex } from './fileIndex'
 import { filterFilePaths } from '../core/files/fileMatch'
 import { sortEntries, isPathWithin, isSamePath, renamePlan, resolveProjectRootFrom } from '../core/files/tree'
+import { OUTSIDE_ROOT, writeWithinRoot } from '../core/files/atomicWrite'
 import { writeFilesToClipboard } from './clipboardFiles'
 import { validateName, uniqueName, canMove, canCopy } from '../core/files/ops'
 import { copyTree, removeTree, removeWithSnapshot } from '../core/files/fsTree'
@@ -4217,14 +4218,17 @@ export function registerIpc(
     return { dataUrl: `data:${mime};base64,${buf.toString('base64')}` }
   })
   ipcMain.handle('files.write', async (_e, filePath: string, content: string) => {
-    await assertAllowedPath(filePath)
-    const tmp = filePath + '.cmtmp'
-    await fs.writeFile(tmp, content, 'utf8')
+    const root = await assertAllowedPath(filePath)
+    // The temporary file and the rename are the editor's only writes, and both used to trust the
+    // lexical check above: a link a repository planted at the temporary name, or a linked directory
+    // inside the root, put the write outside it (security review 2026-09-28). core/files/atomicWrite.ts
+    // opens the temporary file exclusively under a name nobody can plant, and resolves the directory
+    // for real against the root, the way readDataUrl does for reads.
     try {
-      await fs.rename(tmp, filePath)
+      await writeWithinRoot(root, filePath, content)
     } catch (e) {
-      // Clean up so a failed rename (antivirus, a lock, the disk) leaves no temporary file behind, then propagate the error
-      await fs.rm(tmp, { force: true }).catch(() => {})
+      if (e instanceof Error && e.message.startsWith(OUTSIDE_ROOT))
+        throw new Error(t(core.lang, 'files.error.pathNotAllowed'))
       throw e
     }
   })
