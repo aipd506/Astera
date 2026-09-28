@@ -4,6 +4,7 @@
 import net from 'node:net'
 import { HOST_PROTOCOL, type ClientMessage, type HostMessage } from './protocol'
 import { createLineReader, encodeLine } from '../../host/framing'
+import { unsafeSocketDir } from './socketDir'
 
 export interface HostConnection {
   /** `legacyApp`: the Host has an app 1.3.25 or older attached (HostMessage `hello`). Absent otherwise. */
@@ -30,6 +31,13 @@ export async function connectHost(a: {
    *  sends whoever is debugging it looking in the wrong place. */
   log(m: string): void
 }): Promise<HostConnection | ConnectFailure> {
+  // A socket in a directory another user could have made is not this user's Host, whatever answers
+  // there (core/host/socketDir.ts): read as no Host, and said so in the log.
+  const unsafe = await unsafeSocketDir(a.address)
+  if (unsafe !== null) {
+    a.log(`${unsafe} — not connecting there`)
+    return { error: 'unreachable' }
+  }
   return new Promise((resolve) => {
     const listeners = new Set<(m: HostMessage) => void>()
     const closeListeners = new Set<() => void>()

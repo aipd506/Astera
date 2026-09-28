@@ -124,6 +124,29 @@ const rawHost = async (
 }
 
 describe('HostClient', () => {
+  // Security review 2026-09-28: the Host refused to serve from a directory another user could have
+  // made (server.test.ts), but the app connected to whatever answered there — and then sent it every
+  // terminal's environment and keystrokes. The app now asks the same question before connecting.
+  it.skipIf(process.platform === 'win32')('never attaches to a socket in a directory open to everyone', async () => {
+    const addr = addressFor('squat')
+    await fs.mkdir(addr.dirToPrepare!, { recursive: true })
+    await fs.chmod(addr.dirToPrepare!, 0o777)
+    const squatter = net.createServer((sock) => {
+      sock.setEncoding('utf8')
+      sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '9.9.9', pid: 4242, startedAt: 't', features: [] }))
+    })
+    await new Promise<void>((r) => squatter.listen(addr.address, r))
+    const logs: string[] = []
+    let spawnAsked = 0
+    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => { spawnAsked += 1 }, log: (m) => logs.push(m), attempts: 2, retryMs: 10 })
+    c.start()
+    await waitFor(() => spawnAsked > 0)
+    await c.stop()
+    squatter.close()
+    expect(c.status().connected).toBe(false)
+    expect(logs.some((l) => l.includes('not a directory only this user can open'))).toBe(true)
+  })
+
   it('connects to a Host that is already there and reports what it found', async () => {
     const addr = addressFor('already')
     await serveAt(addr, { version: '1.2.3' })

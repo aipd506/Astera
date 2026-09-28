@@ -65,6 +65,19 @@ describe('connectHost', () => {
   })
 
   // 아무도 없는 주소는 기다리는 것이 아니라 바로 답이 나와야 한다
+  // 보안 검토 2026-09-28: 다른 사용자가 먼저 만들 수 있는 폴더의 소켓은 이 사용자의 Host 가 아니다 —
+  // 누가 답하든 붙지 않고, 없는 것으로 읽는다.
+  it.skipIf(process.platform === 'win32')('누구나 들어올 수 있는 폴더의 소켓에는 붙지 않는다', async () => {
+    const address = await listen((sock) => {
+      sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '1.0.0', pid: 1, startedAt: 't', features: [] }))
+    })
+    await fs.chmod(path.dirname(address), 0o777)
+    const logs: string[] = []
+    const r = await connectHost({ address, app: '1.0.0', log: (m) => logs.push(m) })
+    expect(r).toEqual({ error: 'unreachable' })
+    expect(logs.some((l) => l.includes('not a directory only this user can open'))).toBe(true)
+  })
+
   it('아무도 없으면 unreachable 이다', async () => {
     const address =
       process.platform === 'win32'

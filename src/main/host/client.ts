@@ -9,6 +9,7 @@ import { encodeLine, createLineReader } from '../../host/framing'
 // HostStatus is declared in core/types.ts, not here, so the renderer can name it without importing
 // from src/main.
 import type { HostStatus } from '../../core/types'
+import { unsafeSocketDir } from '../../core/host/socketDir'
 
 /** What `spawnHost` is handed: whether the spawn it is about to make is still wanted. */
 export interface SpawnContext {
@@ -108,8 +109,16 @@ const sleep = (ms: number): Promise<void> =>
     timer.unref?.()
   })
 
-const connectOnce = (address: string): Promise<net.Socket> =>
-  new Promise((resolve, reject) => {
+const connectOnce = async (address: string, log: (m: string) => void): Promise<net.Socket> => {
+  // Before anything is sent there: a socket in a directory another user could have made is not this
+  // user's Host, whatever answers (core/host/socketDir.ts). Refused the way an absent Host is, and the
+  // Host this then starts refuses the same directory itself, so nothing of this profile ever runs there.
+  const unsafe = await unsafeSocketDir(address)
+  if (unsafe !== null) {
+    log(`${unsafe} — not connecting there`)
+    throw new Error(unsafe)
+  }
+  return new Promise((resolve, reject) => {
     const socket = net.connect(address)
     socket.setEncoding('utf8')
     socket.once('connect', () => resolve(socket))
@@ -118,6 +127,7 @@ const connectOnce = (address: string): Promise<net.Socket> =>
       reject(err)
     })
   })
+}
 
 export class HostClient {
   private socket: net.Socket | null = null
@@ -451,7 +461,7 @@ export class HostClient {
     let asked = false
     for (let i = 0; i < attempts && !this.stopped; i++) {
       try {
-        const socket = await connectOnce(this.deps.address)
+        const socket = await connectOnce(this.deps.address, this.deps.log)
         // `stop()` may have landed while this connect was in flight. Attaching now would report a
         // connection the caller has already given up on, and the socket's own 'close' handler returns
         // early once stopped — so the status would never be corrected again.

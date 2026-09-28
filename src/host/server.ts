@@ -21,6 +21,7 @@ import type { HostLog } from './log'
 import { AppUnreachable, type OrchCall, type OrchCaller } from '../core/host/orchProtocol'
 import { HOST_UNRESPONSIVE_MS } from '../core/host/unresponsive'
 import { pidLives } from '../core/host/pidFile'
+import { privateDirProblem } from '../core/host/socketDir'
 
 /** Thrown by `startHostServer` when another Host already answers at this address. The entry point
  *  turns it into a quiet exit: losing the race is the normal outcome of two apps starting at once. */
@@ -240,11 +241,11 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
     // EADDRINUSE path below would read as a live Host and step aside for. Design section 5 says
     // access control is the operating system, and that only holds while the directory's own mode says
     // so, so check it rather than assume it.
+    // The same question every client asks before connecting (core/host/socketDir.ts)
     const st = await fs.lstat(deps.dirToPrepare)
-    if (!st.isDirectory() || process.getuid?.() !== st.uid || (st.mode & 0o077) !== 0) {
-      deps.log.write(
-        `${deps.dirToPrepare} is not a directory only this user can open (uid ${st.uid}, mode ${(st.mode & 0o777).toString(8)}) — not serving there`
-      )
+    const problem = privateDirProblem(st, process.getuid?.())
+    if (problem !== null) {
+      deps.log.write(`${deps.dirToPrepare} is not a directory only this user can open (${problem}) — not serving there`)
       throw new Error(UNSAFE_ADDRESS_DIR)
     }
   }
