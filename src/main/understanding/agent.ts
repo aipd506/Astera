@@ -14,6 +14,7 @@ import type { GeneratorSettings } from '../../core/understanding/generatorSettin
 import { extractJson, readClaudeOutput, readCodexOutput } from '../../core/understanding/agentOutput'
 import { agentArgs, codexMcpServerNames } from '../../core/understanding/agentArgs'
 import { defaultCwdProbe, type Probe } from '../../core/sessions/pathProbe'
+import { windowsSpawn } from '../../core/sessions/windowsExecutable'
 
 /** 한 번의 생성에 주는 시간.
  *
@@ -32,7 +33,9 @@ export type AgentRun = { ok: true; value: unknown } | { ok: false; reason: strin
  *  쓰는 방식과 같다(core/sessions/commands.ts). 인자는 전부 이 파일이 만든 것이고 사용자 입력은
  *  프롬프트 하나뿐인데, 그것은 **stdin 으로 보낸다** — cmd 의 인용 규칙을 타지 않는다. */
 function wrap(file: string, args: string[]): { file: string; args: string[] } {
-  return process.platform === 'win32' ? { file: 'cmd.exe', args: ['/c', file, ...args] } : { file, args }
+  // By where PATH says the CLI is, never by name: the cwd below is the project, and cmd.exe would
+  // look a bare name up there first (core/sessions/windowsExecutable.ts)
+  return process.platform === 'win32' ? windowsSpawn(file, args) : { file, args }
 }
 
 interface RunArgs {

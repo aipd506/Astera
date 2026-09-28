@@ -101,6 +101,16 @@ describe('createHostSessionStarter — sessions create, by the spawn paths the H
     expect(h.chats.spawn).not.toHaveBeenCalled()
   })
 
+  // Security review 2026-09-28: the command layer refuses cmd.exe syntax in a terminal prompt; the
+  // Host is the layer that spawns, so it refuses it too, before anything starts.
+  it('a terminal prompt with cmd.exe syntax is refused here too, and nothing is spawned', async () => {
+    const h = rig()
+    const err = await h.start({ kind: 'terminal', accountId: 'acc_c', cwd: '/repo', prompt: 'hi|calc.exe', rollAccountIds: [] }).catch((e: unknown) => e)
+    expect(String(err)).toContain('line break')
+    expect(wasRefusedBeforeActing(err)).toBe(true)
+    expect(h.spawner.createSession).not.toHaveBeenCalled()
+  })
+
   it('a Host with no spawner starts nothing', async () => {
     const h = rig({ spawner: null, chats: null })
     for (const kind of ['terminal', 'chat'] as const) {

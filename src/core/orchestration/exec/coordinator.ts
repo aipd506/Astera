@@ -109,8 +109,10 @@ export interface CoordinatorDeps {
   idleWaitTimeoutMs?: number
 }
 
-/** Characters that break quoting under win32's cmd.exe /c wrapping if they reach the launch prompt */
-export const LAUNCH_FORBIDDEN = /["&|<>^%]/
+/** Characters that break quoting under win32's cmd.exe /c wrapping if they reach the launch prompt —
+ *  the rule lives beside sanitizeResumePrompt now, and `sessions create` checks it too */
+import { LAUNCH_FORBIDDEN } from '../../sessions/commands'
+export { LAUNCH_FORBIDDEN }
 /** Gap between the prompt and Enter when injecting into a reused session. Same value as rolling and the scheduler */
 const ENTER_DELAY_MS = 150
 /** Polling interval while waiting for the busy -> idle transition. Same value as the server's check/ask polling (POLL_MS) */

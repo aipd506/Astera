@@ -190,6 +190,7 @@ import { createFileIndex } from './fileIndex'
 import { filterFilePaths } from '../core/files/fileMatch'
 import { sortEntries, isPathWithin, isSamePath, renamePlan, resolveProjectRootFrom } from '../core/files/tree'
 import { OUTSIDE_ROOT, writeWithinRoot } from '../core/files/atomicWrite'
+import { resolveWindowsExecutable, windowsSpawn } from '../core/sessions/windowsExecutable'
 import { writeFilesToClipboard } from './clipboardFiles'
 import { validateName, uniqueName, canMove, canCopy } from '../core/files/ops'
 import { copyTree, removeTree, removeWithSnapshot } from '../core/files/fsTree'
@@ -7190,13 +7191,27 @@ export function registerIpc(
   // (Volta 등)는 그 폴더의 프로젝트 manifest 를 읽어 도구 버전을 정하므로, 앱의 cwd 에서 검사하면
   // 읽을 manifest 가 없어 무조건 통과하고 세션만 죽는다(설계 D3). 실패의 첫 줄을 함께 돌려준다 —
   // "없음"과 "이 폴더에서는 안 돎"은 사람이 할 일이 다르다.
+  //
+  // **On win32 the CLI is spawned by where PATH says it is, never by name** (security review
+  // 2026-09-28, core/sessions/windowsExecutable.ts): this ran `cmd.exe /c claude --version` in the
+  // chosen folder, and cmd.exe looks a bare name up in its current directory before PATH — so a
+  // repository shipping a `claude.cmd` had it run the moment its folder was picked. A CLI PATH does
+  // not know is reported missing without asking the folder.
   ipcMain.handle('system.checkCli', async (_e, cwd?: string) => {
     const check = (cli: string): Promise<{ ok: boolean; version?: string; error?: string }> =>
       new Promise((resolve) => {
+        const spawn =
+          process.platform === 'win32'
+            ? (() => {
+                const found = resolveWindowsExecutable(cli)
+                return found === null ? null : { ...windowsSpawn(cli, ['--version'], () => found), shell: false }
+              })()
+            : { file: cli, args: ['--version'], shell: true }
+        if (spawn === null) return resolve({ ok: false })
         execFile(
-          cli,
-          ['--version'],
-          { shell: true, timeout: 10_000, windowsHide: true, ...(cwd ? { cwd } : {}) },
+          spawn.file,
+          spawn.args,
+          { shell: spawn.shell, timeout: 10_000, windowsHide: true, ...(cwd ? { cwd } : {}) },
           (err, stdout, stderr) => {
             if (!err) return resolve({ ok: true, version: stdout.trim() })
             const line = String(stderr)

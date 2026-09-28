@@ -5,6 +5,7 @@ import type { BranchRef, RepoProbe } from '../types'
 import { treeKillCommand } from '../run/kill'
 import { cancelledError } from './cancel'
 import { defaultCwdProbe, type Probe } from '../sessions/pathProbe'
+import { windowsExecutable } from '../sessions/windowsExecutable'
 
 export interface GitResult {
   ok: boolean
@@ -126,8 +127,10 @@ export function git(
       }
       const onAbort = (): void => stop('cancelled')
       try {
+        // By PATH on win32, not by name: libuv looks a bare name up in the child's cwd first, and the
+        // cwd here is a repository (windowsExecutable.ts, security review 2026-09-28)
         child = execFile(
-          'git',
+          windowsExecutable('git'),
           args,
           { cwd: opts?.cwd, windowsHide: true, maxBuffer: GIT_MAX_BUFFER_BYTES },
           (err, stdout, stderr) => {

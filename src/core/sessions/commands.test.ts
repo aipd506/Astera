@@ -2,6 +2,14 @@ import { describe, it, expect } from 'vitest'
 import { buildClaudeCommand, buildCodexCommand, buildCodexAppServerCommand, buildClaudeChatCommand } from './commands'
 import { claudeLaunchArgs } from '../chat/claudeProtocol'
 
+/** Where the npm shims live on a test machine: the win32 builders spawn a CLI by where PATH says it
+ *  is, never by name (windowsExecutable.ts), so a test says where that is. */
+const SHIMS: Record<string, string> = {
+  claude: 'C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd',
+  codex: 'C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd'
+}
+const shim = (name: string): string | null => SHIMS[name] ?? null
+
 describe('initialPrompt', () => {
   it('claude: 마지막 위치 인자로 싣는다', () => {
     const { file, args } = buildClaudeCommand('linux')({ initialPrompt: 'C:/u/orch/specs/a.md 를 읽어라' })
@@ -13,13 +21,13 @@ describe('initialPrompt', () => {
     expect(args.at(-1)).toBe('C:/u/orch/specs/a.md 를 읽어라')
   })
   it('win32에서도 cmd.exe 래핑의 마지막에 온다', () => {
-    const { file, args } = buildClaudeCommand('win32')({ initialPrompt: 'C:/u/orch/specs/a.md 를 읽어라' })
+    const { file, args } = buildClaudeCommand('win32', shim)({ initialPrompt: 'C:/u/orch/specs/a.md 를 읽어라' })
     expect(file).toBe('cmd.exe')
     expect(args.at(-1)).toBe('C:/u/orch/specs/a.md 를 읽어라')
   })
   it('initialPrompt는 sanitize하지 않는다 — 경로가 깨지면 안 된다', () => {
     const p = 'C:/u/orch/specs/tsk_1-dsp_1.md 를 읽고 그 지시를 따르라'
-    expect(buildCodexCommand('win32')({ initialPrompt: p }).args.at(-1)).toBe(p)
+    expect(buildCodexCommand('win32', shim)({ initialPrompt: p }).args.at(-1)).toBe(p)
   })
   it('resumeSessionId와 함께 오면 resume 인자 뒤에 온다', () => {
     const { args } = buildCodexCommand('linux')({
@@ -50,7 +58,7 @@ describe('claude --add-dir', () => {
     expect(buildClaudeCommand('linux')({ addDirs: [] }).args).toEqual([])
   })
   it('carries a win32 path through the cmd.exe wrapper', () => {
-    const { file, args } = buildClaudeCommand('win32')({ addDirs: ['C:\Users\me\AppData\Roaming\astera-dev\preview\shots'] })
+    const { file, args } = buildClaudeCommand('win32', shim)({ addDirs: ['C:\Users\me\AppData\Roaming\astera-dev\preview\shots'] })
     expect(file).toBe('cmd.exe')
     expect(args).toContain('C:\Users\me\AppData\Roaming\astera-dev\preview\shots')
   })
@@ -60,8 +68,11 @@ describe('claude --add-dir', () => {
 })
 
 describe('buildCodexAppServerCommand', () => {
-  it('wraps through cmd.exe on win32', () => {
-    expect(buildCodexAppServerCommand('win32')).toEqual({ file: 'cmd.exe', args: ['/c', 'codex', 'app-server'] })
+  it('wraps through cmd.exe on win32, by the shim’s absolute path', () => {
+    expect(buildCodexAppServerCommand('win32', shim)).toEqual({
+      file: 'cmd.exe',
+      args: ['/d', '/c', 'call', SHIMS.codex, 'app-server']
+    })
   })
   it('runs codex directly elsewhere', () => {
     expect(buildCodexAppServerCommand('linux')).toEqual({ file: 'codex', args: ['app-server'] })
@@ -70,11 +81,10 @@ describe('buildCodexAppServerCommand', () => {
 
 describe('buildClaudeChatCommand', () => {
   it('wraps through cmd.exe on win32, claude first', () => {
-    const { file, args } = buildClaudeChatCommand('win32', { bypass: false })
+    const { file, args } = buildClaudeChatCommand('win32', { bypass: false }, shim)
     expect(file).toBe('cmd.exe')
-    expect(args[0]).toBe('/c')
-    expect(args[1]).toBe('claude')
-    expect(args.slice(2)).toEqual(claudeLaunchArgs({ bypass: false }))
+    expect(args.slice(0, 4)).toEqual(['/d', '/c', 'call', SHIMS.claude])
+    expect(args.slice(4)).toEqual(claudeLaunchArgs({ bypass: false }))
   })
   it('runs claude directly elsewhere', () => {
     const { file, args } = buildClaudeChatCommand('linux', { bypass: false })
@@ -86,5 +96,29 @@ describe('buildClaudeChatCommand', () => {
     expect(args).toEqual(claudeLaunchArgs({ resumeSessionId: 'th-1', bypass: true, model: 'opus' }))
     expect(args.indexOf('--resume=th-1')).toBeLessThan(args.indexOf('--permission-mode'))
     expect(args.indexOf('--permission-mode')).toBeLessThan(args.indexOf('--model'))
+  })
+})
+
+// Security review 2026-09-28 (CWE-427): cmd.exe looks a bare name up in the working directory before
+// PATH, and the working directory is the project. A CLI is therefore never named to cmd.exe: a .cmd
+// shim goes by its absolute path, a native .exe is spawned with no shell at all, and a CLI that PATH
+// does not know is spawned bare rather than handed to cmd.exe — the repository's folder is never it.
+describe('win32 never hands a bare CLI name to cmd.exe', () => {
+  it('a .cmd shim is called by its absolute path', () => {
+    expect(buildClaudeCommand('win32', shim)({}).args.slice(0, 4)).toEqual(['/d', '/c', 'call', SHIMS.claude])
+  })
+  it('a native .exe is spawned directly', () => {
+    const exe = 'C:\\Users\\me\\.local\\bin\\claude.exe'
+    expect(buildClaudeCommand('win32', () => exe)({ initialPrompt: 'hi' })).toEqual({ file: exe, args: ['--', 'hi'] })
+    expect(buildClaudeChatCommand('win32', { bypass: true }, () => exe).file).toBe(exe)
+  })
+  it('a CLI PATH does not know is not looked up by cmd.exe', () => {
+    for (const cmd of [
+      buildClaudeCommand('win32', () => null)({}),
+      buildCodexCommand('win32', () => null)({}),
+      buildCodexAppServerCommand('win32', () => null),
+      buildClaudeChatCommand('win32', { bypass: false }, () => null)
+    ])
+      expect(cmd.file).not.toBe('cmd.exe')
   })
 })

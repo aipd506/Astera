@@ -23,6 +23,7 @@ import type { HostChats } from './hostChats'
 import type { HostRolling } from './rolling'
 import type { HostSpawner } from './spawner'
 import { checkCwd, type ProbeResult } from '../core/sessions/pathProbe'
+import { LAUNCH_FORBIDDEN } from '../core/sessions/commands'
 
 export function createHostSessionStarter(d: {
   /** Null for a Host started without the agent CLI paths: it starts no session. */
@@ -58,6 +59,10 @@ export function createHostSessionStarter(d: {
   const terminal = async (o: SessionCreate): Promise<HostSession> => {
     if (!d.spawner)
       throw refusedBeforeActing(new Error('this Host starts no sessions: it was started without the agent CLI paths'))
+    // The command layer refuses these first; this is the layer that spawns, so it refuses them too
+    // (commands.ts LAUNCH_FORBIDDEN — a command-line prompt, cmd.exe on win32)
+    if (o.prompt !== undefined && LAUNCH_FORBIDDEN.test(o.prompt))
+      throw refusedBeforeActing(new Error('the prompt must not contain " & | < > ^ % or a line break'))
     const info = await d.spawner.createSession({
       accountId: o.accountId,
       cwd: o.cwd,

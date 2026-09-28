@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import type { GhFailureKind, GhProbe } from './types'
+import { windowsExecutable } from '../sessions/windowsExecutable'
 
 export interface GhResult {
   ok: boolean
@@ -25,8 +26,9 @@ const MAX_BUFFER_ERROR_CODE = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
  *  buffer is sized explicitly rather than inherited. */
 export function gh(args: string[], opts?: { cwd?: string; timeoutMs?: number }): Promise<GhResult> {
   return new Promise((resolve) => {
+    // By PATH on win32, not by name, for the reason git.ts gives (windowsExecutable.ts)
     execFile(
-      'gh',
+      windowsExecutable('gh'),
       args,
       {
         cwd: opts?.cwd,

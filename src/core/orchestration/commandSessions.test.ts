@@ -110,6 +110,21 @@ describe('sessions create — refused before anything starts', () => {
     await refused({ account: 'acc_c', cwd: 'D:/p', rollAccounts: 'acc_x' }, 400, 'mix')
   })
 
+  // Security review 2026-09-28: a terminal session's prompt is a command-line argument, and on win32
+  // the launch goes through cmd.exe — `--prompt "hi|calc.exe"` ran calc.exe from the Host. The
+  // worker launch has refused these characters from the start; this call did not.
+  it('a terminal prompt with cmd.exe syntax is 2, before anything starts', async () => {
+    for (const prompt of ['hi|calc.exe', 'hi&calc.exe', 'say "hi"', 'a%PATH%b', 'two\nlines', 'x<y', 'x>y', 'x^y'])
+      await refused({ account: 'acc_c', cwd: 'D:/p', prompt }, 400, 'command line')
+  })
+
+  it('a chat prompt goes over stdio and is not checked', async () => {
+    const createSession = vi.fn(async () => row())
+    const r = await call(makeDeps({ createSession }), { account: 'acc_c', cwd: 'D:/p', kind: 'chat', prompt: 'hi|there & "you"' })
+    expect(r.status).toBe(200)
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ prompt: 'hi|there & "you"' }))
+  })
+
   it('an empty --prompt or --title is 2, not a session with nothing', async () => {
     await refused({ account: 'acc_c', cwd: 'D:/p', prompt: true }, 400, '--prompt')
     await refused({ account: 'acc_c', cwd: 'D:/p', title: true }, 400, '--title')

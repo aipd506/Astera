@@ -271,13 +271,17 @@ describe('SessionManager', () => {
     expect(spawned[0].pty.resized).toEqual([{ cols: 100, rows: 40 }])
   })
 
+  // win32 는 PATH 가 말하는 절대 경로로 띄운다 — 이름으로 넘기면 cmd.exe 가 작업 폴더에서 먼저 찾는다
+  // (windowsExecutable.ts, 보안 검토 2026-09-28). 테스트는 npm shim 이 어디 있는지 직접 말해 준다.
+  const SHIM = 'C:\\Users\\me\\AppData\\Roaming\\npm'
+  const shim = (name: string): string => `${SHIM}\\${name}.cmd`
   it('buildClaudeCommand는 win32에서 cmd.exe 래퍼를 쓴다', () => {
-    expect(buildClaudeCommand('win32')({})).toEqual({ file: 'cmd.exe', args: ['/c', 'claude'] })
+    expect(buildClaudeCommand('win32', shim)({})).toEqual({ file: 'cmd.exe', args: ['/d', '/c', 'call', shim('claude')] })
     expect(buildClaudeCommand('darwin')({})).toEqual({ file: 'claude', args: [] })
   })
 
   it('buildCodexCommand는 resume·bypass를 codex 인자로 매핑한다', () => {
-    expect(buildCodexCommand('win32')({})).toEqual({ file: 'cmd.exe', args: ['/c', 'codex'] })
+    expect(buildCodexCommand('win32', shim)({})).toEqual({ file: 'cmd.exe', args: ['/d', '/c', 'call', shim('codex')] })
     expect(buildCodexCommand('darwin')({ resumeSessionId: 'abc' })).toEqual({
       file: 'codex', args: ['resume', 'abc']
     })
@@ -299,14 +303,14 @@ describe('SessionManager', () => {
   // 리뷰 지적: win32는 cmd.exe /c 래퍼라 node-pty의 MSVCRT 인용(\")이 cmd에는 통하지 않는다.
   // 따옴표가 든 프롬프트는 기동 실패(=전환 순간 탭이 죽는다), 공백 없는 &·| 는 cmd가 분리 실행한다.
   it('buildCodexCommand는 프롬프트의 셸 메타문자를 지운다 (cmd.exe 주입·인용 깨짐 방지)', () => {
-    const meta = buildCodexCommand('win32')({
+    const meta = buildCodexCommand('win32', shim)({
       resumeSessionId: 'abc',
       resumePrompt: '계속"하기" & 정리 | 끝 > out < in ^esc'
     })
-    expect(meta.args).toEqual(['/c', 'codex', 'resume', 'abc', '계속 하기 정리 끝 out in esc'])
+    expect(meta.args).toEqual(['/d', '/c', 'call', shim('codex'), 'resume', 'abc', '계속 하기 정리 끝 out in esc'])
     // 공백 없이 붙은 메타문자도 분리 실행 경로가 사라진다
     expect(
-      buildCodexCommand('win32')({ resumeSessionId: 'abc', resumePrompt: '계속&정리' }).args.at(-1)
+      buildCodexCommand('win32', shim)({ resumeSessionId: 'abc', resumePrompt: '계속&정리' }).args.at(-1)
     ).toBe('계속 정리')
     // 줄바꿈도 cmd 커맨드라인을 끊는다
     expect(
@@ -332,8 +336,8 @@ describe('SessionManager', () => {
     expect(
       buildCodexCommand('darwin')({ resumeSessionId: 'abc', resumePrompt: '이어서 작업 진행해 줘' }).args
     ).toEqual(['resume', 'abc', '이어서 작업 진행해 줘'])
-    expect(buildCodexCommand('win32')({ resumeSessionId: 'abc', resumePrompt: ' && ' }).args).toEqual([
-      '/c', 'codex', 'resume', 'abc'
+    expect(buildCodexCommand('win32', shim)({ resumeSessionId: 'abc', resumePrompt: ' && ' }).args).toEqual([
+      '/d', '/c', 'call', shim('codex'), 'resume', 'abc'
     ])
   })
 

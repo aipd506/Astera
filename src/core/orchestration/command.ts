@@ -93,6 +93,7 @@ import { appDriven } from './schedule'
 import type { JobEvent, RunOutcome } from '../types'
 import type { SessionCheck } from '../workUnit/types'
 import { PTY_LOST_SIGHT_EXIT_CODE } from '../sessions/pty'
+import { LAUNCH_FORBIDDEN } from '../sessions/commands'
 import { parseHandoffBody } from '../handoff/parse'
 import type { HandoffBody } from '../handoff/types'
 import type { Lang } from '../i18n'
@@ -3909,6 +3910,15 @@ export async function handleCommand(
         return bad('--unattended is for chat sessions: what the Host does with a permission prompt nobody is there to answer')
       if (args.title !== undefined && str(args.title) === null) return bad('--title needs a value')
       if (args.prompt !== undefined && str(args.prompt) === null) return bad('--prompt needs a value: the first thing the session is asked')
+      // A terminal session's prompt is a command-line argument, and on win32 the launch goes through
+      // cmd.exe, which reads & | < > ^ " as syntax: `--prompt "hi|calc.exe"` ran calc.exe from the
+      // Host, with no session and no permission prompt anywhere (security review 2026-09-28). The
+      // worker launch has refused these characters from the start (coordinator.ts); this call came
+      // later and did not. A chat session's prompt goes over stdio and is not checked.
+      if (args.prompt !== undefined && sessionKind === 'terminal' && LAUNCH_FORBIDDEN.test(str(args.prompt)!))
+        return bad(
+          '--prompt for a terminal session must not contain " & | < > ^ % or a line break: it is passed on the command line. Put the text in a file and ask the session to read it, or start a chat session'
+        )
       const known = await deps.listAccounts()
       const mine = known.find((a) => a.id === account)
       if (!mine) return notFound(`unknown account: ${account}`)
