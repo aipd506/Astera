@@ -1,5 +1,5 @@
 // Multi-selection maths (pure module). Shift+click range selection is defined by the on-screen
-// order, so this has to reproduce FileExplorer's renderDir traversal order exactly — if it drifts,
+// order, so this has to reproduce the explorer tree's row order (buildTreeRows in components/explorerRows.ts) exactly — if it drifts,
 // the selected span stops matching the span the user sees. Like ops.ts and paths.ts, it uses string
 // operations only, no node:path.
 
@@ -10,7 +10,7 @@ export interface VisibleDir {
   entries?: { path: string; isDir: boolean }[]
 }
 
-/** The flat order of the items visible on screen. Reproduces renderDir's traversal exactly — it walks
+/** The flat order of the items visible on screen. Reproduces the tree's row order (buildTreeRows) exactly — it walks
  *  the child listing in order and recurses into an expanded folder in place (so a folder's children
  *  come before that folder's siblings).
  *  A folder that is expanded but has no cache yet (still loading) is skipped — it has no children on

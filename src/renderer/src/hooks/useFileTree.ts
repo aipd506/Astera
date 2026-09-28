@@ -79,7 +79,7 @@ export function useFileTree(
         // error, etc.) are cached as-is and shown to the user.
         // The dirPath !== root condition: when a child folder is evicted it also drops out of the
         // parent's entries list, so it disappears from the tree entirely and there is no problem, but
-        // the root has no parent and renderDir(root, 0) always renders it regardless of the
+        // the root has no parent and the tree (buildTreeRows) always renders it regardless of the
         // expanded/dirs state — evicting the root takes the !state branch and gets permanently stuck
         // on 'loading…', with no way out because a path that is already gone gets no further watcher
         // events and no re-query either. When the root itself is gone, cache the error as it does now

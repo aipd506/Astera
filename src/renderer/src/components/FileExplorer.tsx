@@ -1,21 +1,36 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { parentDir } from '../../../core/files/paths'
 import { validateName, isSubPath, canMove, canCopy } from '../../../core/files/ops'
 import { resolveFileIcon, resolveFolderIcon } from '../../../core/files/icons'
 import { FileIcon } from './FileIcon'
 import { ContextMenu, type MenuItem } from './ContextMenu'
 import { LocalHistoryDialog } from './LocalHistoryDialog'
-import { RowLoading, RootReading, FileOpStatusLine, ROOT_SLOW_MS } from './ExplorerLoading'
+import { RootReading, FileOpStatusLine, ROOT_SLOW_MS } from './ExplorerLoading'
+import { ExplorerRow, type RowActions } from './ExplorerRow'
+import {
+  buildTreeRows,
+  rowOffsets,
+  visibleRange,
+  revealScrollTop,
+  moveCursor,
+  entryPaths,
+  editRowKey,
+  drawnRows,
+  ROW_H,
+  OVERSCAN,
+  DEFAULT_VIEWPORT_H,
+  type CursorKey,
+  type TreeRow
+} from './explorerRows'
 import { toast } from '../lib/toast'
 import { useFileTree, type Entry, type DirState } from '../hooks/useFileTree'
-import { useExplorerSelection } from '../hooks/useExplorerSelection'
+import { useExplorerSelection, type ExplorerSelection } from '../hooks/useExplorerSelection'
 import { useFileOps, errText } from '../hooks/useFileOps'
 import { useGitStatus } from '../hooks/useGitStatus'
 import { useI18n } from '../i18n/I18nProvider'
 import type { UndoEntry } from '../../../core/files/undo'
-import type { GitState } from '../../../core/git/status'
 import { runnableKindForFile } from '../../../core/run/runFile'
-import { ChevronDown, ChevronRight, RefreshCw, X } from 'lucide-react'
+import { RefreshCw, X } from 'lucide-react'
 
 /** Tree snapshot the App holds on to, so that even when the explorer toggle unmounts FileExplorer the tree can be handed back on remount */
 export interface ExplorerTreeState {
@@ -26,6 +41,19 @@ export interface ExplorerTreeState {
    *  selection/anchor are the opposite — they are keyed to root, because once the root changes they go
    *  stale with nothing on screen to show it, which is dangerous. */
   clipboard: { mode: 'cut' | 'copy'; paths: string[] } | null
+}
+
+/** How long a requested reveal waits for its row to appear (a pasted file's folder is still being re-read) */
+const REVEAL_WAIT_MS = 3000
+
+/** Keys that move the selection over the tree's rows */
+const CURSOR_KEYS: Record<string, CursorKey> = {
+  ArrowUp: 'up',
+  ArrowDown: 'down',
+  Home: 'home',
+  End: 'end',
+  PageUp: 'pageUp',
+  PageDown: 'pageDown'
 }
 
 /** File explorer. Root = the active session's cwd, lazy loading — files.list is called only when a folder is expanded. */
@@ -81,6 +109,10 @@ export function FileExplorer({
 
   // After editing ends (commit/cancel/Escape) focus goes back to the tree so F2/Delete can be used repeatedly
   const treeRef = useRef<HTMLDivElement>(null)
+  /** The spacer inside the tree that is as tall as every row — a right-click on it is on empty space */
+  const spaceRef = useRef<HTMLDivElement>(null)
+  /** The row a drag started on — kept drawn while the drag lasts, since its dragend fires on it */
+  const dragSourceRef = useRef<string | null>(null)
 
   // The map is keyed by root, so looking a snapshot up is just a get() — no root-match filtering needed
   // to find the right entry (that part is handled by the key itself).
@@ -123,6 +155,21 @@ export function FileExplorer({
   // by the explorer toggle and a root change, otherwise cross-project paste does not work.
   const sel = useExplorerSelection(root, clipboardRef.current ?? null, tree.flatVisible)
 
+  // A row to bring into view once it exists: what an operation just selected (create, rename,
+  // duplicate, paste, drop, a Local History restore) and the row being edited. The tree is virtualized,
+  // so that row may be far outside the drawn window — or not listed yet, while its folder is re-read.
+  const [reveal, setReveal] = useState<{ key: string; until: number } | null>(null)
+  const requestReveal = (key: string): void => setReveal({ key, until: Date.now() + REVEAL_WAIT_MS })
+  /** The selection as the file operations see it: the same, except that a selection an operation sets
+   *  is also revealed */
+  const opsSel: ExplorerSelection = {
+    ...sel,
+    dispatch: (action) => {
+      sel.dispatch(action)
+      if (action.type === 'selectionSet' && action.paths.length > 0) requestReveal(action.paths[0])
+    }
+  }
+
   // Mirror of the currently committed root, independent of the per-root map — useFileOps needs to know
   // whether root changed while an async op was in flight, and a map has no single "current root" of its
   // own to ask.
@@ -133,7 +180,7 @@ export function FileExplorer({
   const ops = useFileOps({
     root,
     tree,
-    sel,
+    sel: opsSel,
     treeRef,
     stateRef: currentRootRef,
     undoRef,
@@ -175,6 +222,7 @@ export function FileExplorer({
       // used by the next drop
       //
       dragPathsRef.current = []
+      dragSourceRef.current = null
       setDragging(false)
       tree.resetTree()
       sel.dispatch({ type: 'rootCleared' })
@@ -210,6 +258,7 @@ export function FileExplorer({
       // can never hold here). On a remount dragPathsRef is a fresh instance's empty ref and is
       // therefore already empty — the drag payload is not preserved through stateRef.
       dragPathsRef.current = []
+      dragSourceRef.current = null
       setDragging(false)
       tree.resetTree({ load: root })
       // Put focus back on the tree — a project switch usually happens by clicking the Run toolbar's
@@ -381,6 +430,7 @@ export function FileExplorer({
       // rather than the selection we only just dispatched.
       const paths = sel.selection.has(entry.path) ? sel.selectionPaths() : [entry.path]
       dragPathsRef.current = paths
+      dragSourceRef.current = entry.path
       setDragging(true)
       ev.dataTransfer.effectAllowed = 'copyMove'
       // For external apps — validity inside this app is decided from dragPathsRef (this value cannot be read during dragover)
@@ -388,6 +438,7 @@ export function FileExplorer({
     },
     onDragEnd: () => {
       dragPathsRef.current = []
+      dragSourceRef.current = null
       setDragging(false)
       setDropDir(null)
       disarmHoverExpand()
@@ -486,6 +537,7 @@ export function FileExplorer({
       const copy = ev.ctrlKey || ev.metaKey
       const paths = dragPathsRef.current
       dragPathsRef.current = []
+      dragSourceRef.current = null
       setDragging(false)
       setDropDir(null)
       if (paths.length === 0) return
@@ -493,26 +545,14 @@ export function FileExplorer({
     }
   })
 
-  const renaming = (entry: Entry): boolean => editing?.kind === 'rename' && editing.path === entry.path
-
-  // git status → display letter and tooltip key. The letters are language-neutral, so they are not translated.
-  const GIT_MARK: Record<GitState, string> = {
-    new: 'U',
-    modified: 'M',
-    deleted: 'D',
-    conflict: 'C'
-  }
-  const GIT_LABEL: Record<GitState, 'explorer.git.new' | 'explorer.git.modified' | 'explorer.git.deleted' | 'explorer.git.conflict'> = {
-    new: 'explorer.git.new',
-    modified: 'explorer.git.modified',
-    deleted: 'explorer.git.deleted',
-    conflict: 'explorer.git.conflict'
-  }
-
-  const editRow = (depth: number, isDir: boolean): React.JSX.Element => {
+  const editRow = (key: string, depth: number, isDir: boolean, top: number, height: number): React.JSX.Element => {
     const reason = tm(validateName(editValue.trim()))
     return (
-      <div className="fx-row fx-edit" style={{ paddingLeft: depth * 14 + 8 }}>
+      <div
+        key={key}
+        className="fx-row fx-edit"
+        style={{ position: 'absolute', left: 0, right: 0, top, height, paddingLeft: depth * 14 + 8 }}
+      >
         <span className="fx-caret" />
         <FileIcon
           {...(isDir
@@ -545,156 +585,190 @@ export function FileExplorer({
     )
   }
 
-  const renderDir = (dirPath: string, depth: number): React.JSX.Element => {
-    // Cut items are dimmed (VS Code behavior). Descendants of a cut folder go away with it, so they are dimmed too.
-    const isCut = (p: string): boolean =>
-      sel.clipboard?.mode === 'cut' && sel.clipboard.paths.some((c) => isSubPath(c, p))
+  // ---- The virtualized tree ----
+  // The visible tree is flattened into rows (explorerRows.ts) and only the rows overlapping the viewport,
+  // plus OVERSCAN on each side, are drawn — absolutely placed inside a spacer as tall as all the rows
+  // together, so the scrollbar still measures the whole tree. The rows are rebuilt only when the tree
+  // or the edit target changes, never on scroll.
+  const rows = useMemo(
+    () => (root ? buildTreeRows(root, dirs, expanded, editing) : []),
+    [root, dirs, expanded, editing]
+  )
+  // The edit row grows by a line while it shows why the name is invalid — the same test editRow uses
+  const editTall = !!editing && editValue !== '' && !!tm(validateName(editValue.trim()))
+  const offsets = useMemo(() => rowOffsets(rows, editTall), [rows, editTall])
+  const [viewport, setViewport] = useState({ top: 0, h: DEFAULT_VIEWPORT_H })
+  const range = visibleRange(offsets, viewport.top, viewport.h, OVERSCAN)
+  // What the scroll handler and the reveal compare against — the latest render's layout
+  const layoutRef = useRef({ offsets, range, h: viewport.h })
+  layoutRef.current = { offsets, range, h: viewport.h }
 
-    // If a create edit is open for this folder, put the input row at the top — attached to all four
-    // return paths, including loading / read failure / empty folder. That is what makes the New
-    // File/New Folder input row visible even in a folder that has never been expanded or is empty.
-    const creating = editing?.kind === 'create' && editing.parentDir === dirPath
-    const createRow = creating ? editRow(depth, editing.isDir) : null
-
-    const state = dirs[dirPath]
-    if (!state && dirPath === root)
-      return (
-        <>
-          {createRow}
-          <RootReading slow={rootSlow} />
-        </>
-      )
-    if (!state)
-      return (
-        <>
-          {createRow}
-          <div className="fx-note" style={{ paddingLeft: depth * 14 + 24 }}>
-            {t('explorer.dir.loading')}
-          </div>
-        </>
-      )
-    if (state.error)
-      return (
-        <>
-          {createRow}
-          <div className="fx-note" style={{ paddingLeft: depth * 14 + 24 }}>
-            {t('explorer.dir.readFailed', { detail: state.error })}
-          </div>
-        </>
-      )
-    if (!state.entries || state.entries.length === 0)
-      return (
-        <>
-          {createRow}
-          <div className="fx-note" style={{ paddingLeft: depth * 14 + 24 }}>
-            {t('explorer.dir.empty')}
-          </div>
-        </>
-      )
-    return (
-      <>
-        {createRow}
-        {state.entries.map((entry) => {
-          if (!entry.isDir) {
-            if (renaming(entry)) return <div key={entry.path}>{editRow(depth, entry.isDir)}</div>
-            return (
-              <div
-                key={entry.path}
-                // No drop-into here — dropping on a file targets its parent, and highlighting the
-                // parent folder row is what reads correctly as "where this is going". Highlighting the
-                // file row itself would look like dropping inside that file.
-                className={`fx-row file${sel.selection.has(entry.path) ? ' selected' : ''}${isCut(entry.path) ? ' cut' : ''}${dragging && dragPathsRef.current.includes(entry.path) ? ' dragging' : ''}`}
-                style={{ paddingLeft: depth * 14 + 8 }}
-                title={entry.path}
-                onClick={(ev) => {
-                  sel.applyClickSelection(entry.path, ev)
-                }}
-                // Opening is the double click's job, so that a single click leaves focus on the tree.
-                // Opening a file hands the cursor to the editor (FileEditor's focused effect), and with
-                // the cursor in CodeMirror the next Ctrl+C is CodeMirror's copy, which on an empty
-                // selection copies the cursor's line — that is how "copy the file, paste it into the
-                // session" used to paste the file's first line instead of its path.
-                onDoubleClick={(ev) => {
-                  // Ctrl/Shift only change the selection, they never open — the same rule the single
-                  // click follows (applyClickSelection's return value)
-                  if (ev.ctrlKey || ev.metaKey || ev.shiftKey) return
-                  onOpenFile(entry.path)
-                }}
-                onContextMenu={(ev) => {
-                  ev.preventDefault()
-                  sel.applyContextSelection(entry.path)
-                  setMenu({ x: ev.clientX, y: ev.clientY, entry })
-                }}
-                {...dragHandlers(entry)}
-                {...dropHandlers(entry)}
-              >
-                <span className="fx-caret" />
-                <FileIcon {...resolveFileIcon(entry.name)} />
-                <span className={`fx-name${gitStatus.fileState[entry.path] ? ` git-${gitStatus.fileState[entry.path]}` : ''}`}>
-                  {entry.name}
-                </span>
-                {/* a delete or copy working on this file, past ROW_SPINNER_DELAY_MS */}
-                <RowLoading pending={ops.busyRows.has(entry.path)} label="files.op.busy" />
-                {gitStatus.fileState[entry.path] && (
-                  <span
-                    className={`fx-git-mark git-${gitStatus.fileState[entry.path]}`}
-                    title={t(GIT_LABEL[gitStatus.fileState[entry.path]])}
-                    aria-label={t(GIT_LABEL[gitStatus.fileState[entry.path]])}
-                  >
-                    {GIT_MARK[gitStatus.fileState[entry.path]]}
-                  </span>
-                )}
-              </div>
-            )
-          }
-          // The caret, the icon and the child render must all see the same expanded state — read it once and share it across the three
-          const isOpen = expanded.has(entry.path)
-          return (
-            <div key={entry.path}>
-              {renaming(entry) ? (
-                editRow(depth, entry.isDir)
-              ) : (
-                <div
-                  className={`fx-row${sel.selection.has(entry.path) ? ' selected' : ''}${isCut(entry.path) ? ' cut' : ''}${dragging && dragPathsRef.current.includes(entry.path) ? ' dragging' : ''}${dropDir === entry.path ? ' drop-into' : ''}`}
-                  style={{ paddingLeft: depth * 14 + 8 }}
-                  onClick={(ev) => {
-                    if (sel.applyClickSelection(entry.path, ev)) toggleDir(entry.path)
-                  }}
-                  onContextMenu={(ev) => {
-                    ev.preventDefault()
-                    sel.applyContextSelection(entry.path)
-                    setMenu({ x: ev.clientX, y: ev.clientY, entry })
-                  }}
-                  {...dragHandlers(entry)}
-                  {...dropHandlers(entry)}
-                >
-                  <span className="fx-caret">{isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
-                  <FileIcon {...resolveFolderIcon(entry.name, isOpen)} />
-                  <span className="fx-name">{entry.name}</span>
-                  {/* A first read already shows 'Loading…' under the row — the spinner is for re-reads only */}
-                  {ops.busyRows.has(entry.path) ? (
-                    // a delete or copy working on (or into) this folder, past ROW_SPINNER_DELAY_MS
-                    <RowLoading pending label="files.op.busy" />
-                  ) : (
-                    <RowLoading pending={tree.loading.has(entry.path) && !!dirs[entry.path]} />
-                  )}
-                  {gitStatus.folderCount[entry.path] > 0 && (
-                    <span
-                      className="fx-git-count"
-                      title={t('explorer.git.folderCount', { count: gitStatus.folderCount[entry.path] })}
-                    >
-                      {gitStatus.folderCount[entry.path]}
-                    </span>
-                  )}
-                </div>
-              )}
-              {isOpen && renderDir(entry.path, depth + 1)}
-            </div>
-          )
-        })}
-      </>
-    )
+  /** Reads the tree's scroll position and height, and renders again only if that changes which rows
+   *  are drawn — scrolling within one row's height costs nothing. */
+  const syncViewport = (): void => {
+    const el = treeRef.current
+    if (!el) return
+    const h = el.clientHeight || DEFAULT_VIEWPORT_H
+    const top = el.scrollTop
+    const cur = layoutRef.current
+    const r = visibleRange(cur.offsets, top, h, OVERSCAN)
+    if (r.start !== cur.range.start || r.end !== cur.range.end || h !== cur.h) setViewport({ top, h })
   }
+  useLayoutEffect(() => {
+    const el = treeRef.current
+    if (!el) return
+    syncViewport()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => syncViewport())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [root])
+
+  /** Scrolls the least distance that brings row index wholly into view, and draws the new window at once
+   *  (not a frame later, when the scroll event arrives) */
+  const scrollToRow = (index: number): void => {
+    const el = treeRef.current
+    if (!el || index < 0) return
+    const h = el.clientHeight || DEFAULT_VIEWPORT_H
+    const next = revealScrollTop(layoutRef.current.offsets, index, el.scrollTop, h)
+    if (next !== el.scrollTop) el.scrollTop = next
+    syncViewport()
+  }
+
+  // A pending reveal is resolved after each render: once its row exists it is scrolled to; a row that
+  // never turns up (the folder failed to read, the file went away) is given up after REVEAL_WAIT_MS
+  useLayoutEffect(() => {
+    if (!reveal) return
+    const i = rows.findIndex((r) => r.key === reveal.key)
+    if (i >= 0) {
+      scrollToRow(i)
+      setReveal(null)
+    } else if (Date.now() > reveal.until) setReveal(null)
+  })
+
+  // The row being edited is brought into view when editing starts — F2 on a selected row the user has
+  // scrolled away from, or New File in a folder far down. Before virtualization the input's autoFocus
+  // did this on its own; now the row is also kept drawn (below) so the input exists to be focused.
+  const editKey = editRowKey(editing)
+  useEffect(() => {
+    if (editKey) requestReveal(editKey)
+  }, [editKey])
+
+  /** Arrow keys, Home/End and PageUp/PageDown move the single selection over the entry rows. The target
+   *  may be outside the drawn window: it is selected by path, then scrolled into view. */
+  const moveSelection = (key: CursorKey): void => {
+    const current =
+      sel.anchor !== null && sel.selection.has(sel.anchor) ? sel.anchor : ([...sel.selection][0] ?? null)
+    const pageSize = Math.max(1, Math.floor(layoutRef.current.h / ROW_H) - 1)
+    const next = moveCursor(entryPaths(rows), current, key, pageSize)
+    if (next === null) return
+    sel.dispatch({ type: 'selectionSet', paths: [next] })
+    scrollToRow(rows.findIndex((r) => r.key === next))
+  }
+
+  // The rows' event handlers: one object for the component's whole life, calling the latest closures
+  // through a ref — a new object per render would re-render every memoised row on every render
+  const rowActionsRef = useRef<RowActions | null>(null)
+  rowActionsRef.current = {
+    click: (entry, ev) => {
+      // A folder expands on a single-selection click; a file only selects (it opens on the double click)
+      if (sel.applyClickSelection(entry.path, ev) && entry.isDir) toggleDir(entry.path)
+    },
+    doubleClick: (entry, ev) => {
+      if (entry.isDir) return
+      // Ctrl/Shift only change the selection, they never open — the same rule the single click follows
+      // (applyClickSelection's return value)
+      if (ev.ctrlKey || ev.metaKey || ev.shiftKey) return
+      onOpenFile(entry.path)
+    },
+    contextMenu: (entry, ev) => {
+      ev.preventDefault()
+      sel.applyContextSelection(entry.path)
+      setMenu({ x: ev.clientX, y: ev.clientY, entry })
+    },
+    dragStart: (entry, ev) => dragHandlers(entry).onDragStart?.(ev),
+    dragEnd: (entry, ev) => dragHandlers(entry).onDragEnd?.(ev),
+    dragOver: (entry, ev) => dropHandlers(entry).onDragOver?.(ev),
+    dragLeave: (entry, ev) => dropHandlers(entry).onDragLeave?.(ev),
+    drop: (entry, ev) => dropHandlers(entry).onDrop?.(ev)
+  }
+  const rowActions = useMemo<RowActions>(
+    () => ({
+      click: (e, ev) => rowActionsRef.current!.click(e, ev),
+      doubleClick: (e, ev) => rowActionsRef.current!.doubleClick(e, ev),
+      contextMenu: (e, ev) => rowActionsRef.current!.contextMenu(e, ev),
+      dragStart: (e, ev) => rowActionsRef.current!.dragStart(e, ev),
+      dragEnd: (e, ev) => rowActionsRef.current!.dragEnd(e, ev),
+      dragOver: (e, ev) => rowActionsRef.current!.dragOver(e, ev),
+      dragLeave: (e, ev) => rowActionsRef.current!.dragLeave(e, ev),
+      drop: (e, ev) => rowActionsRef.current!.drop(e, ev)
+    }),
+    []
+  )
+
+  // Cut items are dimmed (VS Code behavior). Descendants of a cut folder go away with it, so they are dimmed too.
+  const isCut = (p: string): boolean =>
+    sel.clipboard?.mode === 'cut' && sel.clipboard.paths.some((c) => isSubPath(c, p))
+
+  const renderRow = (row: TreeRow, top: number, height: number): React.JSX.Element => {
+    const place = { position: 'absolute', left: 0, right: 0, top, height } as const
+    switch (row.kind) {
+      case 'entry': {
+        const p = row.entry.path
+        const isDir = row.entry.isDir
+        return (
+          <ExplorerRow
+            key={row.key}
+            entry={row.entry}
+            depth={row.depth}
+            top={top}
+            open={row.open}
+            selected={sel.selection.has(p)}
+            cut={isCut(p)}
+            dragging={dragging && dragPathsRef.current.includes(p)}
+            dropInto={isDir && dropDir === p}
+            gitState={isDir ? undefined : gitStatus.fileState[p]}
+            gitCount={isDir ? (gitStatus.folderCount[p] ?? 0) : 0}
+            busy={ops.busyRows.has(p)}
+            loading={isDir && tree.loading.has(p) && !!dirs[p]}
+            actions={rowActions}
+          />
+        )
+      }
+      case 'edit':
+        return editRow(row.key, row.depth, row.isDir, top, height)
+      case 'rootReading':
+        return (
+          <div key={row.key} style={place}>
+            <RootReading slow={rootSlow} />
+          </div>
+        )
+      case 'note':
+        return (
+          <div
+            key={row.key}
+            className="fx-note"
+            style={{ ...place, display: 'flex', alignItems: 'center', paddingLeft: row.depth * 14 + 24 }}
+          >
+            {row.note === 'loading'
+              ? t('explorer.dir.loading')
+              : row.note === 'readFailed'
+                ? t('explorer.dir.readFailed', { detail: row.detail ?? '' })
+                : t('explorer.dir.empty')}
+          </div>
+        )
+    }
+  }
+
+  // The drawn rows: the window, plus the rows that must stay mounted wherever the scroll is — the edit
+  // row (unmounting its focused input would blur it, and a blur commits the edit) and the row a drag
+  // started on (dragend is dispatched on that element; unmounted, the drag would never end). All under
+  // one parent in index order, so a row moving in or out of the window is never re-parented or moved.
+  const pinKeys = dragging ? [editKey, dragSourceRef.current] : [editKey]
+  const drawn = drawnRows(
+    range,
+    pinKeys.flatMap((k) => (k === null ? [] : [rows.findIndex((r) => r.key === k)])).filter((i) => i >= 0)
+  )
 
   if (!root) {
     return (
@@ -811,8 +885,9 @@ export function FileExplorer({
         className={`fx-tree${gitStatus.stale ? ' git-stale' : ''}`}
         ref={treeRef}
         tabIndex={0}
+        onScroll={syncViewport}
         onContextMenu={(ev) => {
-          if (ev.target === ev.currentTarget) {
+          if (ev.target === ev.currentTarget || ev.target === spaceRef.current) {
             ev.preventDefault()
             setMenu({ x: ev.clientX, y: ev.clientY, entry: null })
           }
@@ -836,6 +911,12 @@ export function FileExplorer({
             sel.dispatch({ type: 'clipboardCleared' })
             return
           }
+          const cursorKey = CURSOR_KEYS[ev.key]
+          if (cursorKey && !ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey) {
+            ev.preventDefault() // the tree's own scrolling is replaced by moving the selection
+            moveSelection(cursorKey)
+            return
+          }
           if (ev.key === 'F2') {
             // Rename needs exactly one target — with several there is no way to decide which one to change
             if (sel.selection.size !== 1) return
@@ -851,7 +932,9 @@ export function FileExplorer({
         }}
         {...dropHandlers(null)}
       >
-        {renderDir(root, 0)}
+        <div ref={spaceRef} style={{ position: 'relative', height: offsets[rows.length] }}>
+          {drawn.map((i) => renderRow(rows[i], offsets[i], offsets[i + 1] - offsets[i]))}
+        </div>
       </div>
       {menu && (
         <ContextMenu x={menu.x} y={menu.y} items={menuItemsFor(menu.entry)} onClose={() => setMenu(null)} />
@@ -881,7 +964,7 @@ export function FileExplorer({
             // screen, which makes it pointless.
             tree.expandDir(parentDir(path))
             tree.loadDir(parentDir(path))
-            sel.dispatch({ type: 'selectionSet', paths: [path] })
+            opsSel.dispatch({ type: 'selectionSet', paths: [path] })
             setHistoryOpen(false)
           }}
           onClose={() => setHistoryOpen(false)}
