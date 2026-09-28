@@ -165,6 +165,8 @@ export const ja: Catalog = {
   'session.rail.toggleSidebar': 'サイドバーの折りたたみ/展開',
   'session.rail.openSessions': 'アカウントと履歴',
   'session.spawn.failed': 'セッションの開始に失敗しました: {message}',
+  'session.spawn.cwdMissing': 'フォルダーが見つかりません: {path}。フォルダーを選び直してください。',
+  'session.spawn.cwdUnreachable': 'フォルダーが時間内に応答しません: {path}。ネットワークドライブの場合は接続を確認してください。',
   'session.spawn.failedWorktreeKept':
     'セッションの開始に失敗しました: {message} (worktree "{name}" は残っているので Worktrees パネルから削除してください)',
   // Rolling-resume guard hit — tells the user the tab was just focused and their chosen options were dropped
@@ -409,7 +411,7 @@ export const ja: Catalog = {
   'shortcut.explorer.cut': '切り取り',
   'shortcut.explorer.copy': 'コピー',
   'shortcut.gesture.itemDrag': '項目をドラッグ',
-  'shortcut.explorer.move': '移動 · Ctrl を押すとコピー',
+  'shortcut.explorer.move': '移動 · {mod} を押すとコピー',
   'shortcut.explorer.undo': '元に戻す',
   'shortcut.run.run': '実行',
   'shortcut.run.stop': '実行を停止',
@@ -429,7 +431,7 @@ export const ja: Catalog = {
   'files.commit.failed': '{action}に失敗しました: {detail}',
   // useFileOps.ts — delete confirmation modal
   'files.delete.undoHint':
-    'Ctrl+Z または Local History から復元できます (最大30日間保管 · 50MB または 5,000 項目を超えるものは除く)。',
+    '{mod}+Z または Local History から復元できます (最大30日間保管 · 50MB または 5,000 項目を超えるものは除く)。',
   'files.delete.confirmOne': '「{name}」を削除しますか？\n{undoHint}',
   'files.delete.confirmDirWithCount':
     'フォルダ「{name}」と配下の {count} 件の項目を削除しますか？\n{undoHint}',
@@ -500,15 +502,16 @@ export const ja: Catalog = {
   'explorer.menu.newFile': '新しいファイル',
   'explorer.menu.newFolder': '新しいフォルダ',
   'explorer.menu.rename': '名前の変更 (F2)',
-  'explorer.menu.delete': '削除 (Del)',
-  'explorer.menu.deleteCount': '削除 ({count} 件, Del)',
+  'explorer.menu.delete': '削除 ({del})',
+  'explorer.menu.deleteCount': '削除 ({count} 件, {del})',
   'explorer.menu.duplicateCount': '複製 ({count} 件)',
-  'explorer.menu.cut': '切り取り (Ctrl+X)',
-  'explorer.menu.copy': 'コピー (Ctrl+C)',
-  'explorer.menu.paste': '貼り付け (Ctrl+V)',
+  'explorer.menu.cut': '切り取り ({mod}+X)',
+  'explorer.menu.copy': 'コピー ({mod}+C)',
+  'explorer.menu.paste': '貼り付け ({mod}+V)',
   'explorer.menu.copyPath': 'パスをコピー',
   'explorer.menu.copyRelativePath': '相対パスをコピー',
   'explorer.menu.reveal': 'エクスプローラーで開く',
+  'explorer.menu.revealMac': 'Finder で表示',
   // FileExplorer.tsx — git status on a tree row (tooltip, aria-label)
   'explorer.git.new': '新しいファイル',
   'explorer.git.modified': '変更あり',

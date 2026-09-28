@@ -90,7 +90,8 @@ import { quitConfirmBody, updateConfirmBody } from './lib/quitConfirm'
 import { toggleSidebarView, type SidebarView } from '../../core/ui/sidebar'
 import { terminalsWithCreated } from './lib/terminalTabs'
 import * as hiddenProjects from './lib/hiddenProjects'
-import { worktreeErrorMessage, isCancelled as isWorktreeCancelled } from './lib/worktreeErrors'
+import { isCancelled as isWorktreeCancelled } from './lib/worktreeErrors'
+import { spawnErrorMessage } from './lib/spawnErrors'
 import { notifyCreated as notifyWorktreeCreated } from './lib/worktreeBus'
 import { useI18n } from './i18n/I18nProvider'
 import {
@@ -126,6 +127,7 @@ import { onFileChanges } from './lib/fileChanges'
 import type { FileChange } from '../../core/files/changeBatch'
 import { HostRuntimeNotice } from './components/HostRuntimeNotice'
 import { House, PanelLeft, Settings, X } from 'lucide-react'
+import { deleteKey, isMac as isMacPlatform, modKey } from './lib/platformKeys'
 
 sessionBus.init()
 
@@ -147,8 +149,9 @@ const scopeKey = (rec: RecordTab): string => `${rec.projectRoot}::${rec.recordId
 // explorer save/select-all/cut/copy/paste/undo are all Cmd on macOS (see MOD below), so they are
 // built with MOD rather than a literal 'Ctrl'. The one deliberate exception is 'Ctrl+Enter' (terminal
 // newline) — TerminalView.tsx leaves that one alone on both platforms because Claude Code reads
-// Ctrl+Enter as a newline regardless of OS. F2 and Delete are also unchanged across platforms.
-const MOD = window.api.platform === 'darwin' ? 'Cmd' : 'Ctrl'
+// Ctrl+Enter as a newline regardless of OS. F2 is unchanged across platforms; delete is Cmd+Backspace
+// on macOS, whose keyboard has no forward Delete without fn (lib/platformKeys.ts).
+const MOD = modKey()
 const SHORTCUTS: Array<{
   group: MessageKey
   items: Array<{ keys: string[]; desc: MessageKey; gestureKey?: MessageKey }>
@@ -178,7 +181,7 @@ const SHORTCUTS: Array<{
     items: [
       { keys: [`${MOD}+S`], desc: 'shortcut.explorer.saveFile' },
       { keys: ['F2'], desc: 'shortcut.explorer.rename' },
-      { keys: ['Delete'], desc: 'shortcut.explorer.delete' },
+      { keys: [isMacPlatform() ? deleteKey() : 'Delete'], desc: 'shortcut.explorer.delete' },
       { keys: [`${MOD}+A`], desc: 'shortcut.explorer.selectAll' },
       { keys: [`${MOD}+X`], desc: 'shortcut.explorer.cut' },
       { keys: [`${MOD}+C`], desc: 'shortcut.explorer.copy' },
@@ -1630,7 +1633,7 @@ export default function App(): React.JSX.Element {
         toast.info(t('worktree.error.cancelled'))
         return
       }
-      const msg = worktreeErrorMessage(raw)
+      const msg = spawnErrorMessage(raw)
       const message = t(msg.key, msg.params)
       // On a failure after the worktree was created, the user is also told that it remains, unrolled-back
       toast.error(
@@ -4884,7 +4887,7 @@ export default function App(): React.JSX.Element {
                               ))
                             )}
                           </span>
-                          <span className="shortcut-desc">{t(it.desc)}</span>
+                          <span className="shortcut-desc">{t(it.desc, { mod: MOD })}</span>
                         </div>
                       ))}
                     </div>

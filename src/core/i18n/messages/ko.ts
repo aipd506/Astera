@@ -257,6 +257,8 @@ export const ko = {
   // 없었고, 그래서 한 번 다른 뷰를 열면 한 번의 누름으로는 돌아올 수 없었다.
   'session.rail.openSessions': '계정과 히스토리',
   'session.spawn.failed': '세션 시작 실패: {message}',
+  'session.spawn.cwdMissing': '폴더를 찾을 수 없습니다: {path}. 폴더를 다시 고르세요.',
+  'session.spawn.cwdUnreachable': '폴더가 제때 응답하지 않습니다: {path}. 네트워크 드라이브라면 연결을 확인하세요.',
   'session.spawn.failedWorktreeKept':
     '세션 시작 실패: {message} (worktree "{name}"는 남아 있으니 Worktrees 패널에서 삭제하세요)',
   // Rolling-resume guard hit — tells the user the tab was just focused and their chosen options were dropped
@@ -572,7 +574,7 @@ export const ko = {
   'shortcut.explorer.cut': '잘라내기',
   'shortcut.explorer.copy': '복사',
   'shortcut.gesture.itemDrag': '항목 드래그',
-  'shortcut.explorer.move': '이동 · Ctrl 누르면 복사',
+  'shortcut.explorer.move': '이동 · {mod} 누르면 복사',
   'shortcut.explorer.undo': '되돌리기',
   'shortcut.run.run': '실행',
   'shortcut.run.stop': '실행 중지',
@@ -593,7 +595,7 @@ export const ko = {
   // useFileOps.ts — delete confirmation modal. The undoHint wording is settled —
   // the "up to" and "over 50MB excluded" specifics have to stay (no over-promising; see the undoHint declaration comment).
   'files.delete.undoHint':
-    'Ctrl+Z 또는 Local History에서 복구할 수 있습니다 (최대 30일 보관 · 50MB 또는 5,000개 항목 초과는 제외).',
+    '{mod}+Z 또는 Local History에서 복구할 수 있습니다 (최대 30일 보관 · 50MB 또는 5,000개 항목 초과는 제외).',
   'files.delete.confirmOne': "'{name}' 을(를) 삭제할까요?\n{undoHint}",
   'files.delete.confirmDirWithCount': "'{name}' 폴더와 하위 {count}개 항목을 삭제할까요?\n{undoHint}",
   'files.delete.confirmDirAll': "'{name}' 폴더와 하위 항목 전부를 삭제할까요?\n{undoHint}",
@@ -662,15 +664,16 @@ export const ko = {
   'explorer.menu.newFile': '새 파일',
   'explorer.menu.newFolder': '새 폴더',
   'explorer.menu.rename': '이름 변경 (F2)',
-  'explorer.menu.delete': '삭제 (Del)',
-  'explorer.menu.deleteCount': '삭제 ({count}개, Del)',
+  'explorer.menu.delete': '삭제 ({del})',
+  'explorer.menu.deleteCount': '삭제 ({count}개, {del})',
   'explorer.menu.duplicateCount': '복제 ({count}개)',
-  'explorer.menu.cut': '잘라내기 (Ctrl+X)',
-  'explorer.menu.copy': '복사 (Ctrl+C)',
-  'explorer.menu.paste': '붙여넣기 (Ctrl+V)',
+  'explorer.menu.cut': '잘라내기 ({mod}+X)',
+  'explorer.menu.copy': '복사 ({mod}+C)',
+  'explorer.menu.paste': '붙여넣기 ({mod}+V)',
   'explorer.menu.copyPath': '경로 복사',
   'explorer.menu.copyRelativePath': '상대 경로 복사',
   'explorer.menu.reveal': '탐색기에서 열기',
+  'explorer.menu.revealMac': 'Finder에서 보기',
   // FileExplorer.tsx — git status on a tree row (tooltip, aria-label)
   'explorer.git.new': '새 파일',
   'explorer.git.modified': '수정됨',

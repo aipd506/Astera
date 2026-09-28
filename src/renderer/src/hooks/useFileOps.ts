@@ -25,6 +25,7 @@ import type { Entry, FileTree } from './useFileTree'
 import type { ExplorerSelection } from './useExplorerSelection'
 import type { UndoEntry, UndoOp } from '../../../core/files/undo'
 import type { Message } from '../../../core/i18n'
+import { modKey } from '../lib/platformKeys'
 
 /** Strips the `Error invoking remote method '<channel>': ` prefix Electron attaches to ipcMain.handle
  *  errors — so the toast keeps only the reason. If the prefix is absent the message passes through
@@ -256,7 +257,7 @@ export function useFileOps(deps: {
     // A failed snapshot (permission error, etc.) is also unrecoverable, but that is not covered here —
     // a separate toast right after the delete (the skipped.failed branch) already says so, and
     // stretching this to three clauses means the confirm modal does not get read.
-    const undoHint = t('files.delete.undoHint')
+    const undoHint = t('files.delete.undoHint', { mod: modKey() })
     let body: string
     if (paths.length === 1) {
       // For a single item, count the descendants exactly and show the number

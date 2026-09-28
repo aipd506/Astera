@@ -34,6 +34,7 @@ import { useI18n } from '../i18n/I18nProvider'
 import type { UndoEntry } from '../../../core/files/undo'
 import { runnableKindForFile } from '../../../core/run/runFile'
 import { RefreshCw, X } from 'lucide-react'
+import { deleteKey, isMac, modKey } from '../lib/platformKeys'
 
 /** Tree snapshot the App holds on to, so that even when the explorer toggle unmounts FileExplorer the tree can be handed back on remount */
 export interface ExplorerTreeState {
@@ -352,20 +353,20 @@ export function FileExplorer({
         {
           label:
             targetCount > 1
-              ? t('explorer.menu.deleteCount', { count: targetCount })
-              : t('explorer.menu.delete'),
+              ? t('explorer.menu.deleteCount', { count: targetCount, del: deleteKey() })
+              : t('explorer.menu.delete', { del: deleteKey() }),
           onSelect: () => void removeSelection(),
           danger: true
         }
       )
       items.push(
         'separator',
-        { label: t('explorer.menu.cut'), onSelect: () => cutOrCopy('cut') },
-        { label: t('explorer.menu.copy'), onSelect: () => cutOrCopy('copy') }
+        { label: t('explorer.menu.cut', { mod: modKey() }), onSelect: () => cutOrCopy('cut') },
+        { label: t('explorer.menu.copy', { mod: modKey() }), onSelect: () => cutOrCopy('copy') }
       )
     }
     items.push('separator', {
-      label: t('explorer.menu.paste'),
+      label: t('explorer.menu.paste', { mod: modKey() }),
       onSelect: () => void paste(dirForCreate), // same interpretation of "here" as New File/New Folder
       // Enabled by either clipboard: the app's own, or the OS one holding files copied in Explorer or
       // Finder. Read while the menu is being built, which is the moment it is shown.
@@ -393,7 +394,7 @@ export function FileExplorer({
         disabled: entry === null
       },
       {
-        label: t('explorer.menu.reveal'),
+        label: t(isMac() ? 'explorer.menu.revealMac' : 'explorer.menu.reveal'),
         onSelect: () =>
           void window.api.files.reveal(target).catch((err: unknown) => {
             toast.error(t('explorer.reveal.failed', { detail: errText(err) }))
@@ -940,7 +941,8 @@ export function FileExplorer({
             if (!entry) return
             ev.preventDefault()
             startRename(entry)
-          } else if (ev.key === 'Delete') {
+          } else if (ev.key === 'Delete' || (isMac() && ev.metaKey && ev.key === 'Backspace')) {
+            // A Mac keyboard has no forward Delete without fn; Cmd+Backspace is the Finder's delete
             if (sel.selection.size === 0) return
             ev.preventDefault()
             void removeSelection()

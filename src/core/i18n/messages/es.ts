@@ -167,6 +167,8 @@ export const es: Catalog = {
   'session.rail.toggleSidebar': 'Contraer o expandir la barra lateral',
   'session.rail.openSessions': 'Cuentas e historial',
   'session.spawn.failed': 'No se pudo iniciar la sesión: {message}',
+  'session.spawn.cwdMissing': 'No se encuentra la carpeta: {path}. Vuelva a elegir la carpeta.',
+  'session.spawn.cwdUnreachable': 'La carpeta no respondió a tiempo: {path}. Si está en una unidad de red, compruebe la conexión.',
   'session.spawn.failedWorktreeKept':
     'No se pudo iniciar la sesión: {message} (el worktree "{name}" se conservó; elimínelo desde el panel Worktrees)',
   // Rolling-resume guard hit — tells the user the tab was just focused and their chosen options were dropped
@@ -415,7 +417,7 @@ export const es: Catalog = {
   'shortcut.explorer.cut': 'Cortar',
   'shortcut.explorer.copy': 'Copiar',
   'shortcut.gesture.itemDrag': 'Arrastrar el elemento',
-  'shortcut.explorer.move': 'Mover · con Ctrl, copiar',
+  'shortcut.explorer.move': 'Mover · con {mod}, copiar',
   'shortcut.explorer.undo': 'Deshacer',
   'shortcut.run.run': 'Ejecutar',
   'shortcut.run.stop': 'Detener ejecución',
@@ -435,7 +437,7 @@ export const es: Catalog = {
   'files.commit.failed': 'Error en {action}: {detail}',
   // useFileOps.ts — delete confirmation modal
   'files.delete.undoHint':
-    'Puede recuperarlo con Ctrl+Z o desde Local History (se guarda hasta 30 días · se excluye lo que supere 50MB o 5.000 elementos).',
+    'Puede recuperarlo con {mod}+Z o desde Local History (se guarda hasta 30 días · se excluye lo que supere 50MB o 5.000 elementos).',
   'files.delete.confirmOne': '¿Eliminar «{name}»?\n{undoHint}',
   'files.delete.confirmDirWithCount':
     '¿Eliminar la carpeta «{name}» y los {count} elementos que contiene?\n{undoHint}',
@@ -506,15 +508,16 @@ export const es: Catalog = {
   'explorer.menu.newFile': 'Archivo nuevo',
   'explorer.menu.newFolder': 'Carpeta nueva',
   'explorer.menu.rename': 'Cambiar nombre (F2)',
-  'explorer.menu.delete': 'Eliminar (Del)',
-  'explorer.menu.deleteCount': 'Eliminar ({count}, Del)',
+  'explorer.menu.delete': 'Eliminar ({del})',
+  'explorer.menu.deleteCount': 'Eliminar ({count}, {del})',
   'explorer.menu.duplicateCount': 'Duplicar ({count})',
-  'explorer.menu.cut': 'Cortar (Ctrl+X)',
-  'explorer.menu.copy': 'Copiar (Ctrl+C)',
-  'explorer.menu.paste': 'Pegar (Ctrl+V)',
+  'explorer.menu.cut': 'Cortar ({mod}+X)',
+  'explorer.menu.copy': 'Copiar ({mod}+C)',
+  'explorer.menu.paste': 'Pegar ({mod}+V)',
   'explorer.menu.copyPath': 'Copiar la ruta',
   'explorer.menu.copyRelativePath': 'Copiar la ruta relativa',
   'explorer.menu.reveal': 'Abrir en el explorador',
+  'explorer.menu.revealMac': 'Mostrar en el Finder',
   // FileExplorer.tsx — git status on a tree row (tooltip, aria-label)
   'explorer.git.new': 'Archivo nuevo',
   'explorer.git.modified': 'Modificado',
