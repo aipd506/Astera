@@ -69,14 +69,24 @@ export function init(): void {
 
 export function attach(sessionId: string, listener: Listener): () => void {
   const buffered = buffers.get(sessionId)
+  // 넘겨준 재생분은 이 차례가 끝날 때까지 쥐고 있는다. StrictMode(dev)는 마운트 직후 effect 를
+  // 걷었다가 다시 거는데, 그 사이에 버려지는 첫 터미널이 재생분을 가져가 버리면 남는 터미널은
+  // 빈 화면이 된다. 같은 차례 안의 detach 는 이것을 버퍼 앞에 되돌려 다음 attach 가 받게 한다.
+  // ack 가 두 번 세어져도 manager.ts 의 ack 는 0 아래로 내려가지 않는다.
+  let handed: string | null = null
   if (buffered) {
     buffers.delete(sessionId)
+    handed = buffered
+    queueMicrotask(() => {
+      handed = null
+    })
     listener(buffered)
   }
   listeners.set(sessionId, listener)
   return () => {
     listeners.delete(sessionId)
     buffers.delete(sessionId)
+    if (handed !== null) buffers.set(sessionId, handed)
   }
 }
 

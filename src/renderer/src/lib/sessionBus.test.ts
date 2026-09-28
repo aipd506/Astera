@@ -116,6 +116,31 @@ describe('sessionBus', () => {
     expect(first).toEqual(['a']) // detach 뒤의 'b'는 오지 않았다
     expect(second).toEqual(['b'])
   })
+
+  // StrictMode(dev)는 마운트 직후 effect 를 한 번 걷었다가 다시 건다. 재생분을 넘겨받은 첫 터미널은
+  // 그 자리에서 버려지므로, 되돌려 두지 않으면 남는 터미널은 빈 화면이다 — dev 앱을 다시 띄울 때마다
+  // 되찾은 세션이 검은 탭으로 돌아오던 것 (2026-09-28 측정).
+  it('넘겨받은 재생분은 같은 차례 안에 detach 되면 다음 attach 가 다시 받는다', () => {
+    emit({ sessionId: 's1', data: 'replay' })
+    const first: string[] = []
+    const off = mod.attach('s1', (d) => first.push(d))
+    off()
+    emit({ sessionId: 's1', data: '+live' })
+    const second: string[] = []
+    mod.attach('s1', (d) => second.push(d))
+    expect(first).toEqual(['replay'])
+    expect(second).toEqual(['replay+live'])
+  })
+
+  it('차례가 지난 뒤의 detach 는 재생분을 되돌리지 않는다 — 탭을 닫았다 여는 것은 예전 그대로', async () => {
+    emit({ sessionId: 's1', data: 'replay' })
+    const off = mod.attach('s1', () => {})
+    await Promise.resolve()
+    off()
+    const second: string[] = []
+    mod.attach('s1', (d) => second.push(d))
+    expect(second).toEqual([])
+  })
 })
 
 // 이 수정의 계약이다. 메인은 이 신고를 받고서야 붙잡아 둔 재생 데이터를 흘리므로(main/rendererGate.ts),
