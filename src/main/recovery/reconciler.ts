@@ -41,15 +41,33 @@ export interface ReconcilerDeps {
 }
 
 /**
- * How long one reconcileAll pass may go on asking the journal, from its start (stage 4 T6).
+ * How long one reconcileAll pass may spend retrying a busy journal (stage 4 T6).
  *
  * Each busy try holds the thread that asks it for the reader's busy timeout, 250 ms by the setting and
  * about 370 ms measured on Windows, and the reconciler runs on Electron's main thread. One dispatch may
  * be asked up to nine times (retryBusy), about 3.3 s of held thread, and a sweep takes its dispatches one
- * after another. Past this budget the rest of the pass is "cannot say" at once, which decide.ts turns
- * into a person's review, rather than a whole boot sweep spent in 370 ms freezes.
+ * after another.
+ *
+ * **Only busy time is charged** (stage 4 final review). A read that answers at once costs nothing, and
+ * neither do git or execute: a healthy journal behind slow spawns never runs this out. It is counted
+ * from the first busy answer of a read, to the end of that read's retry.
+ *
+ * **Past it, the rest waits for a later pass; it is not reviewed.** A dispatch whose journal was never
+ * read (or whose retry the budget cut short) has no evidence either way, and sending it to review would
+ * turn every attempt that predates the journal into a Gate. It stays a candidate, and the next trigger
+ * (a live reconcileOne, the next boot sweep) asks again.
  */
 export const RECOVERY_PASS_BUDGET_MS = 10_000
+
+/** One reconcileAll pass's running total of busy-retry time. */
+interface PassBudget {
+  busyMs: number
+}
+
+/** The journal's evidence about one dispatch. evidenceFor answers it, or null for "cannot say", or
+ *  'deferred' when the pass budget kept the journal from being asked in full, so nothing may be decided
+ *  from it this pass. */
+type Evidence = { witnessed: boolean; promptConfirmed: boolean; checkpoint: CheckpointRow | null }
 
 /** One turn of the event loop, so the window can paint between two dispatches of a sweep. */
 const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
@@ -99,19 +117,29 @@ export class RecoveryReconciler {
   private async evidenceFor(
     runId: string,
     dispatchId: string,
-    /** The pass budget's end on deps.clock, when a sweep is asking; past it nothing is read at all. */
-    deadline?: number
-  ): Promise<{ witnessed: boolean; promptConfirmed: boolean; checkpoint: CheckpointRow | null } | null> {
+    /** The sweep's busy budget; a lone reconcileOne has none. */
+    pass?: PassBudget
+  ): Promise<Evidence | null | 'deferred'> {
     const journal = this.deps.journal
-    const spent = (): boolean => deadline !== undefined && this.clock() >= deadline
-    if (spent()) {
+    const deferred = (why: string): 'deferred' => {
       this.deps.log(
-        `recovery: this pass spent its journal budget (${RECOVERY_PASS_BUDGET_MS} ms), so dispatch ${dispatchId} cannot be said and goes to review unread`
+        `recovery: this pass spent its busy-journal budget (${RECOVERY_PASS_BUDGET_MS} ms), so dispatch ${dispatchId} ${why} and is left for a later pass`
       )
-      return null
+      return 'deferred'
     }
+    if (pass && pass.busyMs >= RECOVERY_PASS_BUDGET_MS) return deferred('was not read')
+    // Busy time runs from the start of the first try that answered busy, since that try held the
+    // thread too; a read that answers at once is never charged.
+    let tryAt = 0
+    let busySince: number | null = null
+    let cut = false
+    const markBusy = (): void => {
+      if (busySince === null) busySince = tryAt
+    }
+    const charged = (): number => (busySince === null ? 0 : this.clock() - busySince)
     const retried = await retryBusy(
       () => {
+        tryAt = this.clock()
         const witnessed = journal.eventsFor(runId, { dispatchId, limit: 1 }).some((e) => e.dispatchId === dispatchId)
         if (!witnessed) return { witnessed, promptConfirmed: false, checkpoint: null }
         const promptConfirmed = journal
@@ -121,10 +149,17 @@ export class RecoveryReconciler {
       },
       {
         sleep: this.deps.sleep,
-        stop: spent,
+        // Asked only after a busy answer.
+        stop: () => {
+          markBusy()
+          if (pass && pass.busyMs + charged() >= RECOVERY_PASS_BUDGET_MS) cut = true
+          return cut
+        },
         onBusy: (err) => this.deps.log(`recovery: the journal is busy, dispatch ${dispatchId} asks again shortly: ${String(err)}`)
       }
     )
+    if (pass) pass.busyMs += charged()
+    if (cut) return deferred('was cut short while the journal was busy')
     if (retried.ok) return retried.value
     this.deps.log(`recovery: eventsFor failed${retried.busy ? ' (still busy)' : ''}: ${String(retried.error)}`)
     return null
@@ -132,24 +167,27 @@ export class RecoveryReconciler {
 
   /** Carries one seed all the way through, or returns false having done nothing at all — the caller
    *  counts only what it acted on. */
-  private async recoverOne(seed: LostAttemptSeed, deadline?: number): Promise<boolean> {
+  private async recoverOne(seed: LostAttemptSeed, pass?: PassBudget): Promise<boolean> {
     if (this.inFlight.has(seed.dispatch.id)) return false
     this.inFlight.add(seed.dispatch.id)
     try {
-      return await this.recoverOneNow(seed, deadline)
+      return await this.recoverOneNow(seed, pass)
     } finally {
       this.inFlight.delete(seed.dispatch.id)
     }
   }
 
-  private async recoverOneNow(seed: LostAttemptSeed, deadline?: number): Promise<boolean> {
+  private async recoverOneNow(seed: LostAttemptSeed, pass?: PassBudget): Promise<boolean> {
     const { runId, taskId, dispatch } = seed
     const now = this.deps.now()
     const journal = this.deps.journal
 
     // null, not false — a read that failed is not a read that found nothing. decide.ts reads a `false`
     // here as positive evidence that the prompt never left the app; null is "we cannot say".
-    const evidence = await this.evidenceFor(runId, dispatch.id, deadline)
+    const found = await this.evidenceFor(runId, dispatch.id, pass)
+    // Not read in full this pass: nothing is decided or journaled, and it stays a candidate.
+    if (found === 'deferred') return false
+    const evidence = found
     const promptConfirmed = evidence === null ? null : evidence.promptConfirmed
 
     // The journal witnesses every attempt it was on for (ATTEMPT_START_REQUESTED at the very least),
@@ -326,11 +364,11 @@ export class RecoveryReconciler {
    *
    *  **It never holds the main thread for a whole pass** (stage 4 T6). The event loop turns between two
    *  dispatches, so the window paints between the busy tries of one and those of the next, and the pass
-   *  asks the journal for at most RECOVERY_PASS_BUDGET_MS from its start: a retry stops there, and the
-   *  dispatches after that go to a person's review without another read. */
+   *  spends at most RECOVERY_PASS_BUDGET_MS retrying a busy journal: a retry stops there, and that
+   *  dispatch and the ones after it are left for a later pass, neither decided nor journaled. */
   async reconcileAll(): Promise<number> {
     let count = 0
-    const deadline = this.clock() + RECOVERY_PASS_BUDGET_MS
+    const pass: PassBudget = { busyMs: 0 }
     let first = true
     for (const seed of candidates(this.deps.getState())) {
       if (!first) await turn()
@@ -341,7 +379,7 @@ export class RecoveryReconciler {
       // for the next trigger, not counted as acted on.
       if (!hasRoom(this.deps.getState(), fresh.runId)) continue
       try {
-        if (await this.recoverOne(fresh, deadline)) count++
+        if (await this.recoverOne(fresh, pass)) count++
       } catch (err) {
         this.deps.log(`recovery: reconcile failed for dispatch ${fresh.dispatch.id}: ${String(err)}`)
       }

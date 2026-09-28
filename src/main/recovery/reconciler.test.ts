@@ -558,7 +558,7 @@ describe('RecoveryReconciler, a sweep that never holds the thread for long (stag
     expect(firstReadOf('dsp_3')).toBeGreaterThan(firstReadOf('dsp_2'))
   })
 
-  it('stops asking a busy journal once the pass budget is spent, and the rest go to a person unread', async () => {
+  it('a journal busy past the budget: the dispatch cut short and the ones after it are left for a later pass, not reviewed', async () => {
     let clock = 0
     const reads: string[] = []
     const executed: Array<{ dispatchId: string; strategy: string }> = []
@@ -592,14 +592,55 @@ describe('RecoveryReconciler, a sweep that never holds the thread for long (stag
       },
       clock: () => clock
     } as never)
-    expect(await r.reconcileAll()).toBe(3)
-    expect(executed.map((e) => e.strategy)).toEqual(['review', 'review', 'review'])
-    // The first dispatch had its whole retry; the second stopped at the budget; the third was not read.
+    // The first dispatch had its whole retry, busy every time: "cannot say", a person's review, as before.
+    // The second was cut short by the budget and the third was never read: both wait for a later pass.
+    expect(await r.reconcileAll()).toBe(1)
+    expect(executed).toEqual([{ dispatchId: 'dsp_1', strategy: 'review' }])
     expect(reads.filter((d) => d === 'dsp_1').length).toBeGreaterThan(1)
+    expect(reads).toContain('dsp_2')
     expect(reads).not.toContain('dsp_3')
     // One try may start just before the budget runs out, never a pause after it.
     expect(clock).toBeLessThanOrEqual(RECOVERY_PASS_BUDGET_MS + 370)
+    expect(logs.some((l) => /budget/.test(l) && l.includes('dsp_2'))).toBe(true)
     expect(logs.some((l) => /budget/.test(l) && l.includes('dsp_3'))).toBe(true)
+  })
+
+  it('a healthy journal with a slow execute: every candidate is handled as usual, none go to review', async () => {
+    let clock = 0
+    const executed: Array<{ dispatchId: string; strategy: string }> = []
+    const journal = {
+      append: () => 0,
+      // dsp_3 predates the journal: no rows name it, so it is left alone, however late in the pass.
+      eventsFor: (_runId: string, page?: EventsPage) =>
+        (page?.dispatchId === 'dsp_3' ? [] : [{ type: 'PROMPT_WRITE_CONFIRMED', dispatchId: page?.dispatchId }]) as never,
+      firstCheckpointFor: () => null,
+      startRecoveryAction: () => ({ recoveryActionId: 'rec_1' }) as never,
+      finishRecoveryAction: () => {}
+    }
+    const r = new RecoveryReconciler({
+      getState: () => three(),
+      setState: async () => {},
+      journal: journal as never,
+      readGitFacts: async () => {
+        clock += 4_000
+        return { exists: true, head: 'aaa', dirty: false, inProgress: null, conflicts: false, branch: 'main' }
+      },
+      smartResume: () => false,
+      execute: async (a: { attempt: { dispatchId: string }; decision: { strategy: string } }) => {
+        // A spawn that takes far longer than the whole budget.
+        clock += 3 * RECOVERY_PASS_BUDGET_MS
+        executed.push({ dispatchId: a.attempt.dispatchId, strategy: a.decision.strategy })
+        return { ok: true as const }
+      },
+      log: () => {},
+      now: () => NOW,
+      clock: () => clock
+    } as never)
+    expect(await r.reconcileAll()).toBe(2)
+    expect(executed).toEqual([
+      { dispatchId: 'dsp_1', strategy: 'redispatch' },
+      { dispatchId: 'dsp_2', strategy: 'redispatch' }
+    ])
   })
 
   it('a pass budget is per pass: the next sweep reads the journal again', async () => {

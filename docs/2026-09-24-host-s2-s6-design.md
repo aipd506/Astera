@@ -2915,10 +2915,14 @@ Each was left as it is when A141 to A144 bounded the app's journal reads.
   3.3 s of held thread in chunks of about 370 ms, and about 5.3 s in all. Past that the answer is
   "cannot say", so a worker that could have resumed on its own waits for a review. Since stage 4 T6 a
   sweep lets the event loop turn between dispatches, so the window paints between those chunks, and one
-  `reconcileAll` pass asks the journal for at most 10 s from its start (`RECOVERY_PASS_BUDGET_MS`). A
-  retry stops at that point, and every dispatch after it goes to review without another read. A long
-  busy spell at boot therefore sends more workers to review than it used to, in exchange for a window
-  that is never held for more than one try at a time.
+  `reconcileAll` pass spends at most 10 s retrying a busy journal (`RECOVERY_PASS_BUDGET_MS`). Only
+  busy time is charged, from the start of a read's first busy try to the end of its retry, so reads that
+  answer at once, git and the spawns themselves never use it up. Once it is spent the retry in progress
+  stops, and that dispatch and every one after it are left for a later pass (a live `reconcileOne`, or
+  the next boot sweep). Nothing is decided or journaled for them, and none of them goes to review
+  unread. Review stays for a dispatch whose own reads answered busy through the whole retry. A long busy
+  spell at boot can therefore leave some lost workers waiting until the next trigger, in exchange for a
+  window that is never held for more than one try at a time.
 - **Every commit still waits for an fsync** (A143). On OneDrive or a slow disk that is the Host's
   thread, or main in front of an older Host.
 
