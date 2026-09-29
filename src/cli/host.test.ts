@@ -823,3 +823,83 @@ describe('runHostCommand says it is waiting (stage 4 T6)', () => {
     }
   })
 })
+
+// After the update that moved the protocol, a Host of the old one can still be serving the profile: it
+// outlives the app by design, and a CLI of the new protocol cannot talk to it. `host start` says so
+// (9) and names `--replace`; with it, the person chooses to have that Host leave, taking its sessions.
+describe('runHostCommand — host start --replace', () => {
+  /** A Host of `protocol` at this profile's address for it: it leaves when told to retire. */
+  const otherHost = async (
+    protocol: number
+  ): Promise<{ home: string; env: NodeJS.ProcessEnv; got: string[]; close(): Promise<void> }> => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-cli-home-'))
+    const env = {} as NodeJS.ProcessEnv
+    const profileDir = userDataDir({ platform: process.platform, env, home })
+    await fs.mkdir(profileDir, { recursive: true })
+    const addr = hostAddress({ profileDir, platform: process.platform, tmpDir: os.tmpdir(), protocol })
+    if (addr.dirToPrepare) await fs.mkdir(addr.dirToPrepare, { recursive: true, mode: 0o700 })
+    const got: string[] = []
+    const socks = new Set<net.Socket>()
+    const server = net.createServer((sock) => {
+      socks.add(sock)
+      sock.setEncoding('utf8')
+      sock.on('error', () => {})
+      sock.on('close', () => socks.delete(sock))
+      sock.on('data', (d: string) => {
+        got.push(d)
+        if (d.includes('"retire"')) {
+          for (const s of socks) s.destroy()
+          server.close()
+        }
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(addr.address, resolve))
+    return {
+      home,
+      env,
+      got,
+      close: async () => {
+        for (const s of socks) s.destroy()
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+        await fs.rm(home, { recursive: true, force: true })
+      }
+    }
+  }
+
+  it('without --replace refuses with 9, names --replace, and sends that Host nothing', async () => {
+    const old = await otherHost(HOST_PROTOCOL - 1)
+    try {
+      const r = await runHostCommand({ cmd: 'host-start', env: old.env, platform: process.platform, home: old.home, noKeepalive: true })
+      const e = failed(r, 'host-start')
+      expect(e.code).toBe('VERSION_MISMATCH')
+      expect(e.message).toContain('astera host start --replace')
+      expect(old.got.join('')).not.toContain('retire')
+    } finally {
+      await old.close()
+    }
+  })
+
+  it('with --replace asks the older Host to leave, then goes on to start one', async () => {
+    const old = await otherHost(HOST_PROTOCOL - 1)
+    try {
+      const r = await runHostCommand({ cmd: 'host-start', env: old.env, platform: process.platform, home: old.home, noKeepalive: true, replace: true })
+      expect(old.got.join('')).toContain('"retire"')
+      // Past the other Host: what is left is this test's lack of a Host build to start, not a 9.
+      expect(failed(r, 'host-start').code).toBe('HOST_NOT_RUNNING')
+      expect(failed(r, 'host-start').message).toContain('no Host build found')
+    } finally {
+      await old.close().catch(() => {})
+    }
+  })
+
+  it('never replaces a Host of a newer protocol', async () => {
+    const newer = await otherHost(HOST_PROTOCOL + 1)
+    try {
+      const r = await runHostCommand({ cmd: 'host-start', env: newer.env, platform: process.platform, home: newer.home, noKeepalive: true, replace: true })
+      expect(failed(r, 'host-start').code).toBe('VERSION_MISMATCH')
+      expect(newer.got.join('')).not.toContain('retire')
+    } finally {
+      await newer.close()
+    }
+  })
+})

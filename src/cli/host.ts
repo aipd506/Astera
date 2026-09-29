@@ -14,6 +14,8 @@ import { hostRuntimeBase, hostRuntimePaths } from '../core/host/runtime'
 import { HOST_STOP_WAIT_MS } from '../core/host/unresponsive'
 import { hostAddress, siblingHostAddresses } from '../host/address'
 import { answers, LEGACY_APP_NOTICE } from '../host/server'
+import { encodeLine } from '../host/framing'
+import net from 'node:net'
 import { resolveSkillsDir } from './skills'
 import { nativePath, userDataDir } from '../core/orchestration/cliDiscovery'
 import type { CliError } from '../core/orchestration/cliOutput'
@@ -75,7 +77,9 @@ export function siblingHostError(a: { found: { protocol: number; address: string
     message:
       `a Host speaking protocol ${a.found.protocol} serves this profile at ${a.found.address}, and this astera speaks protocol ${a.cliProtocol}: ` +
       'they come from different builds of Astera. That Host is running, so its state was not read from the file. ' +
-      'Quit Astera, stop that Host with the build that started it, then start the build you mean to use.',
+      (a.found.protocol < a.cliProtocol
+        ? 'It is from an older Astera. `astera host start --replace` asks it to leave, and the sessions it holds end with it; opening this Astera does the same.'
+        : 'Quit Astera, stop that Host with the build that started it, then start the build you mean to use.'),
     details: { hostProtocol: a.found.protocol, hostAddress: a.found.address, cliProtocol: a.cliProtocol }
   }
 }
@@ -401,6 +405,9 @@ export async function runHostCommand(a: {
   stopTimeoutMs?: number
   /** `--no-keepalive`: nothing on stderr while `host start` or `host stop` waits. */
   noKeepalive?: boolean
+  /** `host start --replace`: a Host of an older protocol serving this profile is asked to leave, and
+   *  the sessions it holds end with it. The person's choice, never the default. */
+  replace?: boolean
   /** The notice's timing and its writer. Test injection only. */
   notice?: { firstMs?: number; everyMs?: number; write?: (line: string) => void }
 }): Promise<HostCommandResult> {
@@ -418,6 +425,7 @@ async function runHostCommandNow(a: {
   platform: NodeJS.Platform
   home: string
   stopTimeoutMs?: number
+  replace?: boolean
 }): Promise<HostCommandResult> {
   if (a.cmd !== 'host-status' && a.cmd !== 'host-start' && a.cmd !== 'host-stop')
     return { ok: false, error: { code: 'FAILED', message: `${a.cmd} is not implemented yet` } }
@@ -500,8 +508,23 @@ async function runHostCommandNow(a: {
   // **Not while a Host of another protocol serves this profile** (conformance audit #12). It is at
   // another address, so nothing above saw it, and a second Host would write the same state file.
   // This is the step the 9 for that case offers next, so it has to be safe to follow.
-  const other = await sibling()
-  if (other) return other
+  const found = await otherProtocolHost({ profileDir, platform: a.platform, tmpDir: os.tmpdir() })
+  if (found) {
+    // **Only an older one, and only when asked.** Its sessions end with it, so that is the person's
+    // call (`--replace`); a newer Host is never pushed aside by an older astera.
+    if (a.replace !== true || found.protocol > HOST_PROTOCOL)
+      return { ok: false, error: siblingHostError({ found, cliProtocol: HOST_PROTOCOL }) }
+    const left = await retireOtherHost(found.address, a.stopTimeoutMs ?? HOST_STOP_WAIT_MS)
+    if (!left)
+      return {
+        ok: false,
+        error: {
+          code: 'TIMEOUT',
+          message: `the Host speaking protocol ${found.protocol} at ${found.address} was asked to leave and is still there — nothing was started beside it`,
+          details: { hostProtocol: found.protocol, hostAddress: found.address }
+        }
+      }
+  }
 
   const targets = hostStartTargets({
     cliEntry: process.argv[1] ?? '',
@@ -556,6 +579,35 @@ async function runHostCommandNow(a: {
       message: `the Host did not answer within ${START_TIMEOUT_MS}ms — its log is at ${targets.logPath}`,
       details: { logPath: targets.logPath }
     }
+  }
+}
+
+/**
+ * Asks the Host at `address` to leave and waits until nothing answers there, for at most `waitMs`.
+ * True once the address is free.
+ *
+ * **`retire` with no reason and no hello**, the way the app's `retireOlderHosts` asks an older Host:
+ * that is the one message every protocol's Host has taken the same way, and the `'protocol'` retire
+ * is the one a Host never refuses (protocol.ts). Nothing else is said to it. If what answers there is
+ * not a Host at all, it has been sent one line it can make nothing of.
+ */
+async function retireOtherHost(address: string, waitMs: number): Promise<boolean> {
+  logToStderr(`asking the Host at ${address} to leave — the sessions it holds end with it`)
+  await new Promise<void>((resolve) => {
+    const sock = net.connect(address)
+    const done = (): void => {
+      sock.destroy()
+      resolve()
+    }
+    sock.on('connect', () => sock.end(encodeLine({ t: 'retire' }), done))
+    sock.on('error', done)
+    setTimeout(done, 2_000).unref?.()
+  })
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    if (!(await answers(address))) return true
+    if (Date.now() >= deadline) return false
+    await sleep(START_POLL_MS)
   }
 }
 

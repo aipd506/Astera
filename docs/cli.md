@@ -83,6 +83,13 @@ astera host stop       # ask the running Host to retire
 
 `astera host start` is idempotent. A Host that is already running is success, not an error.
 
+`astera host start` does not start a second Host while a Host of another protocol serves the same
+profile, which is what an update that moves the protocol leaves behind: the older Host outlives the
+app and the new `astera` cannot talk to it. It exits 9 and says so. `astera host start --replace`
+asks an older Host to leave first and then starts one. **The sessions that Host holds end with it**,
+which is why this is a flag you choose and not what happens on its own. Opening Astera does the
+same. A Host of a newer protocol is never replaced.
+
 `astera host stop` refuses while the Host still holds sessions or running **runs**, and says how many.
 That refusal is the Host protecting work in progress. Stop the work first, then stop the Host. The
 refusal is exit 6 (`CONFLICT`), and the counts are in `error.details.sessions` and
@@ -475,7 +482,8 @@ running coordinator over a flag that never did anything.
 astera version                           CLI, app and protocol versions
 astera status                            is the orchestrator there, and what is running
 
-astera host    status | start | stop
+astera host    status | stop
+astera host    start  [--replace]
 
 astera projects list
 astera projects get   --id <projectId>
@@ -1541,7 +1549,11 @@ The `astera` on your `PATH` and the running Host came from different builds. Qui
 `astera host stop`, and start the version you meant to use. When `error.details.hostProtocol` is
 there, the other Host speaks a different protocol and this `astera` cannot reach it, so its
 `host stop` finds nothing: stop that Host with the build that started it (quitting that Astera, or
-its own `astera host stop`), then run `astera host start` with the build you mean to use.
+its own `astera host stop`), then run `astera host start` with the build you mean to use. After an
+update that build is gone, and the other Host is the older one: `astera host start --replace` asks it
+to leave and starts this build's Host, and the sessions the older Host holds end with it. It is left
+out of `error.nextSteps` on purpose, so that an agent working down that list never ends your sessions
+for you.
 
 **A worker reported while nothing was running**
 Reports a worker could not deliver are written into the profile's queue and applied when the

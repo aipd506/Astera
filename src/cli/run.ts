@@ -1232,7 +1232,9 @@ export async function main(): Promise<void> {
       home: homedir(),
       // `host start` and `host stop` say on stderr that they are still waiting (stage 4 T6), and
       // `--no-keepalive` silences that the same way it silences every other keepalive.
-      noKeepalive: parsed.noKeepalive
+      noKeepalive: parsed.noKeepalive,
+      // `host start --replace`: the person chooses to have an older protocol's Host leave (host.ts)
+      replace: parsed.args.replace === true
     })
     // A failure is a `CliError` and goes out like every other one (review I1): `ok: false`, its code,
     // its nextSteps, and the `error:` sentence under `--human`. `host stop`'s refusal keeps its counts

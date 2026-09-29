@@ -105,7 +105,12 @@ export const USAGE: Record<PublicCommand, CommandUsage> = {
       'For a caller that is a program. It lists the session-only commands as well as the public ones, with their flags, plus the protocol version and the exit codes. Like --help it needs no Host and always exits 0.'
   },
 
-  'host-start': { summary: 'start a Host if none is running (already running is success)' },
+  'host-start': {
+    summary: 'start a Host if none is running (already running is success)',
+    detail:
+      'Refused with 9 while a Host of another protocol serves the profile. With --replace an older one is asked to leave first, and the sessions it holds end with it.',
+    flags: [{ name: 'replace', about: 'ask a Host of an older protocol serving this profile to leave first; its sessions end' }]
+  },
   'host-status': { summary: 'is a Host running, and on which profile' },
   'host-stop': {
     summary: 'ask the running Host to retire',
