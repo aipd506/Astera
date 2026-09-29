@@ -17,7 +17,7 @@ import { humanFor, quietFor } from '../core/orchestration/cliHuman'
 import { answerFromFile, fileAnswerable, readStateFile } from '../core/orchestration/stateFile'
 import { connectHost, type ConnectFailure, type HostConnection } from '../core/host/connect'
 import { HOST_FEATURE_ORCH, HOST_FEATURE_PING, HOST_FEATURE_REQUESTS, HOST_PROTOCOL } from '../core/host/protocol'
-import { cliHostTarget, logToStderr, otherProtocolHost, runHostCommand, siblingHostError } from './host'
+import { cliHostTarget, impostorError, logToStderr, otherProtocolHost, runHostCommand, siblingHostError } from './host'
 import { installFailureOf, resolveSkillsDir, skillsCommand } from './skills'
 import {
   CLI_PROTOCOL,
@@ -148,8 +148,12 @@ export const SILENT_HOST_CODE: CliErrorCode = 'TIMEOUT'
 export function connectFailureEnd(a: {
   error: ConnectFailure['error']
   address: string
-}): { fallback: true } | { fallback: false; code: CliErrorCode; message: string } {
+  profileDir: string
+}): { fallback: true } | { fallback: false; code: CliErrorCode; message: string; details?: Record<string, unknown> } {
   if (a.error === 'unreachable') return { fallback: true }
+  // Somebody else's process at this profile's address (core/host/hostKey.ts): not a Host to read the
+  // file around, and not one to talk to.
+  if (a.error === 'impostor') return { fallback: false, ...impostorError(a.address, a.profileDir) }
   if (a.error === 'protocol')
     return {
       fallback: false,
@@ -1319,7 +1323,7 @@ export async function main(): Promise<void> {
   // Defining `reply` *from* `answer` is what makes that impossible rather than merely unlikely.
   answer = await (async (): Promise<HostAnswer> => {
     const connectStarted = Date.now()
-    const conn = await connectHost({ address, app: CLI_VERSION, log: logToStderr })
+    const conn = await connectHost({ address, profileDir, app: CLI_VERSION, log: logToStderr })
     verbose.say(
       'error' in conn
         ? `connecting to ${address} failed after ${Date.now() - connectStarted}ms: ${conn.error}`
@@ -1329,10 +1333,10 @@ export async function main(): Promise<void> {
       // **셋 중 하나만 "아무도 없다" 다** (connectFailureEnd). 나머지 둘에서 파일을 읽으면 살아
       // 있는 주인의 파일을 0 으로 답하게 된다 — 바로 아래 `orch` 없는 Host 를 9 로 끝내는 가지와
       // 같은 판단이다.
-      const end = connectFailureEnd({ error: conn.error, address })
+      const end = connectFailureEnd({ error: conn.error, address, profileDir })
       if (!end.fallback) {
         if (parsed.cmd === 'version') versionWithoutHost()
-        fail({ code: end.code, message: end.message })
+        fail({ code: end.code, message: end.message, ...(end.details ? { details: end.details } : {}) })
       }
       return withoutHost(
         `cannot reach the Host at ${address} (${conn.error}) — start one with \`astera host start\``

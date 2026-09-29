@@ -1301,7 +1301,7 @@ parses. Like the mode flags above it can come before the command, as in `astera 
 
 ```text
 astera: verbose: Host address \\.\pipe\astera-host-9f2a (profile C:\Users\me\AppData\Roaming\astera)
-astera: verbose: handshake in 4ms: Host 1.4.0, protocol 3, pid 18244, started 2026-09-26T01:02:03.000Z, features orch, ping, requests
+astera: verbose: handshake in 4ms: Host 1.4.0, protocol 4, pid 18244, started 2026-09-26T01:02:03.000Z, features orch, ping, requests
 astera: verbose: call jobs-list took 11ms: status 200
 ```
 
@@ -1442,8 +1442,16 @@ The boundary is your machine and your operating system account.
   handshake, and the Host sends only to peers that completed it, so another account on the machine
   hears nothing. This is the one place the boundary rests on the protocol rather than on file
   permissions.
-- There is no token and no connection file. What used to be a bearer token on a loopback HTTP port
-  was removed with the server it protected.
+- The Host proves it is yours before the app or `astera` sends it anything. The address can be
+  worked out from the profile path, and on Windows another account can create the pipe before your
+  Host does. So the Host keeps a random key in `host/host.key` inside the profile folder, which only
+  your account can read, and answers each connection's one-time challenge with a proof made from
+  it. The key itself never crosses the pipe. Something at the address that cannot answer is not
+  talked to: the app shows why on the Settings Info tab and runs its sessions itself, and `astera`
+  ends with `PERMISSION_DENIED` (exit 5).
+- There is no bearer token and no connection file. What used to be a bearer token on a loopback
+  HTTP port was removed with the server it protected. The Host key above is not a token: nothing
+  presents it, and a process that can read it is already running as you.
 - Public replies are shaped by an allowlist of fields. Account configuration directories, session
   credentials and provider tokens are not part of any reply, in either output mode.
 - Every agent session Astera starts can reach this command, and through it can start worker sessions

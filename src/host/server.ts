@@ -22,6 +22,7 @@ import { AppUnreachable, type OrchCall, type OrchCaller } from '../core/host/orc
 import { HOST_UNRESPONSIVE_MS } from '../core/host/unresponsive'
 import { pidLives } from '../core/host/pidFile'
 import { privateDirProblem } from '../core/host/socketDir'
+import { hostProof } from '../core/host/hostKey'
 
 /** Thrown by `startHostServer` when another Host already answers at this address. The entry point
  *  turns it into a quiet exit: losing the race is the normal outcome of two apps starting at once. */
@@ -107,6 +108,9 @@ export interface HostServerDeps {
    *  and a gap measured on it held a push for as long as the step. Injectable so a test can move time
    *  and fire the trailing push itself instead of waiting out real milliseconds. */
   stateClock?: StateClock
+  /** The profile's Host key (core/host/hostKey.ts), made before this binds. A hello that carries a
+   *  `nonce` is answered with its proof; without a key (tests that do not ask) no proof is sent. */
+  hostKey?: string
 }
 
 /** What the `orch-state` throttle measures gaps with and waits on. `after` returns its cancel. */
@@ -522,7 +526,12 @@ export async function startHostServer(deps: HostServerDeps): Promise<HostServer>
               ...(deps.features ?? [])
             ],
             // Only while one is attached, so `astera host status` can say so (LEGACY_APP_NOTICE).
-            ...(legacyAttached() ? { legacyApp: true as const } : {})
+            ...(legacyAttached() ? { legacyApp: true as const } : {}),
+            // Protocol 4: the answer that tells this account's Host from a squatter (core/host/hostKey.ts).
+            // A nonce longer than any client sends is not worth hashing.
+            ...(deps.hostKey && typeof m.nonce === 'string' && m.nonce.length > 0 && m.nonce.length <= 256
+              ? { proof: hostProof(deps.hostKey, m.nonce) }
+              : {})
           })
           if (roles.get(socket) === 'app') {
             try {

@@ -25,6 +25,7 @@ import { main } from './run'
 import { hostAddress } from '../host/address'
 import { encodeLine, createLineReader } from '../host/framing'
 import { startHostServer, ADDRESS_TAKEN, type HostServer } from '../host/server'
+import { ensureHostKey } from '../core/host/hostKey'
 import { createHostOrch, type HostOrch } from '../host/orch'
 import { createHostJournal } from '../host/hostJournal'
 import { JournalReader } from '../core/continuity/journalReader'
@@ -495,6 +496,7 @@ async function hostRig(o: { repo?: boolean; seed?: OrchState; profileDir?: strin
     version: '9.9.9',
     idleMs: 120_000,
     onIdle: () => {},
+    hostKey: await ensureHostKey(profileDir),
     onMessage: () => false,
     onClientGone: (from) => exits.appGone(from.socket),
     liveCounts: () => ({ sessions: registry.liveCount() + procs.liveCount(), runs: orch.runningRuns() }),

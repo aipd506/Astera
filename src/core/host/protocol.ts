@@ -19,8 +19,15 @@ import type { SlackForwardedEvent } from '../slack/forwarded'
  *  `hostSpeaksProcs` in main/host/outdated.ts is the check). A capability, not an age: an outdated
  *  Host is exactly the one the automatic replacement must still reach, and it cannot answer a
  *  proc-list. A bump would put the new app on a new pipe name and leave the old Host's terminals
- *  invisible to it, which is the one thing the guard must never cause (chat-sessions design §6.5). */
-export const HOST_PROTOCOL = 3
+ *  invisible to it, which is the one thing the guard must never cause (chat-sessions design §6.5).
+ *
+ *  **4 added the Host's proof** (`hello.nonce` answered by `hello.proof`, core/host/hostKey.ts): on
+ *  Windows another account can create the pipe first, and a client has no other way to tell. Unlike
+ *  the features above this cannot be additive: a client that must refuse a Host without a proof would
+ *  refuse a 3 Host it has no way to tell from a squatter, so the number moves, the address moves with
+ *  it, and `retireOlderHosts` sends the 3 Host away. Its terminals end with it, once, on the update that
+ *  brings this in (decided 2026-09-30: supporting Windows machines several people use is worth it). */
+export const HOST_PROTOCOL = 4
 
 /** The proc-* family (line processes). Announced in `hello.features` by a Host that has it; a Host
  *  from before it sends no `features` at all. */
@@ -297,8 +304,11 @@ export type ClientMessage =
    *  **`pid` is the app's own process id** (leftovers Task 1, S6-3). The Host keeps the last one an app
    *  gave and asks whether it lives when the profile's `app.pid` names no live app (a profile the app
    *  could not write). Absent from an older app and from the CLI, and then `app.pid` alone answers, as
-   *  before. Additive, so HOST_PROTOCOL stays 3. */
-  | { t: 'hello'; protocol: number; app: string; role?: 'app' | 'cli'; yields?: string[]; pid?: number }
+   *  before. Additive, so HOST_PROTOCOL stays 3.
+   *
+   *  **`nonce`** (protocol 4): the Host answers it with `proof` (core/host/hostKey.ts), and the client
+   *  sends nothing more until that proof checks out. */
+  | { t: 'hello'; protocol: number; app: string; role?: 'app' | 'cli'; yields?: string[]; pid?: number; nonce?: string }
   /** Leave. Sent when the app finds a Host on another protocol; in slice 1 the Host holds nothing,
    *  so leaving costs nothing. This message's meaning is revisited in slice 2.
    *
@@ -380,6 +390,9 @@ export type HostMessage =
        *  role. `astera host status` says so and asks for the update. Absent otherwise, and from an
        *  older Host. Additive, so HOST_PROTOCOL stays 3. */
       legacyApp?: true
+      /** HMAC of the client's `nonce` under the profile's Host key (core/host/hostKey.ts). Sent only
+       *  in answer to a nonce. */
+      proof?: string
     }
   | { t: 'protocol-mismatch'; protocol: number }
   /** Answered instead of leaving, to a `{ t: 'retire', reason: 'user' }` while something is holding

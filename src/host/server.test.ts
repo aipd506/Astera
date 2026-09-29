@@ -11,6 +11,7 @@ import { HOST_PROTOCOL, HOST_YIELD_ORCH_STATE_LATEST, ORCH_STATE_PUSH_MS, type C
 import { emptyState } from '../core/orchestration/state'
 import { versionOnlyOrchCall, AppUnreachable } from '../core/host/orchProtocol'
 import { HOST_UNRESPONSIVE_MS } from '../core/host/unresponsive'
+import { hostProof } from '../core/host/hostKey'
 
 let dir: string
 let open: HostServer[] = []
@@ -39,6 +40,7 @@ const server = async (
     onAppGreeted?: HostServerDeps['onAppGreeted']
     pidLives?: HostServerDeps['pidLives']
     stateClock?: HostServerDeps['stateClock']
+    hostKey?: HostServerDeps['hostKey']
   } = {}
 ): Promise<{
   s: HostServer
@@ -72,6 +74,7 @@ const server = async (
     // real probe of whatever this machine runs under them.
     pidLives: over.pidLives ?? ((): boolean => true),
     stateClock: over.stateClock,
+    hostKey: over.hostKey,
     log: { write: (m) => logs.push(m), close: () => {} }
   })
   open.push(s)
@@ -209,6 +212,17 @@ describe('startHostServer', () => {
     const got = await talk(h.address, [{ t: 'hello', protocol: HOST_PROTOCOL, app: '1.0.0' }, { t: 'ping', seq: 7 }], 2)
     expect(got[1]).toEqual({ t: 'pong', seq: 7 })
     expect(h.logs.some((l) => l.startsWith('unknown message'))).toBe(false)
+  })
+
+  // Protocol 4 (core/host/hostKey.ts): the client's nonce is answered with an HMAC of the profile's key,
+  // which is how the app and `astera` tell this account's Host from a squatter on the address.
+  it('answers a nonce with the proof of its key, and sends none for a hello without one', async () => {
+    const key = 'c'.repeat(64)
+    const h = await server({ hostKey: key })
+    const [reply] = await talk(h.address, [{ t: 'hello', protocol: HOST_PROTOCOL, app: '1.0.0', nonce: 'ab12' }])
+    expect((reply as { proof?: string }).proof).toBe(hostProof(key, 'ab12'))
+    const [bare] = await talk(h.address, [{ t: 'hello', protocol: HOST_PROTOCOL, app: '1.0.0' }])
+    expect((bare as { proof?: string }).proof).toBeUndefined()
   })
 
   it('answers a hello on another protocol with a mismatch, and does not hang up', async () => {

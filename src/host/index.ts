@@ -20,6 +20,7 @@ import { trustSystemCa } from './systemCa'
 import { openHostLog, logUnhandledRejections } from './log'
 import { flushAll, flushAllLogsSync } from '../core/log/logWriter'
 import { startHostServer, ADDRESS_TAKEN } from './server'
+import { ensureHostKey } from '../core/host/hostKey'
 import { PtyRegistry } from './registry'
 import { createConhostReaper, reapWindowsConsoleHosts } from './conhostReaper'
 import { attachPtyHost } from './ptyHost'
@@ -536,9 +537,20 @@ async function main(): Promise<void> {
         log: (m) => log.write(m)
       })
     : null
+  // Protocol 4: the proof every client checks before it hands this Host anything (core/host/hostKey.ts).
+  // Made before the bind, so no client can meet this Host before its key exists. A Host that cannot
+  // make one would be refused by every client, so it does not serve at all.
+  let hostKey: string
+  try {
+    hostKey = await ensureHostKey(profileDir)
+  } catch (err) {
+    log.write(`could not make the Host key: ${String(err)} — not serving`)
+    process.exit(2)
+  }
   try {
     server = await startHostServer({
       address: addr.address,
+      hostKey,
       dirToPrepare: addr.dirToPrepare,
       version: hostVersion,
       idleMs: IDLE_MS,

@@ -9,6 +9,12 @@ import { encodeLine, createLineReader } from '../../host/framing'
 import { HOST_PROTOCOL, HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, HOST_YIELD_SLACK, type HostMessage } from '../../core/host/protocol'
 import { HostClient } from './client'
 import { hostSpeaksDispatch } from './outdated'
+import { hostProof } from '../../core/host/hostKey'
+
+/** The profile's Host key every test Host holds (protocol 4, core/host/hostKey.ts), and the read the
+ *  client makes of it. */
+const KEY = 'e'.repeat(64)
+const hostKey = async (): Promise<string | null> => KEY
 
 let dir: string
 let servers: HostServer[] = []
@@ -50,6 +56,7 @@ const serveAt = async (
     version: over.version ?? '9.9.9',
     idleMs: 60_000,
     onIdle: over.onIdle ?? ((): void => {}),
+    hostKey: KEY,
     log: { write: () => {}, close: () => {} }
   })
   servers.push(s)
@@ -91,7 +98,7 @@ const rawHost = async (
       'data',
       createLineReader({
         onMessage: (v) => {
-          const m = v as { t: string }
+          const m = v as { t: string; nonce?: string }
           got.push(m)
           if (m.t === 'hello') {
             sock.write(
@@ -101,7 +108,8 @@ const rawHost = async (
                 host: '9.9.9',
                 pid: 4242,
                 startedAt: '2026-09-22T00:00:00.000Z',
-                features
+                features,
+                proof: hostProof(KEY, m.nonce ?? '')
               })
             )
           }
@@ -123,6 +131,101 @@ const rawHost = async (
   }
 }
 
+describe('HostClient — the Host proves itself (protocol 4)', () => {
+  /** Something at the address that says hello the way a Host does but holds no key of this profile:
+   *  another account's process on a shared Windows machine. Records every line it is sent. */
+  const squatter = async (
+    addr: ReturnType<typeof hostAddress>,
+    proofFor: (nonce: string) => string | undefined,
+    before: HostMessage[] = []
+  ): Promise<{ got: Array<{ t: string }>; close(): Promise<void> }> => {
+    if (addr.dirToPrepare) await fs.mkdir(addr.dirToPrepare, { recursive: true, mode: 0o700 })
+    const got: Array<{ t: string }> = []
+    const sockets: net.Socket[] = []
+    const server = net.createServer((sock) => {
+      sockets.push(sock)
+      sock.setEncoding('utf8')
+      sock.on(
+        'data',
+        createLineReader({
+          onMessage: (v) => {
+            const m = v as { t: string; nonce?: string }
+            got.push(m)
+            if (m.t !== 'hello') return
+            for (const b of before) sock.write(encodeLine(b))
+            const proof = proofFor(m.nonce ?? '')
+            sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '9.9.9', pid: 4242, startedAt: 't', features: ['ping'], ...(proof ? { proof } : {}) }))
+          },
+          onBadLine: () => {},
+          onHandlerError: () => {}
+        })
+      )
+    })
+    await new Promise<void>((r) => server.listen(addr.address, r))
+    return {
+      got,
+      close: () =>
+        new Promise<void>((r) => {
+          for (const s of sockets) s.destroy()
+          server.close(() => r())
+        })
+    }
+  }
+
+  for (const [name, proofFor] of [
+    ['no proof', (): undefined => undefined],
+    ['a proof under another key', (nonce: string): string => hostProof('f'.repeat(64), nonce)]
+  ] as const) {
+    it(`does not connect to a hello with ${name}, and sends it nothing after the hello`, async () => {
+      const addr = addressFor(`squat-${name.length}`)
+      const sq = await squatter(addr, proofFor)
+      const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 3, retryMs: 20 })
+      c.start()
+      await settled(c, (s) => s.problem !== null)
+      expect(c.status().connected).toBe(false)
+      expect(c.status().problem).toContain('could not prove')
+      await new Promise((r) => setTimeout(r, 150))
+      expect(sq.got.map((m) => m.t)).toEqual(['hello'])
+      await c.stop()
+      await sq.close()
+    })
+  }
+
+  it('hands a subscriber nothing a peer sends before it has proven itself', async () => {
+    const addr = addressFor('squat-early')
+    const sq = await squatter(addr, () => undefined, [{ t: 'pty-data', id: 'x', data: 'rm -rf ~\r' } as HostMessage])
+    const heard: string[] = []
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 3, retryMs: 20 })
+    c.onMessage((m) => heard.push(m.t))
+    c.start()
+    await settled(c, (s) => s.problem !== null)
+    expect(heard).toEqual([])
+    await c.stop()
+    await sq.close()
+  })
+
+  it('does not trust any hello while this profile has no key', async () => {
+    const addr = addressFor('no-key')
+    await serveAt(addr)
+    const c = new HostClient({ hostKey: async () => null, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 3, retryMs: 20 })
+    c.start()
+    await settled(c, (s) => s.problem !== null)
+    expect(c.status().connected).toBe(false)
+    expect(c.status().problem).toContain('has no Host key')
+    await c.stop()
+  })
+
+  it('connects to a Host that proves itself with this profile key', async () => {
+    const addr = addressFor('proven')
+    await serveAt(addr)
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    c.start()
+    await settled(c, (s) => s.connected)
+    expect(c.status().problem).toBeNull()
+    await c.stop()
+  })
+})
+
 describe('HostClient', () => {
   // Security review 2026-09-28: the Host refused to serve from a directory another user could have
   // made (server.test.ts), but the app connected to whatever answered there — and then sent it every
@@ -138,7 +241,7 @@ describe('HostClient', () => {
     await new Promise<void>((r) => squatter.listen(addr.address, r))
     const logs: string[] = []
     let spawnAsked = 0
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => { spawnAsked += 1 }, log: (m) => logs.push(m), attempts: 2, retryMs: 10 })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => { spawnAsked += 1 }, log: (m) => logs.push(m), attempts: 2, retryMs: 10 })
     c.start()
     await waitFor(() => spawnAsked > 0)
     await c.stop()
@@ -150,7 +253,7 @@ describe('HostClient', () => {
   it('connects to a Host that is already there and reports what it found', async () => {
     const addr = addressFor('already')
     await serveAt(addr, { version: '1.2.3' })
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await settled(c, (s) => s.connected)
     expect(c.status()).toMatchObject({ connected: true, protocol: HOST_PROTOCOL, hostVersion: '1.2.3', problem: null })
@@ -161,7 +264,7 @@ describe('HostClient', () => {
   it('reports the features a hello names', async () => {
     const addr = addressFor('features')
     await serveAt(addr)
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await settled(c, (s) => s.connected)
     expect(c.status().features).toEqual(['proc', 'ping'])
@@ -171,7 +274,7 @@ describe('HostClient', () => {
   it('says hello as the app and yields worktrees to the Host (S3 ruling R4)', async () => {
     const addr = addressFor('yields')
     const host = await rawHost(addr, [])
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await waitFor(() => host.got.some((m) => m.t === 'hello'))
     expect(host.got.find((m) => m.t === 'hello')).toMatchObject({ role: 'app' })
@@ -189,7 +292,7 @@ describe('HostClient', () => {
   it('says it yields dispatch, rolling, chat-takeover and journal as well as worktrees', async () => {
     const addr = addressFor('yields-dispatch')
     const host = await rawHost(addr, [])
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await waitFor(() => host.got.some((m) => m.t === 'hello'))
     expect((host.got.find((m) => m.t === 'hello') as { yields?: string[] }).yields).toEqual([HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, HOST_YIELD_SLACK])
@@ -206,7 +309,7 @@ describe('HostClient', () => {
     const host = await rawHost(addr, [])
     let keeps: () => boolean = () => true
     const logs: string[] = []
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m), keepsSlack: () => keeps() })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m), keepsSlack: () => keeps() })
     c.start()
     await waitFor(() => host.got.some((m) => m.t === 'hello'))
     const yields = (host.got.find((m) => m.t === 'hello') as { yields?: string[] }).yields
@@ -217,7 +320,7 @@ describe('HostClient', () => {
     keeps = () => { throw new Error('boom') }
     const addr2 = addressFor('yields-slack-throw')
     const host2 = await rawHost(addr2, [])
-    const c2 = new HostClient({ address: addr2.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m), keepsSlack: () => keeps() })
+    const c2 = new HostClient({ hostKey, address: addr2.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m), keepsSlack: () => keeps() })
     c2.start()
     await waitFor(() => host2.got.some((m) => m.t === 'hello'))
     expect((host2.got.find((m) => m.t === 'hello') as { yields?: string[] }).yields).not.toContain('slack')
@@ -227,7 +330,7 @@ describe('HostClient', () => {
     keeps = () => false
     const addr3 = addressFor('yields-slack-free')
     const host3 = await rawHost(addr3, [])
-    const c3 = new HostClient({ address: addr3.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m), keepsSlack: () => keeps() })
+    const c3 = new HostClient({ hostKey, address: addr3.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m), keepsSlack: () => keeps() })
     c3.start()
     await waitFor(() => host3.got.some((m) => m.t === 'hello'))
     expect((host3.got.find((m) => m.t === 'hello') as { yields?: string[] }).yields).toContain('slack')
@@ -241,7 +344,7 @@ describe('HostClient', () => {
   it('keeps a dispatch Host driving while unresponsive, and gives the drive back in the turn it drops', async () => {
     const addr = addressFor('dispatch-drop')
     const host = await rawHost(addr, ['proc', 'ping', 'spawn', 'worktrees', 'dispatch'])
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await settled(c, (st) => st.connected)
     expect(hostSpeaksDispatch(c.status())).toBe(true)
@@ -268,8 +371,9 @@ describe('HostClient', () => {
     const raw = net.createServer((sock) => {
       sock.setEncoding('utf8')
       const read = createLineReader({
-        onMessage: () => {
-          sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '1.0.0', pid: process.pid, startedAt: new Date().toISOString() }))
+        onMessage: (v) => {
+          const nonce = (v as { nonce?: string }).nonce ?? ''
+          sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '1.0.0', pid: process.pid, startedAt: new Date().toISOString(), proof: hostProof(KEY, nonce) }))
         },
         onBadLine: () => {},
         onHandlerError: () => {}
@@ -277,7 +381,7 @@ describe('HostClient', () => {
       sock.on('data', read)
     })
     await new Promise<void>((resolve) => raw.listen(addr.address, resolve))
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await settled(c, (s) => s.connected)
     expect(c.status().features).toEqual([])
@@ -288,7 +392,7 @@ describe('HostClient', () => {
   it('asks for a Host when none answers, and connects once it appears', async () => {
     const addr = addressFor('spawned')
     let asked = 0
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       spawnHost: () => {
@@ -310,7 +414,7 @@ describe('HostClient', () => {
   it('waits for an asynchronous spawnHost before counting its attempts', async () => {
     const addr = addressFor('slow-spawn')
     let spawned = false
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       attempts: 3,
@@ -339,7 +443,7 @@ describe('HostClient', () => {
     const installed = new Promise<void>((r) => (release = r))
     const wantedAfter: boolean[] = []
     let asked = false
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       attempts: 2,
@@ -365,7 +469,7 @@ describe('HostClient', () => {
     const addr = addressFor('restart-during-install')
     const releases: Array<() => void> = []
     const wanted: boolean[] = []
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       attempts: 2,
@@ -393,7 +497,7 @@ describe('HostClient', () => {
   // runtime being installed — does not count against it.
   it('does not let ready() run out while spawnHost is still installing', async () => {
     const addr = addressFor('ready-during-install')
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       retryMs: 10,
@@ -411,7 +515,7 @@ describe('HostClient', () => {
 
   it('reports a rejected asynchronous spawnHost as a problem, not an unhandled rejection', async () => {
     const addr = addressFor('spawn-rejects')
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       attempts: 2,
@@ -435,7 +539,7 @@ describe('HostClient', () => {
     let retired = false
     let old: HostServer | null = null
     old = await serveAt(addr, { onIdle: () => { retired = true; void old?.close() } })
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       protocol: HOST_PROTOCOL + 1,
@@ -450,7 +554,7 @@ describe('HostClient', () => {
 
   it('reports the reason when there is no Host and none can be started', async () => {
     const addr = addressFor('never')
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 2, retryMs: 10 })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 2, retryMs: 10 })
     c.start()
     await settled(c, (s) => s.problem !== null)
     expect(c.status().connected).toBe(false)
@@ -477,7 +581,7 @@ describe('HostClient', () => {
     })
     await new Promise<void>((r) => silent.listen(addr.address, r))
     try {
-      const c = new HostClient({
+      const c = new HostClient({ hostKey,
         address: addr.address,
         appVersion: '9.0.0',
         spawnHost: () => {},
@@ -505,7 +609,7 @@ describe('HostClient', () => {
     const addr = addressFor('heartbeat')
     const h = await rawHost(addr, ['proc', 'ping'])
     try {
-      const c = new HostClient({
+      const c = new HostClient({ hostKey,
         address: addr.address,
         appVersion: '9.0.0',
         spawnHost: () => {},
@@ -548,7 +652,7 @@ describe('HostClient', () => {
     const addr = addressFor('no-ping')
     const h = await rawHost(addr, ['proc'])
     try {
-      const c = new HostClient({
+      const c = new HostClient({ hostKey,
         address: addr.address,
         appVersion: '9.0.0',
         spawnHost: () => {},
@@ -572,7 +676,7 @@ describe('HostClient', () => {
   it('can be told the Host is unresponsive, and recovers on the next message from it', async () => {
     const addr = addressFor('told')
     const s = await serveAt(addr)
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await settled(c, (st) => st.connected)
     c.markUnresponsive('the Host did not answer a pty-list within 5s')
@@ -595,7 +699,7 @@ describe('HostClient', () => {
     const addr = addressFor('later-reason')
     const h = await rawHost(addr, ['proc', 'ping'])
     try {
-      const c = new HostClient({
+      const c = new HostClient({ hostKey,
         address: addr.address,
         appVersion: '9.0.0',
         spawnHost: () => {},
@@ -623,7 +727,7 @@ describe('HostClient', () => {
     const addr = addressFor('incomplete')
     await serveAt(addr)
     let incomplete = true
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       spawnHost: () => {},
@@ -642,7 +746,7 @@ describe('HostClient', () => {
   // boot has to branch on it: it decides whether an open Dispatch is written off as lost.
   it('says it never saw a peer when nothing ever answered the address', async () => {
     const addr = addressFor('saw-none')
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 2, retryMs: 10 })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 2, retryMs: 10 })
     c.start()
     await c.ready(3_000)
     expect(c.sawPeer()).toBe(false)
@@ -656,7 +760,7 @@ describe('HostClient', () => {
     const silent = net.createServer((sock) => held.push(sock))
     await new Promise<void>((r) => silent.listen(addr.address, r))
     try {
-      const c = new HostClient({
+      const c = new HostClient({ hostKey,
         address: addr.address,
         appVersion: '9.0.0',
         spawnHost: () => {},
@@ -677,7 +781,7 @@ describe('HostClient', () => {
   it('remembers a peer it shook hands with', async () => {
     const addr = addressFor('saw-connected')
     await serveAt(addr)
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await c.ready(3_000)
     expect(c.sawPeer()).toBe(true)
@@ -686,7 +790,7 @@ describe('HostClient', () => {
 
   it('keeps its status once it is stopped', async () => {
     const addr = addressFor('stopped')
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 1, retryMs: 10 })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {}, attempts: 1, retryMs: 10 })
     c.start()
     await c.stop()
     const before = c.status()
@@ -697,7 +801,7 @@ describe('HostClient', () => {
   it('does not connect after it has been stopped', async () => {
     const addr = addressFor('stop-races-connect')
     await serveAt(addr)
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await c.stop()
     await new Promise((r) => setTimeout(r, 300))
@@ -708,7 +812,7 @@ describe('HostClient', () => {
   it('does not start a Host after it has been stopped', async () => {
     const addr = addressFor('stop-before-spawn')
     let asked = 0
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       spawnHost: () => { asked += 1 },
@@ -728,7 +832,7 @@ describe('HostClient', () => {
     const addr = addressFor('fan-out')
     const server = await serveAt(addr)
     const logs: string[] = []
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m) })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m) })
     c.start()
     await settled(c, (s) => s.connected)
 
@@ -760,7 +864,7 @@ describe('HostClient', () => {
     const addr = addressFor('disconnect')
     const server = await serveAt(addr)
     const logs: string[] = []
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m) })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: (m) => logs.push(m) })
     c.start()
     await settled(c, (s) => s.connected)
 
@@ -784,7 +888,7 @@ describe('HostClient', () => {
   it('does not treat a deliberate stop as the Host disappearing', async () => {
     const addr = addressFor('stop-is-quiet')
     await serveAt(addr)
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     await settled(c, (s) => s.connected)
 
@@ -803,7 +907,7 @@ describe('HostClient', () => {
   it('re-arms after a reconnect, rather than firing twice for one drop or going quiet for the next', async () => {
     const addr = addressFor('disconnect-rearm')
     let server = await serveAt(addr)
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       spawnHost: () => {
@@ -841,7 +945,7 @@ describe('HostClient', () => {
     let server = await serveAt(addr)
     const seen: Array<{ pid: number; startedAt: string }> = []
     const logs: string[] = []
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       spawnHost: () => {
@@ -876,7 +980,7 @@ describe('HostClient', () => {
   it('ready() resolves once the handshake completes, well before its own timeout', async () => {
     const addr = addressFor('ready-connects')
     await serveAt(addr)
-    const c = new HostClient({ address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '9.0.0', spawnHost: () => {}, log: () => {} })
     c.start()
     const start = Date.now()
     await c.ready(5_000)
@@ -887,7 +991,7 @@ describe('HostClient', () => {
 
   it('ready() resolves once the client gives up, without waiting out the full timeout', async () => {
     const addr = addressFor('ready-gives-up')
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       spawnHost: () => {},
@@ -906,7 +1010,7 @@ describe('HostClient', () => {
 
   it('ready() gives up waiting at its own timeout while the client is still trying', async () => {
     const addr = addressFor('ready-times-out')
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '9.0.0',
       spawnHost: () => {},
@@ -932,7 +1036,7 @@ describe('HostClient.restart', () => {
   it('connects again after stop(), to whatever is at the address now', async () => {
     const addr = addressFor('restart-a')
     const first = await serveAt(addr, { version: '1.0.0' })
-    const c = new HostClient({ address: addr.address, appVersion: '2.0.0', log: () => {}, spawnHost: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '2.0.0', log: () => {}, spawnHost: () => {} })
     c.start()
     await settled(c, (s) => s.connected && s.hostVersion === '1.0.0')
     await c.stop()
@@ -948,7 +1052,7 @@ describe('HostClient.restart', () => {
   it('starts a Host when nothing answers after the restart, exactly as the first cycle does', async () => {
     const addr = addressFor('restart-b')
     let spawned = 0
-    const c = new HostClient({
+    const c = new HostClient({ hostKey,
       address: addr.address,
       appVersion: '2.0.0',
       log: () => {},
@@ -972,7 +1076,7 @@ describe('HostClient.restart', () => {
     const addr = addressFor('restart-c')
     const first = await serveAt(addr)
     const seen: string[] = []
-    const c = new HostClient({ address: addr.address, appVersion: '2.0.0', log: () => {}, spawnHost: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '2.0.0', log: () => {}, spawnHost: () => {} })
     c.onConnect((h) => seen.push(`${h.pid}@${h.startedAt}`))
     c.start()
     await waitFor(() => seen.length === 1)
@@ -990,7 +1094,7 @@ describe('HostClient.restart', () => {
     const addr = addressFor('restart-d')
     await serveAt(addr)
     let logs: string[] = []
-    const c = new HostClient({ address: addr.address, appVersion: '2.0.0', log: (m) => logs.push(m), spawnHost: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '2.0.0', log: (m) => logs.push(m), spawnHost: () => {} })
     c.start()
     await settled(c, (s) => s.connected)
     const before = c.status()
@@ -1004,7 +1108,7 @@ describe('HostClient.restart', () => {
   it('marks a Host older than the app as outdated, and one that is not as not', async () => {
     const addr = addressFor('outdated')
     await serveAt(addr, { version: '1.3.20' })
-    const c = new HostClient({ address: addr.address, appVersion: '1.3.21', log: () => {}, spawnHost: () => {} })
+    const c = new HostClient({ hostKey, address: addr.address, appVersion: '1.3.21', log: () => {}, spawnHost: () => {} })
     c.start()
     await settled(c, (s) => s.connected)
     expect(c.status().outdated).toBe(true)
@@ -1012,7 +1116,7 @@ describe('HostClient.restart', () => {
 
     const addr2 = addressFor('current')
     await serveAt(addr2, { version: '1.3.21' })
-    const c2 = new HostClient({ address: addr2.address, appVersion: '1.3.21', log: () => {}, spawnHost: () => {} })
+    const c2 = new HostClient({ hostKey, address: addr2.address, appVersion: '1.3.21', log: () => {}, spawnHost: () => {} })
     c2.start()
     await settled(c2, (s) => s.connected)
     expect(c2.status().outdated).toBe(false)
@@ -1025,7 +1129,7 @@ describe('HostClient.retire announce', () => {
     const addrA = addressFor('retire-announce')
     await serveAt(addrA)
     let gone = 0
-    const a = new HostClient({ address: addrA.address, appVersion: '1.0.0', log: () => {}, spawnHost: () => {} })
+    const a = new HostClient({ hostKey, address: addrA.address, appVersion: '1.0.0', log: () => {}, spawnHost: () => {} })
     a.onDisconnect(() => gone++)
     a.start()
     await settled(a, (s) => s.connected)
@@ -1035,7 +1139,7 @@ describe('HostClient.retire announce', () => {
     const addrB = addressFor('retire-quiet')
     await serveAt(addrB)
     let quiet = 0
-    const b = new HostClient({ address: addrB.address, appVersion: '1.0.0', log: () => {}, spawnHost: () => {} })
+    const b = new HostClient({ hostKey, address: addrB.address, appVersion: '1.0.0', log: () => {}, spawnHost: () => {} })
     b.onDisconnect(() => quiet++)
     b.start()
     await settled(b, (s) => s.connected)

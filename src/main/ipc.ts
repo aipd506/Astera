@@ -34,6 +34,7 @@ import { hostRuntimeBase } from '../core/host/runtime'
 import { createRuntimeInstaller, installHostRuntime, spawnWhenInstalled, type InstalledRuntime } from './host/runtimeInstall'
 import { executableProbe, parseExecutablePath, hostKillPlan, killHostCommand } from './host/hostProcess'
 import { hostPidFilePath, parseHostPidFile } from '../core/host/pidFile'
+import { readHostKey } from '../core/host/hostKey'
 import { hostAddress, retireOlderHosts } from '../host/address'
 import { createHostPtyFactory } from './host/ptyFactory'
 import { createHostProcFactory } from './host/procFactory'
@@ -5745,6 +5746,8 @@ export function registerIpc(
       address: addr.address,
       appVersion: app.getVersion(),
       log: hostLog,
+      // Protocol 4: the Host's hello must carry the proof of this key (core/host/hostKey.ts)
+      hostKey: () => readHostKey(profileDir),
       // Read at every handshake, so the notice belongs to the Host that just answered rather than to
       // whatever the runtime looked like when the app started.
       runtimeIncomplete: () => runtime?.incomplete ?? false,

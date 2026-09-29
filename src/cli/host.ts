@@ -325,6 +325,17 @@ export function cliHostTarget(a: {
   }
 }
 
+/** The answer when something at the address could not prove it is this profile's Host
+ *  (core/host/hostKey.ts). PERMISSION_DENIED (5): it is somebody else's, and this CLI will not talk to
+ *  it. Shared with run.ts's `connectFailureEnd`, which says the same thing for every other command. */
+export function impostorError(address: string, profileDir: string): { code: 'PERMISSION_DENIED'; message: string; details: Record<string, unknown> } {
+  return {
+    code: 'PERMISSION_DENIED',
+    message: `something at ${address} answered as a Host but could not prove it is the Host of the profile ${profileDir} — another account on this machine may be holding the address; nothing was sent to it`,
+    details: { address, profileDir }
+  }
+}
+
 /** How long `host start` waits for a freshly spawned Host to answer its first `hello`, and how often
  *  it checks. Generous, not tuned: a cold start pays for requiring node-pty and opening the pipe, and
  *  there is nothing else this command is doing meanwhile. */
@@ -417,7 +428,10 @@ async function runHostCommandNow(a: {
    *  answered, which the two callers below read differently (a failed `status` and a `start` that
    *  still has spawning left to do are not the same null). */
   const tryStatus = async (): Promise<HostCommandResult | null> => {
-    const connected = await connectHost({ address, app: CLI_VERSION, log: logToStderr })
+    const connected = await connectHost({ address, profileDir, app: CLI_VERSION, log: logToStderr })
+    // Something is there and it is not this profile's Host: not "no Host", and nothing to start one
+    // beside (its address is taken). Said, rather than answered from the state file.
+    if ('error' in connected && connected.error === 'impostor') return { ok: false, error: impostorError(address, profileDir) }
     if ('error' in connected) return null
     const body = hostStatus({ conn: connected, profileDir, jobsInProfile: jobCountFrom(profileDir) })
     connected.close()
@@ -450,7 +464,8 @@ async function runHostCommandNow(a: {
   }
 
   if (a.cmd === 'host-stop') {
-    const connected = await connectHost({ address, app: CLI_VERSION, log: logToStderr })
+    const connected = await connectHost({ address, profileDir, app: CLI_VERSION, log: logToStderr })
+    if ('error' in connected && connected.error === 'impostor') return { ok: false, error: impostorError(address, profileDir) }
     if ('error' in connected) return hostStopResult({ outcome: 'absent' })
     // A `retire` that is honoured gets no reply, only the connection ending — so this races three
     // outcomes: `retire-refused`, the socket closing on its own, or neither ever arriving because the

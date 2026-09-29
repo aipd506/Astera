@@ -10,6 +10,7 @@ import { encodeLine, createLineReader } from '../../host/framing'
 // from src/main.
 import type { HostStatus } from '../../core/types'
 import { unsafeSocketDir } from '../../core/host/socketDir'
+import { newHostNonce, proofMatches } from '../../core/host/hostKey'
 
 /** What `spawnHost` is handed: whether the spawn it is about to make is still wanted. */
 export interface SpawnContext {
@@ -33,6 +34,10 @@ export interface HostClientDeps {
    *  Hosts racing for one address. Time spent in here does not count against `ready(ms)` either. */
   spawnHost(ctx: SpawnContext): void | Promise<void>
   log(m: string): void
+  /** The profile's Host key (core/host/hostKey.ts `readHostKey`), read before each connection. The
+   *  Host's hello has to carry the proof of it, or this client treats what answered as somebody
+   *  else's and sends it nothing more: on Windows another account can create the pipe first. */
+  hostKey(): Promise<string | null>
   /** The protocol this app speaks. Injected only so a test can be the odd one out. */
   protocol?: number
   /** How many times to try the address before giving up on this cycle. */
@@ -163,6 +168,9 @@ export class HostClient {
   /** Whether anything ever accepted a connection at the address. Set once, in `attach`, and never
    *  cleared: see `sawPeer`. */
   private peerSeen = false
+  /** The socket whose Host proved itself (protocol 4), and what its proof is checked against. */
+  private proven: net.Socket | null = null
+  private expecting: { key: string | null; nonce: string } | null = null
   private state: HostStatus = {
     connected: false,
     protocol: null,
@@ -462,6 +470,14 @@ export class HostClient {
     for (let i = 0; i < attempts && !this.stopped; i++) {
       try {
         const socket = await connectOnce(this.deps.address, this.deps.log)
+        // Read after the connect and before the hello: nothing arrives before this client speaks, and
+        // the proof has to be checked the moment the Host's hello lands (see `handleHostMessage`).
+        let key: string | null = null
+        try {
+          key = await this.deps.hostKey()
+        } catch (err) {
+          this.deps.log(`the Host key could not be read: ${String(err)}`)
+        }
         // `stop()` may have landed while this connect was in flight. Attaching now would report a
         // connection the caller has already given up on, and the socket's own 'close' handler returns
         // early once stopped — so the status would never be corrected again.
@@ -469,7 +485,7 @@ export class HostClient {
           socket.destroy()
           return
         }
-        this.attach(socket)
+        this.attach(socket, key)
         return
       } catch {
         // Nothing is listening. Ask for a Host once, then keep trying the address — the Host binds
@@ -497,8 +513,12 @@ export class HostClient {
     if (!this.stopped) this.fail('no Host answered at the address')
   }
 
-  private attach(socket: net.Socket): void {
+  private attach(socket: net.Socket, key: string | null): void {
     this.socket = socket
+    // A new nonce per connection, so an answer seen on one proves nothing on the next.
+    const nonce = newHostNonce()
+    this.proven = null
+    this.expecting = { key, nonce }
     // The connection was accepted, so something is listening at the address. Recorded before the
     // handshake, not after it: a peer that never says hello is exactly the case `sawPeer` exists to
     // tell apart from an address nothing answers.
@@ -599,7 +619,8 @@ export class HostClient {
       // arrives, and its commit hook diffs against the last one it took, so a push a newer one replaced
       // is never missed. The one reader that needs every commit — the app's own journal recorder — is
       // idle while the Host announces `journal`, and every Host that reads this name does.
-      yields: [HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, ...(keepsSlack ? [] : [HOST_YIELD_SLACK])]
+      yields: [HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, ...(keepsSlack ? [] : [HOST_YIELD_SLACK])],
+      nonce
     })
   }
 
@@ -607,8 +628,26 @@ export class HostClient {
     // Before anything is read off it: whatever this message says, it says the Host's event loop is
     // turning. That is the only question `unresponsive` asks, so a Host written off a moment ago
     // takes itself back here rather than waiting for somebody to notice (design F1).
+    // **Nothing from a peer that has not proven itself reaches anyone** (protocol 4, core/host/hostKey.ts).
+    // A Host sends nothing before its hello, so this drops only what a squatter would try to slip in.
+    if (this.proven !== this.socket && m?.t !== 'hello' && m?.t !== 'protocol-mismatch') return
     this.alive()
     if (m?.t === 'hello') {
+      const expecting = this.expecting
+      if (!expecting || expecting.key === null || !proofMatches(expecting.key, expecting.nonce, m.proof)) {
+        this.clearHandshake()
+        // Somebody else's process at this profile's address, most likely another account's on a shared
+        // Windows machine. Cleared before destroying, so the 'close' handler does not reconnect to it;
+        // the Info tab shows the sentence, and Restart tries again.
+        const socket = this.socket
+        this.socket = null
+        socket?.destroy()
+        this.fail(
+          `something at the Host's address answered but could not prove it is this profile's Host${expecting?.key === null ? ' (this profile has no Host key)' : ''} — another account on this machine may be holding the address; nothing was sent to it`
+        )
+        return
+      }
+      this.proven = this.socket
       this.clearHandshake()
       this.drops = 0
       // Judged here, from the two versions this handshake already carries, so the status the Info tab

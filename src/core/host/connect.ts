@@ -5,6 +5,7 @@ import net from 'node:net'
 import { HOST_PROTOCOL, type ClientMessage, type HostMessage } from './protocol'
 import { createLineReader, encodeLine } from '../../host/framing'
 import { unsafeSocketDir } from './socketDir'
+import { newHostNonce, proofMatches, readHostKey } from './hostKey'
 
 export interface HostConnection {
   /** `legacyApp`: the Host has an app 1.3.25 or older attached (HostMessage `hello`). Absent otherwise. */
@@ -18,10 +19,14 @@ export interface HostConnection {
   close(): void
 }
 
-export type ConnectFailure = { error: 'unreachable' | 'protocol' | 'timeout' }
+/** `impostor`: something answered at the address but could not prove it is this profile's Host
+ *  (core/host/hostKey.ts) — another account holding the pipe, most likely. Nothing was sent to it. */
+export type ConnectFailure = { error: 'unreachable' | 'protocol' | 'timeout' | 'impostor' }
 
 export async function connectHost(a: {
   address: string
+  /** The profile whose Host key the answer is checked against. */
+  profileDir: string
   app: string
   timeoutMs?: number
   /** Where a malformed line or a handler that threw gets reported. Every other real caller of
@@ -38,6 +43,10 @@ export async function connectHost(a: {
     a.log(`${unsafe} — not connecting there`)
     return { error: 'unreachable' }
   }
+  // Read before connecting: a Host always makes its key before it binds, so a missing key means no
+  // Host of this profile can be at the address, whatever answers there.
+  const key = await readHostKey(a.profileDir)
+  const nonce = newHostNonce()
   return new Promise((resolve) => {
     const listeners = new Set<(m: HostMessage) => void>()
     const closeListeners = new Set<() => void>()
@@ -60,6 +69,12 @@ export async function connectHost(a: {
         const m = v as HostMessage
         if (!settled) {
           if (m.t === 'protocol-mismatch') return done({ error: 'protocol' })
+          if (m.t === 'hello' && (key === null || !proofMatches(key, nonce, m.proof))) {
+            a.log(
+              `something at ${a.address} answered as a Host but could not prove it is this profile's Host${key === null ? ' (this profile has no Host key)' : ''} — nothing was sent to it`
+            )
+            return done({ error: 'impostor' })
+          }
           if (m.t === 'hello')
             return done({
               hello: {
@@ -92,7 +107,7 @@ export async function connectHost(a: {
     })
     socket.on('data', (c: string) => read(c))
     socket.on('connect', () =>
-      socket.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, app: a.app, role: 'cli' }))
+      socket.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, app: a.app, role: 'cli', nonce }))
     )
   })
 }

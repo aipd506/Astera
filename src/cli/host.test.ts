@@ -18,6 +18,7 @@ import { pendingReportsDirIn } from '../core/orchestration/pendingReports'
 import { hostAddress } from '../host/address'
 import { startHostServer, type HostServerDeps } from '../host/server'
 import { HOST_PROTOCOL } from '../core/host/protocol'
+import { ensureHostKey, hostProof } from '../core/host/hostKey'
 import { HOST_STOP_WAIT_MS, HOST_UNRESPONSIVE_MS, SPAWN_DEADLINE_MS } from '../core/host/unresponsive'
 import { encodeLine } from '../host/framing'
 import { exitCodeFor } from '../core/orchestration/cliOutput'
@@ -44,6 +45,10 @@ const envelopeOf = (
   return JSON.parse(errEnvelope(r.error, cmd)) as { ok: boolean; error: { nextSteps: string[] } }
 }
 
+/** A fake Host's answer to the nonce in the first line it was sent (protocol 4, core/host/hostKey.ts). */
+const proofOf = (key: string, firstData: string): string =>
+  hostProof(key, (JSON.parse(firstData.split(/\r?\n/)[0]) as { nonce?: string }).nonce ?? '')
+
 describe('hostStatus', () => {
   // Host 가 없을 때도 사람에게 할 말이 있어야 한다 — 어느 프로필을 봤는지와, 파일에 몇 개가 있는지.
   //
@@ -53,7 +58,7 @@ describe('hostStatus', () => {
   it('Host 가 없으면 running: false 와 프로필을 낸다', () => {
     expect(hostStatus({ conn: null, profileDir: 'D:/p', jobsInProfile: 3 })).toEqual({
       running: false,
-      protocol: 3,
+      protocol: HOST_PROTOCOL,
       features: [],
       profile: 'D:/p',
       jobsInProfile: 3
@@ -68,7 +73,7 @@ describe('hostStatus', () => {
       running: true,
       pid: 42,
       version: '1.3.25',
-      protocol: 3,
+      protocol: HOST_PROTOCOL,
       features: ['proc', 'orch'],
       profile: 'D:/p',
       jobsInProfile: 3
@@ -270,6 +275,7 @@ describe('runHostCommand — host stop against a real Host', () => {
         idleMs: 60_000,
         onIdle: () => void server.close(),
         liveCounts,
+        hostKey: await ensureHostKey(profileDir),
         log: { write: () => {}, close: () => {} }
       })
       try {
@@ -299,19 +305,21 @@ describe('runHostCommand — host stop against a Host whose event loop is wedged
   // 멎은 Host 를 흉내 낸다 — retire 에도, 그 무엇에도 답이 없다.
   it('답이 없으면 매달리지 않고 TIMEOUT 으로 끝난다', async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-cli-home-'))
+    let key = ''
     const server = net.createServer((sock) => {
       sock.setEncoding('utf8')
       let helloed = false
-      sock.on('data', () => {
+      sock.on('data', (d: string) => {
         if (helloed) return // wedged: hears `retire` land, never answers it
         helloed = true
-        sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '9.9.9', pid: 1, startedAt: 'T', features: [] }))
+        sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '9.9.9', pid: 1, startedAt: 'T', features: [], proof: proofOf(key, d) }))
       })
     })
     try {
       const env = {} as NodeJS.ProcessEnv
       const profileDir = userDataDir({ platform: process.platform, env, home })
       await fs.mkdir(profileDir, { recursive: true })
+      key = await ensureHostKey(profileDir)
       const addr = hostAddress({
         profileDir,
         platform: process.platform,
@@ -363,6 +371,7 @@ describe('runHostCommand — host status against a real Host', () => {
         version: '9.9.9',
         idleMs: 60_000,
         onIdle: () => {},
+        hostKey: await ensureHostKey(profileDir),
         log: { write: () => {}, close: () => {} }
       })
       try {
@@ -722,6 +731,7 @@ describe('runHostCommand says it is waiting (stage 4 T6)', () => {
     const env = {} as NodeJS.ProcessEnv
     const profileDir = userDataDir({ platform: process.platform, env, home })
     await fs.mkdir(profileDir, { recursive: true })
+    const key = await ensureHostKey(profileDir)
     const addr = hostAddress({ profileDir, platform: process.platform, tmpDir: os.tmpdir(), protocol: HOST_PROTOCOL })
     if (addr.dirToPrepare) await fs.mkdir(addr.dirToPrepare, { recursive: true, mode: 0o700 })
     const socks = new Set<net.Socket>()
@@ -730,12 +740,12 @@ describe('runHostCommand says it is waiting (stage 4 T6)', () => {
       sock.on('error', () => {})
       sock.on('close', () => socks.delete(sock))
       let helloed = false
-      sock.on('data', () => {
+      sock.on('data', (d: Buffer | string) => {
         if (helloed) return
         helloed = true
         setTimeout(() => {
           if (!sock.destroyed)
-            sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '9.9.9', pid: 1, startedAt: 'T', features: [] }))
+            sock.write(encodeLine({ t: 'hello', protocol: HOST_PROTOCOL, host: '9.9.9', pid: 1, startedAt: 'T', features: [], proof: proofOf(key, String(d)) }))
         }, helloAfterMs)
       })
     })

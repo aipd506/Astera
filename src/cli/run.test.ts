@@ -717,12 +717,12 @@ describe('connectFailureEnd — 접속 실패 셋을 가른다', () => {
   const addr = '\\\\.\\pipe\\astera-host-x'
 
   it('아무것도 없었을 때만 파일로 답한다', () => {
-    expect(connectFailureEnd({ error: 'unreachable', address: addr })).toEqual({ fallback: true })
+    expect(connectFailureEnd({ error: 'unreachable', address: addr, profileDir: 'P' })).toEqual({ fallback: true })
   })
 
   // 판을 보고 거절한 Host 는 돌고 있고 파일을 쥐고 있다. `orch` 를 알리지 않는 Host 와 같은 자리다.
   it('판이 갈린 것은 VERSION_MISMATCH 이고 파일을 읽지 않는다', () => {
-    const end = connectFailureEnd({ error: 'protocol', address: addr })
+    const end = connectFailureEnd({ error: 'protocol', address: addr, profileDir: 'P' })
     expect(end.fallback).toBe(false)
     expect((end as { code: string }).code).toBe('VERSION_MISMATCH')
     expect(exitCodeFor('VERSION_MISMATCH')).toBe(9)
@@ -732,16 +732,26 @@ describe('connectFailureEnd — 접속 실패 셋을 가른다', () => {
   // 파이프는 열렸는데 hello 가 안 왔다 — 살아 있는데 답하지 않는 Host 이고, 이 저장소는 그것을
   // 위한 회복 코드를 따로 두고 있다. 그 파일을 읽어 running: false 로 답하면 거짓말이다.
   it('답하지 않는 것은 TIMEOUT 이고 파일을 읽지 않는다', () => {
-    const end = connectFailureEnd({ error: 'timeout', address: addr })
+    const end = connectFailureEnd({ error: 'timeout', address: addr, profileDir: 'P' })
     expect(end.fallback).toBe(false)
     expect((end as { code: string }).code).toBe('TIMEOUT')
     expect(exitCodeFor('TIMEOUT')).toBe(7)
   })
 
+  // 프로토콜 4 (core/host/hostKey.ts): 주소에 있는 것이 이 프로필의 Host 라고 증명하지 못했다. 다른 계정이
+  // 주소를 잡고 있을 수 있고, 그쪽에는 아무것도 보내지 않았다. 없는 Host 도, 파일로 답할 일도 아니다.
+  it('증명하지 못한 것은 PERMISSION_DENIED 이고 파일을 읽지 않는다', () => {
+    const end = connectFailureEnd({ error: 'impostor', address: addr, profileDir: 'P' })
+    expect(end.fallback).toBe(false)
+    expect((end as { code: string }).code).toBe('PERMISSION_DENIED')
+    expect(exitCodeFor('PERMISSION_DENIED')).toBe(5)
+    expect((end as { message: string }).message).toContain('could not prove')
+  })
+
   // hello 전의 침묵과 답 전의 침묵은 같은 사실이다. `stuck` 은 1 로 끝나고 있었고,
   // 그러면 스크립트가 "살아 있는데 답하지 않는 Host" 를 두 번 분기해야 한다.
   it('두 침묵은 한 코드를 쓴다', () => {
-    expect((connectFailureEnd({ error: 'timeout', address: addr }) as { code: string }).code).toBe(
+    expect((connectFailureEnd({ error: 'timeout', address: addr, profileDir: 'P' }) as { code: string }).code).toBe(
       SILENT_HOST_CODE
     )
     expect(exitCodeFor(SILENT_HOST_CODE)).toBe(7)
