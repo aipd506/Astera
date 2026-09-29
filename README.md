@@ -80,7 +80,8 @@
 - Read and drive Jobs from a terminal, a CI pipeline or an agent: `astera jobs run`,
   `astera runs wait`, `astera questions answer`. Every session Astera starts already has it
 - It keeps answering after you quit the app, because a background Host owns the work and outlives
-  the window. Workers keep running too
+  the window. Workers keep running too, and you can start sessions and Jobs with the app closed (see
+  [Using Astera from a terminal](#using-astera-from-a-terminal-with-the-app-closed))
 - JSON by default and `--human` for reading, one meaning per exit code, and command lines to run
   next on every error. See [the `astera` command](docs/cli.md)
 
@@ -274,6 +275,41 @@ astera questions answer --id <questionId> --answer "use the existing migration"
 Each exit code has one meaning, so a pipeline can tell a run that finished badly (10) from one waiting
 for a person (8). See [the `astera` command](docs/cli.md) for every command, the JSON format, exit
 codes, retrying a call safely, CI recipes and security notes.
+
+## Using Astera from a terminal, with the app closed
+
+The `astera` command talks to the **Astera Host**, the background process that runs your sessions and
+Jobs. The Host keeps running after you quit the app, so from PowerShell, cmd or any shell you can:
+
+- start agent sessions, see what they show, and type into them
+- create Jobs, add their tasks, run them, wait for them and answer their questions
+- let workers run and move to another account at a usage limit, as they do with the app open
+
+**Once, with the app:**
+
+1. Install Astera, open it, and add your accounts.
+2. **Settings → Agents → Command line tool (astera) → Install the astera command.** If the folder it
+   names is not on your `PATH`, run the line the panel shows.
+3. Open a new shell and check it with `astera version`.
+
+**Then, with the app closed:**
+
+```bash
+astera host start                                    # starts the Host if it is not running
+astera accounts list --human                         # the account ids
+astera sessions create --account <id> --cwd <folder> --prompt "fix the failing test"
+astera sessions list --human
+astera sessions read --id <sessionId>                # what the session's screen shows
+astera sessions send --id <sessionId> --text "yes"
+astera jobs create --objective "…" --cwd <folder> --coordinator-account <id>
+astera tasks add --job <jobId> --spec "…" --account <id>
+astera jobs run --id <jobId>
+astera runs wait --id <runId>
+```
+
+After an update that changes how the app and the Host talk, the Host from before the update cannot
+stay: opening Astera replaces it, or run `astera host start --replace`. The sessions that Host was
+running end with it. See [the `astera` command](docs/cli.md) for everything else.
 
 ## Install
 
