@@ -147,8 +147,15 @@ export function NewSessionDialog({
   const wtTrack = useRef<ReturnType<typeof trackWorktreeCreate> | null>(null)
   const touched = useRef(false)
   // On success App closes this modal (setShowNew(false)), so finally can run after unmount
+  // Set again on every mount, not only in the initial value: StrictMode's dev-only unmount and remount
+  // runs the cleanup once, and a ref left false then drops every progress report for the dialog's life.
   const mounted = useRef(true)
-  useEffect(() => () => void (mounted.current = false), [])
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
 
   useEffect(() => {
     // isSlackReady (core/slack/ready.ts) shares its criteria with SlackNotifier.applyConfig() in
