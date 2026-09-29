@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -39,9 +39,15 @@ describe('provider descriptor', () => {
   })
 
   it('buildCommand가 플랫폼을 반영한다 (팩토리인 이유)', () => {
-    // win32 는 PATH 가 아는 절대 경로로 띄운다. 이 테스트 기계의 PATH 는 claude 를 모르므로 cmd.exe
-    // 없이 이름 그대로다 — cmd.exe 에 이름을 넘기면 작업 폴더에서 먼저 찾는다 (windowsExecutable.ts)
-    expect(makeDescriptors('win32').claude.buildCommand({})).toEqual({ file: 'claude', args: [] })
+    // win32 는 PATH 가 아는 절대 경로로 띄운다. PATH 를 비워 claude 를 모르게 하면 cmd.exe 없이 이름
+    // 그대로다 — cmd.exe 에 이름을 넘기면 작업 폴더에서 먼저 찾는다 (windowsExecutable.ts). 비우지 않으면
+    // claude 가 설치된 Windows 에서는 그 절대 경로가 나와 이 기대가 기계에 따라 갈린다.
+    vi.stubEnv('PATH', '')
+    try {
+      expect(makeDescriptors('win32').claude.buildCommand({})).toEqual({ file: 'claude', args: [] })
+    } finally {
+      vi.unstubAllEnvs()
+    }
     expect(makeDescriptors('darwin').claude.buildCommand({})).toEqual({ file: 'claude', args: [] })
     expect(makeDescriptors('darwin').codex.buildCommand({})).toEqual({ file: 'codex', args: [] })
   })

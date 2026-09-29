@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import path from 'node:path'
 import type { Account, ScheduleConfig, SessionInfo } from '../types'
 import type { Provider } from '../providers/meta'
@@ -204,13 +204,22 @@ async function flushPromises(): Promise<void> {
 }
 
 describe('ChatSessionManager.spawn', () => {
+  // win32 spawns a CLI from where PATH says it is (windowsExecutable.ts), and on a Windows machine
+  // with claude or codex installed that is an absolute path: PATH is emptied here so the expectations
+  // below do not depend on what the machine running them has installed.
+  beforeEach(() => {
+    vi.stubEnv('PATH', '')
+  })
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
   it('spawns codex over app-server, wires env and meta, and starts the adapter', () => {
     const { spawned, manager, handles } = setup('win32')
     const info = manager.spawn({ account: codexAccount, cwd: 'D:/proj' })
 
     expect(spawned).toHaveLength(1)
-    // win32 spawns the CLI by where PATH says it is; this machine's PATH does not know codex, so it is
-    // the bare name with no cmd.exe in between (windowsExecutable.ts)
+    // PATH knows no codex (see beforeEach), so it is the bare name with no cmd.exe in between
     expect(spawned[0].file).toBe('codex')
     expect(spawned[0].args).toEqual(['app-server'])
     expect(spawned[0].opts.env.CODEX_HOME).toBe(codexAccount.configDir)
