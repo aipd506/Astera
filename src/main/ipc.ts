@@ -5028,12 +5028,19 @@ export function registerIpc(
     typeof opId === 'string' && opId !== ''
       ? countFileOp((progress) => send('files:opProgress', { opId, progress }))
       : null
-  const withFileOp = async <T>(opId: unknown, run: (c: FileOpCounter | null) => Promise<T>): Promise<T> => {
+  /** `touched` are the paths the operation creates or removes: the explorer's watcher is closed while
+   *  it runs and reports them afterwards (fileWatcher.ts quietWhile — on Windows a watched bulk delete
+   *  ran at a dozen files a second). */
+  const withFileOp = async <T>(
+    opId: unknown,
+    touched: string[],
+    run: (c: FileOpCounter | null) => Promise<T>
+  ): Promise<T> => {
     const counter = fileOpCounter(opId)
     try {
       // fsTree's and the Local History store's ROOT_UNREACHABLE (a folder that did not answer, refused
       // before any call) in the person's language (fileOpGate.ts).
-      return await withUnreachableInLang(core.lang, () => run(counter))
+      return await fileWatcher.quietWhile(touched, () => withUnreachableInLang(core.lang, () => run(counter)))
     } finally {
       counter?.end()
     }
@@ -5117,7 +5124,7 @@ export function registerIpc(
       // A different volume — copy, then remove the original. force:false gives the same guarantee as the
       // copy handler, so nothing is silently overwritten in the race window between the existence check
       // above and the actual copy.
-      await withFileOp(opId, async (c) => {
+      await withFileOp(opId, [from, to], async (c) => {
         await copyTree(from, to, c ? () => c.entry('copy') : undefined)
         await removeTree(from, c ? () => c.entry('delete') : undefined)
       })
@@ -5143,7 +5150,7 @@ export function registerIpc(
     // core.localHistory.snapshot() on the same (non-dereferencing) basis as fs.cp, so they are not
     // measured again here — measuring here with dirSize (which dereferences) once made the too-large
     // verdict for a folder containing symbolic links disagree with reality.
-    return withFileOp(opId, (c) =>
+    return withFileOp(opId, [targetPath], (c) =>
       removeWithSnapshot({
         projectRoot,
         targetPath,
@@ -5168,7 +5175,7 @@ export function registerIpc(
     // path.basename does not normalise, so a `from` of the form '...\sub\..' can return '..' as-is —
     // that would leak `to` out into destDir's parent, so `to` is checked separately from destDir
     await assertAllowedPath(to)
-    await withFileOp(opId, (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
+    await withFileOp(opId, [to], (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
     return to
   })
 
@@ -5194,7 +5201,7 @@ export function registerIpc(
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
     await assertAllowedPath(to)
-    await withFileOp(opId, (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
+    await withFileOp(opId, [to], (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
     return to
   })
 
