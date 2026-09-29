@@ -93,9 +93,15 @@ renderer·오케스트레이션·기록)으로 나눠 읽고, 후보 6건을 각
 유지, preload·webview 가드, `openExternal` 허용 목록, raw HTML 렌더링 없음, 기록 삭제·복원 경로 확인, SQLite
 파라미터화, `.worktreeinclude` 경로·링크 처리, worktree 삭제 경계, git 인수 주입 없음, 에이전트 스크립트 격리 문구.
 
+**고친 것 (2026-09-30, 사용자 결정: 여러 사람이 쓰는 Windows 도 지원):**
+- Windows 명명 파이프 선점(Medium) `a422ca50`: Host 가 `<프로필>\host\host.key` 에 무작위 키를 두고, 앱·CLI 의
+  hello `nonce` 에 HMAC `proof` 로 답한다(`core/host/hostKey.ts`). 증명이 없거나 틀리면 앱은 아무것도 보내지 않고
+  정보 탭에 이유를 보이며 세션을 스스로 띄우고, CLI 는 `PERMISSION_DENIED`(5). `HOST_PROTOCOL` 3 → 4 라서 이
+  업데이트 한 번은 프로토콜 3 Host 가 물러나며 그 터미널이 끝난다(사용자 동의). dev 앱에서 정상 경로와 선점 경로를
+  모두 확인했다(가짜 파이프는 hello 말고 아무것도 받지 못함).
+- 같은 날 Windows Host 실행 파일 이름을 `astera-host.exe` 로 바꿨다 `9cfe2c62`(바이트는 node.exe 그대로, 서명 유효).
+
 **결정이 필요한 것:**
-- Windows 명명 파이프 선점(Medium): 파이프에는 검사할 폴더가 없다. Host `hello` 에 프로필별 비밀값을 넣거나
-  `GetNamedPipeServerProcessId` 로 서버 프로세스 소유자를 확인해야 하며, 프로토콜 변경이다.
 - (2026-09-29 반영) 위 두 설계 항목 중 `sessions send` 는 실수 방지 수준으로 좁혔다: 에이전트 세션에서 보낸
   send 가 권한 확인·질문 중인 터미널 세션을 향하면 아무것도 치지 않고 6 으로 거부하고 `sessions read` 를 안내한다
   (대화 세션 쪽 검사와 짝). 환경변수를 지우면 우회되므로 경계는 아니다. 진짜 경계가 필요하면 Host 가 소켓 상대의
