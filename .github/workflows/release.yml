@@ -131,7 +131,8 @@ jobs:
       #
       # The signing stage below needs no exception for it. Its collection step takes only binaries
       # whose Authenticode status is not already Valid, and node.exe arrives signed by the OpenJS
-      # Foundation — so it is skipped and keeps the signature it came with.
+      # Foundation — so it is skipped and keeps the signature it came with. It ships as
+      # astera-host.exe: a rename, and the signature lives in the file's bytes, not in its name.
       - name: Build unpacked app
         shell: pwsh
         run: |

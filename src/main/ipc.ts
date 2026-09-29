@@ -6063,6 +6063,8 @@ export function registerIpc(
       }
       if (pid === null) return 'no pid to end'
       const expectedExe = runtime?.paths.exePath ?? process.execPath
+      // A Host started before the runtime's executable was renamed runs from the old name, and is ours too
+      const expectedExes = runtime ? [runtime.paths.exePath, runtime.paths.legacyExePath] : [process.execPath]
       const probe = executableProbe(process.platform, pid)
       let actualExe: string | null = null
       try {
@@ -6073,7 +6075,7 @@ export function registerIpc(
       } catch (err) {
         hostLog(`host: could not read what pid ${pid} is: ${String(err)}`)
       }
-      const plan = hostKillPlan({ platform: process.platform, expectedExe, actualExe })
+      const plan = hostKillPlan({ platform: process.platform, expectedExes, actualExe })
       if (plan === 'skip-gone') {
         hostLog(`host: pid ${pid} is no longer running — nothing to end`)
         return null

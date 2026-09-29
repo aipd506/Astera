@@ -88,7 +88,7 @@ const paths = hostRuntimePaths({ base: BASE, nodeVersion: '24.15.0', appVersion:
 /** A shipped runtime as the installer lays it down. */
 function shippedFs(): FakeFs {
   return new FakeFs().add(
-    SHIPPED + '\\node.exe',
+    SHIPPED + '\\astera-host.exe',
     SHIPPED + '\\runtime.json',
     SHIPPED + '\\node_modules\\node-pty\\lib\\index.js',
     SHIPPED + '\\builds\\1.3.21\\host.js',
@@ -101,7 +101,7 @@ function shippedFs(): FakeFs {
  *  reasons — a build that is not there yet is an ordinary app update, and a node_modules that is not
  *  there is damage. */
 const FILES = {
-  node: ['node.exe', 'node_modules\\node-pty\\lib\\index.js'],
+  node: ['astera-host.exe', 'node_modules\\node-pty\\lib\\index.js'],
   build: ['host.js', 'chunks\\framing-abc.js']
 }
 
@@ -123,10 +123,15 @@ function prepare(fs: FakeFs, files: typeof FILES = FILES, onInstall?: () => void
 
 describe('staleNodeDirs', () => {
   it('keeps the current Node and names every other one', async () => {
-    expect(staleNodeDirs(['node-24.15.0', 'node-22.9.0', 'node-25.0.0'], '24.15.0')).toEqual([
-      'node-22.9.0',
-      'node-25.0.0'
-    ])
+    expect(
+      staleNodeDirs(['node-24.15.0-astera-host', 'node-22.9.0-astera-host', 'node-25.0.0-astera-host'], '24.15.0')
+    ).toEqual(['node-22.9.0-astera-host', 'node-25.0.0-astera-host'])
+  })
+
+  // The directory from before the executable was renamed (node-<version>, holding node.exe) is the
+  // same Node under an old name: once its Host has gone it is only 87 MB nobody uses.
+  it('names the same Node from before the rename', async () => {
+    expect(staleNodeDirs(['node-24.15.0-astera-host', 'node-24.15.0'], '24.15.0')).toEqual(['node-24.15.0'])
   })
 
   it('never names something that is not ours — this list gets deleted', async () => {
@@ -134,7 +139,7 @@ describe('staleNodeDirs', () => {
   })
 
   it('does not mistake node-1 for a prefix of node-10', async () => {
-    expect(staleNodeDirs(['node-1', 'node-10'], '1')).toEqual(['node-10'])
+    expect(staleNodeDirs(['node-1-astera-host', 'node-10-astera-host'], '1')).toEqual(['node-10-astera-host'])
   })
 })
 
@@ -157,6 +162,21 @@ describe('prepareHostRuntime', () => {
     expect(fs.has(paths.exePath)).toBe(true)
     expect(fs.has(paths.entryPath)).toBe(true)
     expect(fs.has(paths.nodeDir + '\\node_modules\\node-pty\\lib\\index.js')).toBe(true)
+  })
+
+  // The machine taking the update that renamed the executable: the old node-<version>\node.exe is
+  // installed and a Host from it may still be running, which Windows will not let anything delete.
+  // The renamed runtime goes into its own directory beside it, and nothing touches the old one here.
+  it('lays the renamed executable down beside a runtime from before the rename, leaving that one alone', async () => {
+    const fs = shippedFs().add(
+      BASE + '\\node-24.15.0\\node.exe',
+      BASE + '\\node-24.15.0\\node_modules\\node-pty\\lib\\index.js',
+      BASE + '\\node-24.15.0\\builds\\1.3.20\\host.js'
+    )
+    fs.throwOn.add(`rm:${BASE}\\node-24.15.0`)
+    expect(await prepare(fs)).toMatchObject({ ready: true, did: 'node', incomplete: false, failure: null })
+    expect(fs.has(paths.exePath)).toBe(true)
+    expect(fs.has(paths.legacyExePath)).toBe(true)
   })
 
   it('lands through a staging directory and a rename, never writing node.exe in place', async () => {

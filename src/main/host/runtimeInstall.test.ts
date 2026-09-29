@@ -16,7 +16,7 @@ const SHIPPED_ROOT = ['C:', 'Program Files', 'Astera', 'resources', 'host-runtim
 const NODE = '24.15.0'
 const APP = '1.3.21'
 const paths = hostRuntimePaths({ base: BASE, nodeVersion: NODE, appVersion: APP })
-const SHIPPED = `${SHIPPED_ROOT}${B}node-${NODE}`
+const SHIPPED = `${SHIPPED_ROOT}${B}node-${NODE}-astera-host`
 
 /** `fs.promises`, as far as this module uses it, over a set of paths — and nothing else. It also
  *  carries every `*Sync` twin, each of which records its own use and throws, so a sync call anywhere
@@ -87,13 +87,13 @@ class MemFs {
 
 function shipped(): MemFs {
   const m = new MemFs().add(
-    `${SHIPPED}${B}node.exe`,
+    `${SHIPPED}${B}astera-host.exe`,
     `${SHIPPED}${B}node_modules${B}node-pty${B}lib${B}index.js`,
     `${SHIPPED}${B}builds${B}${APP}${B}host.js`
   )
   m.files.set(
     `${SHIPPED_ROOT}${B}runtime.json`,
-    JSON.stringify({ node: NODE, files: { node: ['node.exe', `node_modules${B}node-pty${B}lib${B}index.js`], build: ['host.js'] } })
+    JSON.stringify({ node: NODE, files: { node: ['astera-host.exe', `node_modules${B}node-pty${B}lib${B}index.js`], build: ['host.js'] } })
   )
   return m
 }

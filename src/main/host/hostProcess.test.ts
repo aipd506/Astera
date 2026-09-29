@@ -40,7 +40,7 @@ describe('hostKillPlan', () => {
   const expected = 'C:\\Users\\x\\AppData\\Local\\astera\\host-runtime\\node-24.15.0\\node.exe'
 
   it('ends a process whose executable is the one this app starts a Host with', () => {
-    expect(hostKillPlan({ platform: 'win32', expectedExe: expected, actualExe: expected })).toBe('kill')
+    expect(hostKillPlan({ platform: 'win32', expectedExes: [expected], actualExe: expected })).toBe('kill')
   })
 
   // Windows paths differ in case and in separators between what `process.execPath` reports and what
@@ -49,21 +49,28 @@ describe('hostKillPlan', () => {
     expect(
       hostKillPlan({
         platform: 'win32',
-        expectedExe: 'C:/Users/x/AppData/Local/astera/host-runtime/node-24.15.0/node.exe',
+        expectedExes: ['C:/Users/x/AppData/Local/astera/host-runtime/node-24.15.0/node.exe'],
         actualExe: expected.toUpperCase()
       })
     ).toBe('kill')
   })
 
+  // A Host started before the executable was renamed runs from the old name, and is this app's too.
+  it('ends a process whose executable is any of the ones named', () => {
+    const renamed = 'C:\\Users\\x\\AppData\\Local\\astera\\host-runtime\\node-24.15.0-astera-host\\astera-host.exe'
+    expect(hostKillPlan({ platform: 'win32', expectedExes: [renamed, expected], actualExe: expected })).toBe('kill')
+    expect(hostKillPlan({ platform: 'win32', expectedExes: [renamed], actualExe: expected })).toBe('skip-mismatch')
+  })
+
   it('keeps case on linux, where two names that differ in case are two files', () => {
-    expect(hostKillPlan({ platform: 'linux', expectedExe: '/opt/astera/astera', actualExe: '/opt/astera/Astera' })).toBe(
+    expect(hostKillPlan({ platform: 'linux', expectedExes: ['/opt/astera/astera'], actualExe: '/opt/astera/Astera' })).toBe(
       'skip-mismatch'
     )
   })
 
   // darwin's default APFS volume ignores case like NTFS does — the project-wide rule (foldPathCase).
   it('ignores case on darwin', () => {
-    expect(hostKillPlan({ platform: 'darwin', expectedExe: '/opt/astera/astera', actualExe: '/opt/astera/Astera' })).toBe(
+    expect(hostKillPlan({ platform: 'darwin', expectedExes: ['/opt/astera/astera'], actualExe: '/opt/astera/Astera' })).toBe(
       'kill'
     )
   })
@@ -72,20 +79,20 @@ describe('hostKillPlan', () => {
   // number out again, so the pid in a file left behind by a Host that died badly can belong to
   // anything by the time somebody presses the button.
   it('refuses a pid that is now something else', () => {
-    expect(hostKillPlan({ platform: 'win32', expectedExe: expected, actualExe: 'C:\\Windows\\System32\\notepad.exe' })).toBe(
+    expect(hostKillPlan({ platform: 'win32', expectedExes: [expected], actualExe: 'C:\\Windows\\System32\\notepad.exe' })).toBe(
       'skip-mismatch'
     )
   })
 
   it('reports a pid that no longer exists, which is nothing to end and nothing to worry about', () => {
-    expect(hostKillPlan({ platform: 'win32', expectedExe: expected, actualExe: null })).toBe('skip-gone')
+    expect(hostKillPlan({ platform: 'win32', expectedExes: [expected], actualExe: null })).toBe('skip-gone')
   })
 
   // The probe can fail for reasons that are not about the process: PowerShell missing, a permission
   // refusal, a timeout. `actualExe` is null for those too, and "I could not look" must never become
   // "end it anyway".
   it('refuses when the executable could not be read at all', () => {
-    expect(hostKillPlan({ platform: 'darwin', expectedExe: '/opt/a', actualExe: null })).toBe('skip-gone')
+    expect(hostKillPlan({ platform: 'darwin', expectedExes: ['/opt/a'], actualExe: null })).toBe('skip-gone')
   })
 })
 

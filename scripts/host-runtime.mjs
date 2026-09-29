@@ -29,7 +29,10 @@ const OUT = join(ROOT, 'resources', 'host-runtime')
  * consulted, so no `files` entry can bring it back, and a flat layout shipped node-pty-less. One
  * level of nesting puts it at `<dir>/node_modules`, which that same filter keeps.
  */
-const nodeDirName = (version) => `node-${version}`
+const nodeDirName = (version) => `node-${version}-astera-host`
+/** Node's own node.exe, byte for byte, under a name that says whose it is in Task Manager. Both names
+ *  must match `nodeDirName` and `HOST_EXE` in src/core/host/runtime.ts, which reads this tree. */
+const HOST_EXE = 'astera-host.exe'
 const CACHE = join(ROOT, 'build', '.cache')
 
 /**
@@ -122,7 +125,7 @@ async function main() {
   const tree = join(OUT, nodeDirName(NODE.version))
   mkdirSync(tree, { recursive: true })
 
-  writeFileSync(join(tree, 'node.exe'), exe)
+  writeFileSync(join(tree, HOST_EXE), exe)
   writeFileSync(join(tree, 'LICENSE.node.txt'), license)
 
   // package.json is required: node-pty's own entry point is read from it. lib/ is the JavaScript,

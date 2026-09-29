@@ -44,9 +44,22 @@ describe('hostRuntimeBase', () => {
 
 describe('hostRuntimePaths', () => {
   it('nests builds inside the Node directory, so `require("node-pty")` resolves by walking up', () => {
-    expect(paths.nodeDir).toBe(BASE + '\\node-24.15.0')
-    expect(paths.exePath).toBe(BASE + '\\node-24.15.0\\node.exe')
-    expect(paths.buildDir).toBe(BASE + '\\node-24.15.0\\builds\\1.3.21')
-    expect(paths.entryPath).toBe(BASE + '\\node-24.15.0\\builds\\1.3.21\\host.js')
+    expect(paths.nodeDir).toBe(BASE + '\\node-24.15.0-astera-host')
+    expect(paths.buildDir).toBe(BASE + '\\node-24.15.0-astera-host\\builds\\1.3.21')
+    expect(paths.entryPath).toBe(BASE + '\\node-24.15.0-astera-host\\builds\\1.3.21\\host.js')
+  })
+
+  // Task Manager's Details tab lists a process by its file name, and "node.exe" there said nothing
+  // about whose it was. Only the name changes: the bytes are Node's, still carrying its signature.
+  it('names the executable astera-host.exe', () => {
+    expect(paths.exePath).toBe(BASE + '\\node-24.15.0-astera-host\\astera-host.exe')
+  })
+
+  // A directory of its own for the renamed file, so an update lays it down the way a new Node version
+  // is laid down, while a Host from before the rename keeps running out of the old one, and the sweep
+  // takes the old one once that Host is gone. That older Host is still this app's: ending an
+  // unresponsive one has to recognise its executable too.
+  it('says where a runtime from before the rename keeps its executable', () => {
+    expect(paths.legacyExePath).toBe(BASE + '\\node-24.15.0\\node.exe')
   })
 })

@@ -19,13 +19,14 @@
 // rather than `path` for the same reason — this code only ever produces Windows paths, and on win32
 // `path.win32` *is* `path`, so the tests read the same everywhere.
 import { win32 as w } from 'node:path'
-import { NODE_PREFIX, type HostRuntimePaths } from '../../core/host/runtime'
+import { HOST_EXE, NODE_PREFIX, nodeDirName, type HostRuntimePaths } from '../../core/host/runtime'
 
-/** Which `node-*` directories are no longer the current one. **The prefix check is the guard, not
- *  decoration**: this list is deleted, and `base` is a directory a person could have put something
- *  else in. A name that does not look like ours is never a candidate. */
+/** Which `node-*` directories are no longer the current one — the current Node's own directory from
+ *  before the executable was renamed among them. **The prefix check is the guard, not decoration**:
+ *  this list is deleted, and `base` is a directory a person could have put something else in. A name
+ *  that does not look like ours is never a candidate. */
 export function staleNodeDirs(names: readonly string[], keepNodeVersion: string): string[] {
-  const keep = `${NODE_PREFIX}${keepNodeVersion}`
+  const keep = nodeDirName(keepNodeVersion)
   return names.filter((n) => n.startsWith(NODE_PREFIX) && n !== keep)
 }
 
@@ -138,7 +139,7 @@ export async function prepareHostRuntime(a: {
       a.log(`the host runtime's install status could not be shown: ${String(err)}`)
     }
   }
-  if (!(await fs.exists(w.join(shipped, 'node.exe')))) {
+  if (!(await fs.exists(w.join(shipped, HOST_EXE)))) {
     a.log('no host runtime shipped with this build — the Host runs from the app executable')
     return { ready: false, did: 'nothing', incomplete: false, failure: null }
   }

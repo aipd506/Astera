@@ -19,6 +19,18 @@ import { win32 as w } from 'node:path'
  *  literal, not two that could drift apart. */
 export const NODE_PREFIX = 'node-'
 
+/** The Host's executable: Node's own `node.exe`, byte for byte and still carrying Node's signature,
+ *  under a name that says whose it is — Task Manager's Details tab lists a process by its file name,
+ *  and a `node.exe` there said nothing. scripts/host-runtime.mjs writes the file under this name. */
+export const HOST_EXE = 'astera-host.exe'
+
+/** The directory one Node version is laid down in. Named apart from the `node-<version>` that held
+ *  `node.exe` before the rename, so an update lays the renamed file down the way it lays down a new
+ *  Node — into a directory of its own, while a Host started earlier keeps running out of the old one —
+ *  and the sweep takes the old one once that Host has gone. scripts/host-runtime.mjs names the shipped
+ *  directory the same way; the two must agree, since the app copies that directory whole. */
+export const nodeDirName = (nodeVersion: string): string => `${NODE_PREFIX}${nodeVersion}-astera-host`
+
 export interface HostRuntimePaths {
   /** `%LOCALAPPDATA%\<app>\host-runtime` — the parent of every `node-*`. */
   base: string
@@ -26,6 +38,9 @@ export interface HostRuntimePaths {
   nodeDir: string
   /** What the Host is spawned with, in place of `process.execPath`. */
   exePath: string
+  /** Where a runtime of the same Node laid down before the rename keeps its executable. A Host
+   *  started from it is still this app's, and ending an unresponsive one has to recognise it. */
+  legacyExePath: string
   /** `<nodeDir>\builds` — one directory per app version. */
   buildsDir: string
   buildDir: string
@@ -63,13 +78,14 @@ export function hostRuntimeBase(a: {
  * swept and discarded together.
  */
 export function hostRuntimePaths(a: { base: string; nodeVersion: string; appVersion: string }): HostRuntimePaths {
-  const nodeDir = w.join(a.base, `${NODE_PREFIX}${a.nodeVersion}`)
+  const nodeDir = w.join(a.base, nodeDirName(a.nodeVersion))
   const buildsDir = w.join(nodeDir, 'builds')
   const buildDir = w.join(buildsDir, a.appVersion)
   return {
     base: a.base,
     nodeDir,
-    exePath: w.join(nodeDir, 'node.exe'),
+    exePath: w.join(nodeDir, HOST_EXE),
+    legacyExePath: w.join(a.base, `${NODE_PREFIX}${a.nodeVersion}`, 'node.exe'),
     buildsDir,
     buildDir,
     entryPath: w.join(buildDir, 'host.js')

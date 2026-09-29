@@ -46,13 +46,15 @@ export function parseExecutablePath(stdout: string): string | null {
  */
 export function hostKillPlan(a: {
   platform: NodeJS.Platform
-  /** What this app would start a Host with — the runtime's `node.exe`, or the app executable. */
-  expectedExe: string
+  /** What this app starts, or has started, a Host with — the runtime's executable (and the one from
+   *  before it was renamed), or the app executable. */
+  expectedExes: readonly string[]
   /** What the pid actually is, or null when it could not be read. */
   actualExe: string | null
 }): 'kill' | 'skip-gone' | 'skip-mismatch' {
-  if (!a.actualExe) return 'skip-gone'
-  return samePath(a.platform, a.expectedExe, a.actualExe) ? 'kill' : 'skip-mismatch'
+  const actual = a.actualExe
+  if (!actual) return 'skip-gone'
+  return a.expectedExes.some((e) => samePath(a.platform, e, actual)) ? 'kill' : 'skip-mismatch'
 }
 
 /** One file or two. Separators are not differences on win32 and are on posix; case follows the
