@@ -9,8 +9,9 @@
 // systemd user-session environment and never sources ~/.bashrc or ~/.zshrc (and on Wayland often not
 // ~/.profile either), so nvm's shims and ~/.local/bin are missing. Launched from a terminal it works
 // by accident — the parent shell's PATH is inherited — which is why the deb/AppImage install path is
-// the one that breaks. Windows is the exception: PATH there is a machine/user environment variable
-// that a GUI process already inherits, so no shell is launched.
+// the one that breaks. Windows has no shell to ask: PATH there is a machine/user environment variable,
+// read from where Windows keeps it (core/sessions/windowsPath.ts), because a process can inherit a copy that is
+// older than that.
 //
 // Why process.env.PATH is patched directly: session env is built by SessionManager.spawn as
 // { ...process.env } (core/sessions/manager.ts), main/terminalManager.ts's onPath (resolveShell's
@@ -22,6 +23,7 @@
 // and homebrew/mise/asdf/nvm all evaluate shellenv from within an rc file. Statically listing candidate
 // directories would miss every one of them.
 import { execFile } from 'node:child_process'
+import { mergeWindowsPath, parseWindowsPathProbe, windowsPathProbe } from '../core/sessions/windowsPath'
 
 /** Wraps the value in markers to separate PATH from whatever banners/warnings the rc file prints. */
 const START = '__ASTERA_PATH__'
@@ -71,13 +73,20 @@ export function probeShell(platform: NodeJS.Platform, shell: string | undefined)
   return shell || (platform === 'darwin' ? '/bin/zsh' : '/bin/sh')
 }
 
-/** Asks the login shell for PATH. On win32 the shell isn't even launched. */
+/** Asks the login shell for PATH, or on win32 the Path Windows keeps (core/sessions/windowsPath.ts). */
 export async function readLoginPath(opts: {
   platform: NodeJS.Platform
   shell: string | undefined
   run: (file: string, args: string[]) => Promise<string>
 }): Promise<string | null> {
-  if (opts.platform === 'win32') return null
+  if (opts.platform === 'win32') {
+    const probe = windowsPathProbe()
+    try {
+      return parseWindowsPathProbe(await opts.run(probe.file, probe.args))
+    } catch {
+      return null // the inherited PATH then, as before
+    }
+  }
   const shell = probeShell(opts.platform, opts.shell)
   try {
     // Why -i (interactive) is included: version managers like nvm/mise only initialize in an rc file
@@ -99,7 +108,7 @@ function runShell(file: string, args: string[]): Promise<string> {
   })
 }
 
-/** Updates process.env.PATH to the login shell's PATH. Does nothing on win32. */
+/** Updates process.env.PATH from the login shell's PATH, or on win32 from the Path Windows keeps. */
 export async function applyLoginPath(log: (m: string) => void): Promise<void> {
   const before = process.env.PATH
   const loginPath = await readLoginPath({
@@ -108,13 +117,17 @@ export async function applyLoginPath(log: (m: string) => void): Promise<void> {
     run: runShell
   })
   if (loginPath === null) {
-    // Only where a probe actually ran — on win32 there is no failure to report.
-    if (process.platform !== 'win32') log('loginPath: probe failed, keeping the inherited PATH')
+    log('loginPath: probe failed, keeping the inherited PATH')
     return
   }
-  const merged = mergePath(before, loginPath)
+  const win = process.platform === 'win32'
+  const merged = win ? mergeWindowsPath(before, loginPath) : mergePath(before, loginPath)
   if (merged && merged !== before) {
     process.env.PATH = merged
-    log(`loginPath: PATH restored from ${probeShell(process.platform, process.env.SHELL)}`)
+    log(
+      win
+        ? 'loginPath: PATH completed from the Path Windows keeps (this process was started with an older copy)'
+        : `loginPath: PATH restored from ${probeShell(process.platform, process.env.SHELL)}`
+    )
   }
 }

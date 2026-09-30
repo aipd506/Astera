@@ -55,10 +55,18 @@ describe('readLoginPath — 로그인 셸 PATH 프로브', () => {
     expect(noShell.calls[0].file).toBe('/bin/zsh')
   })
 
-  it('win32: 셸을 띄우지 않는다 — PATH 는 환경 변수라 GUI 앱도 그대로 물려받는다', async () => {
-    const rec = recorder(probeOutput('/never'))
-    expect(await readLoginPath({ platform: 'win32', shell: undefined, run: rec.run })).toBeNull()
-    expect(rec.calls).toHaveLength(0)
+  // 2026-09-30, the 1.4.0 update: the installer relaunched the app with the old app's environment,
+  // copied before Codex put its folder on the user Path, and the app said codex was not installed.
+  // So on win32 the Path Windows keeps (Machine, then User) is read the way a fresh process gets it.
+  it('win32: 셸이 아니라 Windows 가 저장해 둔 Path 를 Windows PowerShell 로 읽는다', async () => {
+    const rec = recorder(probeOutput('C:\\Windows\\system32;C:\\Users\\u\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin'))
+    const got = await readLoginPath({ platform: 'win32', shell: undefined, run: rec.run })
+    expect(got).toBe('C:\\Windows\\system32;C:\\Users\\u\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin')
+    expect(rec.calls).toHaveLength(1)
+    // By its absolute path, never by name: a bare name is looked up in the working directory first
+    expect(rec.calls[0].file).toMatch(/[\\/]System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i)
+    expect(rec.calls[0].args.join(' ')).toContain("GetEnvironmentVariable('Path','Machine')")
+    expect(rec.calls[0].args.join(' ')).toContain("GetEnvironmentVariable('Path','User')")
   })
 
   it('프로브가 실패하면 null — 앱 시작을 막지 않는다', async () => {

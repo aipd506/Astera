@@ -135,8 +135,9 @@ export class SessionManager {
     /** Directories every Claude session may read without a prompt — the app's screenshot folder. */
     private sessionReadDirs: string[] = [],
     /** The environment every child env is built from. The app keeps process.env; the Host passes
-     *  its own minus what its start added (hostWorkerBaseEnv, design D4). */
-    private baseEnv: NodeJS.ProcessEnv = process.env,
+     *  its own minus what its start added (hostWorkerBaseEnv, design D4), as a function read at each
+     *  spawn so a PATH it has completed since (core/sessions/windowsPath.ts) reaches the next child. */
+    private baseEnv: NodeJS.ProcessEnv | (() => NodeJS.ProcessEnv) = process.env,
     private checks: SpawnChecks = defaultSpawnChecks()
   ) {}
 
@@ -180,7 +181,8 @@ export class SessionManager {
    *  for the ambient dir). See cliEnv.ts for the full rationale. */
   private envFor(account: Account): Record<string, string | undefined> {
     const descriptor = descriptorOf(this.descriptors, account)
-    return cliEnvFor({ base: this.baseEnv, account, descriptor, homeDir: this.homeDir })
+    const base = typeof this.baseEnv === 'function' ? this.baseEnv() : this.baseEnv
+    return cliEnvFor({ base, account, descriptor, homeDir: this.homeDir })
   }
 
   spawn(opts: {

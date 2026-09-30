@@ -34,7 +34,8 @@ export interface HostChatsDeps {
   platform: NodeJS.Platform
   homeDir: string
   version: string
-  baseEnv: NodeJS.ProcessEnv
+  /** Read at each spawn when a function, so a PATH the Host has completed since reaches the child. */
+  baseEnv: NodeJS.ProcessEnv | (() => NodeJS.ProcessEnv)
   /** The app's chatSend (server.act), for a turn while the app is the writer. */
   askApp(name: 'chatSend', args: [string, string]): Promise<unknown>
   log(m: string): void

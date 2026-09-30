@@ -49,7 +49,7 @@
 <p><a href="https://github.com/parsingk/Astera/blob/main/assets/astera-demo-rolling.mp4">▶ Grabación completa (28s)</a></p>
 </div>
 
-**Reanudación inteligente (experimental)**
+**Reanudación inteligente**
 - Desactivada por defecto. **Configuración → Agentes → Estrategia de reanudación de sesión** elige entre el
   resume propio de la CLI y esta
 - Con ella activada, cuando un límite mueve el trabajo a la siguiente cuenta esa sesión arranca **en
@@ -104,7 +104,7 @@
   y abre la PR contra la rama de la que ese worktree se bifurcó
 - Toma prestada la sesión de `gh` que ya tienes; no se guarda ningún token
 
-**How It Works (experimental)**
+**How It Works**
 - How It Works es para quien no lee código. Escribe con la habilidad `/astera-task` lo que quieres
   hacer y desde ahí empieza a prepararse para registrarlo; cuando el trabajo termina, lee lo que
   pasó y lo redacta
@@ -135,7 +135,7 @@
   elemento en vez de leer una descripción
 - Design Mode se apaga solo cuando la página navega a otro sitio.
 
-**Navegador del agente (experimental)**
+**Navegador del agente**
 - El agente de la sesión tiene una pestaña de página web solo para él y la maneja él mismo. Abre
   una página del servidor de desarrollo, la recarga tras un cambio, lee su dirección y su título, y
   vuelve a leer lo que la consola y la red registraron desde esa carga.

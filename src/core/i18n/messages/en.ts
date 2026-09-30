@@ -57,7 +57,7 @@ export const en: Record<keyof typeof ko, string> = {
     'The damaged file is kept as app-settings.json.bak. To be safe, permission prompts are on: ' +
     'turn on "Run agents without permission checks" in Settings > Agents to skip them again.',
   // Work unit tracking
-  'settings.workUnit.label': 'Work unit tracking (experimental)',
+  'settings.workUnit.label': 'Work unit tracking',
   'settings.workUnit.hint':
     'Lets you declare a piece of work by typing /astera-task with what you want done — one row from ' +
     'there until it ends, however many messages it takes. It only works in a project that is a ' +
@@ -66,14 +66,14 @@ export const en: Record<keyof typeof ko, string> = {
     'existing history is never read.',
   'settings.workUnit.saveFailed': "Couldn't save the work unit tracking setting: {detail}",
   // Agent browser
-  'settings.agentBrowser.label': 'Agent browser (experimental)',
+  'settings.agentBrowser.label': 'Agent browser',
   'settings.agentBrowser.hint':
     'On, each session gets a preview tab of its own to open, reload and read console errors from this project’s dev server. ' +
     'Installs the astera-browser skill for every account. Only localhost can be opened. ' +
     'Sessions already open are not affected; new sessions are.',
   'settings.agentBrowser.saveFailed': 'Could not save the agent browser setting: {detail}',
   // Agent app workspace
-  'settings.agentApp.label': 'Agent app workspace (experimental)',
+  'settings.agentApp.label': 'Agent app workspace',
   'settings.agentApp.hint':
     'On, an agent can launch this project’s app where you never see it (a hidden desktop on Windows, a virtual display on Linux, the background on macOS), drive it and photograph it. ' +
     'It never takes your screen or pointer. On Windows and macOS it shares your clipboard. Installs the astera-app skill for every account. ' +
@@ -383,12 +383,12 @@ export const en: Record<keyof typeof ko, string> = {
   'settings.theme.saveFailed': 'Could not save the theme: {detail}',
   // ResumeStrategySettings.tsx — the two-way resume strategy picker
   'settings.resumeStrategy.label': 'Session resume strategy',
-  'settings.resumeStrategy.smart.label': 'Smart Resume (experimental)',
+  'settings.resumeStrategy.smart.label': 'Smart Resume',
   'settings.resumeStrategy.smart.hint': 'Continues the conversation from a compact checkpoint alone. A handoff memo the agent left while working is passed along too.',
   'settings.resumeStrategy.original.label': 'Resume original session',
   'settings.resumeStrategy.original.hint': "Continues the conversation with the CLI's own resume.",
   'settings.resumeStrategy.saveFailed': 'Could not save the resume strategy: {detail}',
-  'settings.jobContinuity.label': 'Job Continuity (experimental)',
+  'settings.jobContinuity.label': 'Job Continuity',
   'settings.jobContinuity.hint':
     'Keep Jobs recoverable across crashes and restarts. ' +
     'Uses durable job state, native session recovery, and Smart Resume when needed.',

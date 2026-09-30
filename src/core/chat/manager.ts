@@ -43,8 +43,9 @@ export interface ChatManagerDeps {
   /** Test injection; default createClaudeAdapter / createCodexAdapter, picked by provider. */
   createAdapter?(a: { proc: ProcLike; mode: AdapterMode; version: string; log(m: string): void; provider: Provider }): ChatAdapter
   /** The environment a child's is built from. Default `process.env`; the Host passes its own, which is
-   *  not the app's. */
-  baseEnv?: NodeJS.ProcessEnv
+   *  not the app's. A function is read at each spawn, so a PATH the process has completed since
+   *  (core/sessions/windowsPath.ts) reaches the next child. */
+  baseEnv?: NodeJS.ProcessEnv | (() => NodeJS.ProcessEnv)
 }
 
 /** What `spawn` takes, for a caller that builds it elsewhere (./respawn.ts). */
@@ -242,7 +243,12 @@ export class ChatSessionManager {
     // index.ts's roll callbacks from `bypassedOf(oldId)`). Still never on a fresh, first spawn: that
     // path never passes `startWithBypass` at all, so S7's default holds exactly as before.
     const env = {
-      ...cliEnvFor({ base: this.deps.baseEnv ?? process.env, account: opts.account, descriptor, homeDir: this.deps.homeDir }),
+      ...cliEnvFor({
+        base: typeof this.deps.baseEnv === 'function' ? this.deps.baseEnv() : (this.deps.baseEnv ?? process.env),
+        account: opts.account,
+        descriptor,
+        homeDir: this.deps.homeDir
+      }),
       ...(opts.startWithBypass ? BYPASS_ENV : {}),
       // The caller's identity for `astera`, as a pty session has it (core/sessions/manager.ts; cliEnvFor
       // cleared any inherited one above). Without it every chat agent read as the shell, and the check

@@ -24,6 +24,8 @@ import type { HostRolling } from './rolling'
 import type { HostSpawner } from './spawner'
 import { checkCwd, type ProbeResult } from '../core/sessions/pathProbe'
 import { LAUNCH_FORBIDDEN } from '../core/sessions/commands'
+import { ensureOnWindowsPath } from '../core/sessions/windowsPath'
+import { providerOf } from '../core/providers/meta'
 
 export function createHostSessionStarter(d: {
   /** Null for a Host started without the agent CLI paths: it starts no session. */
@@ -86,6 +88,8 @@ export function createHostSessionStarter(d: {
       if (!found) throw new Error(`unknown account: ${o.accountId}`)
       account = found
       await checkCwd(o.cwd, d.probeCwd, `CWD_MISSING: ${o.cwd} does not exist`)
+      // win32: a CLI installed since this Host started, found on the Path Windows keeps (windowsPath.ts)
+      await ensureOnWindowsPath([providerOf(account)])
       bypass = await d.bypass()
     } catch (err) {
       throw err instanceof Error ? refusedBeforeActing(err) : err

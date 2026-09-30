@@ -50,7 +50,7 @@
 <p><a href="https://github.com/parsingk/Astera/blob/main/assets/astera-demo-rolling.mp4">▶ Full recording (28s)</a></p>
 </div>
 
-**Smart Resume (experimental)**
+**Smart Resume**
 - Off by default. **Settings → Agents → Session resume strategy** chooses between the CLI's own
   resume and this one
 - With it on, a usage limit that moves the work to the next account starts that session **blank** and
@@ -102,7 +102,7 @@
   pushes the branch and opens the PR against the branch that worktree was forked from
 - It borrows the `gh` login you already have; no token is stored
 
-**How It Works (experimental)**
+**How It Works**
 
 Understand a finished change without reading every file. Open a work record to see what it does,
 what users will notice, its flow, the reasons behind it, and the files that implement it.
@@ -155,7 +155,7 @@ what to check when an explanation is missing.
   instead of reading a description of it
 - Design Mode turns itself off when the page navigates away.
 
-**Agent browser (experimental)**
+**Agent browser**
 - The session's agent gets a web page tab of its own and drives it itself. It opens a page on the dev
   server, reloads it after a change, reads its address and title, and reads back what the console and
   the network reported since that load.
