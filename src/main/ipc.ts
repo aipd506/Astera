@@ -133,7 +133,7 @@ import { performRepair, repairOnce, repairTargetFor, type RepairDeps } from '../
 import { sameSnapshot, snapshotFor, jobsForProject, outcomeOf } from '../core/orchestration/view'
 import { ensureProject } from '../core/orchestration/projects'
 import { jobOf, resolveRunId } from '../core/orchestration/state'
-import type { WorktreeInfo } from '../core/types'
+import type { CliInstallStatus, WorktreeInfo } from '../core/types'
 
 /** 이 프로젝트의 것인 id 전부 — Job 과 그 회차. **한 집합으로 묻는 이유**는 명령이 둘 중 무엇이든
  *  지목할 수 있기 때문이다: 사이드바의 Job 줄은 Job 의 id 를, 펼친 회차 줄은 회차의 id 를 보낸다. */
@@ -162,6 +162,7 @@ import {
   type AppImageLaunch
 } from '../core/orchestration/exec/shuttle'
 import { appImageLaunchFor, binDirFor, isOnPath, pathHintFor } from '../core/orchestration/cliInstall'
+import { addToUserPath, removeFromUserPath, userPathHas } from './userPath'
 import { WorkerTails } from '../core/orchestration/exec/tail'
 import { releaseArgsFor } from '../core/orchestration/exec/release'
 import {
@@ -5344,18 +5345,23 @@ export function registerIpc(
   const cliBinDir = (): string =>
     binDirFor({ platform: process.platform, env: process.env, home: app.getPath('home') })
 
-  const cliStatus = (): {
-    dir: string
-    installed: boolean
-    onPath: boolean
-    hint: string
-  } => {
+  const cliStatus = async (): Promise<CliInstallStatus> => {
     const dir = cliBinDir()
+    let onPath = isOnPath({ dir, pathVar: process.env.PATH ?? '', platform: process.platform })
+    // win32: this app's own PATH was read once when it started, so a folder put on the user Path since
+    // (by Install, or by the person) is asked of the registry, which is what the next shell reads.
+    if (!onPath && process.platform === 'win32') {
+      onPath = await userPathHas({ dir, env: process.env }).catch((err: unknown) => {
+        orchLog(`the user Path could not be read: ${String(err)}`)
+        return false
+      })
+    }
     return {
       dir,
       installed: shuttleNames().every((n) => existsSync(path.join(dir, n))),
-      onPath: isOnPath({ dir, pathVar: process.env.PATH ?? '', platform: process.platform }),
-      hint: pathHintFor({ dir, platform: process.platform })
+      onPath,
+      hint: pathHintFor({ dir, platform: process.platform }),
+      ...(process.platform === 'win32' ? { canEditUserPath: true as const } : {})
     }
   }
 
@@ -5373,7 +5379,7 @@ export function registerIpc(
   })
 
   ipcMain.handle('cli.status', () => cliStatus())
-  ipcMain.handle('cli.install', async () => {
+  ipcMain.handle('cli.install', async (_e, opts?: { addToPath?: unknown }) => {
     const entryPath = cliEntryPath()
     // 번들을 못 찾으면 쓰지 않는다 — 잘못된 경로를 가리키는 셔틀은 없는 셔틀보다 나쁘다.
     if (!entryPath) throw new Error('CLI_ENTRY_MISSING')
@@ -5381,7 +5387,25 @@ export function registerIpc(
     // When it cannot, the shuttle is written raw as before and the reply says why.
     const { warnings } = await installShuttle({ dir: cliBinDir(), ...publicShuttleTarget(entryPath) })
     for (const w of warnings) orchLog(`public astera shuttle: ${w.code}: ${w.detail}`)
-    return warnings.length > 0 ? { ...cliStatus(), warnings } : cliStatus()
+    // win32, and only when the person left the checkbox on: the folder goes on the user Path, the one
+    // entry this app adds (main/userPath.ts). A failure leaves the command installed and says why; the
+    // panel then shows the line to run by hand, as it always has.
+    let userPath: CliInstallStatus['userPath']
+    let userPathError: string | undefined
+    if (process.platform === 'win32' && opts?.addToPath === true) {
+      try {
+        userPath = await addToUserPath({ dir: cliBinDir(), env: process.env })
+      } catch (err) {
+        userPathError = err instanceof Error ? err.message : String(err)
+        orchLog(`the astera folder could not be put on the user Path: ${userPathError}`)
+      }
+    }
+    return {
+      ...(await cliStatus()),
+      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(userPath ? { userPath } : {}),
+      ...(userPathError ? { userPathError } : {})
+    }
   })
   // 되돌리기(명세 §29). 우리가 쓴 셔틀 파일만 지우고 폴더와 이웃 파일은 남긴다(removeShuttle).
   ipcMain.handle('cli.uninstall', async () => {
@@ -5391,7 +5415,24 @@ export function registerIpc(
       dir: cliBinDir(),
       keepFor: entryPath ? { execPath: process.execPath, entryPath } : undefined
     })
-    return cliStatus()
+    // win32: the folder's entry comes off the user Path too, and nothing else on it. The folder holds
+    // nothing of ours any more, so an entry for it (ours, or one the person added by the hint line)
+    // only points shells at an empty place.
+    let userPathError: string | undefined
+    let removed = false
+    if (process.platform === 'win32') {
+      try {
+        removed = (await removeFromUserPath({ dir: cliBinDir(), env: process.env })) === 'removed'
+      } catch (err) {
+        userPathError = err instanceof Error ? err.message : String(err)
+        orchLog(`the astera folder could not be taken off the user Path: ${userPathError}`)
+      }
+    }
+    return {
+      ...(await cliStatus()),
+      ...(removed ? { userPath: 'removed' as const } : {}),
+      ...(userPathError ? { userPathError } : {})
+    }
   })
   // 갱신(명세 §30). 앱이 옮겨 가면 깔아 둔 공개 셔틀은 예전 실행 파일을 가리킨다. 부팅마다 깔려 있는
   // 것만 지금의 앱으로 다시 쓴다. 깔려 있지 않으면 깔지 않고, PATH 와 셸 프로필은 건드리지 않는다.

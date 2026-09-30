@@ -22,7 +22,16 @@ export const ko = {
   'settings.cli.label': '명령줄 도구 (astera)',
   'settings.cli.hint':
     '설치하면 보통 셸에서도 astera 를 칠 수 있습니다. ' +
-    '앱이 셸 설정 파일을 고치지는 않습니다 — PATH 에 없으면 넣는 방법을 보여 드립니다.',
+    '앱이 셸 설정 파일을 고치지는 않습니다. PATH 에 없으면 넣는 방법을 보여 드립니다.',
+  'settings.cli.hint.win32':
+    '설치하면 PowerShell 이나 명령 프롬프트에서도 astera 를 칠 수 있습니다. ' +
+    '아래를 켜 두면 이 폴더를 사용자 PATH 에 넣고, 제거하면 그 항목만 뺍니다. 새로 여는 창부터 적용됩니다.',
+  'settings.cli.addToPath': '이 폴더를 사용자 PATH 에 추가',
+  'settings.cli.offer': '터미널에서도 astera 명령으로 세션과 Job 을 시작하고 다룰 수 있습니다. 앱을 꺼 둔 채로도 됩니다.',
+  'settings.cli.offer.open': '설정 열기',
+  'settings.cli.installed.pathAdded.toast': 'astera 명령을 설치하고 사용자 PATH 에 넣었습니다. 새로 여는 셸에서 쓸 수 있습니다.',
+  'settings.cli.pathFailed': 'astera 명령은 설치했지만 PATH 에 넣지 못했습니다: {detail}. 아래 한 줄을 직접 실행해 주세요.',
+  'settings.cli.uninstalled.pathRemoved.toast': 'astera 명령을 제거하고 사용자 PATH 에서 그 폴더를 뺐습니다.',
   'settings.cli.installed': '설치됨',
   'settings.cli.notInstalled': '설치되지 않음',
   'settings.cli.install': 'astera 명령 설치',

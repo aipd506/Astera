@@ -18,7 +18,16 @@ export const en: Record<keyof typeof ko, string> = {
   'settings.cli.label': 'Command line tool (astera)',
   'settings.cli.hint':
     'Installing it lets you type astera in an ordinary shell. ' +
-    'The app does not edit your shell profile — if the folder is not on PATH, it shows you the line to add.',
+    'The app does not edit your shell profile. If the folder is not on PATH, it shows you the line to add.',
+  'settings.cli.hint.win32':
+    'Installing it lets you type astera in PowerShell or Command Prompt. ' +
+    'With the box below on, the folder goes on your user PATH, and Uninstall takes that entry out again. Windows opened after that have it.',
+  'settings.cli.addToPath': 'Add this folder to my user PATH',
+  'settings.cli.offer': 'You can start and drive sessions and Jobs from a terminal too, with the astera command. It works with the app closed.',
+  'settings.cli.offer.open': 'Open Settings',
+  'settings.cli.installed.pathAdded.toast': 'The astera command is installed and on your user PATH. Shells you open from now on have it.',
+  'settings.cli.pathFailed': 'The astera command is installed, but the folder could not be put on PATH: {detail}. Run the line below yourself.',
+  'settings.cli.uninstalled.pathRemoved.toast': 'The astera command is removed, and its folder is off your user PATH.',
   'settings.cli.installed': 'Installed',
   'settings.cli.notInstalled': 'Not installed',
   'settings.cli.install': 'Install the astera command',

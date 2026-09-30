@@ -53,6 +53,45 @@ export function isOnPath(a: {
   return pathEntries(a).some((e) => isSamePath(e, a.dir, a.platform))
 }
 
+/** One raw user-Path entry as a folder to compare: quotes and trailing separators off, `%NAME%`
+ *  expanded from `env` (a REG_EXPAND_SZ Path keeps them unexpanded). */
+const userPathFolder = (entry: string, env: NodeJS.ProcessEnv): string =>
+  entry
+    .trim()
+    .replace(/^"|"$/g, '')
+    .replace(/%([^%]+)%/g, (whole, name: string) => {
+      const key = Object.keys(env).find((k) => k.toUpperCase() === name.toUpperCase())
+      return key !== undefined ? (env[key] ?? whole) : whole
+    })
+    .replace(/[\\/]+$/, '')
+
+const hasUserPathEntry = (value: string, dir: string, env: NodeJS.ProcessEnv): boolean =>
+  value.split(';').some((e) => e.trim() !== '' && isSamePath(userPathFolder(e, env), userPathFolder(dir, env), 'win32'))
+
+/**
+ * The win32 user Path with `dir` added at the end, or null when it is there already, however it is
+ * spelled (`%LOCALAPPDATA%\astera\bin`, another case, a trailing separator, quotes). Everything else
+ * is kept exactly as it was: this is the person's value, and only one entry is ours to add.
+ */
+export function userPathWith(value: string, dir: string, env: NodeJS.ProcessEnv): string | null {
+  if (hasUserPathEntry(value, dir, env)) return null
+  // A value that ends in a separator keeps ending in one, so userPathWithout gives back the very same
+  // string (measured: this machine's own Path ended in ';', and dropping it made Uninstall's result
+  // one character short of what Install found).
+  if (value === '') return dir
+  return value.endsWith(';') ? `${value}${dir};` : `${value};${dir}`
+}
+
+/** The win32 user Path with every entry that is `dir` taken out, or null when none is. The other
+ *  entries, empty ones included, stay as they were. */
+export function userPathWithout(value: string, dir: string, env: NodeJS.ProcessEnv): string | null {
+  if (!hasUserPathEntry(value, dir, env)) return null
+  return value
+    .split(';')
+    .filter((e) => e.trim() === '' || !isSamePath(userPathFolder(e, env), userPathFolder(dir, env), 'win32'))
+    .join(';')
+}
+
 /**
  * PATH 에 없을 때 사람에게 건네는 한 줄.
  *

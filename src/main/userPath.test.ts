@@ -1,0 +1,100 @@
+import { describe, it, expect, afterAll } from 'vitest'
+import { addToUserPath, removeFromUserPath, runWindowsPowerShell, userPathHas, type RunPowerShell } from './userPath'
+
+// The real registry and the real PowerShell, on a scratch key under HKCU\Software so the person's own
+// Path is never touched: what the fake below stands in for, checked where it runs.
+describe.skipIf(process.platform !== 'win32')('the scripts against the real registry (win32)', () => {
+  const key = `Software\\AsteraUserPathTest-${process.pid}-${Date.now()}`
+  afterAll(async () => {
+    await runWindowsPowerShell(`Remove-Item -LiteralPath 'HKCU:\\${key}' -Recurse -Force -ErrorAction SilentlyContinue`)
+  })
+
+  it('adds, keeps the kind and the variables unexpanded, and removes only its entry', async () => {
+    const dirHere = 'C:\\Users\\me\\AppData\\Local\\astera\\bin'
+    const envHere = { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' } as NodeJS.ProcessEnv
+    // Ends in ';' on purpose: the real Path of the machine this was first run on did, and Uninstall has
+    // to give that back to the character
+    const original = '%USERPROFILE%\\bin;D:\\한글;'
+    await runWindowsPowerShell(
+      `$k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('${key}'); $k.SetValue('Path', '${original}', [Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close()`
+    )
+    const read = async (): Promise<{ kind: string; value: string }> =>
+      JSON.parse(
+        await runWindowsPowerShell(
+          `[Console]::OutputEncoding = [Text.Encoding]::UTF8; $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('${key}'); [Console]::Out.Write((@{ kind = $k.GetValueKind('Path').ToString(); value = $k.GetValue('Path', $null, 'DoNotExpandEnvironmentNames') } | ConvertTo-Json -Compress))`
+        )
+      ) as { kind: string; value: string }
+    expect(await addToUserPath({ dir: dirHere, env: envHere, key })).toBe('added')
+    expect(await userPathHas({ dir: dirHere, env: envHere, key })).toBe(true)
+    expect(await read()).toEqual({ kind: 'ExpandString', value: `${original}${dirHere};` })
+    expect(await removeFromUserPath({ dir: dirHere, env: envHere, key })).toBe('removed')
+    expect(await userPathHas({ dir: dirHere, env: envHere, key })).toBe(false)
+    expect(await read()).toEqual({ kind: 'ExpandString', value: original })
+  }, 60_000)
+})
+
+const dir = 'C:\\Users\\me\\AppData\\Local\\astera\\bin'
+const env = { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' } as NodeJS.ProcessEnv
+
+/** A registry the scripts read and write: the read script answers with it, a write script is decoded
+ *  back from its base64 and its kind, the way PowerShell would run it. */
+function fakeRegistry(start: { kind: 'String' | 'ExpandString' | 'None'; value: string }): {
+  run: RunPowerShell
+  now: { kind: string; value: string }
+  writes: number
+} {
+  const state = { now: { ...start } as { kind: string; value: string }, writes: 0 }
+  const run: RunPowerShell = async (script) => {
+    const b64 = /FromBase64String\('([^']*)'\)/.exec(script)
+    if (!b64) return JSON.stringify({ kind: state.now.kind, value: state.now.kind === 'None' ? null : state.now.value })
+    const kind = /RegistryValueKind\]::(\w+)/.exec(script)![1]
+    state.now = { kind, value: Buffer.from(b64[1], 'base64').toString('utf8') }
+    state.writes++
+    return ''
+  }
+  return {
+    run,
+    get now() {
+      return state.now
+    },
+    get writes() {
+      return state.writes
+    }
+  }
+}
+
+describe('the win32 user Path the astera command is put on', () => {
+  it('adds the folder, keeps the kind (an expanding Path stays expanding), and tells Explorer', async () => {
+    const reg = fakeRegistry({ kind: 'ExpandString', value: '%USERPROFILE%\\bin;C:\\tools' })
+    expect(await addToUserPath({ dir, env, run: reg.run })).toBe('added')
+    expect(reg.now).toEqual({ kind: 'ExpandString', value: `%USERPROFILE%\\bin;C:\\tools;${dir}` })
+    expect(await userPathHas({ dir, env, run: reg.run })).toBe(true)
+  })
+
+  it('writes nothing when the folder is there already', async () => {
+    const reg = fakeRegistry({ kind: 'String', value: `C:\\tools;%LOCALAPPDATA%\\astera\\bin` })
+    expect(await addToUserPath({ dir, env, run: reg.run })).toBe('present')
+    expect(reg.writes).toBe(0)
+  })
+
+  it('makes a Path that does not exist yet, the kind Windows makes it', async () => {
+    const reg = fakeRegistry({ kind: 'None', value: '' })
+    expect(await addToUserPath({ dir, env, run: reg.run })).toBe('added')
+    expect(reg.now).toEqual({ kind: 'ExpandString', value: dir })
+  })
+
+  it('takes out only the folder on Uninstall, keeping a plain Path plain', async () => {
+    const reg = fakeRegistry({ kind: 'String', value: `C:\\tools;${dir};D:\\bin` })
+    expect(await removeFromUserPath({ dir, env, run: reg.run })).toBe('removed')
+    expect(reg.now).toEqual({ kind: 'String', value: 'C:\\tools;D:\\bin' })
+    expect(await removeFromUserPath({ dir, env, run: reg.run })).toBe('absent')
+    expect(reg.writes).toBe(1)
+  })
+
+  it('carries a value with quotes, semicolons and non-ASCII letters across unchanged', async () => {
+    const odd = `C:\\'quoted' dir;D:\\한글 폴더`
+    const reg = fakeRegistry({ kind: 'ExpandString', value: odd })
+    await addToUserPath({ dir, env, run: reg.run })
+    expect(reg.now.value).toBe(`${odd};${dir}`)
+  })
+})

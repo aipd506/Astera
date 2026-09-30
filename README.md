@@ -288,8 +288,9 @@ Jobs. The Host keeps running after you quit the app, so from PowerShell, cmd or 
 **Once, with the app:**
 
 1. Install Astera, open it, and add your accounts.
-2. **Settings → Agents → Command line tool (astera) → Install the astera command.** If the folder it
-   names is not on your `PATH`, run the line the panel shows.
+2. **Settings → Agents → Command line tool (astera) → Install the astera command.** On Windows it
+   puts the folder on your user `PATH` too (a checkbox, on by default). On macOS and Linux, if the
+   folder is not on your `PATH`, run the line the panel shows.
 3. Open a new shell and check it with `astera version`.
 
 **Then, with the app closed:**

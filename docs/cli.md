@@ -12,11 +12,20 @@ Astera binary in Node mode, so the CLI and the app can never be different versio
    command**.
 2. The panel names the folder it wrote to: `%LOCALAPPDATA%\astera\bin` on Windows,
    `~/.local/bin` on macOS and Linux.
-3. If that folder is not on your `PATH`, the panel shows one line to add it and a **Copy** button.
-   Run that line once, then open a new shell.
+3. **On Windows**, leave **Add this folder to my user PATH** on and the button puts the folder on
+   your user `PATH` itself. Shells opened after that have the command; one already open does not.
+   **Uninstall** takes that one entry out again, and nothing else on your `PATH` changes: the value
+   is written back as it was found, of the same registry kind, with its `%VARIABLE%` entries
+   unexpanded.
+4. On macOS and Linux, or with that box off, a folder that is not on your `PATH` gets one line to add
+   it and a **Copy** button. Run that line once, then open a new shell.
 
-Astera never edits your shell profile. The line is shown for you to run, so that the change is one
-you made and can find again.
+Astera never edits your shell profile. On Windows the only change is the one `PATH` entry above,
+and only when you leave the box on. Elsewhere the line is shown for you to run, so that the change is
+one you made and can find again.
+
+Astera offers this once: the first time it holds an account and the command is not installed, a
+notice says so and opens this panel. Closing the notice or opening the panel settles it.
 
 On Windows, when Astera is installed in a folder whose name has characters outside ASCII and that is
 not inside your user folder, the install also makes the directory junction `%LOCALAPPDATA%\astera\app`

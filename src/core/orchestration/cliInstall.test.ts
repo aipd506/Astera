@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { appImageLaunchFor, binDirFor, isOnPath, pathEntries, pathHintFor } from './cliInstall'
+import { appImageLaunchFor, binDirFor, isOnPath, pathEntries, pathHintFor, userPathWith, userPathWithout } from './cliInstall'
 
 const HOME = '/home/me'
 
@@ -119,3 +119,37 @@ describe('appImageLaunchFor', () => {
     ).toBeUndefined()
   })
 })
+
+// The Install button on Windows puts the folder on the user's Path itself, with the person's consent
+// (the checkbox beside it), and Uninstall takes that one entry out again. The value read and written is
+// the registry's raw one, so an entry that names a variable (%LOCALAPPDATA%\...) is compared expanded.
+describe('userPathWith / userPathWithout (win32 user Path)', () => {
+  const dir = 'C:\\Users\\me\\AppData\\Local\\astera\\bin'
+  const env = { LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local' } as NodeJS.ProcessEnv
+
+  it('appends the folder, keeping everything already there as it was', () => {
+    expect(userPathWith('C:\\tools;%USERPROFILE%\\bin', dir, env)).toBe(`C:\\tools;%USERPROFILE%\\bin;${dir}`)
+    // A Path that ends in a separator keeps ending in one, so Uninstall gives back the very same value
+    expect(userPathWith('C:\\tools;', dir, env)).toBe(`C:\\tools;${dir};`)
+    expect(userPathWith('', dir, env)).toBe(dir)
+  })
+
+  // Measured on this machine's real Path (2026-09-30): it ended in ';', Install dropped that, and
+  // Uninstall gave back a value one character short of the one it found.
+  it('Install then Uninstall gives back exactly the value it found', () => {
+    for (const v of ['', 'C:\\tools', 'C:\\tools;', 'C:\\tools;;', ';C:\\tools', '%USERPROFILE%\\bin;D:\\a b;'])
+      expect(userPathWithout(userPathWith(v, dir, env)!, dir, env), JSON.stringify(v)).toBe(v)
+  })
+
+  it('adds nothing when the folder is already there, however it is spelled', () => {
+    for (const v of [`C:\\tools;${dir}`, `C:\\tools;${dir.toUpperCase()}\\`, 'C:\\tools;%LOCALAPPDATA%\\astera\\bin', `"${dir}"`])
+      expect(userPathWith(v, dir, env), v).toBeNull()
+  })
+
+  it('takes out only the folder, and leaves every other entry, empty ones included, alone', () => {
+    expect(userPathWithout(`C:\\tools;${dir};%USERPROFILE%\\bin`, dir, env)).toBe('C:\\tools;%USERPROFILE%\\bin')
+    expect(userPathWithout('C:\\tools;;%LOCALAPPDATA%\\astera\\bin', dir, env)).toBe('C:\\tools;')
+    expect(userPathWithout('C:\\tools', dir, env)).toBeNull()
+  })
+})
+

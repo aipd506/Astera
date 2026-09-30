@@ -1192,8 +1192,9 @@ export interface CoreApi {
   /** `astera` 명령을 사람의 PATH 에서 닿는 자리에 깔아 둔다(공개 CLI 설계 §10). */
   cli: {
     status(): Promise<CliInstallStatus>
-    /** 셔틀 파일을 그 자리에 쓰고 바뀜 상태를 돌려준다. */
-    install(): Promise<CliInstallStatus>
+    /** 셔틀 파일을 그 자리에 쓰고 바뀜 상태를 돌려준다. `addToPath` (win32): 그 폴더를 사용자 PATH 에도
+     *  넣는다 — 사람이 체크박스로 동의했을 때만 (main/userPath.ts). */
+    install(opts?: { addToPath?: boolean }): Promise<CliInstallStatus>
     /** 그 자리에서 앱이 쓴 셔틀 파일만 지우고 바뀐 상태를 돌려준다. 폴더와 이웃 파일은 남긴다. */
     uninstall(): Promise<CliInstallStatus>
   }
@@ -1712,6 +1713,13 @@ export interface CliInstallStatus {
   onPath: boolean
   /** PATH 에 없을 때 사람이 직접 실행할 한 줄. 앱은 셸 프로필을 고치지 않는다. */
   hint: string
+  /** win32: the Install and Uninstall buttons can put the folder on the user Path themselves, with the
+   *  person's consent (the checkbox beside Install; main/userPath.ts). Absent elsewhere. */
+  canEditUserPath?: true
+  /** Install or Uninstall only: what they did to the user Path, and why not when they could not. A
+   *  change reaches shells opened after it, not one already open. */
+  userPath?: 'added' | 'present' | 'removed'
+  userPathError?: string
   /** 설치 응답에만. `.cmd` 가 정션을 거쳐야 했는데 못 해서 진짜 경로를 적은 까닭들
    *  (core/orchestration/exec/shuttle.ts 의 ShuttleWarning). 있으면 cmd·PowerShell 의 astera 가
    *  돌지 않을 수 있다. */

@@ -131,6 +131,10 @@ import { deleteKey, isMac as isMacPlatform, modKey } from './lib/platformKeys'
 
 sessionBus.init()
 
+/** Whether this renderer has shown the astera command offer (see where it is used). Module scope,
+ *  not a ref: StrictMode's dev-only remount would reset a ref and show a second toast. */
+let cliOfferedThisRun = false
+
 /** The key a record tab's narrowed-flow-step memory (scopedNode) uses. Carries both the project and
  *  the record — a tab id (`record:<id>`) has no project in it, so two projects sharing a record id
  *  would otherwise leak each other's scoping. Kept in one place so the reader, the writer and the
@@ -866,6 +870,49 @@ export default function App(): React.JSX.Element {
   // onKey is registered once at mount, so values and callbacks recreated on every render are read through refs
   const tRef = useRef(t)
   tRef.current = t
+
+  // The astera command, offered (2026-09-30): while this app holds an account and the command is not
+  // installed, a toast says sessions and Jobs can be run from a terminal too, even with the app closed,
+  // and opens Settings → Agents, where Install and its PATH checkbox are. **Settled by the person, not
+  // by being shown**: the mark is written when they close it or press the button (or the command turns
+  // out installed), so a renderer reload right after it appeared does not lose it for good (measured in
+  // the dev app). `cliOfferedThisRun` keeps StrictMode's second run from showing a second one.
+  useEffect(() => {
+    if (accounts.length === 0 || cliOfferedThisRun) return
+    const settle = (): void => {
+      try {
+        localStorage.setItem('cm.cliOffered', '1')
+      } catch {
+        /* storage refused: it may be offered again, which is the lesser harm */
+      }
+    }
+    try {
+      if (localStorage.getItem('cm.cliOffered') === '1') return
+    } catch {
+      return
+    }
+    cliOfferedThisRun = true
+    void window.api.cli
+      .status()
+      .then((s) => {
+        if (s.installed) return settle()
+        const id = toast.info(tRef.current('settings.cli.offer'), {
+          onDismiss: settle,
+          action: {
+            label: tRef.current('settings.cli.offer.open'),
+            onClick: () => {
+              settle()
+              dismiss(id)
+              setSettingsTab('agent')
+              setShowSettings(true)
+            }
+          }
+        })
+      })
+      .catch(() => {
+        cliOfferedThisRun = false
+      })
+  }, [accounts.length])
   const cliRef = useRef(cli)
   cliRef.current = cli
   // The install button on the toast is pressed later — it has to see the real number of running sessions at that moment
