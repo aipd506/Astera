@@ -259,7 +259,7 @@ Astera: every session it starts gets the CLI.
 ### 3. Drive it from a terminal, a script or an agent with the `astera` command
 
 The same Jobs can be listed, started, waited on and answered from an ordinary terminal, a CI pipeline
-or an agent. Install the command once from **Settings → Agents → Command line tool (astera)**. Sessions
+or an agent. Install the command once from **Settings → CLI**. Sessions
 Astera starts already have it, so the agent in any of them can call the same commands. The command
 keeps answering after you quit the app, because the **Astera Host**, the background process that owns
 the work, outlives the window. `astera host start` brings one up if none is running.
@@ -288,7 +288,7 @@ Jobs. The Host keeps running after you quit the app, so from PowerShell, cmd or 
 **Once, with the app:**
 
 1. Install Astera, open it, and add your accounts.
-2. **Settings → Agents → Command line tool (astera) → Install the astera command.** On Windows it
+2. **Settings → CLI → Install the astera command.** On Windows it
    puts the folder on your user `PATH` too (a checkbox, on by default). On macOS and Linux, if the
    folder is not on your `PATH`, run the line the panel shows.
 3. Open a new shell and check it with `astera version`.

@@ -634,6 +634,7 @@ export default function App(): React.JSX.Element {
     | 'appearance'
     | 'accounts'
     | 'agent'
+    | 'cli'
     | 'hiw'
     | 'info'
     | 'shortcuts'
@@ -873,7 +874,7 @@ export default function App(): React.JSX.Element {
 
   // The astera command, offered (2026-09-30): while this app holds an account and the command is not
   // installed, a toast says sessions and Jobs can be run from a terminal too, even with the app closed,
-  // and opens Settings → Agents, where Install and its PATH checkbox are. **Settled by the person, not
+  // and opens Settings → CLI, where Install and its PATH checkbox are. **Settled by the person, not
   // by being shown**: the mark is written when they close it or press the button (or the command turns
   // out installed), so a renderer reload right after it appeared does not lose it for good (measured in
   // the dev app). `cliOfferedThisRun` keeps StrictMode's second run from showing a second one.
@@ -903,7 +904,7 @@ export default function App(): React.JSX.Element {
             onClick: () => {
               settle()
               dismiss(id)
-              setSettingsTab('agent')
+              setSettingsTab('cli')
               setShowSettings(true)
             }
           }
@@ -4524,6 +4525,9 @@ export default function App(): React.JSX.Element {
                     // 제자리다: 어느 계정으로 무엇을 띄울지 정한 다음에 오는 이야기다.
                     // How It Works 의 이름은 사이드바·탭과 같은 키를 쓴다(새 문구를 만들지 않는다).
                     ['agent', t('settings.tab.agent')],
+                    // The astera command has a tab of its own (2026-09-30): it is for a person's own
+                    // terminal, not a setting of the agents the app runs. A name like GitHub's, untranslated.
+                    ['cli', 'CLI'],
                     ['hiw', t('hiw.title')],
                     ['shortcuts', t('settings.tab.shortcuts')],
                     ['slack', 'Slack'],
@@ -4602,13 +4606,17 @@ export default function App(): React.JSX.Element {
                     <p className="settings-hint">{t('settings.defaultKind.hint')}</p>
                   </div>
                 )}
+                {settingsTab === 'cli' && (
+                  <div className="settings-stack">
+                    {/* The astera command: installing it, and on Windows the user PATH (CliSettings). */}
+                    <CliSettings />
+                  </div>
+                )}
                 {settingsTab === 'agent' && (
                   <div className="settings-stack">
-                    {/* 명령줄 도구 — 이 탭의 첫 칸이다. 오케스트레이션은 토글이 아니라 앱이 늘 갖고
-                        있는 것이 되었으므로, 이 명령이 닿을 서버는 언제나 서 있다. */}
-                    <CliSettings />
-                    {/* 권한 모드 — 명령줄 도구 바로 아래. 이 토글이 정하는 것은 Job 워커가 승인을
-                        묻는가이다. 같은 optimistic-update-then-revert 관례를 쓴다. */}
+                    {/* 권한 모드 — 이 탭의 첫 칸이다. 이 토글이 정하는 것은 Job 워커가 승인을
+                        묻는가이다. 같은 optimistic-update-then-revert 관례를 쓴다. 명령줄 도구는
+                        CLI 탭으로 옮겼다. */}
                     <div className="settings-group">
                       <label className="settings-row">
                         <span>{t('settings.agentPermission.label')}</span>

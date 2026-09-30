@@ -8,7 +8,7 @@ Astera binary in Node mode, so the CLI and the app can never be different versio
 
 ## Install
 
-1. Open **Settings → Agents**, and under **Command line tool (astera)** click **Install the astera
+1. Open **Settings → CLI**, and under **Command line tool (astera)** click **Install the astera
    command**.
 2. The panel names the folder it wrote to: `%LOCALAPPDATA%\astera\bin` on Windows,
    `~/.local/bin` on macOS and Linux.
@@ -1509,7 +1509,7 @@ shell.
 
 **`astera: command not found`**
 The install folder is not on your `PATH`, or this shell was opened before you added it. Re-check
-**Settings → Agents → Command line tool (astera)**, run the line it shows, and open a new shell.
+**Settings → CLI**, run the line it shows, and open a new shell.
 
 **"Cannot find module" from `astera` in cmd or PowerShell on Windows**
 cmd.exe reads `astera.cmd` in the console's code page, so a folder name with characters outside ASCII
