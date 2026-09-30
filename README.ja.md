@@ -80,7 +80,8 @@
 - ターミナル、CI パイプライン、エージェントのどこからでも Job を見て動かせます: `astera jobs run`、
   `astera runs wait`、`astera questions answer`。Astera が開始したセッションには最初から入っています
 - アプリを終了しても答え続けます。作業を持つバックグラウンドの Host がウィンドウより長く生きるためです。
-  ワーカーも動き続けます
+  ワーカーも動き続け、アプリを閉じたままセッションや Job を始めることもできます
+  ([アプリを閉じたままターミナルから使う](#アプリを閉じたままターミナルから使う))
 - 出力は既定で JSON、人が読むときは `--human`。終了コードは一つにつき意味が一つで、どのエラーにも
   次に実行するコマンド行が付きます。[`astera` コマンド](docs/cli.md)(英語) を参照してください
 
@@ -250,6 +251,43 @@ astera questions answer --id <questionId> --answer "use the existing migration"
 終了コードは一つにつき意味が一つなので、パイプラインは失敗で終わった Run (10) と人を待っている Run (8)
 を区別できます。すべてのコマンド、JSON 形式、終了コード、安全な再試行、CI の例とセキュリティは
 [`astera` コマンド](docs/cli.md)(英語) を参照してください。
+
+## アプリを閉じたままターミナルから使う
+
+`astera` コマンドは、セッションと Job を動かすバックグラウンドのプロセス **Astera Host** と話します。
+Host はアプリを終了しても動き続けるので、PowerShell、cmd などどのシェルからでも次のことができます。
+
+- エージェントのセッションを始め、その画面を読み、入力を送る
+- Job を作り、タスクを加え、実行し、待ち、質問に答える
+- ワーカーの実行と、利用上限での別アカウントへの切り替え(アプリを開いているときと同じ)
+
+**最初に一度、アプリで:**
+
+1. Astera をインストールして開き、アカウントを追加します。
+2. **設定 → CLI → Install the astera command。** Windows ではフォルダーをユーザーの `PATH` にも
+   入れます(チェックボックス、既定でオン)。macOS と Linux では、そのフォルダーが `PATH` にない場合に
+   パネルが示す 1 行を実行します。
+3. 新しいシェルを開き、`astera version` で確かめます。
+
+**そのあとは、アプリを閉じたまま:**
+
+```bash
+astera host start                                    # Host が動いていなければ起動する
+astera accounts list --human                         # アカウントの id
+astera sessions create --account <id> --cwd <folder> --prompt "fix the failing test"
+astera sessions list --human
+astera sessions read --id <sessionId>                # セッションの画面に映っているもの
+astera sessions send --id <sessionId> --text "yes"
+astera jobs create --objective "…" --cwd <folder> --coordinator-account <id>
+astera tasks add --job <jobId> --spec "…" --account <id>
+astera jobs run --id <jobId>
+astera runs wait --id <runId>
+```
+
+アプリと Host の話し方が変わるアップデートのあとは、アップデート前の Host は残れません。Astera を
+開けば入れ替わり、アプリを開かない場合は `astera host start --replace` を一度実行します。その Host が
+動かしていたセッションは一緒に終わります。ほかのことは [`astera` コマンド](docs/cli.md)(英語) を
+参照してください。
 
 ## インストール
 

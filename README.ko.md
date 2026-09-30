@@ -80,7 +80,8 @@
 - 터미널, CI 파이프라인, 에이전트 어디서든 Job을 보고 움직일 수 있습니다: `astera jobs run`,
   `astera runs wait`, `astera questions answer`. Astera가 시작한 세션에는 이미 들어 있습니다
 - 앱을 종료해도 계속 답합니다. 작업을 쥐고 있는 백그라운드 Host가 창보다 오래 살기 때문입니다.
-  워커도 계속 돕니다
+  워커도 계속 돌고, 앱을 끈 채로 세션과 Job 을 시작할 수도 있습니다
+  ([앱을 끈 채로 터미널에서 쓰기](#앱을-끈-채로-터미널에서-쓰기))
 - 기본 출력은 JSON이고 사람이 읽을 때는 `--human`을 씁니다. 종료 코드마다 뜻이 하나이고, 모든 오류에
   다음에 실행할 명령 줄이 붙습니다. [`astera` 명령](docs/cli.md)을 보세요
 
@@ -246,6 +247,41 @@ astera questions answer --id <questionId> --answer "use the existing migration"
 종료 코드마다 뜻이 하나라서, 파이프라인이 나쁘게 끝난 Run(10)과 사람을 기다리는 Run(8)을 구별할 수
 있습니다. 모든 명령, JSON 형식, 종료 코드, 안전하게 다시 시도하는 법, CI 예시와 보안은
 [`astera` 명령](docs/cli.md)(영어)을 보세요.
+
+## 앱을 끈 채로 터미널에서 쓰기
+
+`astera` 명령은 세션과 Job 을 돌리는 백그라운드 프로세스인 **Astera Host** 와 이야기합니다. Host 는
+앱을 종료해도 계속 돌기 때문에, PowerShell, cmd 나 어느 셸에서든 이렇게 할 수 있습니다.
+
+- 에이전트 세션을 시작하고, 그 화면을 읽고, 입력을 보내기
+- Job 을 만들고 태스크를 넣고 실행하고, 기다리고, 질문에 답하기
+- 워커 실행과 사용 한도에서 다른 계정으로 넘어가기(앱이 켜져 있을 때와 같이)
+
+**처음 한 번, 앱에서:**
+
+1. Astera 를 설치하고 열어서 계정을 등록합니다.
+2. **설정 → CLI → astera 명령 설치.** Windows 에서는 폴더를 사용자 `PATH` 에도 넣어 줍니다(체크박스,
+   기본 켜짐). macOS 와 Linux 에서는 그 폴더가 `PATH` 에 없으면 패널이 보여 주는 한 줄을 실행합니다.
+3. 새 셸을 열고 `astera version` 으로 확인합니다.
+
+**그다음부터, 앱을 끈 채로:**
+
+```bash
+astera host start                                    # Host 가 없으면 띄운다
+astera accounts list --human                         # 계정 id
+astera sessions create --account <id> --cwd <folder> --prompt "fix the failing test"
+astera sessions list --human
+astera sessions read --id <sessionId>                # 세션 화면에 보이는 것
+astera sessions send --id <sessionId> --text "yes"
+astera jobs create --objective "…" --cwd <folder> --coordinator-account <id>
+astera tasks add --job <jobId> --spec "…" --account <id>
+astera jobs run --id <jobId>
+astera runs wait --id <runId>
+```
+
+앱과 Host 가 이야기하는 방식이 바뀌는 업데이트 뒤에는 업데이트 전의 Host 가 남을 수 없습니다. Astera 를
+열면 바뀌고, 앱을 열지 않는다면 `astera host start --replace` 를 한 번 실행합니다. 그 Host 가 돌리던
+세션은 함께 끝납니다. 나머지는 [`astera` 명령](docs/cli.md)(영어)을 보세요.
 
 ## 설치
 

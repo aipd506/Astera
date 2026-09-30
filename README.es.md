@@ -83,7 +83,9 @@
 - Consulta y mueve Jobs desde una terminal, un pipeline de CI o un agente: `astera jobs run`,
   `astera runs wait`, `astera questions answer`. Toda sesión que inicia Astera ya lo tiene
 - Sigue respondiendo después de cerrar la aplicación, porque un Host en segundo plano es dueño del
-  trabajo y vive más que la ventana. Las trabajadoras también siguen
+  trabajo y vive más que la ventana. Las trabajadoras también siguen, y puedes iniciar sesiones y
+  Jobs con la aplicación cerrada (consulta
+  [Usar Astera desde una terminal](#usar-astera-desde-una-terminal-con-la-aplicación-cerrada))
 - JSON por defecto y `--human` para leer, un significado por código de salida y líneas de comando
   para ejecutar a continuación en cada error. Consulta [el comando `astera`](docs/cli.md) (en inglés)
 
@@ -265,6 +267,45 @@ Cada código de salida tiene un solo significado, así que un pipeline distingue
 (10) de uno que espera a una persona (8). Consulta [el comando `astera`](docs/cli.md) (en inglés) para
 ver todos los comandos, el formato JSON, los códigos de salida, cómo reintentar una llamada sin riesgo,
 recetas de CI y notas de seguridad.
+
+## Usar Astera desde una terminal, con la aplicación cerrada
+
+El comando `astera` habla con el **Astera Host**, el proceso en segundo plano que ejecuta tus sesiones y
+tus Jobs. El Host sigue funcionando después de cerrar la aplicación, así que desde PowerShell, cmd o
+cualquier shell puedes:
+
+- iniciar sesiones de agente, ver lo que muestran y escribir en ellas
+- crear Jobs, añadir sus tareas, ejecutarlos, esperarlos y responder a sus preguntas
+- dejar que las trabajadoras sigan y pasen a otra cuenta al llegar a un límite de uso, como con la
+  aplicación abierta
+
+**Una vez, con la aplicación:**
+
+1. Instala Astera, ábrela y añade tus cuentas.
+2. **Ajustes → CLI → Install the astera command.** En Windows también pone la carpeta en tu `PATH` de
+   usuario (una casilla, activada por defecto). En macOS y Linux, si la carpeta no está en tu `PATH`,
+   ejecuta la línea que muestra el panel.
+3. Abre una shell nueva y compruébalo con `astera version`.
+
+**Después, con la aplicación cerrada:**
+
+```bash
+astera host start                                    # inicia el Host si no está en marcha
+astera accounts list --human                         # los id de las cuentas
+astera sessions create --account <id> --cwd <folder> --prompt "fix the failing test"
+astera sessions list --human
+astera sessions read --id <sessionId>                # lo que muestra la pantalla de la sesión
+astera sessions send --id <sessionId> --text "yes"
+astera jobs create --objective "…" --cwd <folder> --coordinator-account <id>
+astera tasks add --job <jobId> --spec "…" --account <id>
+astera jobs run --id <jobId>
+astera runs wait --id <runId>
+```
+
+Tras una actualización que cambia cómo hablan la aplicación y el Host, el Host de antes de la
+actualización no puede quedarse: abrir Astera lo sustituye, o ejecuta `astera host start --replace`.
+Las sesiones que ejecutaba ese Host terminan con él. Para todo lo demás, consulta
+[el comando `astera`](docs/cli.md) (en inglés).
 
 ## Instalación
 
