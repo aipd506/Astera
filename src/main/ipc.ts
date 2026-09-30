@@ -193,6 +193,7 @@ import { filterFilePaths } from '../core/files/fileMatch'
 import { sortEntries, isPathWithin, isSamePath, renamePlan, resolveProjectRootFrom } from '../core/files/tree'
 import { OUTSIDE_ROOT, writeWithinRoot } from '../core/files/atomicWrite'
 import { resolveWindowsExecutable, windowsSpawn } from '../core/sessions/windowsExecutable'
+import { ensureOnWindowsPath } from '../core/sessions/windowsPath'
 import { writeFilesToClipboard } from './clipboardFiles'
 import { validateName, uniqueName, canMove, canCopy } from '../core/files/ops'
 import { copyTree, removeTree, removeWithSnapshot } from '../core/files/fsTree'
@@ -1906,6 +1907,9 @@ export function registerIpc(
       void core.schedulerConfig.set(resumeId, opts.schedule).catch(() => {})
     }
     const account = core.accounts.get(opts.accountId)
+    // win32: a CLI installed since this app started is not on its PATH yet; the Path Windows keeps is
+    // read again first (at most every 30 s, and only when the CLI is missing: core/sessions/windowsPath.ts).
+    if (account) await ensureOnWindowsPath([providerOf(account)])
     // Resolves and passes the provider of every account in the roll chain — the manager rejects a mix.
     // The rollAccountIds combination the modal settled on is checked here as well.
     //
@@ -7251,7 +7255,9 @@ export function registerIpc(
   // repository shipping a `claude.cmd` had it run the moment its folder was picked. A CLI PATH does
   // not know is reported missing without asking the folder.
   ipcMain.handle('system.checkCli', async (_e, cwd?: string) => {
-    const check = (cli: string): Promise<{ ok: boolean; version?: string; error?: string }> =>
+    // A CLI installed since this app started is looked for on the Path Windows keeps too (windowsPath.ts)
+    await ensureOnWindowsPath(['claude', 'codex'])
+    const check =(cli: string): Promise<{ ok: boolean; version?: string; error?: string }> =>
       new Promise((resolve) => {
         const spawn =
           process.platform === 'win32'

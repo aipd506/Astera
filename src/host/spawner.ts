@@ -37,6 +37,7 @@ import { refusedBeforeActing, undoneBeforeFailing } from '../core/host/orchProto
 import { findRollout as findRolloutOnDisk } from '../core/rolling/codexLocate'
 import { descriptorOf, makeDescriptors } from '../core/providers/descriptor'
 import { providerOf } from '../core/providers/meta'
+import { ensureOnWindowsPath } from '../core/sessions/windowsPath'
 import { SessionManager, defaultSpawnChecks } from '../core/sessions/manager'
 import { defaultSessionTitle } from '../core/sessions/title'
 import type { PtyFactory, PtyLike } from '../core/sessions/pty'
@@ -307,7 +308,8 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
     homeDir,
     (id, account, o) => statusLine.spawnConfig(id, account, o),
     [previewShotsDir(profileDir)],
-    hostWorkerBaseEnv(d.env),
+    // Read at each spawn, not once: the Host completes its PATH when a CLI is missing (windowsPath.ts)
+    () => hostWorkerBaseEnv(d.env),
     // The Host's own log: a spawn that had to fall back to a sync check says so in host.log.
     defaultSpawnChecks(log)
   )
@@ -441,6 +443,10 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
     // (core/sessions/pathProbe.ts), where sessions.spawn used to look for them synchronously — the same
     // place in the order, so the refusals before it (settings, account) still come first. The Host has
     // one thread: a sync check on an offline drive would stop every pty it holds. No process (A36).
+    // win32: a CLI installed since this Host started is on the Path Windows keeps, not on the copy this
+    // Host inherited; read again first, at most every 30 s and only when it is missing (windowsPath.ts).
+    // Before prepare, which keys what it finds by the PATH it sees.
+    await ensureOnWindowsPath([providerOf(account)])
     await sessions.prepare({ account, cwd: o.cwd })
     const rollProviders = o.rollAccountIds.map((rid) => providerOf(accounts.find((x) => x.id === rid) ?? account))
     const opensBefore = opens
@@ -487,6 +493,7 @@ export function createHostSpawner(d: HostSpawnerDeps): HostSpawner | null {
     preparedAccounts = accounts
     // CWD_MISSING, or CWD_UNREACHABLE for a folder that did not answer in time; also finds the Git Bash
     // the synchronous rollSpawn below will use, so that spawn looks at nothing on disk.
+    await ensureOnWindowsPath([providerOf(account)]) // before prepare, which keys what it finds by PATH
     await sessions.prepare({ account, cwd })
     preparedBypass = await bypassFromSettings() // RepairNeeded on a damaged settings file (A10)
     await preTrustWorkspace({ account, cwd, homeDir, descriptors, log })

@@ -6,7 +6,7 @@
 // 확인할 수 없다 — 터미널에서 앱을 실행하면 부모 셸의 PATH 를 그대로 물려받아 프로브가 없어도
 // 통과하기 때문이다. 그래서 플랫폼 분기의 증거는 이 검사뿐이다.
 import { describe, it, expect } from 'vitest'
-import { mergeWindowsPath, readLoginPath } from './loginPath'
+import { readLoginPath } from './loginPath'
 
 /** 프로브 출력의 모양 — 마커 사이에 PATH 를 끼운 것 */
 const probeOutput = (p: string): string => `__ASTERA_PATH__${p}__END__`
@@ -67,22 +67,6 @@ describe('readLoginPath — 로그인 셸 PATH 프로브', () => {
     expect(rec.calls[0].file).toMatch(/[\\/]System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i)
     expect(rec.calls[0].args.join(' ')).toContain("GetEnvironmentVariable('Path','Machine')")
     expect(rec.calls[0].args.join(' ')).toContain("GetEnvironmentVariable('Path','User')")
-  })
-})
-
-describe('mergeWindowsPath — 물려받은 Path 는 그대로, 빠진 것만 뒤에', () => {
-  it('keeps the inherited order and appends what the saved Path has that it lacks', () => {
-    expect(mergeWindowsPath('C:\\a;C:\\b', 'C:\\b;C:\\c;C:\\a')).toBe('C:\\a;C:\\b;C:\\c')
-  })
-
-  it('does not add a folder again in another case or with a trailing separator', () => {
-    expect(mergeWindowsPath('C:\\Tools\\', 'c:\\tools;C:\\new')).toBe('C:\\Tools\\;C:\\new')
-  })
-
-  it('keeps the inherited Path as it was when the saved one adds nothing, or cannot be read', () => {
-    expect(mergeWindowsPath('C:\\a;;C:\\b;', 'C:\\a;C:\\b')).toBe('C:\\a;;C:\\b;')
-    expect(mergeWindowsPath('C:\\a', null)).toBe('C:\\a')
-    expect(mergeWindowsPath(undefined, 'C:\\a')).toBe('C:\\a')
   })
 
   it('프로브가 실패하면 null — 앱 시작을 막지 않는다', async () => {

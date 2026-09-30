@@ -141,7 +141,8 @@ export function composeHostRolling(a: {
     platform: a.platform,
     homeDir: os.homedir(),
     version: a.version,
-    baseEnv: hostWorkerBaseEnv(process.env),
+    // Read at each spawn, not once: the Host completes its PATH when a CLI is missing (windowsPath.ts)
+    baseEnv: () => hostWorkerBaseEnv(process.env),
     askApp: (n, args) => a.server().act(n, args),
     log,
     ...a.chatsDeps

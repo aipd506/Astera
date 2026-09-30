@@ -21,6 +21,7 @@ import { openHostLog, logUnhandledRejections } from './log'
 import { flushAll, flushAllLogsSync } from '../core/log/logWriter'
 import { startHostServer, ADDRESS_TAKEN } from './server'
 import { ensureHostKey } from '../core/host/hostKey'
+import { completeWindowsPath } from '../core/sessions/windowsPath'
 import { PtyRegistry } from './registry'
 import { createConhostReaper, reapWindowsConsoleHosts } from './conhostReaper'
 import { attachPtyHost } from './ptyHost'
@@ -96,6 +97,10 @@ async function main(): Promise<void> {
   // S6-22: the OS certificate store joins Node's default CAs before any HTTPS (the usage lookup), so a
   // TLS-inspecting proxy's root verifies. Never throws; on failure the defaults stay (systemCa.ts).
   trustSystemCa(tls, (m) => log.write(m))
+  // win32: the PATH this Host was started with is whatever its starter had, the app or the shell that
+  // ran `astera host start`, and it may predate a CLI's folder (core/sessions/windowsPath.ts). Completed
+  // from the Path Windows keeps before anything is spawned. Never fatal: the inherited PATH otherwise.
+  if (await completeWindowsPath().catch(() => false)) log.write('PATH completed from the Path Windows keeps')
   const addr = hostAddress({ profileDir, platform: process.platform, tmpDir: os.tmpdir(), protocol: HOST_PROTOCOL })
 
   // Where node-pty's own JavaScript lives, for the check below. `createRequire(__filename)` rather

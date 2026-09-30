@@ -10,7 +10,7 @@
 // ~/.profile either), so nvm's shims and ~/.local/bin are missing. Launched from a terminal it works
 // by accident — the parent shell's PATH is inherited — which is why the deb/AppImage install path is
 // the one that breaks. Windows has no shell to ask: PATH there is a machine/user environment variable,
-// read from where Windows keeps it (windowsPathProbe), because a process can inherit a copy that is
+// read from where Windows keeps it (core/sessions/windowsPath.ts), because a process can inherit a copy that is
 // older than that.
 //
 // Why process.env.PATH is patched directly: session env is built by SessionManager.spawn as
@@ -23,6 +23,7 @@
 // and homebrew/mise/asdf/nvm all evaluate shellenv from within an rc file. Statically listing candidate
 // directories would miss every one of them.
 import { execFile } from 'node:child_process'
+import { mergeWindowsPath, parseWindowsPathProbe, windowsPathProbe } from '../core/sessions/windowsPath'
 
 /** Wraps the value in markers to separate PATH from whatever banners/warnings the rc file prints. */
 const START = '__ASTERA_PATH__'
@@ -72,57 +73,7 @@ export function probeShell(platform: NodeJS.Platform, shell: string | undefined)
   return shell || (platform === 'darwin' ? '/bin/zsh' : '/bin/sh')
 }
 
-/**
- * win32: the Path Windows keeps, Machine then User, the way a freshly started process gets it.
- *
- * **A GUI process does not always get that.** It gets a copy of whoever started it, and the 1.4.0
- * update showed where that goes wrong (2026-09-30): the installer relaunched the app with the old
- * app's environment, copied before Codex had put its folder on the user Path, and the app said codex
- * was not installed. Until then it went unnoticed because the CLIs were started through cmd.exe;
- * since they are started from where this process's PATH says they are (windowsExecutable.ts), a stale
- * copy means a missing CLI. Windows PowerShell by its absolute path, and UTF-8 out, so a folder with
- * non-ASCII letters survives.
- */
-const windowsPathProbe = (): { file: string; args: string[] } => ({
-  file: `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
-  args: [
-    '-NoProfile',
-    '-NonInteractive',
-    '-Command',
-    `[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Console]::Out.Write('${START}' + [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User') + '${END}')`
-  ]
-})
-
-/** One win32 Path entry as a folder to compare: case folded, trailing separators and quotes off. */
-const windowsFolderKey = (entry: string): string =>
-  entry
-    .trim()
-    .replace(/^"|"$/g, '')
-    .replace(/[\\/]+$/, '')
-    .toLowerCase()
-
-/**
- * The inherited win32 PATH with every folder of the saved one it lacks appended, in the saved order.
- * **Appended, not put first**: whatever started this process may have put something in front on
- * purpose, and that stays where it was. The inherited string is kept as it is when nothing is new.
- */
-export function mergeWindowsPath(current: string | undefined, saved: string | null): string | undefined {
-  if (saved === null) return current
-  const have = new Set((current ?? '').split(';').filter((e) => e.trim() !== '').map(windowsFolderKey))
-  const added: string[] = []
-  for (const e of saved.split(';')) {
-    if (e.trim() === '') continue
-    const key = windowsFolderKey(e)
-    if (have.has(key)) continue
-    have.add(key)
-    added.push(e.trim())
-  }
-  if (added.length === 0) return current
-  const kept = (current ?? '').replace(/;+$/, '')
-  return kept === '' ? added.join(';') : `${kept};${added.join(';')}`
-}
-
-/** Asks the login shell for PATH, or on win32 the Path Windows keeps (see windowsPathProbe). */
+/** Asks the login shell for PATH, or on win32 the Path Windows keeps (core/sessions/windowsPath.ts). */
 export async function readLoginPath(opts: {
   platform: NodeJS.Platform
   shell: string | undefined
@@ -131,7 +82,7 @@ export async function readLoginPath(opts: {
   if (opts.platform === 'win32') {
     const probe = windowsPathProbe()
     try {
-      return parseLoginPath(await opts.run(probe.file, probe.args))
+      return parseWindowsPathProbe(await opts.run(probe.file, probe.args))
     } catch {
       return null // the inherited PATH then, as before
     }
