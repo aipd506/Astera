@@ -26,7 +26,7 @@ export const ja: Catalog = {
     'すでに開いているセッションには適用されません。次のセッションから有効です。',
   'settings.agentPermission.saveFailed': '権限モードを保存できませんでした: {detail}',
   // Work Unit 追跡
-  'settings.workUnit.label': '作業単位の追跡（実験）',
+  'settings.workUnit.label': '作業単位の追跡',
   'settings.workUnit.hint':
     '/astera-task でやりたいことを書くと、そこから作業が始まり、終わるまで何度やり取りしても同じ1行の' +
     'ままです。git リポジトリのプロジェクトでのみ動作します。' +
@@ -34,14 +34,14 @@ export const ja: Catalog = {
     'オンにした後の会話だけを見ます — 既存の履歴は読みません。',
   'settings.workUnit.saveFailed': '作業単位の追跡設定を保存できませんでした: {detail}',
   // エージェントブラウザ
-  'settings.agentBrowser.label': 'エージェントブラウザ（実験的）',
+  'settings.agentBrowser.label': 'エージェントブラウザ',
   'settings.agentBrowser.hint':
     'オンにすると、各セッションが自分のプレビュータブを持ち、このプロジェクトの開発サーバーを開いて再読み込みし、コンソールエラーを読めます。' +
     'すべてのアカウントに astera-browser スキルをインストールします。localhost のみ開けます。' +
     '既に開いているセッションには適用されません。新しいセッションから有効です。',
   'settings.agentBrowser.saveFailed': 'エージェントブラウザ設定を保存できませんでした: {detail}',
   // エージェントアプリ作業スペース
-  'settings.agentApp.label': 'エージェントアプリ作業スペース（実験的）',
+  'settings.agentApp.label': 'エージェントアプリ作業スペース',
   'settings.agentApp.hint':
     'オンにすると、エージェントがこのプロジェクトのアプリを、あなたには見えない場所 (Windows では隠れたデスクトップ、Linux では仮想ディスプレイ、macOS ではバックグラウンド) で起動し、操作し、撮影できます。' +
     '画面とポインターには触れません。Windows と macOS ではクリップボードを共有します。すべてのアカウントに astera-app スキルをインストールします。' +
@@ -284,12 +284,12 @@ export const ja: Catalog = {
   'settings.theme.saveFailed': 'テーマを保存できませんでした: {detail}',
   // ResumeStrategySettings.tsx — the two-way resume strategy picker
   'settings.resumeStrategy.label': 'セッション再開方法',
-  'settings.resumeStrategy.smart.label': 'スマート再開 (実験)',
+  'settings.resumeStrategy.smart.label': 'スマート再開',
   'settings.resumeStrategy.smart.hint': '簡潔なチェックポイントだけで会話を続けます。エージェントが作業中に残した引き継ぎメモがあれば、それも渡します。',
   'settings.resumeStrategy.original.label': '元のセッションを再開',
   'settings.resumeStrategy.original.hint': '従来の Resume で会話を続けます。',
   'settings.resumeStrategy.saveFailed': '再開方法を保存できませんでした: {detail}',
-  'settings.jobContinuity.label': 'ジョブの継続 (実験的)',
+  'settings.jobContinuity.label': 'ジョブの継続',
   'settings.jobContinuity.hint':
     'クラッシュや再起動をまたいでジョブを復旧できる状態に保ちます。' +
     'ジョブの状態をディスクに残し、エージェントの元のセッションを復元し、必要なときはスマート再開を使います。',

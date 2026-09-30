@@ -61,21 +61,21 @@ export const ko = {
     'app-settings.json.bak 에 남겨 두었습니다. 안전을 위해 권한 확인은 켜 두었습니다. ' +
     '설정 > 에이전트에서 "권한 확인 없이 에이전트 실행"을 다시 켜면 확인 없이 실행됩니다.',
   // Work Unit 추적
-  'settings.workUnit.label': '작업 단위 추적 (실험)',
+  'settings.workUnit.label': '작업 단위 추적',
   'settings.workUnit.hint':
     '/astera-task 로 하려는 일을 적으면 그때부터 한 줄이 시작되고, 끝날 때까지 몇 번을 주고받든 같은 ' +
     '줄로 남습니다. git 저장소인 프로젝트에서만 작동합니다. 이미 열려 있는 세션에는 적용되지 ' +
     '않습니다. 새 세션부터 동작합니다. 켠 뒤의 대화만 봅니다. 이전 기록은 읽지 않습니다.',
   'settings.workUnit.saveFailed': '작업 단위 추적 설정을 저장하지 못했습니다: {detail}',
   // 에이전트 브라우저
-  'settings.agentBrowser.label': '에이전트 브라우저 (실험)',
+  'settings.agentBrowser.label': '에이전트 브라우저',
   'settings.agentBrowser.hint':
     '켜면 세션마다 자기 미리보기 탭을 갖고, 이 프로젝트의 개발 서버를 열고 새로고침하고 콘솔 오류를 읽을 수 있습니다. ' +
     '모든 계정에 astera-browser 스킬을 설치합니다. localhost 만 열 수 있습니다. ' +
     '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다.',
   'settings.agentBrowser.saveFailed': '에이전트 브라우저 설정을 저장하지 못했습니다: {detail}',
   // 에이전트 앱 작업 공간
-  'settings.agentApp.label': '에이전트 앱 작업 공간 (실험)',
+  'settings.agentApp.label': '에이전트 앱 작업 공간',
   'settings.agentApp.hint':
     '켜면 에이전트가 이 프로젝트의 앱을 사람이 보지 않는 곳(Windows 는 숨은 데스크톱, Linux 는 가상 디스플레이, macOS 는 백그라운드)에서 띄우고 조작하고 찍을 수 있습니다. ' +
     '화면과 포인터는 건드리지 않습니다. Windows 와 macOS 에서는 클립보드를 함께 씁니다. 모든 계정에 astera-app 스킬을 설치합니다. ' +
@@ -436,12 +436,12 @@ export const ko = {
   'settings.theme.saveFailed': '테마 저장 실패: {detail}',
   // ResumeStrategySettings.tsx — the two-way resume strategy picker
   'settings.resumeStrategy.label': '세션 재개 방식',
-  'settings.resumeStrategy.smart.label': '스마트 재개 (실험)',
+  'settings.resumeStrategy.smart.label': '스마트 재개',
   'settings.resumeStrategy.smart.hint': '간결한 체크포인트만으로 대화를 이어갑니다. 에이전트가 작업 중 남긴 인계 메모가 있으면 함께 전달합니다.',
   'settings.resumeStrategy.original.label': '원래 세션 재개',
   'settings.resumeStrategy.original.hint': '기존 Resume 방식으로 대화를 이어갑니다.',
   'settings.resumeStrategy.saveFailed': '재개 방식을 저장하지 못했습니다: {detail}',
-  'settings.jobContinuity.label': '작업 이어가기 (실험)',
+  'settings.jobContinuity.label': '작업 이어가기',
   'settings.jobContinuity.hint':
     '앱이 죽거나 다시 시작해도 작업을 복구할 수 있게 유지합니다. ' +
     '작업 상태를 디스크에 남기고, 에이전트의 원래 세션을 되살리며, 필요할 때 스마트 재개를 씁니다.',

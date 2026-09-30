@@ -163,8 +163,8 @@ changed one of them:
 - **P2. Where `app js` is answered.** Above the command layer and below the request receipt line beside
   `requests-show`, because the CLI mints a request id for every call and a command above the line refuses
   one. A retried id replays the recorded result instead of launching twice.
-- **P3. Its own setting.** `agentAppEnabled` in `app-settings.json`, labelled **Agent app workspace
-  (experimental)** under Settings, Agents, off by default. It gates the `astera-app` skill and `app js`
+- **P3. Its own setting.** `agentAppEnabled` in `app-settings.json`, labelled **Agent app workspace**
+  under Settings, Agents, off by default. It gates the `astera-app` skill and `app js`
   alike, and the Host reads it on every `app js`, so it works with the app closed.
 - **P4. The session's folder.** Captures go to the folder every session is granted (`preview/shots`),
   named `app-<uuid>.png`, and are trimmed the way the agent browser's are.

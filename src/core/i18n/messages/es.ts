@@ -26,7 +26,7 @@ export const es: Catalog = {
     'Las sesiones ya abiertas no se ven afectadas. Se aplica a partir de la siguiente sesión.',
   'settings.agentPermission.saveFailed': 'No se pudo guardar el modo de permisos: {detail}',
   // Seguimiento de unidades de trabajo
-  'settings.workUnit.label': 'Seguimiento de unidades de trabajo (experimental)',
+  'settings.workUnit.label': 'Seguimiento de unidades de trabajo',
   'settings.workUnit.hint':
     'Declara una tarea escribiendo /astera-task con lo que quieres hacer, y eso se convierte en una ' +
     'fila propia hasta que termina, sin importar cuántos mensajes haga falta. Solo funciona en un ' +
@@ -35,14 +35,14 @@ export const es: Catalog = {
     'conversaciones posteriores a activarlo — el historial existente nunca se lee.',
   'settings.workUnit.saveFailed': 'No se pudo guardar la configuración de seguimiento: {detail}',
   // Navegador del agente
-  'settings.agentBrowser.label': 'Navegador del agente (experimental)',
+  'settings.agentBrowser.label': 'Navegador del agente',
   'settings.agentBrowser.hint':
     'Activado, cada sesión tiene su propia pestaña de vista previa para abrir, recargar y leer los errores de consola del servidor de desarrollo de este proyecto. ' +
     'Instala la habilidad astera-browser en todas las cuentas. Solo se puede abrir localhost. ' +
     'No afecta a las sesiones ya abiertas; sí a las nuevas.',
   'settings.agentBrowser.saveFailed': 'No se pudo guardar el ajuste del navegador del agente: {detail}',
   // Espacio de trabajo de apps del agente
-  'settings.agentApp.label': 'Espacio de trabajo de apps del agente (experimental)',
+  'settings.agentApp.label': 'Espacio de trabajo de apps del agente',
   'settings.agentApp.hint':
     'Activado, un agente puede abrir la app de este proyecto donde usted no la ve (un escritorio oculto en Windows, una pantalla virtual en Linux, en segundo plano en macOS), manejarla y fotografiarla. ' +
     'Nunca toma su pantalla ni su puntero. En Windows y macOS comparte su portapapeles. Instala la habilidad astera-app en todas las cuentas. ' +
@@ -290,12 +290,12 @@ export const es: Catalog = {
   'settings.theme.saveFailed': 'No se pudo guardar el tema: {detail}',
   // ResumeStrategySettings.tsx — the two-way resume strategy picker
   'settings.resumeStrategy.label': 'Estrategia de reanudación de sesión',
-  'settings.resumeStrategy.smart.label': 'Reanudación inteligente (experimental)',
+  'settings.resumeStrategy.smart.label': 'Reanudación inteligente',
   'settings.resumeStrategy.smart.hint': 'Continúa la conversación solo con un punto de control compacto. Si el agente dejó una nota de traspaso mientras trabajaba, también se entrega.',
   'settings.resumeStrategy.original.label': 'Reanudar la sesión original',
   'settings.resumeStrategy.original.hint': 'Continúa la conversación con el resume propio del CLI.',
   'settings.resumeStrategy.saveFailed': 'No se pudo guardar la estrategia de reanudación: {detail}',
-  'settings.jobContinuity.label': 'Continuidad de trabajos (experimental)',
+  'settings.jobContinuity.label': 'Continuidad de trabajos',
   'settings.jobContinuity.hint':
     'Mantiene los trabajos recuperables tras fallos y reinicios. ' +
     'Usa el estado duradero del trabajo, la recuperación de la sesión nativa y la reanudación inteligente cuando hace falta.',
