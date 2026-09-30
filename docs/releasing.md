@@ -24,6 +24,13 @@ Releases, and installed apps then update themselves through `electron-updater`.
    changelog link are wrapped around it at publish time. Review it before committing: it is the
    release page, and it is the last chance to read it before it is public.
 
+   **If `docs/release-notes/next.md` exists, it goes in first.** It holds what someone had to be told
+   about the next release while the work was done, before anyone knew which version that would be (a
+   `## Before you update` section, say). Put its sections at the top of `<tag>.md` as they are, then
+   delete `next.md` in the same commit, so the next release does not carry it again. This applies
+   even when step 2 is skipped: in that case `<tag>.md` holds only what `next.md` held, which replaces
+   the generated `## New features` and `## Fixes`, so write those two as well.
+
    **Skipping this step is allowed.** With no file the notes generate themselves from the branches
    (see below) — correct, but named after branches rather than written.
 

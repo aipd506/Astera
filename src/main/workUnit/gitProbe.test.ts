@@ -4,7 +4,8 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { makeRepo, tempDir, gitSync } from '../../core/worktrees/testRepo'
 import { classifyTransition } from '../../core/git/transition'
-import { readGitRef, isAncestorOf, readRange } from './gitProbe'
+import { readGitRef, isAncestorOf, readRange, readChangedFiles, type GitRun } from './gitProbe'
+import { git, type GitResult } from '../../core/worktrees/git'
 
 const run = (repo: string, args: string[]): void => {
   gitSync(repo, args)
@@ -115,7 +116,7 @@ describe('readRange', () => {
     run(repo, ['commit', '-m', 'third'])
     const after = headHash(repo)
 
-    const range = await readRange(repo, before, after)
+    const range = (await readRange(repo, before, after))!
     // git log 는 최신 커밋을 먼저 낸다
     expect(range.commits).toEqual([after, mid])
     expect(range.changedFiles.sort()).toEqual(['g.txt', 'has space/한글.txt'])
@@ -145,19 +146,27 @@ describe('readRange', () => {
     const after = headHash(repo)
     expect(after).toHaveLength(64) // SHA-256 해시 — 40자 hex 모양 판정이 있었다면 여기서 깨졌을 것이다
 
-    const range = await readRange(repo, before, after)
+    const range = (await readRange(repo, before, after))!
     expect(range.commits).toEqual([after])
     expect(range.changedFiles).toEqual(['g.txt'])
   })
 
-  it('git 저장소가 아닌 디렉터리 → 던지지 않고 빈 목록', async () => {
+  // 모른다는 것은 비었다는 것이 아니다. 실패(저장소가 아니다, 시간 초과, 출력 한도)를 빈 목록으로
+  // 주면 큰 pull 뒤의 기록이 "아무 것도 안 바뀌었다"로 남는다 — null 이 그 둘을 가른다.
+  it('git 저장소가 아닌 디렉터리 → 던지지 않고 null(모름) — 빈 목록이 아니다', async () => {
     const notRepo = await tempDir('astera-gitprobe-range-notrepo-')
-    await expect(readRange(notRepo, MISSING_HASH, MISSING_HASH)).resolves.toEqual({
-      commits: [],
-      changedFiles: [],
-      authors: [],
-      subjects: []
-    })
+    await expect(readRange(notRepo, MISSING_HASH, MISSING_HASH)).resolves.toBeNull()
+  })
+
+  it('저장소에 없는 커밋이 끼면 null(모름)이다', async () => {
+    const repo = await makeRepo()
+    await expect(readRange(repo, MISSING_HASH, headHash(repo))).resolves.toBeNull()
+  })
+
+  it('두 HEAD 가 같은 구간은 null 이 아니라 빈 목록이다', async () => {
+    const repo = await makeRepo()
+    const h = headHash(repo)
+    await expect(readRange(repo, h, h)).resolves.toEqual({ commits: [], changedFiles: [], authors: [], subjects: [] })
   })
 
   // EG §6 이 pull 에서 수집할 것으로 `Authors` 를 적었고 §40 이 "author metadata" 를 필수 단위
@@ -180,10 +189,117 @@ describe('readRange', () => {
     await commitAs('Alice A', 'c.txt')
     const after = headHash(repo)
 
-    const range = await readRange(repo, before, after)
+    const range = (await readRange(repo, before, after))!
     expect(range.commits).toHaveLength(3)
     expect(range.authors).toEqual(['Alice A', 'Bob  B'])
     // 이 구간을 연 커밋의 author('Test User', makeRepo 가 심었다)는 before 자신이라 범위 밖이다
     expect(range.authors).not.toContain('Test User')
+  })
+})
+
+describe('readChangedFiles', () => {
+  it('바뀐 파일을 준다', async () => {
+    const repo = await makeRepo()
+    await fs.writeFile(path.join(repo, 'n.txt'), 'n', 'utf8')
+    expect(await readChangedFiles(repo)).toEqual(['n.txt'])
+  })
+
+  it('깨끗한 작업 트리는 빈 목록이다', async () => {
+    const repo = await makeRepo()
+    expect(await readChangedFiles(repo)).toEqual([])
+  })
+
+  // 저장소가 아닌 폴더는 "모름"이 아니라 확실한 답이다: 바뀐 것을 잴 git 이 없으니 바뀐 것도 없다.
+  // 탐색기(ipc.ts 의 git.status)가 그렇게 다룬다. null 로 주면 수집기가 git 없는 프로젝트의 모든
+  // 완료를 "모름"으로 붙잡아 파일 없는 기록과 설명 에이전트를 만든다.
+  it('git 저장소가 아닌 폴더는 null 이 아니라 빈 목록이다 (확실히 바뀐 것 없음)', async () => {
+    const notRepo = await tempDir('astera-gitprobe-changed-notrepo-')
+    expect(await readChangedFiles(notRepo)).toEqual([])
+  })
+
+  // git 이 답하지 못했을 때 []를 주면 깨끗한 작업 트리와 구별되지 않는다 — 수집기가 그것을 "바뀐 것
+  // 없음"으로 읽고 Unit 을 지운다.
+  it('저장소인데 status 가 실패하면 빈 목록이 아니라 null(모름)이다', async () => {
+    const repo = await makeRepo()
+    await fs.writeFile(path.join(repo, '.git', 'index'), 'not an index', 'utf8')
+    expect(await readChangedFiles(repo)).toBeNull()
+  })
+
+  it('폴더가 없어 git 을 띄우지도 못하면 null(모름)이다', async () => {
+    const parent = await tempDir('astera-gitprobe-changed-gone-')
+    expect(await readChangedFiles(path.join(parent, 'gone'))).toBeNull()
+  })
+})
+
+// ── git 을 몇 번 띄우는가 (stage 4, task 4) ────────────────────────────
+// 감시 회차마다 도는 두 물음이다. 프로세스 하나하나가 Windows 에서는 바이러스 백신 검사 값을 치른다.
+
+const counting = (): { calls: string[][]; run: GitRun } => {
+  const calls: string[][] = []
+  return {
+    calls,
+    run: (args, opts) => {
+      calls.push(args)
+      return git(args, opts)
+    }
+  }
+}
+
+/** git 을 띄우지 않고 정해진 답을 주는 runner — 시간 초과처럼 진짜로 만들기 어려운 답을 흉내 낸다 */
+const answering = (answer: GitResult): GitRun => async () => answer
+
+describe('readGitRef — 띄우는 수', () => {
+  it('보통의 저장소에서는 git 한 번으로 브랜치와 HEAD 를 함께 읽는다', async () => {
+    const repo = await makeRepo()
+    const { calls, run } = counting()
+    const ref = await readGitRef(repo, run)
+    expect(ref).toEqual({ branch: 'main', head: headHash(repo) })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('브랜치와 같은 이름의 태그가 있어도 symbolic-ref --short 와 같은 이름을 준다', async () => {
+    const repo = await makeRepo()
+    run(repo, ['tag', 'main'])
+    const expected = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
+      cwd: repo,
+      windowsHide: true,
+      encoding: 'utf8'
+    }).trim()
+    expect((await readGitRef(repo)).branch).toBe(expected)
+  })
+
+  it('git 이 답하지 못하면(시간 초과) 둘 다 null 이다 — 지어내지 않는다', async () => {
+    const repo = await makeRepo()
+    const ref = await readGitRef(repo, answering({ ok: false, stdout: '', stderr: 'timed out', timedOut: true }))
+    expect(ref).toEqual({ branch: null, head: null })
+  })
+})
+
+describe('isAncestorOf — 띄우는 수와 모름', () => {
+  it('두 커밋이 있으면 merge-base 한 번으로 답한다', async () => {
+    const repo = await makeRepo()
+    const before = headHash(repo)
+    await fs.writeFile(path.join(repo, 'g.txt'), 'y', 'utf8')
+    run(repo, ['add', 'g.txt'])
+    run(repo, ['commit', '-m', 'second'])
+    const after = headHash(repo)
+    const { calls, run: counted } = counting()
+    expect(await isAncestorOf(repo, before, after, counted)).toBe(true)
+    expect(await isAncestorOf(repo, after, before, counted)).toBe(false)
+    expect(calls).toHaveLength(2)
+  })
+
+  it('merge-base 가 답하지 못하면(종료 코드 없음) null — false 가 아니다', async () => {
+    const repo = await makeRepo()
+    const h = headHash(repo)
+    const timedOut = answering({ ok: false, stdout: '', stderr: 'timed out', timedOut: true })
+    expect(await isAncestorOf(repo, h, h, timedOut)).toBeNull()
+  })
+
+  it('종료 코드 1 만 "조상이 아니다"이고, 그 밖의 실패 코드는 null 이다', async () => {
+    const repo = await makeRepo()
+    const h = headHash(repo)
+    expect(await isAncestorOf(repo, h, h, answering({ ok: false, stdout: '', stderr: '', exitCode: 1 }))).toBe(false)
+    expect(await isAncestorOf(repo, h, h, answering({ ok: false, stdout: '', stderr: 'fatal', exitCode: 128 }))).toBeNull()
   })
 })

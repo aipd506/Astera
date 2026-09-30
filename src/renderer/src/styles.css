@@ -889,6 +889,14 @@ button.primary:disabled { background: var(--elevated); border-color: var(--line-
    all of .modal would change the stacking context of every other modal too. */
 .modal.new-session { position: relative; }
 .modal .loading-overlay { background: var(--panel); border-radius: var(--radius-lg); pointer-events: auto; z-index: 1; }
+/* Worktree creation inside that overlay (WorktreeCreateStatus.tsx): the stage line, and while copying a
+   thin bar with a byte and file count under it, then Cancel. Same spinner, colours and type as the
+   plain one-line wait, so a start without a worktree looks exactly as it did. */
+.worktree-create-body { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
+.worktree-progress-bar { height: 4px; background: var(--line-soft); border-radius: 2px; overflow: hidden; }
+.worktree-progress-bar > div { height: 100%; background: var(--accent); transition: width .2s linear; }
+.worktree-progress-count { font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.worktree-create-status button { margin-left: 6px; }
 .field label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
 .field input[type="text"], .field textarea { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line-soft); padding: 6px; border-radius: var(--radius); }
 /* A field entered line by line, like environment variables — monospaced so the values line up visibly, and resizable in height by the user */
@@ -1081,6 +1089,20 @@ button.primary:disabled { background: var(--elevated); border-color: var(--line-
 .settings-stack { display: flex; flex-direction: column; gap: 22px; }
 .settings-stack .settings-row span:first-child { color: var(--text); font-weight: 600; }
 .settings-group { display: flex; flex-direction: column; gap: 6px; }
+/* 명령줄 도구의 PATH 안내 한 줄. 사람이 그대로 복사해 실행할 글이라 줄바꿈을 허용한다 —
+   한 줄로 잠가 놓으면 끝이 잘려 무엇을 복사하는지 보이지 않는다. 새 색은 만들지 않고
+   터미널과 같은 토큰을 쓴다. */
+/* 설치와 제거 버튼을 한 줄에 둔다. 제거는 설치된 뒤에만 보인다. */
+.cli-actions { display: flex; gap: 8px; }
+.cli-path-hint { display: flex; align-items: flex-start; gap: 8px; }
+.cli-path-hint code { flex: 1; padding: 6px 8px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--bg); color: var(--text-dim);
+  font-size: 11.5px; word-break: break-all; white-space: pre-wrap; }
+.cli-path-hint button { flex: none; padding: 5px 10px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--bg); color: var(--text); cursor: pointer;
+  font-size: 12px; }
+.cli-path-hint button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--ring); }
+
 /* ---------- 에이전트 탭: 재개 방식 카드 ---------- */
 /* .theme-grid/.theme-card와 같은 두 열 카드 배치다. 다만 팔레트 미리보기가 없어 인라인 스타일이
    필요 없으므로 색은 앱 토큰(--line 등)에서 그대로 가져온다. */
@@ -1737,6 +1759,9 @@ input[type="checkbox"]:not(.md-task input):focus-visible {
 .detail-clear { margin-left: auto; background: none; border: 0; padding: 0 2px; color: var(--text-faint); font-size: 12px; cursor: pointer; }
 .detail-clear:hover { color: var(--accent); }
 .detail-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; }
+/* 더 오래된 저널 줄을 한 쪽 더 부르는 버튼(stage 3 T1) — 목록 맨 위, 줄 하나 크기의 조용한 링크 */
+.detail-journal-older { align-self: center; flex: none; margin: 4px 0; background: none; border: 0; padding: 2px 6px; color: var(--text-faint); font-size: 12px; cursor: pointer; }
+.detail-journal-older:hover { color: var(--text); }
 /* 행은 grid 다 — 시각과 표식이 줄마다 같은 x 에 서야 눈으로 훑을 수 있다. flex 로는 칸의 폭이
    내용에 끌려다녀 그 정렬이 깨진다 */
 .detail-ev { display: grid; grid-template-columns: 56px 15px 1fr; gap: 9px; align-items: flex-start; padding: 5px 6px; border-radius: var(--radius-sm); }
@@ -2002,6 +2027,17 @@ input[type="checkbox"]:not(.md-task input):focus-visible {
 }
 .statusbar .status-host-outdated:hover { background: var(--warn-bg); }
 .statusbar .status-host-outdated:disabled { cursor: default; opacity: 0.6; }
+/* The Host runtime being put in place (stage 3 task 2). Plain text and the shared spinner while it
+   works — nothing is wrong, it is only slow — and the same amber outline as the notices above if it
+   failed, because that is the same kind of fact: worth a look, not broken. */
+.statusbar .status-host-runtime {
+  flex: none; margin-left: 12px; display: inline-flex; align-items: center; gap: 6px;
+  color: var(--text-dim); white-space: nowrap;
+}
+.statusbar .status-host-runtime.failed {
+  padding: 2px 8px; line-height: 1.4; color: var(--warn-ink);
+  border: 1px solid var(--warn-ink); border-radius: 999px; cursor: default;
+}
 /* The Host row's three facts, stacked. Right-aligned so their ragged left edges do not read as three
    unrelated things, and so the restart button beside them keeps one place whatever they say. */
 .host-row-detail { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; }
@@ -2095,6 +2131,15 @@ input[type="checkbox"]:not(.md-task input):focus-visible {
   font-variant-numeric: tabular-nums;
 }
 .fx-note { padding: 2px 8px; font-size: 12px; color: var(--text-faint); white-space: nowrap; }
+/* Loading states (ExplorerLoading.tsx): the small shared spinner after a folder's name while its children
+   are read, and the "Reading folder…" line when the root's first read is slow */
+.fx-row-loading { flex-shrink: 0; margin-left: 4px; }
+.fx-reading { display: flex; align-items: center; gap: 6px; padding-left: 12px; }
+/* git status could not be checked — the kept badges are the last answer, so they are dimmed */
+.fx-git-stale { flex: none; overflow: hidden; text-overflow: ellipsis; }
+.fx-tree.git-stale .fx-git-mark,
+.fx-tree.git-stale .fx-git-count,
+.fx-tree.git-stale .fx-name[class*="git-"] { opacity: 0.55; }
 /* the header root row — scoped to the explorer so the shared .panel-header h2 is untouched */
 .file-explorer .panel-header h2 { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .file-explorer .panel-header h2 .fi { width: 12px; height: 12px; }
@@ -2280,6 +2325,8 @@ input[type="checkbox"]:not(.md-task input):focus-visible {
 .jobs-delete:hover { background: none; color: var(--git-deleted); }
 .jobs-empty { margin: auto; text-align: center; padding: 0 24px; color: var(--text-faint); font-size: 13px; }
 .jobs-empty-hint { margin-top: 6px; font-size: 11.5px; }
+/* 아무것도 움직이지 않는 까닭(한도 L3). 경고 색 한 줄 — 사람이 할 일이 있을 수도 있다는 뜻이지 실패가 아니다 */
+.jobs-stall { margin: 10px 10px 4px; padding: 6px 10px; border: 1px solid var(--warn); border-radius: var(--radius-sm); color: var(--warn); font-size: 12px; text-align: left; }
 
 /* 예약 템플릿 줄. **띠도 진행률도 없다** — 템플릿은 돌지 않으므로 그것들이 말할 것이 없다
    (JobsView 의 ScheduleCard 주석). 대신 규칙·다음 시각·회차 수 한 줄이 그 자리를 쓴다 */
@@ -2686,6 +2733,18 @@ input[type="checkbox"]:not(.md-task input):focus-visible {
 .bp-agent-cursor svg { position: relative; display: block; filter: drop-shadow(0 0 3px rgba(139, 92, 246, 0.95)) drop-shadow(0 0 8px rgba(139, 92, 246, 0.8)) drop-shadow(0 0 16px rgba(139, 92, 246, 0.55)); }
 .bp-agent-ripple { position: absolute; left: -18px; top: -18px; width: 36px; height: 36px; border: 2px solid var(--agent-accent); border-radius: 50%; animation: bp-agent-ripple 400ms ease-out forwards; }
 @keyframes bp-agent-ripple { from { transform: scale(0.4); opacity: 0.9; } to { transform: scale(1); opacity: 0; } }
+/* The agent app workspace mirror (AppMirrorPane): the agent's app on a desktop the person never sees.
+   The violet is the agent browser's (--agent-accent), so the same colour means the same thing. */
+.app-mirror { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; background: var(--bg); color: var(--text); }
+.app-mirror-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line-soft); font-size: 12px; }
+.app-mirror-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
+.app-mirror-status { flex: 1; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.app-mirror-btn { font-size: 12px; padding: 2px 10px; }
+.app-mirror-stage { position: relative; flex: 1; min-height: 0; margin: 10px; display: flex; align-items: center; justify-content: center; overflow: hidden; border: 3px solid var(--agent-accent); border-radius: 6px; }
+.app-mirror-stage.running { box-shadow: inset 0 0 40px 6px rgba(139, 92, 246, 0.45); }
+.app-mirror-stage.closed { border-color: var(--line-soft); opacity: 0.6; }
+.app-mirror-frame { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; user-select: none; }
+.app-mirror-empty { color: var(--text-dim); font-size: 13px; }
 .bp-spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line);
   border-top-color: var(--accent); animation: cm-spin .6s linear infinite; }
 /* The browser tab's busy ring on the tab bar — the session ring's shape, in the accent colour */

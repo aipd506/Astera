@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
-import { parentDir } from '../../../core/files/paths'
 import { isSubPath } from '../../../core/files/ops'
 import { flattenVisible } from '../../../core/files/selection'
+import { onFileChanges } from '../lib/fileChanges'
+import {
+  createDelayedPending,
+  createDirLoadQueue,
+  planBatchReload,
+  type DelayedPending,
+  type DirLoadQueue
+} from '../../../core/files/dirReload'
 
 export interface Entry {
   name: string
@@ -20,6 +27,8 @@ export interface DirState {
 export interface FileTree {
   dirs: Record<string, DirState>
   expanded: Set<string>
+  /** Folders whose children have been reading for over ROW_SPINNER_DELAY_MS — the row's inline loading indicator */
+  loading: ReadonlySet<string>
   dirsRef: React.RefObject<Record<string, DirState>>
   loadDir: (dirPath: string) => void
   toggleDir: (dirPath: string) => void
@@ -50,8 +59,14 @@ export function useFileTree(
   const [expanded, setExpanded] = useState<Set<string>>(() => initialTree?.expanded ?? new Set())
   const [dirs, setDirs] = useState<Record<string, DirState>>(() => initialTree?.dirs ?? {})
 
-  const loadDir = (dirPath: string): void => {
-    void window.api.files.list(dirPath).then(
+  const rootRef = useRef(root)
+  rootRef.current = root
+  const [loading, setLoading] = useState<ReadonlySet<string>>(() => new Set())
+
+  // One read of a folder. Only stable setters and refs are used, because the queue below keeps the
+  // first render's copy of this function. Both outcomes are handled, so the promise never rejects.
+  const readDir = (dirPath: string): Promise<void> =>
+    window.api.files.list(dirPath).then(
       (entries) => setDirs((prev) => ({ ...prev, [dirPath]: { entries } })),
       (err) => {
         const msg = err instanceof Error ? err.message : String(err)
@@ -64,12 +79,12 @@ export function useFileTree(
         // error, etc.) are cached as-is and shown to the user.
         // The dirPath !== root condition: when a child folder is evicted it also drops out of the
         // parent's entries list, so it disappears from the tree entirely and there is no problem, but
-        // the root has no parent and renderDir(root, 0) always renders it regardless of the
+        // the root has no parent and the tree (buildTreeRows) always renders it regardless of the
         // expanded/dirs state — evicting the root takes the !state branch and gets permanently stuck
         // on 'loading…', with no way out because a path that is already gone gets no further watcher
         // events and no re-query either. When the root itself is gone, cache the error as it does now
         // so 'Read failed: ENOENT' shows the reason.
-        if (msg.includes('ENOENT') && dirPath !== root) {
+        if (msg.includes('ENOENT') && dirPath !== rootRef.current) {
           setDirs((prev) => {
             if (!(dirPath in prev)) return prev
             const { [dirPath]: _drop, ...rest } = prev
@@ -86,20 +101,34 @@ export function useFileTree(
         setDirs((prev) => ({ ...prev, [dirPath]: { error: msg } }))
       }
     )
-  }
+
+  // Every read goes through one per-folder single flight (core/files/dirReload.ts): a folder is never
+  // read twice at once, and changes that arrive during a read become one more read after it.
+  // The spinner set lags the pending set by ROW_SPINNER_DELAY_MS so short re-reads do not blink the row.
+  const delayedRef = useRef<DelayedPending | null>(null)
+  if (!delayedRef.current) delayedRef.current = createDelayedPending(setLoading)
+  const queueRef = useRef<DirLoadQueue | null>(null)
+  if (!queueRef.current) queueRef.current = createDirLoadQueue(readDir, (p) => delayedRef.current!.update(p))
+  useEffect(() => () => delayedRef.current!.clear(), [])
+  const loadDir = (dirPath: string): void => queueRef.current!.request(dirPath)
 
   const dirsRef = useRef(dirs)
   dirsRef.current = dirs
+  const expandedRef = useRef(expanded)
+  expandedRef.current = expanded
 
   // Live updates: start watching the root, and on a change re-query only the cached parent folder.
   // On re-entry the preserved cache can be stale, so the root is re-queried once.
   useEffect(() => {
     if (!root) return
-    void window.api.files.watch(root)
+    // A refused or failed watch leaves the tree working without live updates — logged, not thrown
+    window.api.files.watch(root).catch((err: unknown) => console.warn('Explorer file watch failed', err))
     loadDir(root) // re-query the root level on re-entry to pick up recent changes (deeper expanded folders catch up via later events or a refresh)
-    const off = window.api.on('files:changed', (c) => {
-      if (c.kind === 'change') return // a file content change does not alter the tree structure
-      if (c.kind === 'unlinkDir') {
+    // One message per watcher window (core/files/changeBatch.ts): its unlinkDir changes clean up the cache,
+    // and its parents — already deduplicated, content changes excluded — are the folders to re-query
+    const off = onFileChanges((batch) => {
+      for (const c of batch.changes) {
+        if (c.kind !== 'unlinkDir') continue
         // Clean up the cache and expanded state for the deleted folder itself and everything under
         // it. Without this, (1) a stale ENOENT cache can survive into a recreate under the same name
         // (a separate path from the ENOENT cleanup in loadDir(a) — the deleted folder itself only
@@ -128,8 +157,22 @@ export function useFileTree(
           return changed ? next : prev
         })
       }
-      const parent = parentDir(c.path)
-      if (dirsRef.current[parent]) loadDir(parent) // only refresh cached (expanded) folders — a side effect kept outside the updater
+      // Each changed folder at most once per batch, and only what is on screen: the root and expanded
+      // folders are re-read; a cached but collapsed one is dropped from the cache so expanding it reads
+      // it fresh. Uncached folders are left alone. Side effects stay outside the updaters.
+      const plan = planBatchReload(batch.parents, {
+        root,
+        isCached: (d) => d in dirsRef.current,
+        isExpanded: (d) => expandedRef.current.has(d)
+      })
+      if (plan.evict.length > 0) {
+        setDirs((prev) => {
+          const next = { ...prev }
+          for (const d of plan.evict) delete next[d]
+          return next
+        })
+      }
+      for (const dir of plan.reload) loadDir(dir)
     })
     return () => {
       off()
@@ -193,6 +236,7 @@ export function useFileTree(
   return {
     dirs,
     expanded,
+    loading,
     dirsRef,
     loadDir,
     toggleDir,

@@ -1,22 +1,24 @@
 import path from 'node:path'
 import os from 'node:os'
 import { execFile } from 'node:child_process'
-import { appendFileSync, existsSync } from 'node:fs'
-import { app } from 'electron'
+import { existsSync } from 'node:fs'
+import { lineLog } from '../core/log/logWriter'
+import { app, net } from 'electron'
 import { AccountRegistry } from '../core/accounts/registry'
 import { PROVIDERS, providerOf } from '../core/providers/meta'
 import { makeDescriptors, descriptorOf, isAmbientDir, type ProviderDescriptor } from '../core/providers/descriptor'
-import { SessionManager } from '../core/sessions/manager'
+import { SessionManager, defaultSpawnChecks } from '../core/sessions/manager'
+import { setProbeLog } from '../core/sessions/pathProbe'
 import { nodePtyFactory } from '../core/sessions/nodePtyFactory'
 import { createPtyRouter } from './host/ptyRouter'
 import { createProcRouter } from './host/procRouter'
 import { nodeProcFactory } from './chat/nodeProcFactory'
-import { ChatSessionManager } from './chat/manager'
+import { ChatSessionManager } from '../core/chat/manager'
 import { HistoryIndex } from '../core/history/index'
 import { SessionCwdCache } from '../core/history/sessionCwdCache'
 import { ProjectSettings } from '../core/projects/settings'
-import { StatusLineManager, resolveNodePath } from './statusline'
-import { RateLimitFetcher } from './usage'
+import { StatusLineManager, resolveNodePath } from '../core/sessions/statusline'
+import { RateLimitFetcher } from '../core/usage/rateLimitFetcher'
 import { CodexUsageFetcher } from './codexUsage'
 import { AccountUsageStore } from './accountUsageStore'
 import { parseStatusLinePayload } from '../core/usage/statusline'
@@ -24,9 +26,9 @@ import { defaultAccountIdOf } from '../core/accounts/defaultAccount'
 import { RollConfigStore } from '../core/rolling/config'
 import { SchedulerConfigStore } from '../core/scheduler/config'
 import { RunConfigStore } from './runConfigStore'
-import { RunManager } from './runManager'
+import { RunManager } from '../core/run/runManager'
 import { TerminalManager } from './terminalManager'
-import { WorktreeRegistry } from '../core/worktrees/registry'
+import { WorktreeRegistry, defaultWorktreeRoot } from '../core/worktrees/registry'
 import { LocalHistoryStore } from '../core/localHistory/store'
 import { ghostAccounts } from '../core/accounts/ghosts'
 import { suggestableCandidates } from '../core/accounts/suggest'
@@ -86,7 +88,7 @@ export interface Core {
    *  StatusLineManager.pruneExcept for what it collects and when it may be called. */
   pruneStatusLinePayloads: (keep: ReadonlySet<string>) => Promise<void>
   hookEventsDir: string // Hook event file directory — watched by index.ts's HookEventWatcher
-  // Rolling config persistence. index.ts does the persisting (the rolling.ts persistConfig wiring);
+  // Rolling config persistence. index.ts does the persisting (the claudeCoordinator.ts persistConfig wiring);
   // ipc.ts no longer restores from here — it only reads (get) for sessions.resumeDefaults
   rollConfig: RollConfigStore
   // Scheduler config persistence. Persisting is shared between index.ts (the scheduler.ts persistConfig
@@ -219,14 +221,12 @@ export async function createCore(userDataDir: string, osLocale: string): Promise
   // other long-running subsystem in main follows. A chat session's failures are protocol failures and
   // there is no terminal to print them on, so this file is the only place they are recorded.
   // Never throws: a log that cannot be written must not take a chat session down with it.
-  const chatLogFile = path.join(userDataDir, 'chat.log')
-  const chatLog = (m: string): void => {
-    try {
-      appendFileSync(chatLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a failed log write blocks nothing */
-    }
-  }
+  const chatLog = lineLog(path.join(userDataDir, 'chat.log'))
+  // The spawn path's own file, by the same convention: a path probe that timed out (an offline drive
+  // on PATH, or a session folder on one) and a spawn that had to fall back to a sync check are told
+  // here. Set as the probe log too, so the terminal's shell lookup writes to the same place.
+  const sessionsLog = lineLog(path.join(userDataDir, 'sessions.log'))
+  setProbeLog(sessionsLog)
   // descriptors is injected explicitly — left unspecified, each of them calls makeDescriptors(process.platform)
   // again, so every instance gets its own table (plus two command builders SessionManager never uses).
   const sessions = new SessionManager(
@@ -238,7 +238,9 @@ export async function createCore(userDataDir: string, osLocale: string): Promise
     (id, account, opts) => statusLine.spawnConfig(id, account, opts),
     // A Claude session may read the app's screenshot folder without a prompt — that is where Design
     // Mode writes the crops whose paths it sends. previewShotsDir is the same path capture.ts writes.
-    [previewShotsDir(userDataDir)]
+    [previewShotsDir(userDataDir)],
+    process.env,
+    defaultSpawnChecks(sessionsLog)
   )
   // The chat sessions. It is handed `procRouter.factory` rather than a factory chosen now, for exactly
   // the reason SessionManager is handed `ptyRouter.factory`: which one a spawn reaches is decided at
@@ -277,14 +279,20 @@ export async function createCore(userDataDir: string, osLocale: string): Promise
     path.join(userDataDir, 'worktrees.json'),
     // The default root carries the app name. It only steers new worktrees — a root saved in
     // worktrees.json wins over it, and existing entries keep the absolute path they were created at
-    path.join(os.homedir(), 'astera-worktrees')
+    defaultWorktreeRoot(os.homedir()),
+    // A recovery at load, a write refused over a damaged file and a throwing listener are recorded in
+    // their own file, as chat.log is; nothing else would show them. Never throws.
+    lineLog(path.join(userDataDir, 'worktrees.log'))
   )
   await worktrees.load()
   const localHistory = new LocalHistoryStore(path.join(userDataDir, 'local-history'))
   await localHistory.load()
   const appSettings = new AppSettingsStore(path.join(userDataDir, 'app-settings.json'))
   await appSettings.load()
-  const usageFetcher = new RateLimitFetcher()
+  // electron's net.fetch, not Node's: it honours the system proxy and certificate store (S6 design §2.2).
+  const usageFetcher = new RateLimitFetcher(undefined, undefined, undefined, undefined, undefined, (u, i) =>
+    net.fetch(u, i) as unknown as ReturnType<import('../core/usage/rateLimitFetcher').FetchLike>
+  )
   const codexUsageFetcher = new CodexUsageFetcher()
   const accountUsage = new AccountUsageStore(path.join(userDataDir, 'account-usage.json'))
   // A cache, so a failed load is an empty cache and nothing more — there is no recovered flag to

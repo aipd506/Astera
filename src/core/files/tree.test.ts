@@ -1,7 +1,16 @@
 import { describe, it, expect } from 'vitest'
 import path from 'node:path'
-import { sortEntries, isPathWithin, projectRootOf, buildIgnoreMatcher, type DirEntry } from './tree'
-import { absPath } from '../testPaths'
+import {
+  sortEntries,
+  isPathWithin,
+  isSamePath,
+  renamePlan,
+  projectRootOf,
+  resolveProjectRootFrom,
+  buildIgnoreMatcher,
+  type DirEntry
+} from './tree'
+import { absPath, foldsCaseHere } from '../testPaths'
 
 const e = (name: string, isDir: boolean): DirEntry => ({ name, path: `D:\\p\\${name}`, isDir })
 
@@ -41,8 +50,22 @@ describe('isPathWithin', () => {
     expect(isPathWithin(base, absPath('work', 'proj', 'src', 'a.ts'))).toBe(true)
   })
 
-  it('대소문자 차이를 무시한다', () => {
-    expect(isPathWithin(base, absPath('WORK', 'proj', 'src'))).toBe(true)
+  // 대소문자는 플랫폼마다 답이 다르다 — platform 을 넘겨 어느 OS 에서든 세 가지를 다 본다
+  it('win32 와 darwin 에서는 대소문자 차이를 무시한다', () => {
+    expect(isPathWithin(base, absPath('WORK', 'proj', 'src'), 'win32')).toBe(true)
+    expect(isPathWithin(base, absPath('WORK', 'proj', 'src'), 'darwin')).toBe(true)
+    expect(isSamePath(base, absPath('work', 'PROJ'), 'win32')).toBe(true)
+  })
+
+  it('linux 에서는 대소문자만 다른 형제가 안에 있지 않다', () => {
+    // /home/u/proj 와 /home/u/PROJ 는 linux 에서 서로 다른 두 폴더다
+    expect(isPathWithin(absPath('home', 'u', 'proj'), absPath('home', 'u', 'PROJ', 'x'), 'linux')).toBe(false)
+    expect(isSamePath(absPath('home', 'u', 'Proj'), absPath('home', 'u', 'proj'), 'linux')).toBe(false)
+    expect(isPathWithin(absPath('home', 'u', 'proj'), absPath('home', 'u', 'proj', 'x'), 'linux')).toBe(true)
+  })
+
+  it('win32 에서는 대소문자만 다른 형제가 여전히 안에 있다', () => {
+    expect(isPathWithin(absPath('home', 'u', 'proj'), absPath('home', 'u', 'PROJ', 'x'), 'win32')).toBe(true)
   })
 
   // 구분자 무시는 win32에서만 의미가 있다 — POSIX에서 `\`는 구분자가 아니라 이름에 쓸 수 있는 글자다
@@ -106,6 +129,115 @@ describe('projectRootOf', () => {
   })
 })
 
+// 앱(ipc.ts)과 Host 가 같이 부르는 해석기. 앱 쪽 주석의 두 경우 — 저장소 경계와 중첩 저장소 — 가
+// 여기서 규칙으로 고정된다.
+describe('resolveProjectRootFrom', () => {
+  const rootIs = (root: string | null) => {
+    const asked: string[] = []
+    return {
+      asked,
+      repoRoot: async (dir: string): Promise<string | null> => {
+        asked.push(dir)
+        return root
+      }
+    }
+  }
+
+  it('알려진 프로젝트의 하위 폴더는 그 프로젝트로 올린다', async () => {
+    const git = rootIs(absPath('work', 'proj'))
+    const cwd = absPath('work', 'proj', 'src', 'main')
+    expect(
+      await resolveProjectRootFrom({ cwd, repoPaths: [], projectPaths: [absPath('work', 'proj')], repoRoot: git.repoRoot })
+    ).toBe(absPath('work', 'proj'))
+    // git 은 target 에 대해 한 번만 부른다 — 후보마다 부르지 않는다
+    expect(git.asked).toEqual([cwd])
+  })
+
+  // 세션을 연 적 없는 중첩 저장소(서브모듈, 벤더링된 클론). 그 저장소는 후보가 아니고 부모만
+  // 후보다 — 경계가 없으면 정규화가 저장소 밖으로 올라가 워커가 엉뚱한 저장소에서 돈다.
+  it('후보가 cwd 의 저장소 루트 밖이면 올리지 않는다', async () => {
+    const cwd = absPath('work', 'proj', 'vendor', 'lib', 'src')
+    const git = rootIs(absPath('work', 'proj', 'vendor', 'lib'))
+    expect(
+      await resolveProjectRootFrom({ cwd, repoPaths: [], projectPaths: [absPath('work', 'proj')], repoRoot: git.repoRoot })
+    ).toBe(cwd)
+  })
+
+  it('중첩 저장소 자신이 후보면 부모가 아니라 그것으로 올린다', async () => {
+    const cwd = absPath('work', 'proj', 'vendor', 'lib', 'src')
+    const git = rootIs(absPath('work', 'proj', 'vendor', 'lib'))
+    expect(
+      await resolveProjectRootFrom({
+        cwd,
+        repoPaths: [],
+        projectPaths: [absPath('work', 'proj'), absPath('work', 'proj', 'vendor', 'lib')],
+        repoRoot: git.repoRoot
+      })
+    ).toBe(absPath('work', 'proj', 'vendor', 'lib'))
+  })
+
+  // 저장소 루트와 cwd 사이의 후보는 같은 저장소다 — 그 구간에는 .git 이 있을 수 없다.
+  it('저장소 루트 아래의 더 깊은 후보를 고른다', async () => {
+    const cwd = absPath('work', 'mono', 'pkg', 'a', 'src')
+    const git = rootIs(absPath('work', 'mono'))
+    expect(
+      await resolveProjectRootFrom({
+        cwd,
+        repoPaths: [],
+        projectPaths: [absPath('work'), absPath('work', 'mono'), absPath('work', 'mono', 'pkg', 'a')],
+        repoRoot: git.repoRoot
+      })
+    ).toBe(absPath('work', 'mono', 'pkg', 'a'))
+  })
+
+  // 경계가 막으려는 피해는 저장소 안에서만 생긴다. 후보를 다 버리면 하위 폴더 Run 이 다시 안 보인다.
+  it('cwd 가 저장소가 아니면 경계 없이 올린다', async () => {
+    const git = rootIs(null)
+    expect(
+      await resolveProjectRootFrom({
+        cwd: absPath('work', 'plain', 'docs'),
+        repoPaths: [],
+        projectPaths: [absPath('work', 'plain')],
+        repoRoot: git.repoRoot
+      })
+    ).toBe(absPath('work', 'plain'))
+  })
+
+  it('담는 후보가 없으면 받은 cwd 를 그대로 돌려준다', async () => {
+    const cwd = absPath('elsewhere', 'x')
+    expect(
+      await resolveProjectRootFrom({ cwd, repoPaths: [absPath('work', 'proj')], projectPaths: [], repoRoot: rootIs(cwd).repoRoot })
+    ).toBe(cwd)
+  })
+
+  // 워크트리의 repoPath 는 knownProjectPaths 에 저장소 루트가 아직 없을 때 그 자리를 채운다.
+  it('워크트리 레지스트리의 repoPath 도 후보다', async () => {
+    const git = rootIs(absPath('work', 'fresh'))
+    expect(
+      await resolveProjectRootFrom({
+        cwd: absPath('work', 'fresh', 'src'),
+        repoPaths: [absPath('work', 'fresh')],
+        projectPaths: [],
+        repoRoot: git.repoRoot
+      })
+    ).toBe(absPath('work', 'fresh'))
+  })
+
+  // 같은 폴더가 두 표기로 오면 앞선 목록(워크트리 repoPath)의 표기가 저장된다 — 앱의 순서 그대로.
+  it.runIf(foldsCaseHere)('같은 폴더의 두 표기는 repoPaths 의 표기를 돌려준다', async () => {
+    const lower = absPath('work', 'proj')
+    const upper = absPath('WORK', 'PROJ')
+    expect(
+      await resolveProjectRootFrom({
+        cwd: absPath('work', 'proj', 'src'),
+        repoPaths: [upper],
+        projectPaths: [lower],
+        repoRoot: rootIs(lower).repoRoot
+      })
+    ).toBe(upper)
+  })
+})
+
 describe('buildIgnoreMatcher', () => {
   it('gitignore 없이도 크로스랭귀지 heavy 디렉토리를 제외한다', () => {
     const ig = buildIgnoreMatcher(null)
@@ -114,6 +246,14 @@ describe('buildIgnoreMatcher', () => {
     }
     for (const p of ['src', 'src/index.ts', 'README.md', 'a/b/main.py']) {
       expect(ig(p)).toBe(false)
+    }
+  })
+
+  // 모바일·테스트 도구가 만드는 무거운 생성 폴더. 감시에서만 빠지고 트리 목록에는 그대로 보인다
+  it('Pods·.dart_tool·coverage 도 감시에서 뺀다', () => {
+    const ig = buildIgnoreMatcher(null)
+    for (const p of ['Pods', 'ios/Pods/x.h', '.dart_tool', 'app/.dart_tool/pkg', 'coverage', 'coverage/lcov.info']) {
+      expect(ig(p)).toBe(true)
     }
   })
 
@@ -133,5 +273,32 @@ describe('buildIgnoreMatcher', () => {
   it('윈도우 역슬래시 경로도 판정한다', () => {
     expect(buildIgnoreMatcher(null)('a\\node_modules\\x')).toBe(true)
     expect(buildIgnoreMatcher(null)('src\\index.ts')).toBe(false)
+  })
+})
+
+describe('renamePlan — files.rename 이 대상을 어떻게 다루는가', () => {
+  // linux 에서 A.txt 와 a.txt 는 두 파일이다. 대소문자만 다른 이름으로 바꾸는 것을 "같은 파일의 철자
+  // 바꾸기" 로 보면 있는지 검사를 건너뛰고 임시 이름을 거쳐 다른 파일 A.txt 를 덮는다
+  it('linux: 대소문자만 다른 이름으로 바꾸기는 보통의 이름 바꾸기다 — 대상이 있으면 거절된다', () => {
+    expect(renamePlan('/p/a.txt', '/p/A.txt', 'linux')).toBe('checkThenRename')
+  })
+
+  it('win32: 같은 파일의 대소문자만 바꾸기는 임시 이름을 거친다', () => {
+    expect(renamePlan('D:\\p\\a.txt', 'D:\\p\\A.txt', 'win32')).toBe('viaTemp')
+  })
+
+  it('darwin 도 임시 이름을 거친다', () => {
+    expect(renamePlan('/p/a.txt', '/p/A.txt', 'darwin')).toBe('viaTemp')
+  })
+
+  it('정확히 같은 경로면 아무것도 하지 않는다', () => {
+    expect(renamePlan(absPath('p', 'a.txt'), absPath('p', 'a.txt'), 'linux')).toBe('noop')
+    expect(renamePlan(absPath('p', 'a.txt'), absPath('p', 'a.txt'), 'win32')).toBe('noop')
+  })
+
+  it('다른 이름이면 어디서나 검사 뒤 바꾼다', () => {
+    for (const platform of ['linux', 'win32', 'darwin']) {
+      expect(renamePlan(absPath('p', 'a.txt'), absPath('p', 'b.txt'), platform)).toBe('checkThenRename')
+    }
   })
 })

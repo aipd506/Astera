@@ -3,6 +3,8 @@ import type {
   RendererApi,
   CoreEventChannel,
   CoreEvents,
+  HostStatus,
+  HostRuntimeInstallState,
   UpdateCampaignInfo,
   UpdateStatus
 } from '../core/types'
@@ -25,9 +27,13 @@ const EVENT_CHANNELS = [
   'session:busy',
   'session:schedState',
   'history:updated',
+  'history:scan',
   'accounts:changed',
   'accounts:ghostsChanged',
   'files:changed',
+  'files:changedBatch',
+  'files:opProgress',
+  'worktree:createProgress',
   'git:changed',
   'cli:install',
   'run:data',
@@ -44,6 +50,9 @@ const EVENT_CHANNELS = [
   'terminal:exit',
   'terminal:created',
   'orch:state',
+  'orch:host',
+  'host:driver',
+  'workspace:event',
   'understanding:changed',
   'sessionTasks:changed',
   'sessionTasks:goalIgnored',
@@ -95,6 +104,7 @@ const api = {
   worktrees: {
     list: invoke('worktrees.list'),
     create: invoke('worktrees.create'),
+    cancelCreate: invoke('worktrees.cancelCreate'),
     listBranches: invoke('worktrees.listBranches'),
     remove: invoke('worktrees.remove'),
     isGitRepo: invoke('worktrees.isGitRepo'),
@@ -138,15 +148,21 @@ const api = {
     getConfig: invoke('slack.getConfig'),
     setConfig: invoke('slack.setConfig')
   },
+  /** `astera` 명령을 사람의 PATH 에서 닿는 자리에 깔아 둔다(공개 CLI 설계 §10). */
+  cli: {
+    status: invoke('cli.status'),
+    install: invoke('cli.install'),
+    uninstall: invoke('cli.uninstall')
+  },
   settings: {
     getLang: invoke('settings.getLang'),
     setLang: invoke('settings.setLang'),
-    getOrchestrationEnabled: invoke('settings.getOrchestrationEnabled'),
-    setOrchestrationEnabled: invoke('settings.setOrchestrationEnabled'),
     getWorkUnitTrackingEnabled: invoke('settings.getWorkUnitTrackingEnabled'),
     setWorkUnitTrackingEnabled: invoke('settings.setWorkUnitTrackingEnabled'),
     getAgentBrowserEnabled: invoke('settings.getAgentBrowserEnabled'),
     setAgentBrowserEnabled: invoke('settings.setAgentBrowserEnabled'),
+    getAgentAppEnabled: invoke('settings.getAgentAppEnabled'),
+    setAgentAppEnabled: invoke('settings.setAgentAppEnabled'),
     getGithubPolling: invoke('settings.getGithubPolling'),
     setGithubPolling: invoke('settings.setGithubPolling'),
     getDesktopNotify: invoke('settings.getDesktopNotify'),
@@ -166,6 +182,7 @@ const api = {
     setTheme: invoke('settings.setTheme'),
     getFirstRunAsked: invoke('settings.getFirstRunAsked'),
     markFirstRunAsked: invoke('settings.markFirstRunAsked'),
+    takeRecoveryNotice: invoke('settings.takeRecoveryNotice'),
     getDefaultSessionKind: invoke('settings.getDefaultSessionKind'),
     setDefaultSessionKind: invoke('settings.setDefaultSessionKind')
   },
@@ -224,6 +241,8 @@ const api = {
     installCli: invoke('system.installCli'),
     relaunch: invoke('system.relaunch'),
     appVersion: invoke('system.appVersion'),
+    // fire — 메인이 답할 것이 없고, 렌더러도 기다릴 것이 없다. 한 방향의 신고다.
+    rendererReady: fire('system.rendererReady'),
     homeDir: invoke('system.homeDir'),
     openExternal: invoke('system.openExternal')
   },
@@ -281,6 +300,10 @@ const api = {
   },
   orch: {
     list: invoke('orch.list'),
+    /** The Host gate, read once at mount. **Its own door rather than a field on the snapshot** —
+     *  the list call is only ever made with a project open, and the state that needs this most is the one
+     *  with none (ruling F41). Changes arrive on the 'orch:host' event. */
+    hostGate: invoke('orch.hostGate'),
     runDetail: invoke('orch.runDetail'),
     completion: invoke('orch.completion'),
     command: invoke('orch.command'),
@@ -297,10 +320,36 @@ const api = {
   },
   host: {
     status: invoke('host.status'),
+    /** Every change of the Host's status, as it happens. The row also polls, but a Host that stops
+     *  answering is news a person is waiting for right then — they are looking at the screen because
+     *  a session did not open — and a poll would leave them reading a stale "connected" for up to
+     *  half a minute (docs/2026-09-22-host-unresponsive-recovery-design.md F1). */
+    onStatus: (cb: (s: HostStatus) => void) => {
+      const l = (_e: unknown, s: HostStatus): void => cb(s)
+      ipcRenderer.on('host:status', l)
+      return (): void => {
+        ipcRenderer.removeListener('host:status', l)
+      }
+    },
+    /** The Host runtime's install, as the status bar shows it (stage 3 task 2). */
+    runtimeInstall: invoke('host.runtimeInstall'),
+    onRuntimeInstall: (cb: (s: HostRuntimeInstallState) => void) => {
+      const l = (_e: unknown, s: HostRuntimeInstallState): void => cb(s)
+      ipcRenderer.on('host:runtime-install', l)
+      return (): void => {
+        ipcRenderer.removeListener('host:runtime-install', l)
+      }
+    },
     sessionsOutlivingApp: invoke('host.sessionsOutlivingApp'),
     survivesUpdate: invoke('host.survivesUpdate'),
     replace: invoke('host.replace'),
+    driver: invoke('host.driver'),
     holdings: invoke('host.holdings')
+  },
+  workspace: {
+    list: invoke('workspace.list'),
+    stop: invoke('workspace.stop'),
+    close: invoke('workspace.close')
   },
   conversation: {
     open: invoke('conversation.open'),
@@ -322,6 +371,8 @@ const api = {
     answer: invoke('chat.answer'),
     setModel: invoke('chat.setModel'),
     setPermissionMode: invoke('chat.setPermissionMode'),
+    // chat takeover P8: the session's unattended permission policy.
+    setUnattendedPermission: invoke('chat.setUnattendedPermission'),
     listPermissionModes: invoke('chat.listPermissionModes'),
     listModels: invoke('chat.listModels'),
     configuredModel: invoke('chat.configuredModel'),

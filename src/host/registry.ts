@@ -4,6 +4,8 @@
 // No `net` here and no node-pty either — the pty arrives as a dependency, so the whole file is
 // testable with a fake and the same code runs under a real ConPTY without a test ever spawning one.
 import type { PtyEntry, PtyMeta, PtyOpenOptions } from '../core/host/protocol'
+// Imports nothing itself, so it adds nothing to the Host bundle but the one pattern.
+import { isOnlyTerminalReports } from '../core/terminal/reports'
 
 /** How much of a dead session's screen goes into the log. A couple of lines is what says which of
  *  "not found", "refused", "printed an error" happened; a whole scrollback in a log file is a
@@ -13,7 +15,8 @@ const LAST_SCREEN_CHARS = 400
 /** The tail of a session's buffer as one printable log line.
  *
  *  **Does not reuse `stripAnsi` (core/rolling/detect.ts) on purpose** — this file states at the top
- *  that it imports nothing outside `core/host/protocol`, because it bundles into the Host's own
+ *  that it imports nothing outside `core/host/protocol` (and `core/terminal/reports`, which imports
+ *  nothing at all), because it bundles into the Host's own
  *  executable; pulling in the rolling module to save four lines would drag its detection machinery
  *  along with it. That is the same reason `PtyOpenOptions` repeats fields instead of importing them. */
 function lastScreen(buffer: string): string {
@@ -48,18 +51,39 @@ export interface RegistryPty {
 export type RegistrySpawn = (file: string, args: string[] | string, opts: PtyOpenOptions) => RegistryPty
 
 /** Characters of scrollback kept per session, counted in UTF-16 code units — the unit
- *  `main/orchestration/tail.ts` counts, and for the reason its comment gives: a Hangul character is
+ *  `core/orchestration/exec/tail.ts` counts, and for the reason its comment gives: a Hangul character is
  *  one unit and two bytes, so counting bytes would halve a Korean session's scrollback. Roughly
  *  2,500 lines of 100 characters. */
 export const SCROLLBACK_CHARS = 256_000
+
+/** How many ended entries that are not agent sessions are kept (M4). Ended sessions are always kept:
+ *  the spawner's `held`, `sessionExitCode` and the handover sweep read them. */
+export const DEAD_ENTRIES_KEPT = 64
 
 interface Entry {
   id: string
   pty: RegistryPty
   pid: number
   meta: PtyMeta | null
+  /** The folder this pty was opened in (`opts.cwd`). The Host's "is this folder in use" reads it
+   *  (host S3 ruling R8): only a session's note carries a cwd, and a run or a shell tab in a worktree
+   *  holds that folder just as much. */
+  cwd: string
   buffer: string
   alive: boolean
+  /** The size the app last gave this pty — at spawn, then at every resize. `sessions read` renders
+   *  the scrollback at it (host/sessions.ts), because the bytes were painted for that size. */
+  cols: number
+  rows: number
+  /** When anything was last typed into this pty, by the app or through the Host, in ms since the
+   *  epoch; null until the first write. `sessions list` holds a hook event against it
+   *  (core/hooks/sessionState.ts): input after the event is something the event cannot account for.
+   *  A write of nothing but terminal reports (a focus change, a reply to the TUI's own query) is not
+   *  typing, and leaves it alone (core/terminal/reports.ts). */
+  lastWriteAt: number | null
+  /** How the pty ended, or null while it is alive. Kept after the buffer is dropped, because the
+   *  Host's exit handling asks for it after the fact (`sessionExitCode`). */
+  exitCode: number | null
 }
 
 export interface PtyRegistryDeps {
@@ -67,12 +91,24 @@ export interface PtyRegistryDeps {
   log(m: string): void
   /** Test injection; the wiring leaves it out and gets SCROLLBACK_CHARS. */
   scrollback?: number
+  /** Test injection; the wiring leaves it out and gets Date.now. */
+  now?: () => number
 }
 
 export class PtyRegistry {
   private readonly entries = new Map<string, Entry>()
-  private dataCb: (id: string, data: string) => void = () => {}
-  private exitCb: (id: string, exitCode: number) => void = () => {}
+  /** The ended entries that are not sessions, oldest ending first (`pruneEnded`). */
+  private readonly endedOrder = new Set<string>()
+  // Sets, not single slots: attachPtyHost broadcasts to the clients and the Host's own spawner reads
+  // the same output and exits, and a second subscriber must not silently disconnect the first.
+  private readonly dataCbs = new Set<(id: string, data: string) => void>()
+  private readonly exitCbs = new Set<(id: string, exitCode: number) => void>()
+  /** Every listener hears a note: at open (when the pty has one) and after every merge (Slack in the
+   *  Host, P7). Neither the spawner nor the app's bridge needs this; the Host's Slack does, to register a
+   *  session the moment its pty opens and to rename it from its note. */
+  private readonly metaCbs = new Set<(id: string, meta: PtyMeta, why: 'open' | 'note') => void>()
+  /** Listeners that have thrown, by kind, so each is logged once and not on every chunk. */
+  private readonly failedCbs = { data: new Set<unknown>(), exit: new Set<unknown>(), meta: new Set<unknown>() }
   private readonly deps: PtyRegistryDeps
   /** `slice(-0)` returns the whole string, so a scrollback of 0 would turn the cap off rather than
    *  down. One character is the smallest honest answer to "keep almost nothing". Computed once here,
@@ -85,12 +121,34 @@ export class PtyRegistry {
     this.scrollback = Math.max(1, deps.scrollback ?? SCROLLBACK_CHARS)
   }
 
-  onData(cb: (id: string, data: string) => void): void {
-    this.dataCb = cb
+  /** Adds a listener; every one registered hears every chunk. Returns the unsubscribe. */
+  onData(cb: (id: string, data: string) => void): () => void {
+    this.dataCbs.add(cb)
+    return () => {
+      this.dataCbs.delete(cb)
+    }
   }
 
-  onExit(cb: (id: string, exitCode: number) => void): void {
-    this.exitCb = cb
+  /** Adds a listener; every one registered hears every exit, after `exitCode` is recorded. Returns the
+   *  unsubscribe. */
+  onExit(cb: (id: string, exitCode: number) => void): () => void {
+    this.exitCbs.add(cb)
+    return () => {
+      this.exitCbs.delete(cb)
+    }
+  }
+
+  /** Adds a listener for an entry's note: at open (when it has one) and after every merge. Isolated like
+   *  onData: a throw is logged once and costs no other listener. Returns the unsubscribe. */
+  onMeta(cb: (id: string, meta: PtyMeta, why: 'open' | 'note') => void): () => void {
+    this.metaCbs.add(cb)
+    return () => {
+      this.metaCbs.delete(cb)
+    }
+  }
+
+  private tellMeta(id: string, meta: PtyMeta, why: 'open' | 'note'): void {
+    for (const cb of [...this.metaCbs]) this.tell(cb, 'meta', id, () => cb(id, meta, why))
   }
 
   open(a: {
@@ -110,15 +168,31 @@ export class PtyRegistry {
       this.deps.log(`pty ${a.id} could not be started: ${String(err)}`)
       return { ok: false, error: String(err) }
     }
-    const entry: Entry = { id: a.id, pty, pid: pty.pid, meta: a.meta ?? null, buffer: '', alive: true }
+    const entry: Entry = {
+      id: a.id,
+      pty,
+      pid: pty.pid,
+      meta: a.meta ?? null,
+      cwd: a.opts.cwd,
+      buffer: '',
+      alive: true,
+      cols: a.opts.cols,
+      rows: a.opts.rows,
+      lastWriteAt: null,
+      exitCode: null
+    }
     this.entries.set(a.id, entry)
     pty.onData((d) => {
-      // The same shape TerminalManager's own buffer uses: append, then keep the tail.
-      entry.buffer = (entry.buffer + d).slice(-this.scrollback)
-      this.dataCb(a.id, d)
+      // The same shape TerminalManager's own buffer uses: append, then keep the tail. **Only while
+      // alive**: ConPTY can deliver output after the exit, and an ended entry is kept (a session for
+      // good), so a buffer refilled then would be kept for the rest of the Host's life with no reader.
+      // The listeners still hear it.
+      if (entry.alive) entry.buffer = (entry.buffer + d).slice(-this.scrollback)
+      for (const cb of this.dataCbs) this.tell(cb, 'data', a.id, () => cb(a.id, d))
     })
     pty.onExit(({ exitCode }) => {
       entry.alive = false
+      entry.exitCode = exitCode
       // **A session that ended badly leaves its last screen here.** The buffer is cleared on the next
       // line and the Host is the only place it exists — the app may not even be running — so without
       // this an exit is a timestamp and an exit code, and when the pty layer cannot supply the code
@@ -131,14 +205,53 @@ export class PtyRegistry {
       // The scrollback goes with the session. The Host outlives the app, so an entry kept for the rest
       // of the Host's life is a quarter of a million characters kept for the rest of the Host's life,
       // and a project that runs a build every minute would leave a great many of them. The entry
-      // itself stays: it is a few fields, and `list` reporting a session as gone is how the app tells
-      // "it ended while I was away" from "it was never here".
+      // itself stays for a while: it is a few fields, and `list` reporting a pty as gone is how the
+      // app tells "it ended while I was away" from "it was never here", and how a late `pty-attach`
+      // is answered with the exit it missed. **An ended session stays for good**, because the
+      // spawner's `held`, `sessionExitCode` and the handover sweep ask for it by session id at any
+      // later time; any other ended entry stays until DEAD_ENTRIES_KEPT newer ones have ended
+      // (`pruneEnded`, M4).
       entry.buffer = ''
       this.deps.log(`pty ${a.id} exited ${exitCode}`)
-      this.exitCb(a.id, exitCode)
+      for (const cb of this.exitCbs) this.tell(cb, 'exit', a.id, () => cb(a.id, exitCode))
+      // After the listeners, which read this entry's note. It is the newest ended one now, so it is
+      // never the one that goes.
+      if (entry.meta?.kind !== 'session') this.pruneEnded(a.id)
     })
     this.deps.log(`pty ${a.id} started, pid ${pty.pid}`)
+    // After the entry is in place and its handlers are set, so a listener that asks the registry about
+    // this pty (`sessionPty`, `metaOf`) finds it.
+    if (entry.meta) this.tellMeta(a.id, entry.meta, 'open')
     return { ok: true, pid: pty.pid }
+  }
+
+  /** Records that `id`, an entry that is not a session, has just ended, and drops the one that ended
+   *  longest ago once more than DEAD_ENTRIES_KEPT have (M4). **By ending order, not opening order**:
+   *  a dev server opened at the Host's start and ending after a day of builds is the newest ended
+   *  entry, and a late `pty-attach` for it must still be answered with its exit. Set and Map
+   *  operations only, so nothing here can throw into node-pty's exit callback. */
+  private pruneEnded(id: string): void {
+    this.endedOrder.add(id)
+    for (const old of this.endedOrder) {
+      if (this.endedOrder.size <= DEAD_ENTRIES_KEPT) return
+      this.endedOrder.delete(old)
+      this.entries.delete(old)
+    }
+  }
+
+  /** Calls one listener and keeps its throw to itself. **The registry owns the fan-out, so it is the
+   *  one place that isolates it**: a throw would otherwise skip every listener after it (the app's
+   *  broadcast among them) and then escape into node-pty's own event handler, where nothing catches it
+   *  and the Host exits with every pty it holds. Logged once per listener and kind, because a
+   *  listener that throws on one chunk usually throws on every chunk. */
+  private tell(cb: unknown, kind: 'data' | 'exit' | 'meta', id: string, call: () => void): void {
+    try {
+      call()
+    } catch (err) {
+      if (this.failedCbs[kind].has(cb)) return
+      this.failedCbs[kind].add(cb)
+      this.deps.log(`pty ${id}: a ${kind} listener threw, and is logged only this once: ${String(err)}`)
+    }
   }
 
   /** Every command is a no-op for an id the registry does not have. The app can legitimately send one
@@ -149,11 +262,29 @@ export class PtyRegistry {
   }
 
   write(id: string, data: string): void {
-    this.live(id)?.pty.write(data)
+    const e = this.live(id)
+    if (!e) return
+    e.pty.write(data)
+    if (!isOnlyTerminalReports(data)) e.lastWriteAt = (this.deps.now ?? Date.now)()
+  }
+
+  /** When `write` last reached this pty, or null for one never written to or never here. */
+  lastWrite(id: string): number | null {
+    return this.entries.get(id)?.lastWriteAt ?? null
   }
 
   resize(id: string, cols: number, rows: number): void {
-    this.live(id)?.pty.resize(cols, rows)
+    const e = this.live(id)
+    if (!e) return
+    e.pty.resize(cols, rows)
+    e.cols = cols
+    e.rows = rows
+  }
+
+  /** The size recorded by `open` and `resize`, or null for an id that was never here. */
+  size(id: string): { cols: number; rows: number } | null {
+    const e = this.entries.get(id)
+    return e ? { cols: e.cols, rows: e.rows } : null
   }
 
   kill(id: string): void {
@@ -186,6 +317,7 @@ export class PtyRegistry {
     // A new object rather than a mutation: `list` hands the meta out by reference, and an entry
     // already reported must not change under whoever is holding it.
     e.meta = { ...e.meta, restore: { ...e.meta.restore, ...patch } }
+    this.tellMeta(id, e.meta, 'note')
   }
 
   /** The scrollback, or empty for an id that was never here — and empty, too, for one that has ended,
@@ -196,8 +328,59 @@ export class PtyRegistry {
     return this.entries.get(id)?.buffer ?? ''
   }
 
+  /** The note this pty was opened with, or null for one opened without a note or never here. A map
+   *  lookup, because the spawner's data tap calls it for every chunk. */
+  metaOf(id: string): PtyMeta | null {
+    return this.entries.get(id)?.meta ?? null
+  }
+
+  /** The live pty whose note is `kind: 'session'` with this app id, or null. A scan: it is asked once
+   *  per command, never per chunk. **Of several live ones, the one opened last**, the same rule as
+   *  `sessionExitCode`: a roll that keeps the session id kills the old pty and opens the new one at
+   *  once, and a slow ConPTY kill leaves both alive for a while. A stop or a write for the session
+   *  belongs to the new one. Insertion order is opening order, because `open` refuses a reused id. */
+  sessionPty(sessionId: string): string | null {
+    let last: string | null = null
+    for (const e of this.entries.values())
+      if (e.alive && e.meta?.kind === 'session' && e.meta.id === sessionId) last = e.id
+    return last
+  }
+
+  /** How the pty for this session ended, or null when it is alive or was never here. A scan, asked
+   *  once per exit. A session with a live pty has not ended, whatever an earlier pty of it did; of
+   *  several ended ones, the one opened last is the answer.
+   *
+   *  **Boxed, so that "ended with no code" is not "never here".** node-pty can end a pty with no code
+   *  (the `exited undefined` lines), and that answers `{ code: null }`: the session did end. The
+   *  Host's handover sweep closes an ended session's Dispatch and skips one the registry never held
+   *  (R3), and a bare `null` for both would skip a pty that is dead. */
+  sessionExitCode(sessionId: string): { code: number | null } | null {
+    let ended: { code: number | null } | null = null
+    for (const e of this.entries.values()) {
+      if (e.meta?.kind !== 'session' || e.meta.id !== sessionId) continue
+      if (e.alive) return null
+      ended = { code: e.exitCode ?? null }
+    }
+    return ended
+  }
+
+  /** How this pty ended: null while it is alive or for an id never here, `{ code: null }` for one
+   *  that ended with no code. By pty id, as `sessionExitCode` is by session id. */
+  exitCodeOf(id: string): { code: number | null } | null {
+    const e = this.entries.get(id)
+    return e && !e.alive ? { code: e.exitCode ?? null } : null
+  }
+
   list(): PtyEntry[] {
     return [...this.entries.values()].map((e) => ({ id: e.id, pid: e.pid, meta: e.meta, alive: e.alive }))
+  }
+
+  /** Every live entry with the folder it was opened in (`opts.cwd`) and its note. For "is this folder
+   *  in use" (host/worktrees.ts) and for closing the sessions in a worktree. */
+  liveEntries(): Array<{ id: string; cwd: string; meta: PtyMeta | null }> {
+    const out: Array<{ id: string; cwd: string; meta: PtyMeta | null }> = []
+    for (const e of this.entries.values()) if (e.alive) out.push({ id: e.id, cwd: e.cwd, meta: e.meta })
+    return out
   }
 
   liveCount(): number {

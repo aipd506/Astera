@@ -4,7 +4,9 @@
 // be verified (the same reason as explorerState.ts).
 // It uses neither node:path nor node:crypto — the renderer has to see the same rules when it shows
 // the history list.
-// There are no imports — this module is entirely self-contained.
+// Its imports are paths.ts, which is node-free for the same reason, and a type from i18n.
+import { foldPathCase, runtimePlatform } from './paths'
+import type { Message } from '../i18n'
 
 /** Cap on total snapshot bytes per project. Past it, the oldest go first */
 export const MAX_TOTAL_BYTES = 200 * 1024 * 1024
@@ -24,14 +26,20 @@ export interface HistoryEntry {
   isDir: boolean
 }
 
-// Path normalization — unify separators, lowercase, drop the trailing separator. The same rule as
-// norm in ops.ts (win32 case-insensitive).
-const norm = (p: string): string => p.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
+// Path normalization — unify separators, drop the trailing separator, and fold case where the
+// platform ignores it (foldPathCase: win32 and darwin fold, linux does not). The same rule as norm in
+// ops.ts.
+const unifySeparators = (p: string): string => p.replace(/\//g, '\\').replace(/\\+$/, '')
+const norm = (p: string, platform: string): string => foldPathCase(unifySeparators(p), platform)
 
 /** The key in index.json. It is the full normalized path, not a hash, so it can never collide.
- *  This is what guarantees history never gets mixed up between projects. */
-export function normalizeProjectPath(rootPath: string): string {
-  return norm(rootPath)
+ *  This is what guarantees history never gets mixed up between projects.
+ *
+ *  Older builds lower-cased this key on every platform; on linux an index.json written then holds
+ *  `\home\u\proj` for `/home/u/Proj`. The store finds such a key with legacyFoldedKey and moves its
+ *  entries over (store.ts, adopt). */
+export function normalizeProjectPath(rootPath: string, platform: string = runtimePlatform()): string {
+  return norm(rootPath, platform)
 }
 
 /** Project path -> the **directory name** under the store. node:crypto is unavailable, so this uses
@@ -39,9 +47,15 @@ export function normalizeProjectPath(rootPath: string): string {
  *  key in index.json is normalizeProjectPath. A collision merely means two projects share a
  *  directory — the snapshots inside are unique by timestamp + name and list() filters by the
  *  normalized path, so correctness does not break.
- *  The result holds only [0-9a-z], so it is usable as a directory name on any filesystem. */
+ *  The result holds only [0-9a-z], so it is usable as a directory name on any filesystem.
+ *
+ *  **Case is folded here on every platform, linux included, unlike normalizePath.** This names
+ *  directories that already exist on disk: every snapshot an older build took sits under the folded
+ *  hash, and restore finds it by recomputing this value. Folding costs nothing but the sharing this
+ *  comment already allows for — two linux projects differing only in case share a directory, and the
+ *  index key (case-exact on linux) keeps their entries apart. */
 export function projectKey(rootPath: string): string {
-  const s = norm(rootPath)
+  const s = unifySeparators(rootPath).toLowerCase()
   let h = 0x811c9dc5
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i)
@@ -71,6 +85,33 @@ export function snapshotId(deletedAt: number, originalName: string, taken: strin
 /** This size is not snapshotted */
 export function tooLarge(size: number): boolean {
   return size > TOO_LARGE_BYTES
+}
+
+/** Cap on the number of entries in a single snapshot: every descendant of a folder — files, folders
+ *  and links alike — not counting the folder itself (a lone file counts as 1). So a folder of exactly
+ *  5,000 files is kept and one of 5,001 is not. The byte cap alone lets through a folder of tens of thousands of tiny files — well under
+ *  50MB, yet copying it one file at a time before the delete even starts takes minutes. Past this it
+ *  is treated exactly like a too-large item: no snapshot, the delete still happens, the user is told. */
+export const TOO_MANY_ENTRIES = 5000
+
+/** What to tell the user when a delete kept no snapshot. `tooLarge` covers both caps (bytes and entry
+ *  count), and its wording names both — written into each locale's text with that locale's digit
+ *  grouping (5,000 / 5.000), as files.delete.undoHint already is — so a folder skipped for its entry
+ *  count does not read as "over 50MB". Change those strings together with the caps. 'delete' is the explorer's delete, which the user confirmed (so it is information); 'undo' is
+ *  a Ctrl+Z that removed something permanently without asking (so it is an error). */
+export function snapshotSkipNotices(
+  skipped: { tooLarge: boolean; failed: boolean },
+  context: 'delete' | 'undo'
+): { level: 'info' | 'error'; message: Message }[] {
+  const out: { level: 'info' | 'error'; message: Message }[] = []
+  if (context === 'delete') {
+    if (skipped.tooLarge) out.push({ level: 'info', message: { key: 'files.delete.skippedTooLarge' } })
+    if (skipped.failed) out.push({ level: 'info', message: { key: 'files.delete.skippedFailed' } })
+  } else {
+    if (skipped.tooLarge) out.push({ level: 'error', message: { key: 'files.undo.permanentTooLarge' } })
+    if (skipped.failed) out.push({ level: 'error', message: { key: 'files.undo.permanentSnapshotFailed' } })
+  }
+  return out
 }
 
 /** The ids to evict, oldest first. Entries past the retention window go first, and if the total is

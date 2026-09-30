@@ -1,12 +1,30 @@
-import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, shell, webContents, Notification } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  Tray,
+  Menu,
+  nativeImage,
+  ipcMain,
+  shell,
+  webContents,
+  Notification,
+  // Squirrel.Mac itself, not electron-updater's wrapper around it. Only listened to — see the
+  // staging block below for why its verdict has to be read separately from electron-updater's.
+  autoUpdater as squirrel
+} from 'electron'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { appendFileSync, existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, promises as fsp } from 'node:fs'
 import type { AppUpdater } from 'electron-updater'
 import iconAsset from '../../resources/icon.png?asset'
 import trayAsset from '../../resources/tray.png?asset'
 import { createCore, type Core } from './core'
+import { clearAppRunning, markAppRunning } from '../core/host/pidFile'
+import { flushAllLogsSync, lineLog } from '../core/log/logWriter'
 import { applyLoginPath } from './loginPath'
+import { startUp, startingPageUrl, loadInto, storedTheme } from './startup'
+import type { Theme } from '../core/theme/themes'
+import { pickInitialLang } from '../core/i18n/locale'
 import { shouldForceWaylandOzone } from './ozone'
 import { registerIpc, parseAllowedExternalUrl, type OrchHandle } from './ipc'
 import { isOwnDocument } from './navigationGuard'
@@ -15,24 +33,52 @@ import { AgentGuestRegistry } from './agentBrowser/registry'
 import { registerPreviewDevTools } from './preview/devtools'
 import { registerPreviewEmulation } from './preview/emulation'
 import { registerPreviewCapture } from './preview/capture'
-import { RollingCoordinator } from './rolling'
+import { RollingCoordinator } from '../core/rolling/claudeCoordinator'
 import { SchedulerCoordinator } from './scheduler'
-import { chatDriver, ptyDriver, routedDriver } from './sessionDriver'
-import { CodexRollingCoordinator } from './codexRolling'
+import { chatDriver, ptyDriver, routedDriver } from '../core/sessions/sessionDriver'
+import { CodexRollingCoordinator } from '../core/rolling/codexCoordinator'
 import { BlockRegistry } from '../core/rolling/blockRegistry'
+import type { RollSnapshot } from '../core/rolling/snapshot'
+import { chatSpawnOptsOf } from '../core/chat/respawn'
+import { writeRollSnapshotTo } from './rollSnapshotSink'
 import { memoiseLoginStatus } from '../core/accounts/loginStatusCache'
-import { SlackNotifier, SlackConfigStore } from './slack'
-import { SlackInboxController, createSocketClient } from './slackInbox'
-import { HookEventWatcher } from './hookEvents'
+import { SlackNotifier } from '../core/slack/notifier'
+import { SlackConfigStore } from './slackConfigStore'
+import { SlackInboxController } from '../core/slack/inbox'
+import { createSocketClient, createWebClient } from './slackSdk'
+import { createSlackOwnership, type SlackOwnership } from './slackOwnership'
+import { hearForwarded } from '../core/slack/forwarded'
+import { HookEventWatcher } from '../core/hooks/eventWatcher'
 import { fanOutHookEvent } from './hookFanOut'
 import { DesktopNotifier } from './desktopNotifier'
 import { createAttentionState } from './attention'
 import { createPendingPromptState } from './pendingPrompt'
-import { CodexRolloutWatcher } from './codexRolloutWatcher'
+import { CodexRolloutWatcher } from '../core/sessions/codexRolloutWatcher'
 import { t } from '../core/i18n'
 import { loadPolicy, nextCheckDelayMs, parsePolicyUrl, shouldApplyCampaign } from './updatePolicy'
-import type { SessionInfo, RollStateEvent, UpdateCampaignInfo } from '../core/types'
+import {
+  NOTHING_STAGED,
+  extractForManualInstall,
+  installRoute,
+  reduceStaging,
+  type StagingEvent,
+  type StagingState
+} from './manualInstall'
+import type {
+  SessionInfo,
+  RollStateEvent,
+  UpdateCampaignInfo,
+  InstallOutcome,
+  UpdateStatus
+} from '../core/types'
+import {
+  afterCheckTimeout,
+  checkWithTimeout,
+  createUpdateStateTracker,
+  UPDATE_CHECK_TIMEOUT_MS
+} from '../core/update/checkTimeout'
 import { providerOf } from '../core/providers/meta'
+import { USAGE_GATE_MAX_AGE_MS } from '../core/usage/rateLimitFetcher'
 
 // The dev (unpackaged) app uses a different userData folder than the installed one. The installer
 // writes to %APPDATA%\Astera, and because Windows is case-insensitive the dev build (app name
@@ -52,12 +98,6 @@ if (!app.isPackaged) app.setPath('userData', app.getPath('userData') + '-dev')
 if (shouldForceWaylandOzone(process.platform, process.env['WAYLAND_DISPLAY'], existsSync))
   app.commandLine.appendSwitch('ozone-platform', 'wayland')
 
-// The oldest usage figure the limit gate is allowed to decide on. RateLimitFetcher's default 5-minute
-// cache is fine for a status bar but fatal for a verdict — a reading taken just below the threshold
-// (96%, say) would reject a genuine limit 90 seconds later. The phrase re-matches on every chunk while
-// it is on screen, so this window doubles as the query throttle.
-const USAGE_GATE_MAX_AGE_MS = 10_000
-
 // The carriage return the rolling coordinators write to submit a prompt on a pty. The `write` routing
 // in their dep blocks below recognises it in order to drop it: a chat session is handed a whole
 // message rather than keystrokes, so the Enter that follows the text on a pty has nothing to do there.
@@ -68,6 +108,7 @@ let codexRollingRef: CodexRollingCoordinator | null = null
 let schedulerRef: SchedulerCoordinator | null = null
 let codexRolloutRef: CodexRolloutWatcher | null = null
 let slackInboxControllerRef: SlackInboxController | null = null // Slack inbound socket rebuilder — cut on quit
+let slackOwnershipRef: SlackOwnership | null = null // who owns Slack — its hand-back timer is cut on quit
 let rollingRef: RollingCoordinator | null = null // lets the hook callback reach a coordinator created later
 let orchRef: OrchHandle | null = null // orchestration shutdown cleanup + the rolling seam
 let hostClientStopRef: (() => Promise<void>) | null = null // Astera Host client — closes the socket on quit
@@ -79,8 +120,9 @@ let hostClientRetireRef: (() => Promise<void>) | null = null
 let hostSurvivesUpdateRef: (() => boolean) | null = null
 // fix wave 최종, F1: the tab-briefing function, handed over unconditionally (OrchWiring.onTabResumeReady)
 // — unlike orchRef above, this is set the moment registerIpc runs, whether or not orchestration ever
-// boots. Read by the two rolling coordinators' resumeText dep when orchRef is null (orchestration off),
-// so a plain tab session's Smart Resume briefing does not depend on the unrelated orchestration toggle.
+// boots. Read by the two rolling coordinators' resumeText dep when orchRef is null (the server did not
+// come up), so a plain tab session's Smart Resume briefing does not depend on orchestration having
+// started.
 let tabResumeTextRef: ((sessionId: string, form: 'handover' | 'update') => Promise<string | null>) | null =
   null
 // Work Unit 수집기의 "이 세션은 이어받은 것이다" 알림. `tabResumeTextRef` 와 같은 갈래다 —
@@ -178,11 +220,28 @@ function buildMacMenu(): Menu {
  *  guest belongs to an agent — the guard would let an agent's tab walk off this machine. */
 const agentGuests = new AgentGuestRegistry((id) => webContents.fromId(id))
 
-function createWindow(): BrowserWindow {
+/** Loads the app's own page into the window. Split from createWindow because on macOS/Linux the
+ *  window opens before core exists (startup.ts) and shows a start-up page until this runs — which it
+ *  does right where the window used to be created, ahead of registerIpc with no await in between. */
+function loadApp(win: BrowserWindow): void {
+  const devUrl = process.env['ELECTRON_RENDERER_URL']
+  loadInto(
+    win,
+    devUrl ? { url: devUrl } : { file: path.join(__dirname, '../renderer/index.html') },
+    (m) => console.log(m)
+  )
+}
+
+/** `startingText` null loads the app at once (win32, exactly as before); otherwise the window shows
+ *  that text on a start-up page, and the caller loads the app with loadApp once core is ready. */
+function createWindow(startingText: string | null = null, theme?: Theme): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
     title: 'Astera',
+    // The theme's background from the first frame, before any page paints: the default is white, and
+    // every theme the app has is dark (startup.ts startingPageUrl says what that looked like).
+    ...(theme ? { backgroundColor: theme.colors.bg } : {}),
     icon: APP_ICON, // window/taskbar icon (electron-builder win.icon only changes the installed exe icon)
     titleBarStyle: 'hidden',
     // macOS: titleBarStyle:'hidden' leaves the traffic-light buttons floating in the top-left. The
@@ -212,8 +271,8 @@ function createWindow(): BrowserWindow {
     // in Electron; installPreviewGuards below is what makes turning it on safe.
     webPreferences: { preload: path.join(__dirname, '../preload/index.js'), sandbox: false, webviewTag: true }
   })
-  if (process.env['ELECTRON_RENDERER_URL']) win.loadURL(process.env['ELECTRON_RENDERER_URL'])
-  else win.loadFile(path.join(__dirname, '../renderer/index.html'))
+  if (startingText === null) loadApp(win)
+  else loadInto(win, { url: startingPageUrl(startingText, theme) }, (m) => console.log(m))
   win.maximize()
 
   // DevTools in development. Its usual accelerators (Ctrl/Cmd+Shift+I, F12) come from Electron's
@@ -358,6 +417,9 @@ app.on('activate', () => {
 
 app.whenReady().then(async () => {
   if (!gotSingleInstanceLock) return // second instance — waits for quit without initializing
+  // Tells a Host this app is not attached to that an app is alive and may be running sessions the
+  // Host cannot see, so it refuses to remove a worktree folder under them (core/host/pidFile.ts).
+  markAppRunning(app.getPath('userData'), process.pid)
   // Windows delivers a toast against the process's AppUserModelID and silently drops it when that
   // does not match a shortcut's — indistinguishable from the OS-refusal case DesktopNotifierDeps's
   // `show` already expects to swallow (design doc §9). Called unconditionally rather than guarded to
@@ -378,23 +440,38 @@ app.whenReady().then(async () => {
   if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(APP_ICON)
   // Launched from Finder on macOS or from a .desktop entry on Linux, there's no login shell PATH.
   // claude/codex/git/node are all looked up via PATH, so this must be restored before createCore
-  // (= StatusLineManager.init, account detection).
-  await applyLoginPath((m) => console.log(m))
-  core = await createCore(app.getPath('userData'), app.getLocale())
-  const win = createWindow()
+  // (= StatusLineManager.init, account detection) — and so before any session spawns, which all come
+  // after core. The window no longer waits for it: on macOS/Linux it opens first with a start-up page
+  // saying what is being waited on, and the wait is bounded (startup.ts). Windows is unchanged.
+  // The theme the person picked, so the window and the start-up page wear it from the first frame.
+  // One small local file; anything wrong with it reads as the default (storedTheme).
+  const theme = await storedTheme(() => fsp.readFile(path.join(app.getPath('userData'), 'app-settings.json'), 'utf8'))
+  const started = await startUp({
+    platform: process.platform,
+    probeLoginPath: () => applyLoginPath((m) => console.log(m)),
+    openWindow: () => {
+      const w =
+        process.platform === 'win32'
+          ? createWindow(null, theme)
+          : createWindow(t(pickInitialLang(app.getLocale()), 'startup.readingShellEnv'), theme)
+      mainWindow = w
+      return w
+    },
+    createCore: () => createCore(app.getPath('userData'), app.getLocale()),
+    log: (m) => console.log(m)
+  })
+  core = started.core
+  const win = started.win
+  // On Linux a close is a real close (see createWindow): closed during the probe, the window is gone
+  // and the app is already quitting — there is nothing to load and nothing to wire up.
+  if (win.isDestroyed()) return
+  if (process.platform !== 'win32') loadApp(win)
   mainWindow = win
   // Slack progress notifications: hook events, roll state, limits and exits go out over an Incoming
   // Webhook or a Slack bot (chat.postMessage) — SlackNotifier abstracts both behind a transport, so
   // the wiring here does not know which path is in play. Logs go to userData/slack.log (same pattern
   // as rolling.log) — the webhook URL and bot token are never recorded.
-  const slackLogFile = path.join(app.getPath('userData'), 'slack.log')
-  const slackLog = (m: string): void => {
-    try {
-      appendFileSync(slackLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not block the notification */
-    }
-  }
+  const slackLog = lineLog(path.join(app.getPath('userData'), 'slack.log'))
   const slackStore = new SlackConfigStore(path.join(app.getPath('userData'), 'slack.json'))
   const slack = new SlackNotifier({
     getAccount: (id) => {
@@ -406,7 +483,21 @@ app.whenReady().then(async () => {
     },
     readStatusPayload: (id) => core!.statusLinePayload(id),
     lang: () => core!.lang,
-    log: slackLog
+    log: slackLog,
+    // core has no default SDK constructor (P1) — the app supplies it explicitly, where it always did
+    // before this was the default.
+    createPoster: createWebClient,
+    // The session's thread keys go into its note (spec S5, P9), so an app restart resumes the root
+    // instead of opening a second one. A chat session's note is the chat manager's, a terminal
+    // session's the session manager's.
+    remember: (sid, patch) => {
+      try {
+        if (core!.chat.has(sid)) core!.chat.remember(sid, patch)
+        else core!.sessions.remember(sid, patch)
+      } catch {
+        /* a note must not cost a notice */
+      }
+    }
   })
   // The one attention verdict (main/attention.ts): is a session working, or waiting for a person,
   // decided from the same hook stream Slack and the desktop sink already read. Constructed here,
@@ -461,7 +552,7 @@ app.whenReady().then(async () => {
   })
   // Slack thread reply intake. Connects only when an app token is present and bot mode is on — on
   // the webhook path there are no threads, so there is nothing to reply into. SlackInboxController
-  // safely rebuilds the socket whenever settings change (reconfigureInbox in registerIpc below) —
+  // safely rebuilds the socket whenever settings change (slackOwnership.configChanged, from registerIpc) —
   // that fixed a bug where turning bot mode off left the socket attached to the old channel until
   // the next restart.
   const slackInboxController = new SlackInboxController({
@@ -501,10 +592,29 @@ app.whenReady().then(async () => {
     isQuitting: () => quitting
   })
   slackInboxControllerRef = slackInboxController
-  void slackStore.load().then((c) => {
-    slack.applyConfig(c)
-    void slackInboxController.apply(c)
+  // Who owns Slack (Slack in the Host, P4, P5): this app, or a Host that announced `slack-owner`. Nothing
+  // is applied at start any more: slack.json is read and the socket opened only once the startup chain
+  // settles with no Slack-owning Host (registerIpc calls `settled`), or after the hand-back grace when one
+  // goes away. Before that, the notifier hears its inputs with no transport and posts nothing.
+  const slackOwnership = createSlackOwnership({
+    load: () => slackStore.load(),
+    apply: (c) => {
+      slack.applyConfig(c)
+      void slackInboxController.apply(c)
+    },
+    yieldAll: () => {
+      slack.setTransport(null)
+      void slackInboxController.stop()
+    },
+    // Final review M2: what was held while a Slack-owning Host was away, told here once this app takes Slack.
+    hear: (ev) => hearForwarded(slack, ev),
+    after: (ms, fn) => {
+      const t = setTimeout(fn, ms)
+      return () => clearTimeout(t)
+    },
+    log: slackLog
   })
+  slackOwnershipRef = slackOwnership
   // codex rollout watcher: codex has neither hooks nor a statusLine mechanism, so this one tail of
   // the rollout jsonl answers both questions — task_complete for turn completion, and the token_count
   // records the usage chips draw. Independent of rolling. Every codex session is watched (the caller
@@ -519,7 +629,11 @@ app.whenReady().then(async () => {
         return null
       }
     },
-    onTurnComplete: (sessionId, rolloutPath) => slack.onCodexTurnComplete(sessionId, rolloutPath),
+    // The watcher stays for the usage chips; its turn end reaches the notifier only while this app owns
+    // Slack (P12): a Slack-owning Host watches its codex terminal sessions itself.
+    onTurnComplete: (sessionId, rolloutPath) => {
+      if (slackOwnership.local()) slack.onCodexTurnComplete(sessionId, rolloutPath)
+    },
     // The mapping goes into the note the Host keeps for that session's pty, which is the only place it
     // can be read back from after a restart — the scan that made it cannot be run again for a session
     // whose spawn is in the past. With no Host the pty has no note and this does nothing.
@@ -541,30 +655,33 @@ app.whenReady().then(async () => {
     // is not one of these taps: it no longer reads a hook payload directly, it subscribes to `attention`
     // instead (desktopNotifier.ts's constructor) — see hookFanOut.ts's own comment on why `attention`
     // still runs first regardless.
-    (sid, payload) => fanOutHookEvent({ attention, pendingPrompt, slack, rolling: rollingRef }, sid, payload),
+    // Slack hears the hooks only while this app owns it: a Slack-owning Host reads the same hook files.
+    (sessionId, payload) =>
+      fanOutHookEvent(
+        {
+          attention,
+          pendingPrompt,
+          slack: {
+            onHookEvent: (sid, p) => {
+              if (slackOwnership.local()) slack.onHookEvent(sid, p)
+            }
+          },
+          rolling: rollingRef
+        },
+        sessionId,
+        payload
+      ),
     slackLog
   )
   hookWatcher.start()
 
   // Account rolling: progress logs go to userData/rolling.log (same pattern as updater.log)
-  const rollLog = path.join(app.getPath('userData'), 'rolling.log')
   // Both coordinators' `log` dep, and the one their chat routing below writes its own refusals to — a
   // named function rather than the two inline copies it replaces, because that routing is in the dep
-  // literal and cannot reach the `log` it is declaring.
-  const rollingLog = (m: string): void => {
-    try {
-      appendFileSync(rollLog, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not block rolling */
-    }
-  }
-  const schedLog = (m: string): void => {
-    try {
-      appendFileSync(rollLog, `${new Date().toISOString()} [sched] ${m}\n`)
-    } catch {
-      /* a logging failure must not block the schedule */
-    }
-  }
+  // literal and cannot reach the `log` it is declaring. The schedule writes the same file, `[sched]`
+  // marked, through the same writer, so the two keep one order.
+  const rollingLog = lineLog(path.join(app.getPath('userData'), 'rolling.log'))
+  const schedLog = (m: string): void => rollingLog(`[sched] ${m}`)
   // Reports the per-entry validation result for scheduler.json — createCore has no logger, so it is
   // logged here instead. The normal path (recovered=false, dropped=0, pruned=0) stays quiet.
   {
@@ -647,32 +764,217 @@ app.whenReady().then(async () => {
   const cachedLoginStatus = memoiseLoginStatus((id) => core!.accounts.loginStatus(id), {
     ttlMs: 10_000
   })
+  /** What a roll event costs the app, for both coordinators' `send` and for the Host's rolls (S6 Task
+   *  14, design §3.4): the renderer, the Work Unit collector, the scheduler, orchestration, Slack and the
+   *  desktop sink, each isolated in its own try so one tap's throw does not block the rest or the roll.
+   *  `orchestration` is false for a roll the Host made and pushed: the Host already rekeyed the Dispatch
+   *  and the coordinator slot, so the app's tap must not do it a second time over the mirror. `codex`
+   *  adds the codex rollout watcher's re-register, which only a codex roll needs. */
+  const fanOutRollEvent = (
+    channel: 'session:rolled' | 'session:rollState',
+    payload: unknown,
+    opts: { orchestration: boolean; codex: boolean; renderer?: boolean }
+  ): void => {
+    // `renderer: false` (S6-17): a Host roll whose new session the app did not adopt. The app's own
+    // taps below still run; the renderer hears of the new session from the next sweep's adopter.
+    try {
+      if (opts.renderer !== false && !win.isDestroyed()) win.webContents.send(channel, payload)
+    } catch {
+      /* renderer send failures are ignored */
+    }
+    // Work Unit 수집기도 롤을 탭한다. 굴린 세션은 새 세션 id 를 받고, `--resume` 이 그
+    // 세션의 트랜스크립트에 이전 대화를 통째로 다시 적는다 — 알리지 않으면 수집기가 처음 보는
+    // 세션으로 여겨 그 파일을 0 부터 읽고, 그것이 곧 켜기 전의 대화다(스펙 §16.1).
+    // **claude 에서는 경로를 건네지 않는다.** 이 게시의 payload 에는 없고, 굴려서 띄운 프로세스가
+    // 어느 파일을 쓸지는 그 세션의 statusLine 이 도착해야 정해진다(claudeCoordinator.ts 의 applyMeta 가 그것을
+    // 기다린다). 추측 대신 세션 id 만 알리고, 파일 끝을 잡는 일은 수집기가 그 세션을 처음 보는
+    // 회차로 미룬다. **codex 에서는 건네줄 수 있다**: 재개된 codex 는 새 파일을 만들지 않고 바로 이
+    // dest 에 이어 쓰므로(아래 주석) 그 순간의 파일 끝이 곧 되쓰기가 끝난 자리다. 빈 대화로 굴릴 때는
+    // `undefined` 이고, 그때는 claude 쪽처럼 수집기가 다음 회차에 끝을 잡는다.
+    // **`oldSessionId` goes along too (Important 3).** The killed session's open task has to be
+    // re-keyed onto the new one, or that session's exit event — which follows this — would
+    // interrupt it for no reason: a usage limit is not a completion. claudeCoordinator.ts's roll() goes
+    // kill → spawn → this publish with no await in between, so the killed session's real
+    // (asynchronous) exit event is guaranteed to arrive after this notification. (A Host roll's exit
+    // is held until this has run — hostRollView.) **codex sessions do not create a Unit today** (see
+    // collector.ts's header comment for why), so passing `oldSessionId` there has nothing to re-key and
+    // quietly does nothing for now. Passed anyway, because an asymmetry caught on only one side becomes
+    // a silent bug the day codex support arrives.
+    try {
+      if (channel === 'session:rolled') {
+        const p = payload as { oldSessionId: string; info: SessionInfo; dest?: string }
+        workUnitForkRef?.(p.info.id, p.dest, p.oldSessionId)
+      }
+    } catch {
+      /* a Work Unit tap failure must not block rolling */
+    }
+    // The fork above is made once per roll (preflight C10), and the new pty's note records it: the note
+    // keeps `rolledFrom` for the pty's life, so the adopter of a later app instance would otherwise fork
+    // again and skip the transcript lines written while the app was closed. remember() does nothing for
+    // a chat session (no pty note) or a fallback session (no Host).
+    try {
+      if (channel === 'session:rolled') {
+        const p = payload as { oldSessionId: string; info: SessionInfo }
+        core!.sessions.remember(p.info.id, { forkSeen: p.oldSessionId })
+      }
+    } catch {
+      /* a note failure must not block rolling */
+    }
+    // The scheduler taps rolling events too — isolated in its own try, separate from the Slack
+    // tap, so a throw out of rekey does not silently swallow the Slack notification (rolled) below.
+    try {
+      if (channel === 'session:rolled') {
+        const p = payload as { oldSessionId: string; info: SessionInfo; dest?: string }
+        scheduler.rekey(p.oldSessionId, p.info.id) // the schedule follows the roll chain
+        if (opts.codex) {
+          // dest: the rollout path copied into the target account just before an ordinary roll
+          // (codexRolling.roll() carries it along). The respawn resumes, so codex appends to that very
+          // file instead of creating a new one — it is what the watcher has to tail, and searching for a
+          // newly created file would find nothing at all. It is handed over directly; the watcher starts
+          // at the end of it so the turns from before the roll are not reported again. **`undefined` on
+          // a blank-slate roll (Smart Resume)** — that respawn is a fresh `codex` with no rollout to
+          // copy or hand over yet, so `register` below falls back to its own search, the same path a
+          // brand-new session already takes (codexCoordinator.ts's `roll()` documents the same fallback at
+          // its own `send('session:rolled', ...)` call).
+          //
+          // When rolling switches accounts the session respawns under a new sessionId and a new
+          // rollout file appears — without re-registering, both turn-completion notifications and the
+          // usage chips stop for good after the switch. `opts.codex` says this is a codex roll (the
+          // codex coordinator's own send, or a Host roll of a codex session — ipc.ts asks the account),
+          // so re-checking the provider is unnecessary. Unconditional for a pty session, matching
+          // the spawn path: the chips are needed whether or not this session asked for Slack, and the
+          // watcher gates the turn callback on info.slackNotify itself.
+          //
+          // **A chat session is registered here too, not just by its own `ready`.** A rolled chat
+          // session's `ready` only fires ~1–3s later, once the respawned CLI completes its handshake,
+          // and until then nothing in the watcher knows this session at all. What that costs is not
+          // notifications — they are off for a chat session (`{ notifyTurns: false }`, below: it
+          // announces its own turn ends from the protocol, so a watcher callback would make it two) —
+          // nor the usage chips, which `register` resets along with `limits`/`context` anyway. It is
+          // that `codexSessionIdFor` and `rolloutPathFor` have no answer for the new id during that
+          // window, and everything that asks them (the history-resume guard, the rollout lookups) is
+          // told this session does not exist. Registering here closes exactly that gap. `register`
+          // replaces the entry wholesale (codexRolloutWatcher.ts), so `ready`'s later re-register does
+          // not drift the flag back to its default; that is why the old Ruling 4c-6 skip is no longer
+          // needed here.
+          //
+          // The old registration's native id is read before it is dropped — `unregister` erases it —
+          // **and only when `p.dest` is there**, i.e. when this roll resumed the same thread onto a
+          // copied rollout. A blank-slate roll (Smart Resume) starts a *different* thread and
+          // codexRolling nulls `chain.codexSessionId` for it, so handing the old id over would have the
+          // watcher's own `findRollout` narrow its search to the dead thread and hide the new rollout
+          // for the whole handshake window.
+          const rolledChatId = core!.chat.has(p.info.id)
+            ? p.dest
+              ? codexRollout.codexSessionIdFor(p.oldSessionId) ?? undefined
+              : undefined
+            : null
+          codexRollout.unregister(p.oldSessionId)
+          if (rolledChatId !== null) codexRollout.register(p.info, p.dest, rolledChatId, { notifyTurns: false })
+          else if (!core!.chat.has(p.info.id)) codexRollout.register(p.info, p.dest)
+        }
+      } else if (channel === 'session:rollState') {
+        // Suppress schedule firing during the roll-resume window (switching/trust/waiting/nudged).
+        // codex rolling sends session:rollState too (switching/waiting/adopted/none). 'adopted' is not
+        // one of the states that suppresses: it says a chain taken back from the Host cannot judge its
+        // own limit, which is not a resume window, and the switch in handleRollState leaves it to the
+        // default on purpose.
+        scheduler.handleRollState(payload as RollStateEvent)
+      }
+    } catch {
+      /* a schedule tap failure must not block rolling or the Slack notification */
+    }
+    // 오케스트레이션도 롤링 이벤트를 탭한다. 워커 세션이 롤되면 그 Dispatch 의 sessionId 를 새
+    // 세션으로 옮겨야 한다 — 그 값이 worker_done 을 되돌려 묶는 유일한 키다. 다른 탭들과 같은
+    // 이유로 자기 try 안에 격리한다. Host 가 굴린 롤은 건너뛴다(`opts.orchestration`): Host 가
+    // 이미 옮겼다.
+    try {
+      if (opts.orchestration) {
+        if (channel === 'session:rolled') {
+          const p = payload as { oldSessionId: string; info: SessionInfo }
+          orchRef?.onRolled(p.oldSessionId, p.info)
+        } else if (channel === 'session:rollState') {
+          // 정지 시점 스냅샷 — 이벤트를 통째로 넘긴다. 어떤 게시가 정지 에피소드의 시작인지
+          // 가르는 일과 세션별 기억은 OrchRollTap 이 갖는다(core/orchestration/exec/rollTap.ts).
+          orchRef?.onRollState(payload as RollStateEvent)
+        }
+      }
+    } catch {
+      /* an orchestration tap failure must not block rolling */
+    }
+    // Slack notifications tap rolling events too, for both providers. Isolated so a tap exception does
+    // not block rolling. Without this the SlackNotifier record stays on the old id, so turn
+    // notifications stop after the switch, onRolled cannot cancel the scheduled exit timer so a false
+    // session-exit goes out, and limit-reached, account-switch and reset notifications never arrive.
+    //
+    // While a Host owns Slack (Slack in the Host, spec §3.3), this app's own chains are forwarded to it: it
+    // cannot see them. The forward is synchronous, so for a roll it goes out in the same turn as the
+    // respawn's pty-spawn (the coordinators spawn and then send with no await between), behind it on the one
+    // socket. The Host holds the new entry back while the old record stands (P7), so the `rolled` moves the
+    // old thread onto the new id in either order and no second root is opened (Task 8 carry 2).
+    try {
+      if (slackOwnership.local()) {
+        if (channel === 'session:rolled') {
+          const p = payload as { oldSessionId: string; info: SessionInfo }
+          slack.onRolled(p.oldSessionId, p.info)
+        } else if (channel === 'session:rollState') {
+          slack.onRollState(payload as RollStateEvent)
+        }
+      } else if (opts.orchestration) {
+        // The Host owns Slack and cannot see this app's own chains (spec §3.3). A Host roll
+        // (orchestration false) is the Host's own, and forwarding it back would announce it twice.
+        if (channel === 'session:rolled') {
+          const p = payload as { oldSessionId: string; info: SessionInfo; dest?: string }
+          slackOwnership.forward({ kind: 'rolled', oldSessionId: p.oldSessionId, info: p.info, ...(p.dest ? { dest: p.dest } : {}) })
+        } else if (channel === 'session:rollState') {
+          slackOwnership.forward({ kind: 'roll-state', event: payload as RollStateEvent })
+        }
+      }
+    } catch {
+      /* a Slack tap failure must not block rolling */
+    }
+    // The desktop sink taps rolling events too, mirroring the Slack tap above. Isolated so an
+    // exception here does not block rolling.
+    try {
+      if (channel === 'session:rollState') desktop.onRollState(payload as RollStateEvent)
+    } catch {
+      /* a desktop notification failure must not block rolling */
+    }
+  }
+  /** Where a chain's snapshot goes (S6 R4, chat takeover spec §3.3): written into the note of the
+   *  session's process, the pty's or the chat proc's, for the Host to carry on if this app goes away. A
+   *  fallback session has no Host at all: remember() does nothing there. Shared by both coordinators. */
+  const writeRollSnapshot = (id: string, snap: RollSnapshot): void =>
+    writeRollSnapshotTo(id, snap, {
+      isChat: (x) => core!.chat.has(x),
+      rememberChat: (x, p) => core!.chat.remember(x, p),
+      rememberPty: (x, p) => core!.sessions.remember(x, p)
+    })
   const rolling = new RollingCoordinator({
     // A chain's session may be a pty or a chat session (slice 4c); the coordinator says which through
     // `kind` and the rest is routed here, so neither coordinator imports a manager. A chat respawn
     // resumes by thread id — the same value a pty chain resumes by, under the chat manager's name for
-    // it — and carries the chain's carry-on prompt as its first turn.
+    // it — and carries the chain's carry-on prompt as its first turn. The options are built by
+    // chatSpawnOptsOf, the mapping the Host's roll uses too (chat takeover Task 2): it carries the
+    // chain's restoreExtra into the new chat proc's note, the person's model, and the old session's
+    // unattended policy.
     spawn: (opts) =>
       opts.kind === 'chat'
-        ? core!.chat.spawn({
-            account: opts.account,
-            cwd: opts.cwd,
-            resumeThreadId: opts.resumeSessionId,
-            initialPrompt: opts.initialPrompt,
-            rollAccountIds: opts.rollAccountIds,
-            rollPrompt: opts.rollPrompt,
-            slackNotify: opts.slackNotify,
-            bypassPermissions: opts.bypassPermissions,
-            title: opts.title,
-            model: opts.model,
-            // design F5 fix round 1 (Important 2/3): computed here, the same way ipc.ts's own
-            // spawnSession does — synchronously, off the cache core.ts warms once at startup — rather
-            // than threaded through RollingDeps.spawn's opts: this is a fact about the *target*
-            // account's CLI on this machine's PATH, not about the chain rolling.ts is tracking.
-            bypassSignal: core!.bypassSignalFor(providerOf(opts.account)),
-            startWithBypass: opts.startWithBypass
-          })
+        ? core!.chat.spawn(
+            chatSpawnOptsOf(opts, {
+              unattendedOf: (x) => core!.chat.unattendedOf(x),
+              // design F5 fix round 1 (Important 2/3): computed here, the same way ipc.ts's own
+              // spawnSession does — synchronously, off the cache core.ts warms once at startup — rather
+              // than threaded through RollingDeps.spawn's opts: this is a fact about the *target*
+              // account's CLI on this machine's PATH, not about the chain claudeCoordinator.ts is tracking.
+              bypassSignal: core!.bypassSignalFor(providerOf(opts.account))
+            })
+          )
         : core!.sessions.spawn(opts),
+    // What the synchronous respawn above would otherwise look for on disk (the folder, and Git Bash on
+    // win32), looked for before the kill and without blocking this thread: an offline drive fails the
+    // roll here, where it is rescheduled, instead of freezing every window at the spawn.
+    prepareSpawn: (account, cwd) => core!.sessions.prepare({ account, cwd }),
     // What the roll above carries: the model the person picked, read off the session being rolled
     // before it is killed. Terminal chains never reach this — the manager only knows chat sessions.
     chosenModelOf: (id) => core!.chat.chosenModelOf(id),
@@ -727,79 +1029,11 @@ app.whenReady().then(async () => {
       // printed and the statusLine snapshot is frozen by then (see RateLimitPeak).
       return u.status === 'ok' ? u.peak : null
     },
-    send: (channel, payload) => {
-      try {
-        if (!win.isDestroyed()) win.webContents.send(channel, payload)
-      } catch {
-        /* renderer send failures are ignored */
-      }
-      // Work Unit 수집기도 롤을 탭한다. 굴린 세션은 새 세션 id 를 받고, `--resume` 이 그
-      // 세션의 트랜스크립트에 이전 대화를 통째로 다시 적는다 — 알리지 않으면 수집기가 처음 보는
-      // 세션으로 여겨 그 파일을 0 부터 읽고, 그것이 곧 켜기 전의 대화다(스펙 §16.1).
-      // **경로는 건네지 않는다.** 이 게시의 payload 에는 없고, 굴려서 띄운 프로세스가 어느 파일을
-      // 쓸지는 그 세션의 statusLine 이 도착해야 정해진다(rolling.ts 의 applyMeta 가 그것을
-      // 기다린다). 추측 대신 세션 id 만 알리고, 파일 끝을 잡는 일은 수집기가 그 세션을 처음
-      // 보는 회차로 미룬다. 다른 탭들과 같은 이유로 자기 try 안에 격리한다.
-      // **`oldSessionId` goes along too (Important 3).** The killed session's open task has to be
-      // re-keyed onto the new one, or that session's exit event — which follows this — would
-      // interrupt it for no reason: a usage limit is not a completion. rolling.ts's roll() goes
-      // kill → spawn → this publish with no await in between, so the killed session's real
-      // (asynchronous) exit event is guaranteed to arrive after this notification.
-      try {
-        if (channel === 'session:rolled') {
-          const p = payload as { oldSessionId: string; info: SessionInfo }
-          workUnitForkRef?.(p.info.id, undefined, p.oldSessionId)
-        }
-      } catch {
-        /* a Work Unit tap failure must not block rolling */
-      }
-      // The scheduler taps rolling events too — isolated in its own try, separate from the Slack
-      // tap, so a throw out of rekey does not silently swallow the Slack notification (rolled) below.
-      try {
-        if (channel === 'session:rolled') {
-          const p = payload as { oldSessionId: string; info: SessionInfo }
-          scheduler.rekey(p.oldSessionId, p.info.id) // the schedule follows the roll chain
-        } else if (channel === 'session:rollState') {
-          // Suppress schedule firing during the roll-resume window (switching/trust/waiting/nudged)
-          scheduler.handleRollState(payload as RollStateEvent)
-        }
-      } catch {
-        /* a schedule tap failure must not block rolling or the Slack notification */
-      }
-      // 오케스트레이션도 롤링 이벤트를 탭한다. 워커 세션이 롤되면 그 Dispatch 의 sessionId 를 새
-      // 세션으로 옮겨야 한다 — 그 값이 worker_done 을 되돌려 묶는 유일한 키다. 다른 탭들과 같은
-      // 이유로 자기 try 안에 격리한다.
-      try {
-        if (channel === 'session:rolled') {
-          const p = payload as { oldSessionId: string; info: SessionInfo }
-          orchRef?.onRolled(p.oldSessionId, p.info)
-        } else if (channel === 'session:rollState') {
-          // 정지 시점 스냅샷 — 이벤트를 통째로 넘긴다. 어떤 게시가 정지 에피소드의 시작인지
-          // 가르는 일과 세션별 기억은 OrchRollTap 이 갖는다(main/orchestration/rollTap.ts).
-          orchRef?.onRollState(payload as RollStateEvent)
-        }
-      } catch {
-        /* an orchestration tap failure must not block rolling */
-      }
-      // Slack notifications tap rolling events too. Isolated so a tap exception does not block rolling.
-      try {
-        if (channel === 'session:rolled') {
-          const p = payload as { oldSessionId: string; info: SessionInfo }
-          slack.onRolled(p.oldSessionId, p.info)
-        } else if (channel === 'session:rollState') {
-          slack.onRollState(payload as RollStateEvent)
-        }
-      } catch {
-        /* a Slack tap failure must not block rolling */
-      }
-      // The desktop sink taps rolling events too, mirroring the Slack tap above. Isolated so an
-      // exception here does not block rolling.
-      try {
-        if (channel === 'session:rollState') desktop.onRollState(payload as RollStateEvent)
-      } catch {
-        /* a desktop notification failure must not block rolling */
-      }
-    },
+    send: (channel, payload) => fanOutRollEvent(channel, payload, { orchestration: true, codex: false }),
+    // S6 R4, chat takeover §3.3: the chain written into its process's note (the pty's or the chat
+    // proc's), for the Host to carry on if this app goes away. A fallback session has no Host at all:
+    // remember() does nothing there (writeRollSnapshot).
+    snapshot: writeRollSnapshot,
     log: rollingLog,
     lang: () => core!.lang,
     blocks,
@@ -810,7 +1044,7 @@ app.whenReady().then(async () => {
     orchEnv: () => orchRef?.orchEnv(),
     // Job Continuity: binds the native session id to the open Dispatch as soon as the coordinator learns it.
     onNativeSession: (sid, native) => orchRef?.onNativeSession(sid, native),
-    // Job 워커의 재개 packet(Task 4b/4c), 없으면(오케스트레이션이 꺼져 있거나 탭 세션이면) 탭
+    // Job 워커의 재개 packet(Task 4b/4c), 없으면(탭 세션이거나 서버가 서지 못했으면) 탭
     // 브리핑으로 저하한다 — resumeTextDep 의 JSDoc(fix wave 최종, F1/F3).
     resumeText: resumeTextDep,
     // 한도에 걸린 세션을 어떻게 이어갈지(Task 1 의 설정) — orchEnv 와 같은 이유로 getter 다: 값이
@@ -826,25 +1060,22 @@ app.whenReady().then(async () => {
     // Routed by kind exactly as the claude coordinator's is, and for the same reason — see its own
     // comment. `resumePrompt` has no counterpart here: it is the argument behind `codex resume <id>`,
     // and a chat session is not started from a command line, so a chat roll carries its prompt as
-    // `initialPrompt` (codexRolling.ts's roll() sends only that one for a chat chain).
+    // `initialPrompt` (codexCoordinator.ts's roll() sends only that one for a chat chain).
     spawn: (opts) =>
       opts.kind === 'chat'
-        ? core!.chat.spawn({
-            account: opts.account,
-            cwd: opts.cwd,
-            resumeThreadId: opts.resumeSessionId,
-            initialPrompt: opts.initialPrompt,
-            rollAccountIds: opts.rollAccountIds,
-            rollPrompt: opts.rollPrompt,
-            slackNotify: opts.slackNotify,
-            bypassPermissions: opts.bypassPermissions,
-            title: opts.title,
-            // design F5 fix round 1 (Important 2/3) — same as the claude coordinator's own callback.
-            bypassSignal: core!.bypassSignalFor(providerOf(opts.account)),
-            startWithBypass: opts.startWithBypass
-          })
+        ? core!.chat.spawn(
+            chatSpawnOptsOf(opts, {
+              unattendedOf: (x) => core!.chat.unattendedOf(x),
+              // design F5 fix round 1 (Important 2/3) — same as the claude coordinator's own callback.
+              bypassSignal: core!.bypassSignalFor(providerOf(opts.account))
+            })
+          )
         : core!.sessions.spawn(opts),
-    // design F5 fix round 1 (Important 3): rolling.ts's own dep, same contract.
+    // What the synchronous respawn above would otherwise look for on disk (the folder, and Git Bash on
+    // win32), looked for before the kill and without blocking this thread: an offline drive fails the
+    // roll here, where it is rescheduled, instead of freezing every window at the spawn.
+    prepareSpawn: (account, cwd) => core!.sessions.prepare({ account, cwd }),
+    // design F5 fix round 1 (Important 3): claudeCoordinator.ts's own dep, same contract.
     bypassedOf: (id) => core!.chat.bypassedOf(id),
     kill: (id) => (core!.chat.has(id) ? core!.chat.kill(id) : core!.sessions.kill(id)),
     write: (id, d) => {
@@ -879,126 +1110,11 @@ app.whenReady().then(async () => {
     // account copied the transcript and respawned into a CLI that immediately failed. Memoised: see
     // cachedLoginStatus above for why this path is and the IPC one is not.
     loginStatus: cachedLoginStatus,
-    send: (channel, payload) => {
-      try {
-        if (!win.isDestroyed()) win.webContents.send(channel, payload)
-      } catch {
-        /* renderer send failures are ignored */
-      }
-      // Work Unit 수집기도 롤을 탭한다 — claude 쪽과 같은 자리, 같은 이유다. **여기서는 경로를
-      // 건네줄 수 있다**: 재개된 codex 는 새 파일을 만들지 않고 바로 이 dest 에 이어 쓰므로(아래
-      // 주석) 그 순간의 파일 끝이 곧 되쓰기가 끝난 자리다. 빈 대화로 굴릴 때는 `undefined` 이고,
-      // 그때는 claude 쪽처럼 수집기가 다음 회차에 끝을 잡는다.
-      // **codex sessions do not create a Unit today** (see collector.ts's header comment for why),
-      // so passing `oldSessionId` has nothing to re-key and quietly does nothing for now. Passed
-      // anyway, same as the path above, because an asymmetry caught on only one side becomes a
-      // silent bug the day codex support arrives.
-      // 자기 try 안에 두는 것도 claude 쪽과 같다 — 아래 블록의 rekey 와 rollout 재등록이 이
-      // 호출의 예외에 함께 쓸려 가지 않게 한다.
-      try {
-        if (channel === 'session:rolled') {
-          const p = payload as { oldSessionId: string; info: SessionInfo; dest?: string }
-          workUnitForkRef?.(p.info.id, p.dest, p.oldSessionId)
-        }
-      } catch {
-        /* a Work Unit tap failure must not block codex rolling */
-      }
-      try {
-        if (channel === 'session:rolled') {
-          // dest: the rollout path copied into the target account just before an ordinary roll
-          // (codexRolling.roll() carries it along). The respawn resumes, so codex appends to that very
-          // file instead of creating a new one — it is what the watcher has to tail, and searching for a
-          // newly created file would find nothing at all. It is handed over directly; the watcher starts
-          // at the end of it so the turns from before the roll are not reported again. **`undefined` on
-          // a blank-slate roll (Smart Resume)** — that respawn is a fresh `codex` with no rollout to
-          // copy or hand over yet, so `register` below falls back to its own search, the same path a
-          // brand-new session already takes (codexRolling.ts's `roll()` documents the same fallback at
-          // its own `send('session:rolled', ...)` call).
-          const p = payload as { oldSessionId: string; info: SessionInfo; dest?: string }
-          scheduler.rekey(p.oldSessionId, p.info.id) // the schedule follows the roll chain
-          // When rolling switches accounts the session respawns under a new sessionId and a new
-          // rollout file appears — without re-registering, both turn-completion notifications and the
-          // usage chips stop for good after the switch. codexRolling is the codex-only coordinator
-          // (ipc.ts's spawn branch already splits on provider), so every session reaching here is
-          // codex — re-checking the provider is unnecessary. Unconditional for a pty session, matching
-          // the spawn path: the chips are needed whether or not this session asked for Slack, and the
-          // watcher gates the turn callback on info.slackNotify itself.
-          //
-          // **A chat session is registered here too, not just by its own `ready`.** A rolled chat
-          // session's `ready` only fires ~1–3s later, once the respawned CLI completes its handshake,
-          // and until then nothing in the watcher knows this session at all. What that costs is not
-          // notifications — they are off for a chat session (`{ notifyTurns: false }`, below: it
-          // announces its own turn ends from the protocol, so a watcher callback would make it two) —
-          // nor the usage chips, which `register` resets along with `limits`/`context` anyway. It is
-          // that `codexSessionIdFor` and `rolloutPathFor` have no answer for the new id during that
-          // window, and everything that asks them (the history-resume guard, the rollout lookups) is
-          // told this session does not exist. Registering here closes exactly that gap. `register`
-          // replaces the entry wholesale (codexRolloutWatcher.ts), so `ready`'s later re-register does
-          // not drift the flag back to its default; that is why the old Ruling 4c-6 skip is no longer
-          // needed here.
-          //
-          // The old registration's native id is read before it is dropped — `unregister` erases it —
-          // **and only when `p.dest` is there**, i.e. when this roll resumed the same thread onto a
-          // copied rollout. A blank-slate roll (Smart Resume) starts a *different* thread and
-          // codexRolling nulls `chain.codexSessionId` for it, so handing the old id over would have the
-          // watcher's own `findRollout` narrow its search to the dead thread and hide the new rollout
-          // for the whole handshake window.
-          const rolledChatId = core!.chat.has(p.info.id)
-            ? p.dest
-              ? codexRollout.codexSessionIdFor(p.oldSessionId) ?? undefined
-              : undefined
-            : null
-          codexRollout.unregister(p.oldSessionId)
-          if (rolledChatId !== null) codexRollout.register(p.info, p.dest, rolledChatId, { notifyTurns: false })
-          else if (!core!.chat.has(p.info.id)) codexRollout.register(p.info, p.dest)
-        } else if (channel === 'session:rollState') {
-          // codex rolling sends session:rollState too (switching/waiting/adopted/none) — suppress the
-          // resume window. 'adopted' is not one of the states that suppresses: it says a chain taken
-          // back from the Host cannot judge its own limit, which is not a resume window, and the
-          // switch in handleRollState leaves it to the default on purpose.
-          scheduler.handleRollState(payload as RollStateEvent)
-        }
-      } catch {
-        /* a tap failure must not block rolling */
-      }
-      // 오케스트레이션도 롤링 이벤트를 탭한다. 워커 세션이 롤되면 그 Dispatch 의 sessionId 를 새
-      // 세션으로 옮겨야 한다 — 그 값이 worker_done 을 되돌려 묶는 유일한 키다. 다른 탭들과 같은
-      // 이유로 자기 try 안에 격리한다.
-      try {
-        if (channel === 'session:rolled') {
-          const p = payload as { oldSessionId: string; info: SessionInfo }
-          orchRef?.onRolled(p.oldSessionId, p.info)
-        } else if (channel === 'session:rollState') {
-          // 정지 시점 스냅샷 — 이벤트를 통째로 넘긴다. 어떤 게시가 정지 에피소드의 시작인지
-          // 가르는 일과 세션별 기억은 OrchRollTap 이 갖는다(main/orchestration/rollTap.ts).
-          orchRef?.onRollState(payload as RollStateEvent)
-        }
-      } catch {
-        /* an orchestration tap failure must not block rolling */
-      }
-      // Slack notifications tap codex rolling events too (mirroring the claude side) — isolated so a
-      // tap exception does not block rolling. Without this the SlackNotifier record stays on the old
-      // id, so turn notifications stop after the switch, onRolled cannot cancel the scheduled exit
-      // timer so a false session-exit goes out, and limit-reached, account-switch and reset
-      // notifications never arrive for codex at all.
-      try {
-        if (channel === 'session:rolled') {
-          const p = payload as { oldSessionId: string; info: SessionInfo }
-          slack.onRolled(p.oldSessionId, p.info)
-        } else if (channel === 'session:rollState') {
-          slack.onRollState(payload as RollStateEvent)
-        }
-      } catch {
-        /* a Slack tap failure must not block rolling */
-      }
-      // The desktop sink taps rolling events too, mirroring the Slack tap above. Isolated so an
-      // exception here does not block rolling.
-      try {
-        if (channel === 'session:rollState') desktop.onRollState(payload as RollStateEvent)
-      } catch {
-        /* a desktop notification failure must not block rolling */
-      }
-    },
+    send: (channel, payload) => fanOutRollEvent(channel, payload, { orchestration: true, codex: true }),
+    // S6 R4, chat takeover §3.3: the chain written into its process's note (the pty's or the chat
+    // proc's), for the Host to carry on if this app goes away. A fallback session has no Host at all:
+    // remember() does nothing there (writeRollSnapshot).
+    snapshot: writeRollSnapshot,
     log: (m) => rollingLog(`[codex] ${m}`),
     lang: () => core!.lang,
     blocks,
@@ -1008,7 +1124,7 @@ app.whenReady().then(async () => {
     orchEnv: () => orchRef?.orchEnv(),
     // Job Continuity: binds the native session id to the open Dispatch as soon as the coordinator learns it.
     onNativeSession: (sid, native) => orchRef?.onNativeSession(sid, native),
-    // Job 워커의 재개 packet(Task 4b/4c) — rolling.ts 의 같은 필드, 같은 resumeTextDep 이다.
+    // Job 워커의 재개 packet(Task 4b/4c) — claudeCoordinator.ts 의 같은 필드, 같은 resumeTextDep 이다.
     resumeText: resumeTextDep,
     // 한도에 걸린 세션을 어떻게 이어갈지(Task 1 의 설정) — orchEnv 와 같은 이유로 getter 다: 값이
     // 설정 화면에서 앱 수명 중간에 바뀌고, 이 코디네이터는 그보다 먼저 만들어진다.
@@ -1021,25 +1137,12 @@ app.whenReady().then(async () => {
   // other subsystem: a log file (userData/orchestration.log, same pattern as rolling.log and
   // slack.log) and shutdown cleanup.
   const orchLogFile = path.join(app.getPath('userData'), 'orchestration.log')
-  const orchLog = (m: string): void => {
-    try {
-      appendFileSync(orchLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not block orchestration */
-    }
-  }
+  const orchLog = lineLog(orchLogFile)
   // The app's side of the Astera Host channel. Its own file, beside rolling.log, slack.log and
   // orchestration.log — one per subsystem. The Host writes host/host.log from its end; this is the
   // other end of the same conversation, and somebody asking why Settings says Not connected has to
   // find it under a name that says Host rather than buried in an unrelated subsystem's log.
-  const hostLogFile = path.join(app.getPath('userData'), 'host-client.log')
-  const hostLog = (m: string): void => {
-    try {
-      appendFileSync(hostLogFile, `${new Date().toISOString()} ${m}\n`)
-    } catch {
-      /* a logging failure must not take the Host client down */
-    }
-  }
+  const hostLog = lineLog(path.join(app.getPath('userData'), 'host-client.log'))
   registerIpc(
     core,
     win,
@@ -1049,13 +1152,16 @@ app.whenReady().then(async () => {
     {
       notifier: slack,
       store: slackStore,
-      reconfigureInbox: (cfg) => void slackInboxController.apply(cfg) // rebuild the socket on settings change
+      // A settings save is applied by whichever process owns Slack (ownership.configChanged): here, which
+      // rebuilds the socket too, or in the Host through slack-reload.
+      ownership: slackOwnership
     },
     codexRolling,
     scheduler,
     codexRollout,
     {
       log: orchLog,
+      logPath: orchLogFile,
       onStarted: (h) => {
         orchRef = h
       },
@@ -1063,7 +1169,8 @@ app.whenReady().then(async () => {
       // see OrchWiring.onTabResumeReady's JSDoc (ipc.ts) and resumeTextDep above.
       onTabResumeReady: (fn) => {
         tabResumeTextRef = fn
-      }
+      },
+      deliverChat: (sid, text) => sessionDriver.deliver(sid, text)
     },
     () => refreshTrayMenu(win), // rebuild Open/Quit in the new language after settings.setLang
     // 위 두 send 탭이 부를 자리를 받아 둔다. registerIpc 가 돌아오면서 바로 채워지고,
@@ -1075,6 +1182,12 @@ app.whenReady().then(async () => {
     agentGuests,
     {
       log: hostLog,
+      // S6 D4: the same registry both coordinators share, exchanged with a Host that speaks `blocks`.
+      blocks,
+      // A roll the Host made and pushed (S6 §3.4) costs the app what its own rolls cost, except the
+      // orchestration tap: the Host already rekeyed the Dispatch, and hostRollView (ipc.ts) passes
+      // `orchestration: false` — pinned by its tests rather than here.
+      fanOutRollEvent,
       // Handed over as soon as the client exists, whether or not a Host is ever reached — the same
       // shape as onTabResumeReady above. Read from will-quit.
       onHostClientReady: ({ stop, retire, survivesUpdate }) => {
@@ -1117,20 +1230,12 @@ app.whenReady().then(async () => {
   // Auto-update: pulled from public GitHub Releases with no credentials. Progress is surfaced both
   // to a file log (userData/updater.log) and to the renderer (shown in the title bar).
   if (app.isPackaged) {
-    const logFile = path.join(app.getPath('userData'), 'updater.log')
-    const flog = (m: string): void => {
-      try {
-        appendFileSync(logFile, `${new Date().toISOString()} ${m}\n`)
-      } catch {
-        /* a logging failure must not block the update */
-      }
-    }
-    const push = (s: {
-      state: string
-      version?: string
-      percent?: number
-      message?: string
-    }): void => {
+    const flog = lineLog(path.join(app.getPath('userData'), 'updater.log'))
+    // The last state pushed, so a check that runs out of time knows what the screen is showing
+    // (afterCheckTimeout).
+    const updateStates = createUpdateStateTracker()
+    const push = (s: UpdateStatus): void => {
+      updateStates.record(s)
       flog(JSON.stringify(s))
       try {
         if (!win.isDestroyed()) win.webContents.send('update:status', s)
@@ -1168,7 +1273,36 @@ app.whenReady().then(async () => {
         const settleCheck = (): void => {
           userInitiatedCheck = false
         }
-        autoUpdater.on('checking-for-update', () => push({ state: 'checking' }))
+
+        // **Downloaded is not the same as installable on macOS.** electron-updater announces
+        // 'update-downloaded' before Squirrel.Mac has looked at the build at all, and on an
+        // ad-hoc-signed release Squirrel then refuses it every time — permanently, for the reason
+        // manualInstall.ts sets out. Left at that, the app offers "restart and install" for a build
+        // that cannot be installed, and pressing it does nothing whatsoever.
+        //
+        // So the native updater is watched directly for the verdict electron-updater does not pass
+        // on. It is the same object electron-updater drives internally, so this only listens; it
+        // never drives it. Guarded to darwin because Squirrel.Mac is the only updater with this
+        // split, and electron's autoUpdater has no meaning on Linux.
+        let staging: StagingState = NOTHING_STAGED
+        let downloaded: { version: string; file: string } | null = null
+        const advanceStaging = (e: StagingEvent): void => {
+          const before = staging
+          staging = reduceStaging(staging, e)
+          // Announced once, on the edge. The refusal arrives about a second after the download, so
+          // without this the person is looking at an install button that already cannot work.
+          if (staging.refused && !before.refused)
+            push({ state: 'manual', version: downloaded?.version, message: staging.refused })
+        }
+        if (process.platform === 'darwin') {
+          squirrel.on('update-downloaded', () => advanceStaging({ type: 'staged' }))
+          squirrel.on('error', (e) => advanceStaging({ type: 'error', message: e?.message ?? String(e) }))
+        }
+
+        autoUpdater.on('checking-for-update', () => {
+          advanceStaging({ type: 'check' }) // a newer version would replace whatever was judged before
+          push({ state: 'checking' })
+        })
         autoUpdater.on('update-available', (i) => {
           push({ state: 'available', version: i.version })
           settleCheck()
@@ -1180,7 +1314,14 @@ app.whenReady().then(async () => {
         autoUpdater.on('download-progress', (p) =>
           push({ state: 'downloading', percent: Math.round(p.percent) })
         )
-        autoUpdater.on('update-downloaded', (i) => push({ state: 'downloaded', version: i.version }))
+        autoUpdater.on('update-downloaded', (i) => {
+          // The file itself, straight from the event, rather than a guess at electron-updater's
+          // cache layout — it is what the manual path unpacks, and it has already been checked
+          // against the sha512 in the feed by the time this fires.
+          downloaded = { version: i.version, file: i.downloadedFile }
+          advanceStaging({ type: 'downloaded' })
+          push({ state: 'downloaded', version: i.version })
+        })
         autoUpdater.on('error', (e) => {
           const message = e?.message ?? String(e)
           if (userInitiatedCheck) push({ state: 'error', message })
@@ -1198,9 +1339,29 @@ app.whenReady().then(async () => {
           flog(`next auto check: ${Math.round(delay / 60_000)}min (consecutive failures ${consecutiveFailures})`)
           checkTimer = setTimeout(() => void runAutomaticCheck(), delay)
         }
+        // checkForUpdates has no deadline of its own; a feed that never answers would leave
+        // "checking" on screen for good (core/update/checkTimeout.ts). On the deadline the screen is
+        // put back and the wait is logged; the check itself cannot be cancelled and may still land.
+        const checkOnce = async (userInitiated: boolean): Promise<'done' | 'timedOut'> => {
+          const r = await checkWithTimeout(
+            () => autoUpdater.checkForUpdates(),
+            UPDATE_CHECK_TIMEOUT_MS,
+            () => flog(`WARN update check timed out after ${UPDATE_CHECK_TIMEOUT_MS / 1000}s (${userInitiated ? 'manual' : 'automatic'})`)
+          )
+          if (r !== 'timedOut') return 'done'
+          const next = afterCheckTimeout(updateStates.last(), userInitiated, updateStates.beforeCheck())
+          if (next && 'messageKey' in next)
+            push({
+              state: 'error',
+              message: t(core!.lang, next.messageKey, { seconds: UPDATE_CHECK_TIMEOUT_MS / 1000 })
+            })
+          else if (next) push(next)
+          if (userInitiated) settleCheck()
+          return 'timedOut'
+        }
         const runAutomaticCheck = async (): Promise<void> => {
           try {
-            await autoUpdater.checkForUpdates()
+            if ((await checkOnce(false)) === 'timedOut') throw new Error('timed out')
             consecutiveFailures = 0
           } catch (e) {
             consecutiveFailures += 1
@@ -1212,8 +1373,7 @@ app.whenReady().then(async () => {
         ipcMain.handle('update:check', async () => {
           userInitiatedCheck = true
           try {
-            await autoUpdater.checkForUpdates()
-            consecutiveFailures = 0
+            if ((await checkOnce(true)) === 'done') consecutiveFailures = 0
           } catch {
             /* the state is delivered through the error event */
           }
@@ -1226,7 +1386,35 @@ app.whenReady().then(async () => {
             /* the state is delivered through the error event */
           }
         })
-        ipcMain.handle('update:install', async () => {
+        ipcMain.handle('update:install', async (): Promise<InstallOutcome> => {
+          // The macOS fallback, taken only once Squirrel has actually refused this build. Nothing is
+          // downloaded here: autoDownload already fetched and checksummed the zip, so this unpacks
+          // what is on disk, strips the quarantine attribute that would otherwise make Gatekeeper
+          // block the new app, and shows it to the person in Finder to drag into /Applications.
+          // The app does not quit itself on this path — the renderer asks first, then quits, so the
+          // Finder window is not the only thing left explaining what just happened.
+          if (installRoute(process.platform, staging) === 'manual') {
+            if (!downloaded) {
+              // Refused with nothing on disk to offer. Not reachable through the button (the button
+              // only appears after a download) but a handler must not lie about what it did.
+              flog('ERROR manual install requested with no downloaded file')
+              return { mode: 'failed', message: t(core!.lang, 'update.manual.noFile') }
+            }
+            try {
+              const appPath = await extractForManualInstall({
+                downloadedFile: downloaded.file,
+                version: downloaded.version
+              })
+              flog(`manual install prepared: ${appPath}`)
+              shell.showItemInFolder(appPath)
+              return { mode: 'manual', appPath }
+            } catch (e) {
+              const message = (e as Error)?.message ?? String(e)
+              flog(`ERROR manual install failed: ${message}`)
+              return { mode: 'failed', message }
+            }
+          }
+
           // **The Host is left running wherever it can be.** That is the point of having one: its
           // sessions carry on through the install and the new version takes them back. macOS and
           // Linux replace a running binary without complaint, so this was always true there.
@@ -1250,6 +1438,7 @@ app.whenReady().then(async () => {
             }
           }
           autoUpdater.quitAndInstall()
+          return { mode: 'auto' }
         })
 
         // Update campaign. The policy is fetched from the same address with the same token as the
@@ -1289,8 +1478,13 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   quitting = true
+  slackOwnershipRef?.dispose() // no hand-back may open a socket while quitting
+  slackOwnershipRef = null
   void slackInboxControllerRef?.stop() // Slack inbound socket cleanup — a failure must not block quit
   slackInboxControllerRef = null
+  // What the logs hold so far, written now (stage 3, task 3): a quit that never reaches will-quit (a
+  // crash in a window's teardown) still leaves them on disk. Synchronous, once — acceptable at quit.
+  flushAllLogsSync()
 })
 // win32 quits once every window is closed. macOS has the opposite convention, and it genuinely fits
 // this app — sessions keep running in the background, and rolling and Slack notifications need to
@@ -1300,6 +1494,8 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 app.on('will-quit', () => {
+  // Only removes a file naming this process, so the instance that lost the lock leaves the other's.
+  clearAppRunning(app.getPath('userData'), process.pid)
   if (!core) return
   // **Whether quitting ends a pty is now a question, and it is asked per pty** (slice 2 design §1).
   // While they were all this process's own children, ending them here was the only honest thing to
@@ -1376,4 +1572,15 @@ app.on('will-quit', () => {
   } catch {
     /* shutdown cleanup failures are ignored */
   }
+})
+// Registered after the cleanup above, so it runs after it: the lines that cleanup writes are on disk
+// too before the process ends (stage 3, task 3). Separate so the cleanup's early return (no core yet)
+// cannot skip it. The process's own `exit` hook (logWriter.ts) flushes once more for anything later.
+// **A few milliseconds are left open here** (review I1): Electron does not wait on a promise from
+// will-quit, so unlike the Host's `leave` this cannot `await flushAll()`. An async append that started
+// within the last flush (at most one, LOG_FLUSH_MS apart) may land after these sync lines, or be lost
+// if the process ends before the thread pool writes it. The writer skips rotation while one is in
+// flight, so no line goes into a file that is being renamed.
+app.on('will-quit', () => {
+  flushAllLogsSync()
 })

@@ -42,6 +42,74 @@ describe('createPendingPromptState', () => {
     expect(state.get('s1')).toBeNull()
   })
 
+  // The capture also records UserPromptSubmit (for `astera sessions list`); it neither clears nor
+  // replaces a waiting question here.
+  it('UserPromptSubmit leaves the capture alone', () => {
+    const state = createPendingPromptState()
+    const changes: unknown[] = []
+    state.onHookEvent('s1', pre('call-1'))
+    state.subscribe((_id, p) => changes.push(p))
+    state.onHookEvent('s1', { hook_event_name: 'UserPromptSubmit', prompt: 'go' })
+    expect(state.get('s1')?.toolUseId).toBe('call-1')
+    expect(changes).toEqual([])
+  })
+
+  // StopFailure fires instead of Stop when an API error ends the turn (Claude Code 2.1.280's payload:
+  // `error`, `error_details`, the error text as `last_assistant_message`). The turn is over either way,
+  // so no question from it is still on screen, and the form must not stay drawn.
+  it('StopFailure clears it, as Stop does', () => {
+    const state = createPendingPromptState()
+    const changes: unknown[] = []
+    state.onHookEvent('s1', pre('call-1'))
+    state.subscribe((_id, p) => changes.push(p))
+    state.onHookEvent('s1', {
+      session_id: 'cc-1',
+      transcript_path: 'D:/t.jsonl',
+      cwd: 'D:/work',
+      hook_event_name: 'StopFailure',
+      error: 'server_error',
+      last_assistant_message: 'API Error: 500 Internal server error'
+    })
+    expect(state.get('s1')).toBeNull()
+    expect(changes).toEqual([null])
+  })
+
+  // StopFailure is captured async (so is UserPromptSubmit): a prompt sent right after a failed turn
+  // can land its UserPromptSubmit first and the old StopFailure after the new turn's question. The
+  // capture stamps when it started (`astera_at`); a turn end older than the latest prompt belongs to
+  // the turn before, and the question on screen now stays drawn.
+  it.each(['StopFailure', 'Stop'])('a %s older than the latest prompt leaves the new question up', (name) => {
+    const state = createPendingPromptState()
+    state.onHookEvent('s1', { hook_event_name: 'UserPromptSubmit', prompt: 'again', astera_at: 1_020 })
+    state.onHookEvent('s1', { ...(pre('call-2') as object), astera_at: 1_500 })
+    state.onHookEvent('s1', { hook_event_name: name, error: 'rate_limit', astera_at: 1_000 })
+    expect(state.get('s1')?.toolUseId).toBe('call-2')
+  })
+
+  // Lines with no stamp (an older capture), a tie, and a gap far past any reordering (a wall clock set
+  // back 30 s) keep the append-order rule.
+  it.each([
+    ['no stamp', {}, {}],
+    ['a clock stepped back 30 s', { astera_at: 1_000_000 }, { astera_at: 1_000_000 - 20_000 }],
+    ['the same millisecond', { astera_at: 1_000 }, { astera_at: 1_000 }],
+    ['a turn end newer than the prompt', { astera_at: 1_000 }, { astera_at: 1_005 }]
+  ])('with %s the turn end clears it', (_label, promptAt, endAt) => {
+    const state = createPendingPromptState()
+    state.onHookEvent('s1', { hook_event_name: 'UserPromptSubmit', prompt: 'go', ...promptAt })
+    state.onHookEvent('s1', pre('call-1'))
+    state.onHookEvent('s1', { hook_event_name: 'StopFailure', error: 'server_error', ...endAt })
+    expect(state.get('s1')).toBeNull()
+  })
+
+  it('forget drops the prompt time with the capture', () => {
+    const state = createPendingPromptState()
+    state.onHookEvent('s1', { hook_event_name: 'UserPromptSubmit', prompt: 'go', astera_at: 2_000 })
+    state.forget('s1')
+    state.onHookEvent('s1', pre('call-1'))
+    state.onHookEvent('s1', { hook_event_name: 'StopFailure', error: 'server_error', astera_at: 1_000 })
+    expect(state.get('s1')).toBeNull()
+  })
+
   it('the latest PreToolUse wins', () => {
     const state = createPendingPromptState()
     state.onHookEvent('s1', pre('call-1', 'Bash', { command: 'ls' }))

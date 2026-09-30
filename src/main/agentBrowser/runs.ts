@@ -1,8 +1,9 @@
 // One `astera browser js` from one session, start to finish: find or make the tab, run the script
 // against it, say when the tab is busy. Serial per session — two scripts driving one page is not a
 // case worth handling, so the second is refused rather than queued.
-import { createLog, Interrupted, WAIT_TIMEOUT_MS, type RunResult } from '../../core/agentBrowser/script'
+import { createLog, WAIT_TIMEOUT_MS, type RunResult } from '../../core/agentBrowser/script'
 import { runScript, type RunContext } from '../../core/agentBrowser/scriptRunner'
+import { gateHelpers } from '../../core/agentBrowser/scriptGate'
 import type { AgentBuffers } from './buffers'
 import path from 'node:path'
 import { agentOpenTarget } from '../../core/agentBrowser/urls'
@@ -70,34 +71,14 @@ export interface RunsDeps {
  *  What this does **not** do is cancel a helper that is already inside its body when the abort lands:
  *  only entry is gated. An `open()` parked in `ensureGuest`'s `waitFor`, for instance, can resume
  *  after the run has returned and call `loadURL` once. That single action is the bound — it cannot
- *  start another, because the next helper call parks. */
+ *  start another, because the next helper call parks.
+ *
+ *  The gate itself is `gateHelpers` from `core/agentBrowser/scriptGate.ts`, shared with the agent
+ *  workspace's script runner rather than ported a second time (preflight ruling F4); `withAtReset` is
+ *  this run's binding of it, with `SYNCHRONOUS_HELPERS` and no `onHelper` — this runner has no mirror
+ *  to tell, so it gets exactly the behaviour above. */
 function withAtReset(raw: Record<string, unknown>, ctx: RunContext, signal: AbortSignal): Record<string, unknown> {
-  const wrapped: Record<string, unknown> = {}
-  for (const [name, value] of Object.entries(raw)) {
-    if (typeof value !== 'function') {
-      wrapped[name] = value
-      continue
-    }
-    wrapped[name] = (...args: unknown[]) => {
-      if (signal.aborted) {
-        // A helper a script may call without `await` cannot park — nothing would be suspended — so it
-        // throws; every other helper parks (see this function's doc comment for why failing them is
-        // worse). helpers.ts owns the list, beside the helpers themselves.
-        if (SYNCHRONOUS_HELPERS.has(name)) throw new Interrupted(ctx.at, 'stopped')
-        return new Promise<never>(() => {})
-      }
-      const result = (value as (...a: unknown[]) => unknown)(...args)
-      if (result instanceof Promise) {
-        return result.then((v) => {
-          ctx.at = 'script'
-          return v
-        })
-      }
-      ctx.at = 'script'
-      return result
-    }
-  }
-  return wrapped
+  return gateHelpers(raw, ctx, signal, SYNCHRONOUS_HELPERS)
 }
 
 /** The running Runs that belong to the project at `cwd`, as `DevServer`s. A Run counts when the user

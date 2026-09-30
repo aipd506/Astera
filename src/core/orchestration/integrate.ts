@@ -1,15 +1,16 @@
 // 워크트리에서 끝난 일을 **이 Run 이 일하는 뿌리**(runRootOf — 워크트리가 있으면 그것, 없으면
 // 프로젝트 폴더)로 합쳐야 하는가에 대한 **순수 판정**. git 을 부르지 않고
 // fs 도 만지지 않는다 — 상태만 보고 답하므로 테스트가 되고, 실제 병합(그리고 그 실패의 되돌리기)은
-// 배선(src/main/ipc.ts)이 한다. slotsToFill 이 지키는 것과 같은 경계다.
+// 배선(src/core/orchestration/exec/integrateGit.ts, 앱은 src/main/ipc.ts 에서 Host 는
+// src/host/worktrees.ts 에서 부른다)이 한다. slotsToFill 이 지키는 것과 같은 경계다.
 //
 // **판정이 먼저이고 git 이 나중인 이유는 값이다.** runScheduler 는 모든 setState 뒤에 돌고 그 대부분은
 // 띄울 것이 없는 저장이다. pendingMerges 가 비면 git 프로세스가 하나도 뜨지 않는다 — 저장마다 git 을
 // 두세 번 부르면 상태를 쓰는 모든 명령이 그만큼 느려진다(같은 이유로 그 루프는 슬롯이 없을 때 계정
 // 조회 앞에서 빠진다).
 import { isSamePath } from '../files/tree'
-import type { OrchState } from './state'
-import type { Run, Task } from './types'
+import { jobOf, type OrchState } from './state'
+import type { Job, JobRun, Task } from './types'
 
 /** 의존 하나가 남긴 워크트리 — 그 의존 Task 의 id 와 그것이 돌았던 폴더 */
 interface WorktreeDep {
@@ -54,7 +55,7 @@ function worktreeDeps(s: OrchState, taskId: string): WorktreeDep[] {
       // "아직 열려 있다"의 판정은 이 저장소의 것을 그대로 쓴다(schedule.ts 의 slotsToFill,
       // server.ts 의 worker-start). 두 번째 정의를 만들면 둘이 갈라진다.
       if (!d.outcome && !d.endedAt) continue
-      if (isSamePath(d.cwd, runRootOf(run))) continue
+      if (isSamePath(d.cwd, runRootOf(run, jobOf(s, run)))) continue
       found.push({ taskId: depId, cwd: d.cwd })
     }
   }
@@ -70,8 +71,8 @@ function worktreeDeps(s: OrchState, taskId: string): WorktreeDep[] {
  *  한 줄짜리 함수를 두는 이유는 부르는 곳이 넷이라서다(병합 판정·병합 가능 판정·배치·통합 대상).
  *  `run.worktree ?? run.cwd` 를 네 번 적으면 다섯 번째 자리가 생겼을 때 그것만 빠질 수 있고,
  *  그 실패는 "워커가 프로젝트 폴더에서 돈다"로 나타나 이 변경 전과 똑같이 보인다. */
-export function runRootOf(run: Run): string {
-  return run.worktree ?? run.cwd
+export function runRootOf(run: JobRun, job: Pick<Job, 'cwd'> | undefined): string {
+  return run.worktree ?? job?.cwd ?? ''
 }
 
 /** 이 Run 의 Dispatch 가 쓴 워크트리 경로들, 중복 없이 — 만난 순서 그대로.
@@ -91,10 +92,14 @@ export function runWorktrees(s: OrchState, runId: string): string[] {
   const taskIds = new Set(s.tasks.filter((t) => t.runId === runId).map((t) => t.id))
   const run = s.runs.find((r) => r.id === runId)
   if (!run) return []
+  // 프로젝트 폴더는 계획의 것이다. **없을 수도 있는 값으로 다룬다** — 고아 회차(Job 기록이 사라진
+  // 것)에 빈 문자열을 쓰면 isSamePath 가 path.resolve('') 로 프로세스의 cwd 를 집어, 엉뚱한 폴더가
+  // 이 목록에서 빠진다.
+  const jobCwd = jobOf(s, run)?.cwd
   const out: string[] = []
   for (const d of s.dispatches) {
     if (!taskIds.has(d.taskId)) continue
-    if (isSamePath(d.cwd, run.cwd)) continue
+    if (jobCwd !== undefined && isSamePath(d.cwd, jobCwd)) continue
     if (!out.some((p) => isSamePath(p, d.cwd))) out.push(d.cwd)
   }
   // **Run 워크트리는 Dispatch 가 아니라 Run 이 들고 있다.** Dispatch 의 cwd 만 보면 그 폴더가 목록에서
@@ -112,7 +117,7 @@ export function runWorktrees(s: OrchState, runId: string): string[] {
   // 프로세스보다 오래 살고 손으로 고쳐진다 — 그 값이 프로젝트 폴더면 이 목록이 곧 "지울 폴더" 이므로
   // 사용자의 프로젝트를 지우라는 뜻이 된다(removeWorktree 의 위험 경로 검사가 막기는 하지만, 막히는
   // 것에 기대는 것과 애초에 넘기지 않는 것은 다르다).
-  if (run.worktree !== undefined && !isSamePath(run.worktree, run.cwd)) {
+  if (run.worktree !== undefined && (jobCwd === undefined || !isSamePath(run.worktree, jobCwd))) {
     if (!out.some((p) => isSamePath(p, run.worktree as string))) out.push(run.worktree)
   }
   return out
@@ -209,7 +214,7 @@ export function runsWorkingIn(s: OrchState, cwd: string): Set<string> {
  *
  *  병합은 작업 트리를 바꾼다. 워커가 그 폴더에서 파일을 읽고 고치는 중에 앱이 그 아래에서 파일을
  *  갈아치우면, 그 워커는 자기가 읽은 것과 다른 트리에 편집을 얹는다 — 그 실패는 조용하고 되짚기
- *  어렵다. 합치는 자리가 곧 그 뿌리이므로(ipc.ts 의 배치), 이것이 막는 것은 "통합 에이전트가
+ *  어렵다. 합치는 자리가 곧 그 뿌리이므로(core/orchestration/exec/dispatchLoop.ts 의 배치), 이것이 막는 것은 "통합 에이전트가
  *  합치는 중에 앱이 다른 접합점을 합치는" 경우이고 순차 Run 에서는 "앞 Task 가 아직 그 폴더에서
  *  도는데 다음 Task 를 위한 병합을 시작하는" 경우다.
  *
@@ -219,7 +224,7 @@ export function runsWorkingIn(s: OrchState, cwd: string): Set<string> {
 export function workingInRunRoot(s: OrchState, runId: string): boolean {
   const run = s.runs.find((r) => r.id === runId)
   if (!run) return false
-  return runsWorkingIn(s, runRootOf(run)).size > 0
+  return runsWorkingIn(s, runRootOf(run, jobOf(s, run))).size > 0
 }
 
 /** 통합 Task 의 spec 본문. **영어다** — 이것을 읽는 것은 사람이 아니라 에이전트이고, 같은 이유로

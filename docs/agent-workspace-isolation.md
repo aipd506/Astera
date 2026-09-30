@@ -1,11 +1,239 @@
-# Agent workspace isolation — design brief
+# Agent workspace isolation, design brief
 
-Status: **scope decided, mechanism measured, design not written yet.** This is the brief a next
-session starts from: the problem, what was measured, the candidate shapes, and what is still open.
+Status: **shipped for Windows, Linux and macOS** (2026-09-27). The designs are
+[docs/superpowers/specs/2026-09-27-agent-workspace-isolation-design.md](superpowers/specs/2026-09-27-agent-workspace-isolation-design.md)
+and, for the other two platforms,
+[docs/superpowers/specs/2026-09-27-agent-workspace-linux-macos-design.md](superpowers/specs/2026-09-27-agent-workspace-linux-macos-design.md);
+what shipped is summarised under the two "Shipped" sections below. The rest of this brief is the
+problem and the measurements the design stands on, kept as they were written.
 
-Written 2026-09-08 after the explorer clipboard work (develop `5ac2116`) forced the question, and
-updated the same day with the scope decisions and a spike that measured an isolated desktop
-directly.
+## Shipped (Linux and macOS, 2026-09-27)
+
+The script API, `WorkspaceManager`, the mirror tab and every lifecycle rule are the Windows ones. Only
+the `Desk` changes, chosen per platform by `workspaceDeskStarter` (`src/host/workspace/platformDesk.ts`),
+and the Host announces `workspace` on all three.
+
+- **Linux** (`src/host/workspace/deskLinux.ts`). Each workspace gets its own Xvfb display, from `:90`
+  up, at 1920x1080. The app starts through `sh` in a process group of its own, with `DISPLAY` set,
+  `WAYLAND_DISPLAY` and `WAYLAND_SOCKET` removed, and `XDG_SESSION_TYPE=x11`, `GDK_BACKEND=x11`,
+  `QT_QPA_PLATFORM=xcb`, `SDL_VIDEODRIVER=x11` and `ELECTRON_OZONE_PLATFORM_HINT=x11` set (a newer
+  Electron no longer reads that last hint alone, so Chromium, GTK, Qt and SDL are each pointed at X11
+  directly). `DBUS_SESSION_BUS_ADDRESS` is removed too, and `XDG_RUNTIME_DIR` points at a folder of
+  the desk's own (`astera-xrt-` and a random suffix under the temp folder, mode 0700), removed when the
+  desk closes or its Xvfb exits. The person's session bus, portals, notifications, tray, `wayland-0` and
+  audio sockets all live on that bus or in their runtime folder, so the app reaches none of them. The
+  tools the desk runs get the same environment. `windows()` and `keys()` use xdotool, `windowShot()` and the frames without CDP use
+  ImageMagick's `import`. Xvfb runs with `-noreset`, and before anything is launched the desk moves
+  the display's pointer to its last pixel, bottom right, out of the centered window an Electron app
+  opens with no window manager: X reports a window mapped, moved or resized under the pointer to the
+  app as a mouse move with no button down, and Chromium lets that end the press `drag()` made over
+  CDP. Parking did not make CI's drag start (run 36310700864), so on Linux a CDP press that starts no
+  drag within 2 s is followed by the same drag with the display's own pointer: xdotool presses at the
+  source (the window's origin from `xdotool getwindowgeometry`, the point in it from the page's
+  frame offset, `getBoundingClientRect` and `devicePixelRatio`), moves in five steps to the target
+  and holds the button while CDP drops the intercepted data, then lets go and parks the pointer again.
+  It is real X input, but on the workspace's own display. xdotool runs with `LC_ALL=C.UTF-8` unless
+  the Host already has a UTF-8 locale, since under the C locale `xdotool type` refuses non-ASCII text. Left to itself, xdotool
+  types a character the US keyboard has no key for (Hangul, emoji, accented letters) by binding it
+  to a spare key for that one press and unbinding it right after, and Chromium, reading the binding
+  late, drops some whatever the delay. So `keys()` first reads the display's keyboard map with
+  `xkbcomp`, binds every such character of the text to a key the map leaves free (17 on Xvfb's
+  default map; longer texts go in pieces), waits 300 ms, types at xdotool's default 12 ms a
+  character, waits again, and puts the map back. Where the map cannot be read, or has no free key,
+  such text is typed at 100 ms a character instead. `drag()` reads an element's centre again, for up
+  to 5 s, while it lies outside the page's viewport, and then fails with the numbers rather than
+  press where nothing is. It needs no signed in desktop, so it runs over SSH, in CI and on a server.
+  `app js` is refused, with the install line for the distribution, when Xvfb, xdotool or `import` is
+  missing.
+- **macOS** (`src/host/workspace/deskMac.ts`). Nothing is created. The app starts in the person's
+  session in the background, in a process group of its own: an app bundle is opened with `open -g -j -n`
+  and a tag (`--astera-desk=<name>-<seq>`) unique to that launch in its arguments, found afterward with
+  `ps`; a plain command runs through `sh` instead. Both get `ASTERA_APP_CHROMIUM_FLAGS`, holding the
+  switches that keep a page nobody sees rendering, so a project's app can read it and start with
+  `show: false`. The window is never moved, so it may sit behind the person's own (user decision L3b).
+  Only the page is driven. `windows()`, `windowShot()` and `keys()` are refused with the reason, and
+  `app js` is refused over SSH.
+- **Kill and leftovers** (`src/host/workspace/posixProc.ts`). A start time is read from `/proc` on
+  Linux and from `ps -o lstart=` on macOS, the same way when a launch is recorded and when it is
+  checked, with the same 2 s tolerance. A match ends the process group with `SIGTERM`, then `SIGKILL`
+  after 2 s. `workspaces.json` records the Xvfb pid as the helper on Linux, and only the launched app on
+  macOS.
+- **How it is tested.** Each Desk is unit tested with injected processes and files on every platform.
+  The real e2e (`desktop.linux.e2e.test.ts`, `desktop.mac.e2e.test.ts`) runs in CI on the ubuntu and
+  macos jobs with `ASTERA_DESKTOP_E2E=1`, after the ubuntu job installs `xvfb xdotool imagemagick`.
+
+Rulings the plan made where the Linux and macOS spec was silent:
+
+- **L-R1. Linux keys focus the window and use XTEST.** `xdotool --window` sends synthetic events, which
+  Chromium ignores. The display is the workspace's own, so focusing on it takes nothing from anyone.
+- **L-R2. `windowShot()` with no title photographs the largest titled window**, as on Windows, and the
+  whole display only when no window has a title.
+- **L-R3. `className` is empty on Linux.** `hwnd` is the X window id.
+- **L-R4. Display numbers are reserved inside the Host**, so two workspaces starting at once get two
+  displays; an Xvfb that exits before it is ready (another Host took the number) is retried on the next
+  one, three times at most.
+- **L-R5. macOS never moves a window.** That needs Accessibility, which is not asked for. An app that
+  reads `ASTERA_APP_CHROMIUM_FLAGS` can keep its window hidden; the e2e fixture does.
+- **L-R6. A macOS app bundle** is found by a tag (`--astera-desk=<name>-<seq>`) unique to that launch,
+  added to its arguments and matched afterward with `ps` among the processes that started since `open`
+  ran, never by path and time alone (an earlier instance, or the person's own, could match that). It
+  sees only what reaches it after its path, not the launch environment.
+- **L-R7. The Linux tool check runs on every `app js`**, so a tool installed while the Host runs counts
+  at once. A check that fails is logged and refuses nothing.
+- **L-R8. The feature is announced on all three platforms**, tools or not; the refusal explains, and
+  checks the platform and SSH first, the setting next, and the Linux tools last, so a Host with the
+  workspace off never names tools to install for a feature it would refuse anyway.
+
+Known limits, beside the spec's:
+
+- **macOS:** a Dock icon can appear while the app runs, and native windows, dialogs and keys cannot be
+  driven. A plain command's window can show unless the app keeps it hidden, and an app that ignores the
+  hide marker and shows its window anyway can come to the front. A bundle is found by the tag in its
+  arguments, not by its path, so a bundle that App Translocation (macOS's own quarantine of a bundle
+  opened from certain folders) runs from another path should still be found; that case has not been
+  tested. A Screen Recording and Accessibility permission mode may come later, as an
+  opt-in, to move a window or drive native input (user decision L3a).
+- **Linux:** an app that only speaks Wayland cannot start on Xvfb; Electron apps use X11 through the
+  hint. A window that covers the whole screen covers the parked pointer too, so a window mapped over
+  it during `drag()` can still stop that drag from starting. The clipboard is Xvfb's own, so `paste()` pastes only what the app itself copied. The app starts
+  with no session bus, so none of the person's services reach it, their secret service included: an
+  app that keeps secrets with Electron's `safeStorage` gets its `basic_text` backend there, not the
+  person's keyring, and a file chooser opens as the toolkit's own dialog on the virtual display, never
+  as a portal. Electron, Chromium or libdbus may set up a bus of their own for the virtual display
+  (through `dbus-launch`, where it is installed), and the processes the app starts afterward inherit
+  its address. That bus is never the person's, and a daemon it starts leaves the process group (see
+  Both). A stale X lock file only makes the reservation skip that display number; it
+  removes nothing.
+- **Both:** a process that leaves its process group (a `setsid`, a daemon) escapes the group kill, as a
+  process that detaches from the tree does on Windows. The command runs as `sh -c`, then a newline, then
+  `wait`, so a child put in the background is still there to end. A blank line sits between them, so a
+  command ending in a backslash continues onto that empty line and still reaches `wait`. A command with
+  an unclosed heredoc, or one that calls `exit`, defeats that `wait`, and such a child may not be
+  cleaned up.
+
+## Shipped (Windows, 2026-09-27)
+
+An agent session runs `astera app js --file check.js`. The Host answers it whether or not the Astera
+app is open. The first `launch()` in a session creates a Windows desktop object nobody switches to,
+starts the project's app there (a Run configuration or a command), and connects to the app's debugging
+port. The script drives the page over CDP (`snapshot`, `click`, `fill`, `press`, `paste`, `drag`,
+`dropFiles`, `screenshot`) and the native windows through the desktop helper (`windows`, `windowShot`,
+`keys`). The person's screen, foreground window and pointer are never touched; the clipboard is shared.
+
+- **Where it lives.** `src/core/workspace/` (the JSON line protocol, the idle and leftover rules, the
+  script gate, and the helpers over the `Cdp` and `Desk` ports, none of it Windows specific) and
+  `src/host/workspace/` (the PowerShell desktop helper with its embedded C#, the CDP client, the worker
+  each script runs in, and `WorkspaceManager`). The app shows a mirror tab per session
+  (`AppMirrorPane`), in the agent's violet, with the running helper, a Stop and a Close.
+- **What the agent is told.** `resources/skills/app-guide.md`, printed by `astera app help`, and the
+  `astera-app` skill, installed while **Agent app workspace** is on in Settings.
+- **Lifecycle.** One desktop per session, cleaned up on `close()`, on Close in the tab, when the
+  session ends, after 10 minutes without a script, and when the Host leaves. A Host that starts after
+  one that died ends the recorded processes whose start time still matches
+  (`<profile>/orch/workspaces.json`). Ending the helper does not by itself end the apps on its desktop
+  (measured); the manager's own cleanup and the next Host's leftover sweep end them by pid and start
+  time.
+- **How it is tested.** Unit tests with fake ports for every helper and rule; a real Host server and
+  orch for `app js` with no app attached and for the mirror events; and a real desktop e2e
+  (`src/host/workspace/desktop.e2e.test.ts`, run with `ASTERA_DESKTOP_E2E=1` on a signed in Windows
+  desktop) that launches an Electron fixture, drives it, and checks that the foreground window is the
+  same before and after and that nothing is left running.
+
+Rulings the implementation plan made where the spec was silent, adjusted below where the real desktop
+changed one of them:
+
+- **P1. The script deadline and the launch wait (amended 2026-09-28).** The script stays at 60 s, but
+  the time `launch()` and `relaunch()` spend waiting for the app's debugging port and page does not
+  count against it, up to `LAUNCH_WAIT_MAX_MS` (5 minutes) of such waiting over the whole script. A first
+  dev build of an Electron or webpack app can take longer than 60 s, and before this amendment such an app
+  could never be launched, since the script ended first. `waitMs` defaults to 60 s and is honoured up to
+  5 minutes. The wait for the port is `min(waitMs, what the launch wait may last minus 2 s)`, where what
+  it may last is the rest of the 5 minutes plus the script's own time left, so a port that never opens is
+  reported by `launch` with the `--remote-debugging-port` hint rather than as `at: "timeout"`. It then
+  waits up to 10 s more (`PAGE_READY_MS`), inside the same launch wait, for the page to finish parsing
+  past `about:blank`, and still succeeds if the page never settles by then, since the page helpers speak
+  for themselves after that. The Host's runner keeps the deadline (`ScriptDeadline` in
+  `src/core/workspace/script.ts`, driven by `src/host/workspace/scriptWorker.ts`), and the helpers run on
+  the Host's thread, so it knows exactly when a launch wait is in flight. A busy loop is still cut at 60 s
+  of time outside launch waits, a wait past the 5 minutes counts against the script again, Stop ends the
+  script at once whatever it is waiting for, and the memory limits are unchanged. While a launch waits,
+  the mirror tab shows "Starting the app… Ns", from the `launching` seconds on the Host's state event,
+  said again every second. The agent's `astera app js` waits for 60 s plus the 5 minutes plus its usual
+  headroom before it gives up (`clientTimeoutMs` in `src/cli/run.ts`).
+- **P2. Where `app js` is answered.** Above the command layer and below the request receipt line beside
+  `requests-show`, because the CLI mints a request id for every call and a command above the line refuses
+  one. A retried id replays the recorded result instead of launching twice.
+- **P3. Its own setting.** `agentAppEnabled` in `app-settings.json`, labelled **Agent app workspace
+  (experimental)** under Settings, Agents, off by default. It gates the `astera-app` skill and `app js`
+  alike, and the Host reads it on every `app js`, so it works with the app closed.
+- **P4. The session's folder.** Captures go to the folder every session is granted (`preview/shots`),
+  named `app-<uuid>.png`, and are trimmed the way the agent browser's are.
+- **P5. Embedded as a string.** The desktop helper script is a constant in the Host, ASCII only, written
+  to `<profile>/host/desk-<hash>.ps1` at first use (rewritten only when it differs) and run with
+  `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File`, because an encoded command
+  would pass the command line limit.
+- **P6. The app's opt in.** The Host pushes workspace events only to an app whose hello yields
+  `workspace`, and captures frames only while one is attached.
+- **P7. The mirror tab.** One workbench tab per session, placed in the background on the first event that
+  opens a workspace, drawn only while the workspace is active. A workspace that closes leaves the tab
+  showing closed until the person closes it.
+- **P8. When the session ends.** A session ends, for its workspace, 5 s after its last pty or line process
+  exits, because a roll reopens the same session id.
+- **P9. Driving an app is not browsing the web.** `click` follows links, since the page is the app under
+  test, and `press` sends trusted CDP key events rather than the agent browser's synthetic ones.
+- **P10. No interactive desktop.** `app js` is refused, before any process starts, on a platform the
+  workspace does not run on, over SSH on Windows and macOS (the Host's own environment says so), and in
+  a non-interactive session (a window station that is not visible; the helper says so). **Adjusted:**
+  the desktop helper cannot attach PowerShell's own thread to the desktop, since that fails with
+  `ERROR_BUSY` (measured); it attaches a fresh thread for each window, capture or key request
+  instead (`OnDesk`), and replies with whichever message is innermost. The spec left "its own thread"
+  open as an implementation detail; this costs one thread per request, which is cheap. Linux refuses
+  only for a missing tool (the Linux and macOS section above).
+- **P11. What is recorded for leftovers.** `workspaces.json` holds, per workspace, the launched root pid
+  and the helper pid, each with its creation time. At Host start, and by `relaunch()` for the app it ends,
+  a recorded pid is only ended when the live process's creation time is still within 2 s of the recorded
+  one; a malformed file kills nothing. **Adjusted:** ending the helper does not by itself end the apps on
+  its desktop (measured), so this same pid and start time check, run by the manager's own cleanup and by
+  the next Host's leftover sweep, is what ends them, not the helper's own exit.
+- **P12. Frames.** JPEG, at most 960 px wide, about one a second while a script runs and an app yields
+  `workspace`, plus one capture after each helper that changes the screen, coalesced while one is in
+  flight; only the latest frame is kept.
+- **P13. Each script in a worker of its own (amended 2026-09-27).** The Host runs every `app js` script
+  in a worker thread, with the helpers left on its own thread behind the same gate, and ends the worker at
+  the 60 second deadline (which launch waits do not count, P1) or on Stop. A busy loop, before or after an `await`, is cut off and no longer
+  freezes the Host or any session's terminal (`src/host/workspace/scriptWorker.ts`).
+- **P14. Each script in a process of its own (amended 2026-09-27).** The Host starts one child process
+  per `app js` script, from its own runtime with an environment built from nothing, and the worker of P13
+  runs inside it with its heap limited to 256 MB. The child ends itself when its memory passes 512 MB,
+  which counts ArrayBuffer and TypedArray memory the heap limit does not see, and the script reports
+  `at: "memory"`. A child that dies any other way reports `at: "crashed"`. The deadline, Stop, Close,
+  the session ending and the Host's orderly exit all end the child's process tree. If the Host crashes,
+  the child sees its channel close and ends itself, but a process the script started is not ended with
+  it. Memory a script takes can no longer take the Host down.
+
+Two more limits, found only once a real desktop and a real helper were driven (Task 3, Task 10):
+
+- **Every desk request times out at 15 s.** A launch, a capture, a windows list or a key press that gets
+  no answer in that time ends the helper, since a hung window must not block every later call.
+- **A process that detaches from the launched tree can escape cleanup.** The manager and the leftover
+  sweep both walk the tree by pid and start time; a process that forks off and reparents itself is not
+  found that way.
+
+Known limits, beside the spec's:
+
+- **The clipboard is shared**, so `paste()` reads what the person copied, and your app can overwrite
+  what they copied.
+- **Dragging out of the app to Explorer or another app is impossible.** This desktop has no real
+  pointer, so an OS level drag never starts; `dropFiles()` proves the drop side only.
+- **A closed mirror tab reappears when the Host reconnects while that workspace is still open.** The
+  Close in the app ends the tab, not the workspace; a workspace the Host still holds is shown again once
+  the app reconnects.
+- **A script is ended at 512 MB of memory.** It runs in a process of its own (P14), so running out of
+  memory ends that process and reports `at: "memory"`; the Host and every other session keep running.
+- An Electron app that is not started with a debugging port gets the native helpers only.
+  `snapshot().url` is empty for an address that is not http or https (a `file:` or custom scheme page).
+
+**Linux and macOS** shipped next, in the section above.
 
 ## The problem
 
@@ -145,17 +373,24 @@ logon session, and is out of scope for the shape above.
 4. **The first round targets an Electron app plus the OS around it.** That means the project's own
    app launched from a Run configuration, driven precisely, with the OS-integration cases that
    survive the measurements above.
+5. **No CLI surface, and the Host owns it (2026-09-26).** The public `astera` CLI gets no command or
+   flag for isolation. If it is built, it lives in the Host, so a Run started from the CLI with the app
+   closed gets the same isolation as one started from the app: its workers still run in the user's
+   logon session and would take the screen the same way. Where there is no interactive desktop (CI,
+   SSH, a server), it switches itself off, since there is no screen to protect.
+6. **The Host owns it whether the app is open or not (2026-09-26).** Whoever started the worker (the
+   app while it is open, the Host once it has quit), the worker asks the Host for the hidden desktop and
+   the app in it, so quitting the app mid-verification loses nothing. The open app only shows what the
+   Host reports: captures or a marker that an agent is driving an app out of sight. The agent browser
+   stays as it is, in the app, and still does not work with the app closed.
 
-## Still open
+## Decided since (2026-09-27)
 
-- **Who drives.** A scripted API in the agent-browser style, or a CDP endpoint the skill drives
-  directly. The agent browser's own history argues for the scripted API, because its guardrails all
-  turned out to be load-bearing: a busy tab, a stop, a bounded script.
-- **Visibility.** The agent browser shows a violet frame and a pointer while it works. The
-  equivalent for a desktop the person cannot see is undecided: a tab that mirrors `PrintWindow`
-  captures, a status pill, or nothing.
-- **Lifecycle.** The desktop object dies when its last process exits (measured). Who creates it,
-  when, and what happens to a stranded instance is undesigned.
+- **Who drives.** Decided (W3): a scripted API in the agent browser's style, `astera app js`.
+- **Visibility.** Decided (W4): a mirror tab per session, with the latest capture in a violet frame,
+  the running helper, a Stop and a Close.
+- **Lifecycle.** Decided (W5): one desktop per session, created at the first `launch()`, cleaned up
+  when the session ends, on `close()`, or after 10 minutes without a script.
 
 ## Suggested next step
 

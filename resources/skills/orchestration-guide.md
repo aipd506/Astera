@@ -1,7 +1,14 @@
 # Cross-vendor orchestration — full guide
 
-This document, which `astera help` prints, is the single source of truth for usage. Everything below
-is a runnable command line — use it as written rather than guessing.
+This document, which `astera help` prints, is the reference for the whole orchestration surface,
+including the commands that are not public, which are documented here and nowhere else. For the
+public commands only, one command's flags are also one line away with `astera <noun> <verb> --help`,
+and `docs/cli.md` is the reference for that surface and the exit codes. Everything below is a
+runnable command line, so use it as written rather than guessing.
+
+**Section 12 is for any session, not only a coordinator.** When you are asked to plan work for later,
+to check on or talk to another agent session, or to fix a missing Astera skill, the command for it is
+there: `jobs create`, `sessions`, `skills install`.
 
 `astera` is a **command** on the PATH of any session the app started. Its absolute path is in
 `$ASTERA_CLI` (section 10).
@@ -11,8 +18,8 @@ the environment variable first.** It is the same program. The variable is read t
 reads environment variables: `"$ASTERA_CLI"` in bash or zsh, `& $env:ASTERA_CLI` in PowerShell — in
 PowerShell `$ASTERA_CLI` alone is an unrelated, empty variable, so do not take it as the check. Read
 every example below with `astera` replaced that way if you need to. **Only** when the environment
-variable itself is empty does it mean this session was not started by the app, or that orchestration
-is off — in which case it has to be enabled in settings and a new session started.
+variable itself is empty does it mean this session was not started by the app — in which case a new
+session started by Astera is what gets you the command.
 
 ## 1. Six concepts
 
@@ -28,13 +35,13 @@ is off — in which case it has to be enabled in settings and a new session star
 In practice there is one Run — `task-create` and `check` use the most recent Run automatically unless
 told otherwise. `run-use --id <run>` only checks that the Run exists and returns success; it binds
 nothing to the session (the current implementation is a no-op). If you plan to keep several Runs going
-at once, pass `--run <run>` explicitly on every command (`task-create`, `task-list` and `check`
+at once, pass `--run <run>` explicitly on every command (`task-create`, `tasks list` and `check`
 accept it).
 
 **Passing `--run` on `task-create` is worth doing even with one Run of your own.** The default is
-whatever Run was created last across the whole app, so a Job someone makes in the sidebar between
-your `run-create` and your `task-create` becomes that default, and every Task you create after it
-lands in their Job. Nothing fails when this happens — the Tasks are simply somewhere else. Take the
+whatever run was started last across the whole app, so a Job someone runs from the sidebar (or a
+schedule that fires) between your `run-create` and your `task-create` becomes that default, and every
+Task you create after it lands in their run. Nothing fails when this happens — the Tasks are simply somewhere else. Take the
 id from `run-create --json` and pass it on every `task-create`.
 
 **"It does no scheduling or batching" above is true only for a Run made through the syntax this
@@ -78,11 +85,11 @@ different provider judges it.
 | `validating` | `completed` | the validation run exits `0`, and the Task has no `--review` |
 | `validating` | `reviewing` | the validation run exits `0`, and the Task has `--review` (4.2) |
 | `validating` | `failed` | the validation run exits non-zero, **on a Run with no convergence policy** — the same retry path as any other failure. On a convergence Run (section 11) a failure is never routed here directly: it reaches `blocked` (an exhausted or unopenable repair, as a Gate) or back to `dispatched` (a repair) instead, and the only way this exact edge is taken is `task-update` — never `gate-resolve mark-failed`, whose own edge is `blocked` → `failed` below |
-| `validating` | `dispatched` | **convergence Runs only** (section 11) — a check failed and the app opened a repair Dispatch on the same worker, through `openRepairDispatch`. You did nothing to cause this edge and there is nothing to do about it but wait |
+| `validating` | `dispatched` | **convergence Runs only** (section 11). A check failed and Astera (the app, or the Host while the app is closed) opened a repair Dispatch on the same worker, through `openRepairDispatch`. You did nothing to cause this edge and there is nothing to do about it but wait |
 | `validating` | `blocked` | the validation cannot run at all — a Gate opens automatically. On a convergence Run this edge also covers a paused Run, a Task with `--convergence off`, a repair the app could not start, and the repair budget running out (section 11) |
 | `reviewing` | `completed` | the reviewer reports `worker_done --outcome succeeded` |
 | `reviewing` | `failed` | the reviewer reports `worker_done --outcome failed`, **on a Run with no convergence policy** — the same retry path as any other failure. On a convergence Run (section 11) this edge is reached the same restricted way as `validating` → `failed` above |
-| `reviewing` | `dispatched` | **convergence Runs only** (section 11) — the review found a blocking issue and the app opened a repair Dispatch, through `openRepairDispatch` |
+| `reviewing` | `dispatched` | **convergence Runs only** (section 11). The review found a blocking issue and Astera opened a repair Dispatch, through `openRepairDispatch` |
 | `reviewing` | `blocked` | the review cannot run at all (no other provider has a usable account, or the reviewer dies without reporting) — a Gate opens automatically. Same convergence additions as `validating` → `blocked` above |
 | `failed` | `dispatched` | `worker-start --retry-of <dsp>` (fewer than 3 consecutive failures) |
 | `failed` | (terminal) | 3 consecutive failures — circuit break, no further retries |
@@ -135,8 +142,8 @@ Task in a Run.
   repair reads `Checks failed: <name(s)> (<ran> of <total> ran)` (or `Checks failed (<ran> of <total>
   ran)` if none are named) — never the literal words `validation passed`/`validation failed`, so do not
   match on those on a convergence Run. That convergence-branch body carries only the exit code, not the
-  output tail — read the failed check's own tail off the Task's `checks` field (`task-list --json`)
-  instead. Either way, that message is what wakes `check`, so a validated
+  output tail — read the failed check's own tail off the Task's `checks` field (`tasks list`, in
+  `data.tasks[].checks`) instead. Either way, that message is what wakes `check`, so a validated
   Task is **not** settled when `worker_done` comes back — wait for its validation message before you
   decide what to dispatch next. (A validation that cannot run at all announces itself differently again,
   and the same way on every Run regardless of convergence: as a Gate's `decision_gate` message, never a
@@ -214,14 +221,20 @@ Arguments like `--spec`, `--body`, `--question`, and `--result` **read from stdi
 value `-` (4.6). Every command already outputs JSON — the `--json` flag is accepted but makes no
 difference to the output.
 
+**`astera agent-context` prints this whole surface as JSON**, including every command below, with
+each one's flags, the protocol version and the exit code table. It needs no Host and always exits 0.
+Prefer it over this section when you want the list rather than the explanation: the command set in
+it is held to what the program actually routes, so it cannot name a command this build does not
+have. The flags in it are still written by hand, as they are here.
+
 ### 4.1 Run
 
 ```
 run-create --objective <s> [--cwd <p>]
            [--convergence [--max-fix-attempts <n>] [--max-review-rounds <n>] [--blocking-severity <high|medium>]]
            [--json]
-run-list [--json]
-run-show --id <run> [--json]
+jobs list [--json]
+jobs get --id <run> [--json]
 run-use --id <run> [--json]        # confirms existence only; binds nothing (see section 1)
 run-configs [--json]               # that Run's project's run configurations, [{ id, name, type }]
 ```
@@ -239,7 +252,7 @@ repository, pass that repository's root and open your session there.
 
 `run-configs` returns the Run's project's run configurations as `[{ id, name, type }]` — the ids
 `task-create --validate` accepts (4.2). It always reads the **most recently created** Run and takes no
-`--run` flag, unlike `task-list` and `check` (section 1). It changes no state, and unlike most commands
+`--run` flag, unlike `tasks list` and `check` (section 1). It changes no state, and unlike most commands
 here it is **not** coordinator-only — a worker may call it to see what it will be judged by before it
 starts.
 
@@ -253,18 +266,18 @@ and several commands you would otherwise reach for are refused while that is hap
 
 ```
 task-create --title <s> --spec <s|-> --account <id,…> [--run <run>] [--deps <json_array>] [--validate <configId,…>] [--review] [--json]
-task-list [--run <run>] [--status <s>] [--ready] [--brief] [--json]
+tasks list [--run <run>] [--status <s>] [--ready] [--brief] [--json]
 task-update --id <tsk> --status <s> [--result <s|->] [--json]   # bypasses the transition table — see section 8
 task-update --id <tsk> --convergence off [--json]                # stops the app's own repairs on this Task — section 11
-dispatch-show --task <tsk> [--json]        # that Task's Dispatch history as an array (retries and the app's review Dispatch included)
+dispatch-show --task <tsk> [--json]        # that Task's Dispatch history in data.dispatches (retries and the app's review Dispatch included)
 
 gate-create --task <tsk> --question <s|-> [--options <json_array>] [--json]
 gate-resolve --id <gat> --resolution <s> [--json]
-gate-list [--task <tsk>] [--status <s>] [--json]
+questions list [--task <tsk>] [--status <s>] [--json]
 ```
 
 - What the server blocks for workers is `task-create`, `task-update`, `gate-create`, and
-  `gate-resolve` (section 6, `COORDINATOR_ONLY`). `task-list`, `dispatch-show`, and `gate-list` are
+  `gate-resolve` (section 6, `COORDINATOR_ONLY`). `tasks list`, `dispatch-show`, and `questions list` are
   not rejected for workers, but a worker follows section 6 and only uses `send` and `ask`, so it never
   needs them.
 - The target flag for `task-update` is **`--id`**, not `--task` — passing `--task` yields
@@ -312,7 +325,7 @@ gate-list [--task <tsk>] [--status <s>] [--json]
   the first failure stops it** — later configurations in the list report `not-run`, not `failed`; they
   never got the chance to say either way.
 - **`--review` makes this Task's completion depend on another agent's judgement** — a value-less flag,
-  the same shape as `task-list --ready`. Omit it and nothing changes. With it, a successful report (and
+  the same shape as `tasks list --ready`. Omit it and nothing changes. With it, a successful report (and
   a passing validation, if `--validate` is also attached) moves the Task to `reviewing` instead of
   `completed` (section 2, which covers what happens next, when it is worth attaching, and what the
   reviewer sees).
@@ -353,7 +366,7 @@ accounts [--agent <claude|codex>] [--json]
   new worktree. Without it the request is rejected with `400 --name is required for --worktree new`.
   It is unused (ignored) with `--worktree current` or an explicit path.
 - **The placement rule.** Referred to elsewhere in this guide and defined here. A Run's concurrency
-  (`run-show --id <run>`, defaulting to 3) decides where its workers belong:
+  (`jobs get --id <run>`, defaulting to 3) decides where its workers belong:
   - **1 or less — sequential.** Omit `--worktree`. Every worker runs where that Run works, one after
     another.
   - **2 or more — parallel.** Pass `--worktree new --name <short-name>` so each worker gets its own
@@ -378,18 +391,23 @@ accounts [--agent <claude|codex>] [--json]
   and `worker-start` is refused the ordinary way instead (`400 dispatch already open: <id>`) — either
   way it is refused, only the message differs. Read section 11 in full before driving a convergence
   Run; this bullet is the pointer, not the reference.
+- **A Task whose Run does not exist is refused `400 unknown run for task: <id>`**, the same code `send`
+  already answers for it: a Job's definition Task has no Run of its own, and a dangling id is the other
+  way there. A Task the app or a coordinator gave you always has one.
 - `--terminal <sessionId>` reuses an existing worker session. This is the only case where a new Task
-  can be handed to the same session without `--retry-of` (see the example in section 5).
+  can be handed to the same session without `--retry-of` (see the example in section 5). The session
+  must belong to a worker of the **same Run** as the Task being started; a session of another Run is
+  refused with `403` and nothing is typed into it.
   **A Task placed into an existing session inherits that session's account chain, not its own.** The
   chain is fixed when a session starts, so a Task whose `--account` list differs from the list the
   session was started with can be moved onto an account it was never given — or have nowhere to move
   when the session was started on a single account. Per-Task account lists and `--terminal` do not
   mix: reuse a session only for Tasks that carry the same account list it was started with.
-- A successful `worker-start` responds with `{ sessionId, cwd, specPath, dispatchId }`. That is where
-  the `dispatchId` used by later commands comes from — record it.
+- A successful `worker-start` responds with `data` = `{ sessionId, cwd, specPath, dispatchId }`. That
+  is where the `dispatchId` used by later commands comes from — record it (`.data.dispatchId`).
 - **The app does not close a Dispatch that has been `worker-retain`ed.** After that, `worker-stop` is
   rejected with **409 `dispatch is retained`** (and the state does not change), and `worker-release`
-  returns 200 but with **`"skipped": "retained"`** in the response — meaning the session is still
+  returns 200 but with **`"skipped": "retained"`** in `data` — meaning the session is still
   alive. **There is no command that undoes retention.** If that session really has to end, the user
   must close the tab themselves (at which point the app closes the Dispatch); to give up only the
   tracking, use `worker-abandon`. Mistaking a live session for a dead one and starting a new worker in
@@ -398,7 +416,7 @@ accounts [--agent <claude|codex>] [--json]
 - **On a convergence Run, `worker-release` refuses a Dispatch whose Task is still converging** —
   `409 task <tsk> is still converging — release after it completes`. Section 11 has the exact
   condition; do not read a 409 here as "retry the release," read it as "wait."
-- `accounts` returns `{ id, label, provider }[]`. **Looking the accounts up first and then choosing
+- `accounts` returns `data.accounts`, a list of `{ id, label, provider }`. **Looking the accounts up first and then choosing
   `--account`** is the core of what this app adds to orchestration — never guess, always confirm a
   real id with `accounts` before passing it to `worker-start`. **Usage and remaining quota are not
   included** — they cannot be known at lookup time. Quota only becomes known through a failed
@@ -432,8 +450,12 @@ help [--skills-dir <p>]
   its own Dispatch.
 - `ask --resume <questionId>` keeps waiting on that question id alone, with no `--task-id`,
   `--dispatch-id`, or `--question` (section 8).
-- `help` takes no arguments. It works without a server connection (`ASTERA_INFO`), but `ASTERA_SKILLS`
-  (or `--skills-dir`) must be present for it to find this document.
+- **`reply --id` names a `question` message, not any message.** An id that does not exist is `404`; an
+  id that exists but is not a `question` (a `status`, a `worker_done`, and so on) is `400 not a
+  question: <id>`. Only a `question` can be replied to.
+- `help` takes no arguments. It works with no Host running. It reads this document from
+  `--skills-dir` when given, else from `ASTERA_SKILLS`, else from the `resources/skills` folder of
+  the Astera build the command belongs to, so it also works in a shell Astera did not start.
 
 ### 4.5 Recovery (coordinator only)
 
@@ -465,20 +487,236 @@ EOF
 Do not pass long text directly as a command-line argument — quoting and special characters break
 differently from shell to shell.
 
-### 4.7 Exit codes
+### 4.7 What comes back
+
+**Every reply is an envelope.** One line of JSON, always one of these two shapes:
+
+```json
+{"ok":true,"data":{ … }}
+{"ok":false,"error":{"code":"NOT_FOUND","message":"unknown run: run_x","details":{},"nextSteps":["astera runs list"]}}
+```
+
+**Everything this guide describes lives inside `data`.** Where a section says a command "responds
+with `{sessionId, cwd, …}`", that object is `data`. Read `.data.sessionId`, not `.sessionId`.
+
+**A list arrives under a name, not as a bare array.** The name is the noun:
+
+| Command | Where the list is |
+|---|---|
+| `tasks list` | `data.tasks` |
+| `questions list` | `data.questions` |
+| `dispatch-show` | `data.dispatches` |
+| `inbox` | `data.messages` |
+| `run-configs` | `data.configs` |
+| `accounts` | `data.accounts` |
+| `jobs list` / `runs list` / `projects list` | `data.jobs` / `data.runs` / `data.projects` |
+| `accounts list` / `run-configs list` / `sessions list` | `data.accounts` / `data.runConfigs` / `data.sessions` |
+| `skills list` / `skills install` | `data.accounts`, each with its `skills` |
+
+Anything else that returns a list gives `data.items`. A bare top-level array can never grow a field
+without breaking every reader, which is why there are none.
+
+`error.code` is for branching and `error.message` is for a person. The codes are the closed set in
+the table below.
+
+**`error.nextSteps` is for you.** It is always present, and its entries are command lines to run
+rather than sentences to interpret. The steps depend on the command as well as the code, so a `4`
+from `worker-show` offers `astera tasks list` then `astera dispatch-show --task <taskId>`, while a
+`4` from `task-update` offers `astera tasks list` alone. Every step is one your session is allowed
+to call: a `4` from `ask`, which a worker reaches, never suggests a coordinator-only command.
+
+Where an id is already in `details` it is filled in, so the line can be run as it stands. A
+placeholder still in angle brackets is one you supply. **Two lines can mean two different things**,
+and the shape of the failure says which: where the second line needs a value the first produces, as
+with `tasks list` before `dispatch-show --task`, run them in order; where they are alternatives, as
+with the `8` that offers both `questions answer` and `runs resume`, `error.details.state` says which
+one applies. An empty list means there is no one command that is right for this failure. Read
+`message` and decide.
+
+### 4.8 Exit codes
 
 The exit code of `astera` is the only sound basis for deciding success or failure from `$?` in a
-shell:
+shell. Each `error.code` maps to exactly one of these:
 
-| Exit code | Meaning |
-|---|---|
-| `0` | The server responded 2xx |
-| `1` | The server responded with a non-2xx status (400/403/404/409/500, …) |
-| `2` | Argument parsing itself failed (e.g. an unknown flag) — the request never reached the server |
+| Exit code | `error.code` | Meaning |
+|---|---|---|
+| `0` | — | The command succeeded (`ok: true`) |
+| `1` | `FAILED` | Something failed that none of the codes below describes |
+| `2` | `INVALID_ARGUMENTS` | The parser refused, or the Host rejected the arguments (400) |
+| `3` | `HOST_NOT_RUNNING` | The Host could not be reached, and this command is not one the state file can answer |
+| `4` | `NOT_FOUND` | No such id (404) |
+| `5` | `PERMISSION_DENIED` | Refused for this session (403) — e.g. a worker calling a coordinator command |
+| `6` | `CONFLICT` | Rejected because of current state (409) — e.g. a Task that already has an open Dispatch |
+| `7` | `TIMEOUT` | A deadline elapsed — this client's own, or the Host's `wait`, or a Host that is running and not answering |
+| `8` | `WAITING_FOR_INPUT` | A `wait` stopped because a person is needed — a question is open, or the run is paused (see below) |
+| `9` | `VERSION_MISMATCH` | The Host does not have that command — the CLI and the Host are different builds |
+| `10` | `RUN_FAILED` | A Job or run finished in failure |
 
-**A timeout response from `check --wait` or `ask` is also HTTP 200, so the exit code is `0`.** What
+**`wait` is the only place `ok` reports the outcome rather than the call.** `jobs wait` and
+`runs wait` hold one request open until the run ends, and the ending decides the exit code: `0`
+finished well, `10` finished in failure, `8` stopped for a person, `7` the deadline passed. The
+default deadline is an hour; `--timeout-ms` changes it. A `7` is not a failure of the Job — it is
+this command giving up on waiting, and `error.details.progress` says how far it had got.
+
+`8` (`WAITING_FOR_INPUT`) is what `jobs wait` and `runs wait` answer when a question is open **or**
+the run is paused — both mean nothing moves until a person acts. `error.details.state` says which,
+and for a question `details.questionId` is the one to answer.
+
+**`3` and `4` are different questions.** `3` means the orchestrator is not reachable at all; `4` means it is there
+and does not know that id. Do not retry a `4`.
+
+**`3` and `7` are the two that mean "I do not know".** Every other code is a decision: the command
+ran and this is what happened. These two say only that no answer came back — the connection dropped,
+or the deadline passed with the Host still there — and the Host commits before it answers, so the
+command may well have run. Do not read either as "it failed, do it again". Section 4.10 is what to
+do instead, and the error itself carries the two commands to run.
+
+**`9` is not your mistake.** It means the `astera` on the PATH and the running app came from
+different builds. Report it rather than working around it.
+
+**A timeout response from `check --wait` or `ask` is a success, so the exit code is `0`.** What
 sections 5 and 6 say about "a timeout is not a failure" is carried directly by this rule — do not
-treat a timeout as an error based on `$?`; check the `timedOut` field in the response body.
+treat a timeout as an error based on `$?`; read `data.timedOut`.
+
+**A timed-out `ask` carries its own recovery in `data.nextSteps`.** That is the same kind of list as
+`error.nextSteps` above — command lines to run, not advice — and for this answer it holds exactly one
+line, the one that waits again on the question you already asked:
+
+```json
+{"ok":true,"data":{"answered":false,"timedOut":true,"questionId":"msg_ab12cd34",
+                   "nextSteps":["astera ask --resume msg_ab12cd34"]}}
+```
+
+Run that line. Do not ask again: the question is still open and still in front of the same person, so
+a second one is answered once and waited on twice (section 6).
+
+**When the id is not there, the list is empty and `data.cannotResume` says why**, rather than handing
+you a line you cannot run:
+
+> the answer did not name the question, so this wait cannot be resumed safely; the question may still
+> be pending, so do not ask again
+
+**A `7` from `ask` is a different ending and says a different thing.** There the Host never answered
+at all, so nothing came back to be missing an id — and this CLI cannot tell from the reply whether
+your question was ever created. **The request id can**, and the message says so:
+
+> no answer came back at all, so this wait cannot be resumed from here — but this call carried a
+> request id, and `astera requests show --id <id>` says whether the question was created and what its
+> id is. Run that before asking again: asking again risks a second question in front of the same
+> person
+
+Read the two apart. The first says a question exists and cannot be named; the second says the reply
+told you nothing and the receipt is where to look. **One first move either way: do not ask again.**
+Run the command in that message (4.10 is the whole of it); a `completed` receipt hands you the
+`questionId` to `--resume`, and only an `absent` leaves you with nothing to resume — that is when to
+tell your coordinator with `send --type escalation`. A `7` from `ask` that *was* a `--resume` carries
+the id it was given, so its `nextSteps` already has the line to run.
+
+### 4.9 While you wait
+
+`ask`, `check --wait`, `jobs wait` and `runs wait` hold one request open for minutes at a time. While
+they do, a line goes to **stderr** every 15 seconds:
+
+```text
+astera: waiting for ask, 45s so far; the Host answered 5s ago
+```
+
+It is there because a long silence and a wedged Host look identical from outside. The tail of the
+line is the answer to that: the command asks the Host for a heartbeat while it waits and reports how
+long ago it last answered. Past 15 seconds of silence the line says that instead, and then what you
+are looking at is probably not a wait any more (`astera host status`).
+
+**stdout is untouched** — it carries the one result, so nothing has to be filtered out of it.
+`--no-keepalive` turns the lines off.
+
+### 4.10 When you do not know whether it landed
+
+Exit `3` and exit `7` are the two endings where no answer came back (4.8). The Host commits before it
+answers, so between the work happening and the reply reaching you there is a window in which the
+command ran and you were told nothing. A `worker-start` sent twice across that window is two agents
+in one worktree.
+
+**Every command carries a request id, whether or not you passed one.** When one of those two endings
+happens, the error hands you that id and the two commands to run:
+
+```json
+{"ok":false,"error":{"code":"HOST_NOT_RUNNING",
+  "message":"the Host closed the connection before answering worker-start",
+  "details":{"requestId":"d9cea50f-d589-4cd8-8132-d1ab5e3fbfbf",
+             "queryCommand":"astera requests show --id d9cea50f-d589-4cd8-8132-d1ab5e3fbfbf",
+             "retryCommand":"astera worker-start --task tsk_9f2b --agent codex --account acc1 --worktree current --request-id d9cea50f-d589-4cd8-8132-d1ab5e3fbfbf"},
+  "nextSteps":["astera host start","astera requests show --id d9cea50f-d589-4cd8-8132-d1ab5e3fbfbf"]}}
+```
+
+**Follow `nextSteps` in the order it gives them.** For a `7` the receipt question comes first, because
+the Host is there and can answer it. For a `3` it comes second, behind `astera host start`, and that
+order is deliberate: with no Host reachable, `requests show` is a second `3` and tells you nothing.
+
+`retryCommand` is the line you ran with that id on it, for after you know. It is POSIX shell syntax —
+bash, zsh and Git Bash; PowerShell reads the same quotes apart from a value containing a single quote
+of its own, and `cmd.exe` does not read single quotes at all, so requote there. Nothing in it is left
+where a shell would expand it, so pasting it cannot run anything but `astera`.
+
+**A command that read part of itself from standard input gets `retryNote` instead of
+`retryCommand`**, because there is no line to print: the payload was never on the command line, so a
+printed line would carry a bare `-` and send an empty body. The note names the flags that read stdin
+and the id to pass. Run what you ran, with `--request-id <that id>`, feeding the same text in the same
+way. `queryCommand` is there either way.
+
+**`astera requests show --id <id>` has three answers and all three exit `0`**, because not finding a
+receipt is an answer rather than a failure. `data.interpretation` is the runtime's own sentence for
+the one you got, and it is worth reading rather than deriving:
+
+> **`completed`** — Request `<requestId>` already took effect (`<command>`). The recorded response is
+> what this Host answered the first time. Treat it exactly as if you had received it then: the ids in
+> it name things that exist. Do not send the command again.
+
+`data.response` carries that answer whole, status and body, including an error body when what the
+Host recorded was a failure.
+
+> **`pending`** — Request `<requestId>` is running on this Host right now (`<command>`). Nothing is
+> lost and nothing is decided: wait and ask again. Do not send the command again, because a second
+> attempt while this one is in flight is refused with exit 6.
+
+> **`absent`** — This Host holds no receipt for request `<requestId>` under your caller identity, and
+> that is not proof that nothing happened. There are four ways to see it and only one of them means
+> nothing happened: the request never reached a Host, and retrying is correct; it reached a Host that
+> has since restarted, which comparing `hostStartedAt` with the time you sent it will tell you; you
+> are asking under a different session than the one that sent it; or the command changed nothing, so
+> there was nothing to record and retrying gets the same answer. Before retrying, look at the state
+> rather than at the receipt, because the state is the only record that survives everything.
+
+**That last sentence is the discipline.** Receipts live in the Host's memory and die with it, so
+`absent` is the one answer that decides nothing. Look at the state instead: does the run exist
+(`astera runs list --job <j>`), is the dispatch open (`astera dispatch-show --task <t>`), is the
+question already answered (`astera questions get --id <q>`). With no Host running at all,
+`requests show` is exit `3` like any other command that needs one, and for the same reason: there is
+no receipt to have.
+
+**Retrying is presenting the same id again.** `--request-id <id>` on any command says that this call
+and the earlier one are one request. A command that already took effect is not done twice: the Host
+replays what it answered the first time, the reply carries `"replayed": true` beside `"ok"`, and the
+exit code is the original answer's — so a replayed `4` is still a `4`.
+
+**`"observed": true` is a different word for a different thing.** `ask` and `check --ack <id> --wait`
+commit and then wait, and a recorded timeout from one of them is not a fact about the world — it is
+how long some earlier call waited. Handing that back would answer instantly out of somebody else's
+stopwatch and leave you looping. So those two are not replayed from the record: the commit is not
+repeated (no second question, no second ack), the command runs again, and the body is what is true
+now. **Read an `observed` body as a first answer**, because it is one: a fresh `check` can hand you a
+delivery, with a new `deliveryId` to ack, that nobody has seen.
+
+**One id names one call.** Present the same id with a different command or different arguments and it
+is refused with `2`, naming the command the id was first used for, rather than being answered with
+somebody else's result. Changing only `--timeout-ms` is the same call: asking for more patience does
+not change what you asked for.
+
+**`--resume` and the request id are for two different things.** A `check --wait` or `ask` that times
+out is a success (4.8) and tells you so; `ask --resume <questionId>` continues that wait, and its
+`data.nextSteps` hands you the line. The request id is for the other case: **no answer came back at
+all**, so you have no `questionId` and cannot tell whether the question was even created. Present the
+id instead — no second question is created, and the reply says whether the answer has since arrived.
+A timeout you expected is `--resume`; an answer you lost is the key.
 
 ## 5. The Delivery contract of `check`
 
@@ -487,15 +725,19 @@ treat a timeout as an error based on `$?`; check the `timedOut` field in the res
   the same batch back with no messages lost.
 - **Ack only after handling every message in the batch.** Acking after reading only part of it loses
   the rest for good (replay is per batch, not per message).
+- **`--ack <deliveryId>` naming a batch that is not there** (already acked, or never issued) is refused
+  `404`, and the body carries `runId`, the Run it was checked against, so call `check --run <runId>`
+  next: it hands back whatever batch is still unacknowledged, with its current `deliveryId`, so you are
+  not guessing which one to ack.
 - `--types <t,…>` **only decides when a new batch gets created** — the batch that comes back is always
   every undelivered message. And **if an unacknowledged batch already exists, it is returned as-is
   regardless of `--types`** — you have to work through the backlog before the next `--types` filter
   means anything.
-- A timeout from `check --wait` (`{count:0, messages:[], timedOut:true}`) or an immediate
+- A timeout from `check --wait` (`data` = `{count:0, messages:[], timedOut:true}`) or an immediate
   `{count:0, messages:[]}` is **a checkpoint, not a worker failure.** Real coding work takes 15–60
   minutes. Keep waiting — just call `check --wait` again — unless you receive `worker_done` or
   `escalation`, the session is gone (confirm with `worker-show`), or the user tells you to stop. A
-  timeout response also exits `0` (4.7), so do not misread `$?` as failure.
+  timeout response also exits `0` (4.8), so do not misread `$?` as failure.
 
 ## 6. Worker obligations
 
@@ -524,13 +766,24 @@ server blocks `check` and `inbox` as coordinator-only (403).
   ```bash
   astera ask --task-id <tsk> --dispatch-id <dsp> --question - --options "choice1,choice2" --json
   ```
-  On `{"answered":true,"answer":"…"}`, proceed accordingly.
+  On `data` = `{"answered":true,"answer":"…"}`, proceed accordingly.
 - **If `ask` times out, do not ask again — keep waiting with `--resume`.** The question stays pending,
-  and re-asking is rejected (one unanswered question per Dispatch):
+  and re-asking is rejected (one unanswered question per Dispatch). The answer hands you the line to
+  run, so take it from there rather than assembling one:
   ```bash
-  astera ask --resume <questionId> --json
+  answer=$(astera ask --task-id <tsk> --question - --json < q.txt)
+  echo "$answer" | jq -r '.data.nextSteps[]'   # astera ask --resume msg_ab12cd34
+  astera ask --resume msg_ab12cd34 --json      # and again, as many times as it takes
   ```
-  Repeat as many times as needed.
+  A timeout is not a failure — nothing about the question changed, only this call gave up waiting on
+  it. If `data.nextSteps` is empty, `data.cannotResume` says why (section 4.8); guessing an id from
+  there waits on somebody else's question.
+- **A worker's `ask --resume <id>` only ever reaches its own dispatch's question.** An id that does not
+  exist and an id that belongs to another dispatch come back the same way, `403 cannot resume a question
+  for another dispatch`, before the message's type is even looked at; the answer does not say which one
+  it was, so guessing at the id from the reply tells you nothing. Only an id that is your own dispatch's
+  and is not a `question` still comes back `400 not a question: <id>`. A coordinator or a shell calling
+  `--resume` keeps the plain `404`/`400` split instead.
 - **When ownership is still valid and the coordinator should step in but it is not blocking, use
   `escalation`** (non-blocking):
   ```bash
@@ -539,9 +792,11 @@ server blocks `check` and `inbox` as coordinator-only (403).
 - **A report the app cannot take is written down, not lost.** The app can be closed while a worker
   the Host keeps running finishes its Task. When the server cannot be reached at all, `worker_done`
   and `escalation` — and only those two — are appended to a queue in the app's profile, and the
-  answer is `{"queued":true,"applied":false,"path":"…"}` with exit code `0`. Read both halves: the
-  report is safe and the app applies it at the next start that has orchestration on, and nothing in
-  the Job has moved yet. Do not send it again and do not read it as the work having failed. Every
+  answer is `ok: true` with `data` = `{"queued":true,"applied":false,"path":"…"}` and exit code `0`.
+  **`ok` there means the command ran, not that the report arrived** — `applied: false` is the half
+  that says it did not. Read both halves: the
+  report is safe. The Host applies it the next time it starts, with the app open or closed (with an
+  older Host, the app applies it the next time it starts). Nothing in the Job has moved yet. Do not send it again and do not read it as the work having failed. Every
   other command still fails the way it always did — a file cannot answer an `ask`. A report the
   server would reject anyway (no `--outcome`, no `--task-id`, no `--dispatch-id`) is not queued: it
   fails as it always has, so fix it and send it again.
@@ -671,10 +926,11 @@ meaningless and repeats the same failure indefinitely.
 
 ## 9. Do not — summary
 
-- Do not conclude a worker failed from a `check --wait` timeout or `{count:0}` (section 5).
+- Do not conclude a worker failed from a `check --wait` timeout or `data.count === 0` (section 5).
 - Do not kill a worker over heartbeats, terminal activity, or an idle TUI (section 7).
 - Do not try to move state by hand after `worker_done` (section 8).
-- If `ask` times out, do not re-ask — keep waiting with `--resume <questionId>` (section 6).
+- If `ask` times out, do not re-ask — run the line the answer hands you in `data.nextSteps`, which is
+  `--resume <questionId>` (sections 4.8 and 6).
 - `worker-start --retry-of` does not inherit placement — pass `--worktree`, `--agent`, and `--account`
   again (4.3).
 - Do not try to call `check` or `inbox` from a worker session — they are rejected. Use only `send` and
@@ -694,15 +950,27 @@ meaningless and repeats the same failure indefinitely.
   refused — and do not `task-update` it either, even though that one is not refused (section 11).
 - Do not resolve a `convergence-exhausted` Gate yourself — `retry-once`/`mark-failed` is a person's call
   (section 11).
+- Do not `sessions send` without a `sessions read` right before it. The text answers whatever prompt
+  the other session shows, a folder-trust or first-run screen included (12.3).
+- Do not send anything again after exit `3` or `7`. Follow `nextSteps` in its order (4.10): after a
+  `7` that is `requests show`, after a `3` it is `astera host start` first, then `requests show`.
 
 ## 10. Environment variables
 
 | Variable | Value | Applies to |
 |---|---|---|
 | `ASTERA_CLI` | Absolute path to the CLI executable. Its directory is prepended to this session's PATH, so `astera` works too | Orchestrator and workers alike |
-| `ASTERA_INFO` | Absolute path to the connection info JSON (`{port, token}`) | Everyone (except `help`, which does not need it) |
+| `ASTERA_PROFILE_DIR` | Absolute path to the Astera profile folder this app is running on. `astera` derives the Host's address from it, and writes a report it could not deliver into that profile's queue | Everyone (except `help`, which needs no Host) |
 | `ASTERA_SESSION` | This session's app session id — the caller's identity | Everyone |
 | `ASTERA_SKILLS` | Absolute path to the directory holding this document | Everyone (`help` reads it from there) |
+
+**Two more variables exist, and neither is set for you.** `ASTERA_HOST` points `astera` at one
+specific Host by address; it overrides the address derived from `ASTERA_PROFILE_DIR` and **nothing
+else** — the state file and the report queue still come from the profile. `ASTERA_PROFILE=dev`
+selects the development profile when neither of the other two is set. So the order is: the profile is
+`ASTERA_PROFILE_DIR` if set, otherwise the platform's folder for `ASTERA_PROFILE`'s app name; and the
+address is `ASTERA_HOST` if set, otherwise the one derived from that profile. Inside a session the app
+sets `ASTERA_PROFILE_DIR` and you should not override any of the three.
 
 **Only this session's PATH is modified** — the app does not touch the user or system PATH. So a shell
 the app did not start has no `astera`, and even if it did, it owns no Dispatch and can do nothing as a
@@ -712,8 +980,8 @@ single extension-less `astera` file. Calling `astera` works from any shell, and 
 the path in the `ASTERA_CLI` environment variable always does — `"$ASTERA_CLI"` in bash or zsh,
 `& $env:ASTERA_CLI` in PowerShell.
 
-An empty `ASTERA_CLI` means this session was not started by the app, or orchestration is off — enable
-it in settings and start a new session. Use this value too whenever a script needs the absolute path.
+An empty `ASTERA_CLI` means this session was not started by the app — start one from Astera. Use this
+value too whenever a script needs the absolute path.
 
 **Stub installation**: at server startup the app installs the stub into **both claude and codex**
 accounts at `<configDir>/skills/astera-orchestration/SKILL.md`. `AGENTS.md` is a user file and is left
@@ -730,12 +998,13 @@ a Task with neither `--validate` nor `--review` is unaffected too: convergence o
 happens when a check or a review fails.
 
 **What it means.** On a convergence Run, a Task with `--validate` and/or `--review` does not settle
-its own failure — the app does. When a check fails, or a review finds a blocking issue, the app sends
-the failure back to the **same worker session** as a new section of its spec file and reruns the
-Task's checks; a `worker-start --retry-of` from you never happens for this Task. You see this as a
-`status` message whose body says `repair <k> of <maxFixAttempts>` — that is the app working, not a
-report going missing. **Do not start a worker for a converging Task, and do not try to retry it
-yourself** — there is nothing for you to retry; wait for the next message.
+its own failure. Astera does, the app or, while the app is closed, the Host. When a check fails, or a
+review finds a blocking issue, Astera sends the failure back to the **same worker session** as a new
+section of its spec file and reruns the Task's checks; a `worker-start --retry-of` from you never
+happens for this Task. You see this as a `status` message whose body says
+`repair <k> of <maxFixAttempts>`. That is Astera working, not a report going missing.
+**Do not start a worker for a converging Task, and do not try to retry it yourself.** There is
+nothing for you to retry; wait for the next message.
 
 **Turning it on.**
 ```
@@ -750,7 +1019,7 @@ run-create --objective <s> --convergence [--max-fix-attempts <n>] [--max-review-
   "I configured it" when nothing was configured.
 - It cannot be turned on for a Run that already exists, and there is no `run-update` for it — decide at
   `run-create` time.
-- `run-show --id <run> --json` echoes the policy back as `.convergence` (absent means off) if you need
+- `jobs get --id <run> --json` echoes the policy back as `.convergence` (absent means off) if you need
   to check what a Run you did not create was given.
 
 **What ends a repair loop.** Two ways, and only one of them is yours to act on:
@@ -761,7 +1030,7 @@ run-create --objective <s> --convergence [--max-fix-attempts <n>] [--max-review-
   order is unchanged). Nothing further needed.
 - **It exhausts its budget.** More than `--max-fix-attempts` consecutive check failures, or more than
   `--max-review-rounds` review rounds. This opens a Gate with `kind: "convergence-exhausted"` and
-  `options: ["retry-once", "mark-failed"]` on `gate-list`/`gate-create`'s response shape — **read the
+  `options: ["retry-once", "mark-failed"]` on `questions list`/`gate-create`'s response shape — **read the
   `kind` and `options` fields, not the Gate's `question` text**, which is written in whatever language
   the app is set to. **This is a person's decision, not yours.** `retry-once` opens exactly one more
   repair outside the normal budget; `mark-failed` moves the Task to `failed` the way `task-update`
@@ -808,3 +1077,149 @@ each result is unambiguous.
 **`--validate`'s comma list (4.2) is what convergence repairs run against.** The list runs in the order
 given, in every Run, and the first failure stops it; on a convergence Run that first failure is what
 gets sent back to the worker, named by its configuration's `name` — the ones after it never ran.
+
+## 12. The public commands an agent uses
+
+Everything above is what a coordinator and its workers use inside one Run. `astera` also has a public
+surface, the one `docs/cli.md` describes, and a few of its commands are for you as well. They reach
+what lies outside the Run you were handed, or outside any Run: a Job a person will start later,
+another agent session, the skills installed in an account. **They are not a second way to drive your
+own Run.**
+
+| When you need to | Use | Not |
+|---|---|---|
+| plan work that a person, not you, starts later | `jobs create`, then `tasks add --job` | `run-create`, whose Run is yours to drive now |
+| know which accounts exist, before `tasks add --account` or `--coordinator-account` | `accounts list` | a guessed id |
+| know the ids `tasks add --validate` takes | `run-configs list --job <jobId>` | `run-configs`, which reads the latest run's project |
+| see what another agent session is doing, or give it one short message | `sessions list`, `sessions read`, then `sessions send` | `worker-read` and `worker-start --terminal`, which are for your own Dispatches |
+| find out why an Astera skill is missing, and put it back | `skills list`, `skills install` | copying a `SKILL.md` by hand |
+| learn whether a call whose answer you lost took effect | `requests show` | sending it again |
+
+`astera <noun> <verb> --help` prints one command's flags, and it needs no Host.
+
+### 12.1 When not to use them
+
+- **A coordinator inside its Run keeps using section 4.** `task-create --run`, `worker-start`,
+  `check`, `worker-show`, `worker-read` and the rest. `tasks add --run <run>` reaches the same Run, but
+  it adds nothing a coordinator needs, and one vocabulary per Run is easier to read back.
+- **A Run someone laid out in the app gets no new Tasks from `tasks add` either** (section 1). Raise a
+  plan you think is wrong with `gate-create`.
+- **A worker uses none of this except `requests show`**, which answers a worker's own lost `send` or
+  `ask` the same way (4.10). `jobs create` and `tasks add` go through `run-create` and
+  `task-create`, so a worker is refused them with exit `5`, the same boundary as section 6. A worker
+  talks to its coordinator with `send` and `ask`, never by typing into a session.
+- **Do not type into your own workers.** A worker's next instruction is a Task, given with
+  `worker-start --terminal <sessionId>` (section 8). Text typed with `sessions send` is outside every
+  Dispatch: no Task records it and no `worker_done` answers it.
+- **Do not type into your own session.** `$ASTERA_SESSION` is your own id, and `sessions list` lists
+  you too. Text sent there arrives as input to you.
+- **Do not create a Job for work you are about to do yourself**, and do not start one someone asked
+  you only to plan. `jobs create` runs nothing; starting it is the person's call, and it spends their
+  quota.
+- **Do not reach for `skills install` to switch a skill on.** It installs what the app's settings
+  already enable and nothing else. A skill whose setting is off comes back in `data.notEnabled`
+  with the setting that turns it on: tell the person, and let them decide.
+
+### 12.2 Planning work for later: `jobs create` and `tasks add --job`
+
+```bash
+# 1) Which accounts exist. The account rules of 4.2 apply here unchanged: ask when it is not clear
+astera accounts list --json
+
+# 2) The plan. Nothing runs; it comes back marked pendingStart with no run. Its id is .data.id
+astera jobs create --objective "migrate the payment module" --cwd "/abs/path/to/repo" --json
+
+# 3) The ids --validate takes, if a Task's result can be checked by running something (section 2)
+astera run-configs list --job job_4f2a --json
+
+# 4) Its Tasks. Each comes back with its own id in .data.id; --deps takes those ids
+astera tasks add --job job_4f2a --account acc_main --title "move the types" --spec - --json <<'EOF'
+Move the payment types into src/payments/types.ts. ...
+EOF
+astera tasks add --job job_4f2a --account acc_main --title "add tests" --spec - --deps '["tsk_1a2b3c4d"]' --validate <configId> --json <<'EOF'
+Once the types have moved, add regression tests. ...
+EOF
+```
+
+- **Pass `--cwd` with the repository root**, for the same two reasons as section 4.1: it decides
+  where the workers run and which window's Jobs sidebar shows the Job.
+- **`tasks add` takes exactly one of `--job` or `--run`**, with no default. A Job id given to `--run`,
+  or a run id given to `--job`, is a `4`, never quietly the other kind.
+- **Then say what you made.** The person sees the Job in the Jobs sidebar, waiting to be run, and
+  starts it there. `jobs run --id <jobId>` starts it from here, and is theirs to ask for.
+
+### 12.3 Another session: `sessions list`, `sessions read`, `sessions send`
+
+```bash
+astera sessions list --json
+astera sessions read --id <sessionId> --json
+astera sessions send --id <sessionId> --text "Please rebase on develop before you push." --request-id <an-id-you-choose> --json
+```
+
+`sessions list` gives each session's `id`, `kind` (`terminal` or `chat`), `title`, `accountId`,
+`cwd`, `alive` and `state`. `state` is `working`, `waiting` or `unknown`, and `waiting` only says
+that the session stopped at a prompt: it does not say which prompt.
+
+**`sessions send` types into whatever the other session is showing.** The text and the Enter answer
+the prompt on the screen, whatever it is. **Read the screen with `sessions read` right before every
+send**, and send only when it shows the agent's own input prompt. These were measured on a real
+Claude Code session:
+
+- **In a folder it has not seen, Claude Code first asks whether to trust the folder, and the answer
+  under the cursor is "No, exit".** Text and Enter there end the session.
+- **On Claude Code's first-run theme picker, a digit picks a theme and the Enter after it takes the
+  next screen's default, which starts a login** and tries to open a browser to sign in.
+- **At a permission prompt, your text is the answer to the permission.**
+
+If the screen shows any of these, do not send. Tell the person what the session is waiting on. A
+send into a terminal session at a permission prompt or a question is refused with 6 anyway, before
+anything is typed, and the message names the `sessions read` to run.
+
+**Keep what you send short.** Measured on the same Claude Code session: a one-line send is submitted,
+and `state` goes from `unknown` to `working` to `waiting` as that turn runs; text with a line break in
+it is submitted as one message, not split. A long text (about 2,000 characters) is submitted too, but
+Claude reads text typed that way as pasted content, and it hedged on an instruction inside it as
+something it had not been told directly. So when the other session needs a lot of context, write it
+to a file and send one short line that names the file.
+
+**A chat session takes a send as one turn.** With Astera open, a chat session that is waiting on an
+approval or a question card refuses the send with exit `6` and names the card; `sessions send` does
+not answer cards, and nothing was sent. **With Astera closed you cannot see a card**: `sessions read`
+has no `pending` then, and the send is not refused. Your turn waits behind the card in the agent and
+runs once someone answers it in Astera, so "sent" does not mean the other session has read it yet. A
+session that has ended is a `6` as well.
+
+**Pass `--request-id` on every send, with an id you choose.** A retry with the same id is replayed:
+the Host answers what it answered the first time and types nothing a second time.
+
+**Exit `3` and exit `7` mean "I do not know whether it was typed", not "it failed".** Do not send
+again. Follow `nextSteps` in the order it gives them (4.10): after a `7` that is the receipt, after a
+`3` it is `astera host start` first, because with no Host the receipt question is a second `3`:
+
+```bash
+astera requests show --id <requestId> --json
+```
+
+A `completed` receipt is the answer the send got, and that answer can be a recorded refusal: read
+`data.response`, which holds the Host's `status` and `body`. Only a `2xx` status whose body has
+`"sent": true` means it was typed; a `409` is a refusal, and nothing was sent. A `pending` one means
+it is being typed right now: ask again in a moment. After an `absent`, read the screen before you
+decide anything, because the screen is then the only record of whether the text arrived.
+
+### 12.4 A missing skill: `skills list` and `skills install`
+
+```bash
+astera skills list --json
+astera skills install --json
+```
+
+- **Use them when a skill the person expects is not there**, for example `/astera-browser` not
+  found, or right after an account was added: a new account gets no skills until the app restarts.
+- `skills list` changes nothing. Per account it gives each skill's `enabled` (whether its setting is
+  on) and `installed` (`current`, `stale`, `missing` or `not-ours`).
+- `skills install` writes only what the settings enable, and leaves a file Astera did not write
+  exactly as it is (`skipped-not-ours`). Any `failed` makes it exit `1`.
+- **A session that is already open never sees a skill installed after it started**, and that includes
+  yours. Say so, and suggest a new session.
+- Both answer from the profile's files, with no Host and no app. They refuse `--request-id` with exit
+  `2`; running `skills install` twice is safe anyway, because the second run writes nothing.

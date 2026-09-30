@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { readPendingReports, applyPendingReports, MAX_APPLY_ATTEMPTS } from './pendingDrain'
+import { readPendingReports, applyPendingReports, MAX_APPLY_ATTEMPTS } from '../../core/orchestration/pendingDrain'
 import {
   pendingReportFileName,
   pendingReportTempName,
@@ -11,7 +11,7 @@ import {
   serializePendingReport,
   type PendingReport
 } from '../../core/orchestration/pendingReports'
-import { OrchestrationStore } from './store'
+import { OrchestrationStore } from '../../core/orchestration/store'
 import {
   applyWorkerDone,
   emptyState,
@@ -19,6 +19,7 @@ import {
   type OrchState
 } from '../../core/orchestration/state'
 import { candidates } from '../recovery/reconciler'
+import { handleCommand, type OrchServerDeps } from '../../core/orchestration/command'
 
 let dir: string
 beforeEach(async () => {
@@ -180,6 +181,36 @@ describe('applyPendingReports', () => {
     expect(await files()).toEqual([])
     // The rejection is the only record left of what that worker said, so it has to carry it.
     expect(said.join(' ')).toContain('unknown dispatch: dsp_gone')
+  })
+
+  // `send` answers a report for a Dispatch that is gone with 404 now, not 400. The wiring in ipc.ts
+  // reads any non-2xx as a refusal; a 404 is as permanent as a 400, so the file must still go rather
+  // than be kept for a retry that would get the same answer at every start.
+  it('clears a report handleCommand answers 404 — a vanished Dispatch is a refusal, not a retry', async () => {
+    await queue({ at: '2026-09-10T01:00:00.000Z', nonce: 'aaaaaaaa', dispatchId: 'dsp_gone' })
+    let state = emptyState()
+    const deps = {
+      getState: () => state,
+      setState: async (next: OrchState) => {
+        state = next
+      },
+      now: () => '2026-09-10T03:00:00.000Z'
+    } as unknown as OrchServerDeps
+    const statuses: number[] = []
+    const r = await applyPendingReports({
+      queued: await readPendingReports({ dir, log: () => {} }),
+      // The same rule as the wiring's `apply` in ipc.ts
+      apply: async (rep) => {
+        const reply = await handleCommand(deps, { sessionId: rep.sessionId }, rep.cmd, rep.args)
+        statuses.push(reply.status)
+        return { ok: reply.status >= 200 && reply.status < 300, detail: `${reply.status} ${JSON.stringify(reply.body)}` }
+      },
+      writeOff: async () => {},
+      log: () => {}
+    })
+    expect(statuses).toEqual([404])
+    expect(r).toEqual({ applied: 0, rejected: 1, kept: 0, gaveUp: 0 })
+    expect(await files()).toEqual([])
   })
 
   it('keeps a report whose application threw, so the next start can try again', async () => {
@@ -371,7 +402,8 @@ describe('applyPendingReports', () => {
 describe('a report that arrived while the app was away, from the boot the app then has', () => {
   const stored = (): OrchState => ({
     ...emptyState(),
-    runs: [{ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: '2026-09-10T00:00:00.000Z' }],
+    jobs: [{ id: 'job_1', objective: 'o', cwd: 'D:/p', createdAt: '2026-09-10T00:00:00.000Z' }],
+    runs: [{ id: 'run_1', jobId: 'job_1', ordinal: 1, createdAt: '2026-09-10T00:00:00.000Z' }],
     tasks: [
       {
         id: 'tsk_1',

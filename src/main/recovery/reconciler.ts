@@ -2,74 +2,75 @@
 // strategy, journals the decision, and hands it to execute.ts. Nothing here decides or carries out a
 // strategy — those live in core/recovery/decide.ts and main/recovery/execute.ts, the same split the
 // orchestration guide draws between "what happened", "what to do" and "doing it".
-import type { OrchState } from '../../core/orchestration/state'
+import { jobOf, placedByApp, type OrchState } from '../../core/orchestration/state'
 import { checkConfigIdsOf, policyOf } from '../../core/orchestration/convergence'
-import { DEFAULT_CONCURRENCY, type Dispatch } from '../../core/orchestration/types'
+import { DEFAULT_CONCURRENCY } from '../../core/orchestration/types'
 import type { GitFacts, LostAttempt, RecoveryDecision } from '../../core/recovery/types'
 import { decideRecovery } from '../../core/recovery/decide'
 import type { ContinuityEvent, ContinuityEventType } from '../../core/continuity/events'
-import type { CheckpointRow, ContinuityJournal, JournalEventRow, RecoveryActionRow } from '../continuity/journal'
+import type { CheckpointRow, ContinuityJournal, RecoveryActionRow } from '../../core/continuity/journal'
+import { retryBusy } from '../../core/continuity/busyRetry'
 import type { ExecuteResult } from './execute'
 
-/** What `candidates` found, before a decision has been asked for. */
-export interface LostAttemptSeed {
-  runId: string
-  taskId: string
-  /** The Dispatch that was lost — the new attempt (if any) links back to it through `retryOf`. */
-  dispatch: Dispatch
-}
+// `candidates` and its seed live in core now (the Host's lost-worker Gate asks the same question, R16).
+export { candidates, type LostAttemptSeed } from '../../core/recovery/candidates'
+import { candidates, type LostAttemptSeed } from '../../core/recovery/candidates'
+
+/** What the reconciler needs of the journal. A port rather than the class since the Host journal (J3):
+ *  in front of a Host that writes the journal the app reads through a read-only reader and sends its
+ *  writes as `journal-append` (appJournal.ts); otherwise these are the app's own ContinuityJournal. */
+export type ReconcilerJournal = Pick<
+  ContinuityJournal,
+  'eventsFor' | 'firstCheckpointFor' | 'append' | 'startRecoveryAction' | 'finishRecoveryAction'
+>
 
 export interface ReconcilerDeps {
   getState(): OrchState
   setState(next: OrchState): Promise<void>
-  journal: ContinuityJournal
+  journal: ReconcilerJournal
   readGitFacts(cwd: string): Promise<GitFacts>
   smartResume(): boolean
   execute(a: { attempt: LostAttempt; decision: RecoveryDecision; state: OrchState; now: string }): Promise<ExecuteResult>
   log(m: string): void
   /** ISO clock. The journal holds no clock of its own — every write takes its time from the caller. */
   now(): string
+  /** The pause before a busy journal is asked again; a timer when left out. Tests pass one that does not wait. */
+  sleep?(ms: number): Promise<void>
+  /** A monotonic clock in ms, for the pass budget; performance.now when left out. Tests pass one of their own. */
+  clock?(): number
 }
 
-/** A Dispatch this sweep can act on: closed on its own (no `closedBy` — a person's stop, abandon or
- *  pause is left alone), and with no reported outcome. */
-const isLost = (d: Dispatch): boolean =>
-  d.endedAt !== undefined && d.outcome === undefined && d.closedBy === undefined
-
-/** Every dispatched Task whose Run is live (not paused, not a schedule template) and whose most
- *  recent Dispatch was lost — one seed per Task, and none at all when the Task already has an open
- *  Dispatch (a fresh attempt is already running).
+/**
+ * How long one reconcileAll pass may spend retrying a busy journal (stage 4 T6).
  *
- *  **The most recent Dispatch, then the lost test — not the most recent lost one.** Filtering the
- *  person-closed attempts out first would reach past a stop to an older crash: a worker crashes, the
- *  boot sweep restarts it, the person stops the restart they did not want, and the next boot
- *  recovers the original attempt anyway. That is exactly what `Dispatch.closedBy` exists to prevent,
- *  and through `worker-abandon` it would put a second agent in a worktree whose resources may still
- *  be live. */
-export function candidates(state: OrchState): LostAttemptSeed[] {
-  const runs = new Map(state.runs.map((r) => [r.id, r]))
-  const out: LostAttemptSeed[] = []
-  for (const task of state.tasks) {
-    if (task.status !== 'dispatched') continue
-    const run = runs.get(task.runId)
-    // The scheduler's own three Run gates, copied whole. `pendingStart` is the one that looks
-    // redundant — it is a one-way gate `startRun` clears, so a Run holding it cannot have dispatched
-    // anything to lose. schedule.ts refuses that inference for its own gates all the same, because
-    // orchestration.json outlives the process and is hand-edited, and recovery is a second door into
-    // starting workers: it holds to the same standard.
-    if (!run || run.paused === true || run.schedule !== undefined || run.pendingStart === true) continue
-    const own = state.dispatches.filter((d) => d.taskId === task.id)
-    // A `dispatched` Task always has one — openDispatch writes the Dispatch and the status together.
-    // The guard is here because orchestration.json outlives the process and is hand-edited, the same
-    // reason schedule.ts refuses to infer a Task's account from the command that made it.
-    if (own.length === 0) continue
-    if (own.some((d) => d.endedAt === undefined)) continue
-    const latest = own.reduce((a, b) => (b.startedAt > a.startedAt ? b : a))
-    if (!isLost(latest)) continue
-    out.push({ runId: task.runId, taskId: task.id, dispatch: latest })
-  }
-  return out
+ * Each busy try holds the thread that asks it for the reader's busy timeout, 250 ms by the setting and
+ * about 370 ms measured on Windows, and the reconciler runs on Electron's main thread. One dispatch may
+ * be asked up to nine times (retryBusy), about 3.3 s of held thread, and a sweep takes its dispatches one
+ * after another.
+ *
+ * **Only busy time is charged** (stage 4 final review). A read that answers at once costs nothing, and
+ * neither do git or execute: a healthy journal behind slow spawns never runs this out. It is counted
+ * from the first busy answer of a read, to the end of that read's retry.
+ *
+ * **Past it, the rest waits for a later pass; it is not reviewed.** A dispatch whose journal was never
+ * read (or whose retry the budget cut short) has no evidence either way, and sending it to review would
+ * turn every attempt that predates the journal into a Gate. It stays a candidate, and the next trigger
+ * (a live reconcileOne, the next boot sweep) asks again.
+ */
+export const RECOVERY_PASS_BUDGET_MS = 10_000
+
+/** One reconcileAll pass's running total of busy-retry time. */
+interface PassBudget {
+  busyMs: number
 }
+
+/** The journal's evidence about one dispatch. evidenceFor answers it, or null for "cannot say", or
+ *  'deferred' when the pass budget kept the journal from being asked in full, so nothing may be decided
+ *  from it this pass. */
+type Evidence = { witnessed: boolean; promptConfirmed: boolean; checkpoint: CheckpointRow | null }
+
+/** One turn of the event loop, so the window can paint between two dispatches of a sweep. */
+const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
 
 /** Recovery is a second door into starting workers, so it obeys the scheduler's concurrency rule too
  *  (the `room` calculation in core/orchestration/schedule.ts's slotsToFill). Several lost Tasks in one
@@ -81,7 +82,7 @@ const hasRoom = (state: OrchState, runId: string): boolean => {
   const openHere = state.dispatches.filter(
     (d) => !d.outcome && !d.endedAt && state.tasks.find((t) => t.id === d.taskId)?.runId === runId
   ).length
-  return openHere < (run.concurrency ?? DEFAULT_CONCURRENCY)
+  return openHere < (jobOf(state, run)?.concurrency ?? DEFAULT_CONCURRENCY)
 }
 
 export class RecoveryReconciler {
@@ -98,20 +99,96 @@ export class RecoveryReconciler {
     }
   }
 
+  /** A dispatch whose recovery is under way: a sweep and a live reconcileOne can overlap now that the
+   *  journal reads wait on the event loop (stage 3 T1 review), and only the first acts. */
+  private readonly inFlight = new Set<string>()
+
+  private clock(): number {
+    return this.deps.clock ? this.deps.clock() : performance.now()
+  }
+
+  /** What recovery reads from the journal about one dispatch (stage 3 T1): whether any row names it,
+   *  whether its prompt write was confirmed, and its first checkpoint. Each is one indexed read of at
+   *  most one row, never the Run's whole record; the rows are checked again here, so a port that ignores
+   *  the bound still answers right. A busy journal is asked again first (retryBusy). null when any read
+   *  failed: "cannot say", which decide.ts turns into a person's review. **The checkpoint counts too**
+   *  (stage 3 T1 review): read as absent, it drops the base head and the native session, and a worker
+   *  that committed on a clean tree would be restarted with its commits duplicated. */
+  private async evidenceFor(
+    runId: string,
+    dispatchId: string,
+    /** The sweep's busy budget; a lone reconcileOne has none. */
+    pass?: PassBudget
+  ): Promise<Evidence | null | 'deferred'> {
+    const journal = this.deps.journal
+    const deferred = (why: string): 'deferred' => {
+      this.deps.log(
+        `recovery: this pass spent its busy-journal budget (${RECOVERY_PASS_BUDGET_MS} ms), so dispatch ${dispatchId} ${why} and is left for a later pass`
+      )
+      return 'deferred'
+    }
+    if (pass && pass.busyMs >= RECOVERY_PASS_BUDGET_MS) return deferred('was not read')
+    // Busy time runs from the start of the first try that answered busy, since that try held the
+    // thread too; a read that answers at once is never charged.
+    let tryAt = 0
+    let busySince: number | null = null
+    let cut = false
+    const markBusy = (): void => {
+      if (busySince === null) busySince = tryAt
+    }
+    const charged = (): number => (busySince === null ? 0 : this.clock() - busySince)
+    const retried = await retryBusy(
+      () => {
+        tryAt = this.clock()
+        const witnessed = journal.eventsFor(runId, { dispatchId, limit: 1 }).some((e) => e.dispatchId === dispatchId)
+        if (!witnessed) return { witnessed, promptConfirmed: false, checkpoint: null }
+        const promptConfirmed = journal
+          .eventsFor(runId, { dispatchId, types: ['PROMPT_WRITE_CONFIRMED'], limit: 1 })
+          .some((e) => e.type === 'PROMPT_WRITE_CONFIRMED' && e.dispatchId === dispatchId)
+        return { witnessed, promptConfirmed, checkpoint: journal.firstCheckpointFor(dispatchId) }
+      },
+      {
+        sleep: this.deps.sleep,
+        // Asked only after a busy answer.
+        stop: () => {
+          markBusy()
+          if (pass && pass.busyMs + charged() >= RECOVERY_PASS_BUDGET_MS) cut = true
+          return cut
+        },
+        onBusy: (err) => this.deps.log(`recovery: the journal is busy, dispatch ${dispatchId} asks again shortly: ${String(err)}`)
+      }
+    )
+    if (pass) pass.busyMs += charged()
+    if (cut) return deferred('was cut short while the journal was busy')
+    if (retried.ok) return retried.value
+    this.deps.log(`recovery: eventsFor failed${retried.busy ? ' (still busy)' : ''}: ${String(retried.error)}`)
+    return null
+  }
+
   /** Carries one seed all the way through, or returns false having done nothing at all — the caller
    *  counts only what it acted on. */
-  private async recoverOne(seed: LostAttemptSeed): Promise<boolean> {
+  private async recoverOne(seed: LostAttemptSeed, pass?: PassBudget): Promise<boolean> {
+    if (this.inFlight.has(seed.dispatch.id)) return false
+    this.inFlight.add(seed.dispatch.id)
+    try {
+      return await this.recoverOneNow(seed, pass)
+    } finally {
+      this.inFlight.delete(seed.dispatch.id)
+    }
+  }
+
+  private async recoverOneNow(seed: LostAttemptSeed, pass?: PassBudget): Promise<boolean> {
     const { runId, taskId, dispatch } = seed
     const now = this.deps.now()
     const journal = this.deps.journal
 
-    // null, not [] — a read that failed is not a read that found nothing. decide.ts reads a `false`
+    // null, not false — a read that failed is not a read that found nothing. decide.ts reads a `false`
     // here as positive evidence that the prompt never left the app; null is "we cannot say".
-    const events = this.note('eventsFor', null as JournalEventRow[] | null, () => journal.eventsFor(runId))
-    const promptConfirmed =
-      events === null
-        ? null
-        : events.some((e) => e.type === 'PROMPT_WRITE_CONFIRMED' && e.dispatchId === dispatch.id)
+    const found = await this.evidenceFor(runId, dispatch.id, pass)
+    // Not read in full this pass: nothing is decided or journaled, and it stays a candidate.
+    if (found === 'deferred') return false
+    const evidence = found
+    const promptConfirmed = evidence === null ? null : evidence.promptConfirmed
 
     // The journal witnesses every attempt it was on for (ATTEMPT_START_REQUESTED at the very least),
     // so rows that name this dispatch are the evidence recovery reasons from. None of them, on a read
@@ -120,16 +197,14 @@ export class RecoveryReconciler {
     // This is what bounds the first sweep after the toggle is switched on: store.load()'s restart
     // cleanup closes every open Dispatch as outcome_unknown, so without it every Task any past crash
     // ever stranded inside the 30-day TTL would be decided from an empty record.
-    if (events !== null && !events.some((e) => e.dispatchId === dispatch.id)) {
+    if (evidence !== null && !evidence.witnessed) {
       this.deps.log(
         `recovery: no journal rows for dispatch ${dispatch.id} — the attempt predates this journal, leaving it alone`
       )
       return false
     }
 
-    const checkpoint = this.note('firstCheckpointFor', null as CheckpointRow | null, () =>
-      journal.firstCheckpointFor(dispatch.id)
-    )
+    const checkpoint = evidence?.checkpoint ?? null
     const baseHead = checkpoint?.gitHead ?? null
 
     const state = this.deps.getState()
@@ -160,12 +235,24 @@ export class RecoveryReconciler {
       // policyOf 로 본다, run.convergence !== undefined 가 아니다 — 손으로 고친 "convergence": null 은
       // !== undefined 로는 정책이 있다고 잘못 읽히지만, policyOf 는 falsy 한 convergence 를 그대로
       // "정책 없음" 으로 읽는다(이 파일이 손으로 고쳐질 수 있다는 전제는 곳곳에 이미 있다).
-      appDriven: run.autoDispatch === true || (policyOf(state, task) !== null && dispatch.repair !== undefined),
+      appDriven: placedByApp(jobOf(state, run), run) || (policyOf(state, task) !== null && dispatch.repair !== undefined),
       ...(dispatch.repair ? { repair: dispatch.repair } : {}),
       ...(dispatch.grantedExtra ? { grantedExtra: true } : {})
     }
 
     const git = await this.deps.readGitFacts(dispatch.cwd)
+    // The reads above waited on the event loop (a busy journal, git). A person may have stopped or
+    // reopened this dispatch meanwhile (stage 3 T1 review): acted on only while it is still a candidate.
+    // Another trigger may also have started a worker in this Run, so the concurrency room is asked again.
+    const after = this.deps.getState()
+    if (!candidates(after).some((c) => c.dispatch.id === dispatch.id)) {
+      this.deps.log(`recovery: dispatch ${dispatch.id} is no longer lost, leaving it alone`)
+      return false
+    }
+    if (!hasRoom(after, runId)) {
+      this.deps.log(`recovery: run ${runId} filled up while dispatch ${dispatch.id}'s evidence was read, left for the next trigger`)
+      return false
+    }
     const decision = decideRecovery({ attempt, git, smartResume: this.deps.smartResume() })
 
     const mk = (type: ContinuityEventType, payload: Record<string, unknown>): ContinuityEvent => ({
@@ -273,17 +360,26 @@ export class RecoveryReconciler {
    *  without counting, and it is the fresh seed that is acted on, not the stale one.
    *
    *  An attempt recoverOne itself declines (no journal rows name it) is not counted either — it
-   *  returns before anything is journaled or executed. */
+   *  returns before anything is journaled or executed.
+   *
+   *  **It never holds the main thread for a whole pass** (stage 4 T6). The event loop turns between two
+   *  dispatches, so the window paints between the busy tries of one and those of the next, and the pass
+   *  spends at most RECOVERY_PASS_BUDGET_MS retrying a busy journal: a retry stops there, and that
+   *  dispatch and the ones after it are left for a later pass, neither decided nor journaled. */
   async reconcileAll(): Promise<number> {
     let count = 0
+    const pass: PassBudget = { busyMs: 0 }
+    let first = true
     for (const seed of candidates(this.deps.getState())) {
+      if (!first) await turn()
+      first = false
       const fresh = candidates(this.deps.getState()).find((c) => c.dispatch.id === seed.dispatch.id)
       if (!fresh) continue
       // The concurrency limit binds recovery too (hasRoom above) — a candidate with no room is left
       // for the next trigger, not counted as acted on.
       if (!hasRoom(this.deps.getState(), fresh.runId)) continue
       try {
-        if (await this.recoverOne(fresh)) count++
+        if (await this.recoverOne(fresh, pass)) count++
       } catch (err) {
         this.deps.log(`recovery: reconcile failed for dispatch ${fresh.dispatch.id}: ${String(err)}`)
       }

@@ -3,10 +3,13 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { Account } from '../types'
 import { PTY_LOST_SIGHT_EXIT_CODE, type PtyFactory, type PtyLike, type PtySpawnOptions } from './pty'
-import { SessionManager, prependToPath } from './manager'
+import { SessionManager, prependToPath, type SpawnChecks } from './manager'
+import { createGitBashResolver } from './gitBash'
+import { PROBE_CACHE_TTL_MS, PROBE_CONCURRENCY, PROBE_TIMEOUT_MS, PathKeyedCache, createProbePool, createProber } from './pathProbe'
 import { buildClaudeCommand, buildCodexCommand } from './commands'
 import { makeDescriptors } from '../providers/descriptor'
-import { absPath } from '../testPaths'
+import { absPath, foldsCaseHere } from '../testPaths'
+import type { RollSnapshot, RollSpawnExtra } from '../rolling/snapshot'
 
 class FakePty implements PtyLike {
   pid = 4242
@@ -29,6 +32,7 @@ class FakePty implements PtyLike {
   pause() { this.paused = true; this.pauseCalls++ }
   resume() { this.paused = false; this.resumeCalls++ }
   remember(patch: Record<string, unknown>) { this.remembered.push(patch) }
+  emitExit(exitCode: number) { this.exitCb({ exitCode }) }
   /** What `createPtyRouter` stamps on a real handle — set by the tests that care which
    *  factory made the pty. Absent is a pty this process owns, which is what the router
    *  writes with no Host and what every other test here wants. */
@@ -167,12 +171,13 @@ describe('SessionManager', () => {
     expect('CLAUDE_CONFIG_DIR' in spawned[0].opts.env).toBe(false)
   })
 
-  it('기본 계정 판정은 경로 대소문자 차이를 무시한다', () => {
+  // 대소문자를 접는 것은 win32 와 darwin 뿐 — linux 에서 대소문자만 다른 폴더는 홈 기본 폴더가 아니라 격리 계정이다
+  it('기본 계정 판정은 대소문자를 접는 플랫폼에서 경로 대소문자 차이를 무시한다', () => {
     const homeDir = absPath('Users', 'tester')
     const defaultAccount: Account = { ...account, configDir: absPath('Users', 'Tester', '.CLAUDE') }
     const { manager, spawned } = setup(100, 20, homeDir)
     manager.spawn({ account: defaultAccount, cwd: process.cwd() })
-    expect('CLAUDE_CONFIG_DIR' in spawned[0].opts.env).toBe(false)
+    expect('CLAUDE_CONFIG_DIR' in spawned[0].opts.env).toBe(!foldsCaseHere)
   })
 
   it('격리 계정(<home>/.claude 아님)은 기존대로 CLAUDE_CONFIG_DIR을 주입한다', () => {
@@ -266,13 +271,17 @@ describe('SessionManager', () => {
     expect(spawned[0].pty.resized).toEqual([{ cols: 100, rows: 40 }])
   })
 
+  // win32 는 PATH 가 말하는 절대 경로로 띄운다 — 이름으로 넘기면 cmd.exe 가 작업 폴더에서 먼저 찾는다
+  // (windowsExecutable.ts, 보안 검토 2026-09-28). 테스트는 npm shim 이 어디 있는지 직접 말해 준다.
+  const SHIM = 'C:\\Users\\me\\AppData\\Roaming\\npm'
+  const shim = (name: string): string => `${SHIM}\\${name}.cmd`
   it('buildClaudeCommand는 win32에서 cmd.exe 래퍼를 쓴다', () => {
-    expect(buildClaudeCommand('win32')({})).toEqual({ file: 'cmd.exe', args: ['/c', 'claude'] })
+    expect(buildClaudeCommand('win32', shim)({})).toEqual({ file: 'cmd.exe', args: ['/d', '/c', 'call', shim('claude')] })
     expect(buildClaudeCommand('darwin')({})).toEqual({ file: 'claude', args: [] })
   })
 
   it('buildCodexCommand는 resume·bypass를 codex 인자로 매핑한다', () => {
-    expect(buildCodexCommand('win32')({})).toEqual({ file: 'cmd.exe', args: ['/c', 'codex'] })
+    expect(buildCodexCommand('win32', shim)({})).toEqual({ file: 'cmd.exe', args: ['/d', '/c', 'call', shim('codex')] })
     expect(buildCodexCommand('darwin')({ resumeSessionId: 'abc' })).toEqual({
       file: 'codex', args: ['resume', 'abc']
     })
@@ -294,14 +303,14 @@ describe('SessionManager', () => {
   // 리뷰 지적: win32는 cmd.exe /c 래퍼라 node-pty의 MSVCRT 인용(\")이 cmd에는 통하지 않는다.
   // 따옴표가 든 프롬프트는 기동 실패(=전환 순간 탭이 죽는다), 공백 없는 &·| 는 cmd가 분리 실행한다.
   it('buildCodexCommand는 프롬프트의 셸 메타문자를 지운다 (cmd.exe 주입·인용 깨짐 방지)', () => {
-    const meta = buildCodexCommand('win32')({
+    const meta = buildCodexCommand('win32', shim)({
       resumeSessionId: 'abc',
       resumePrompt: '계속"하기" & 정리 | 끝 > out < in ^esc'
     })
-    expect(meta.args).toEqual(['/c', 'codex', 'resume', 'abc', '계속 하기 정리 끝 out in esc'])
+    expect(meta.args).toEqual(['/d', '/c', 'call', shim('codex'), 'resume', 'abc', '계속 하기 정리 끝 out in esc'])
     // 공백 없이 붙은 메타문자도 분리 실행 경로가 사라진다
     expect(
-      buildCodexCommand('win32')({ resumeSessionId: 'abc', resumePrompt: '계속&정리' }).args.at(-1)
+      buildCodexCommand('win32', shim)({ resumeSessionId: 'abc', resumePrompt: '계속&정리' }).args.at(-1)
     ).toBe('계속 정리')
     // 줄바꿈도 cmd 커맨드라인을 끊는다
     expect(
@@ -327,8 +336,8 @@ describe('SessionManager', () => {
     expect(
       buildCodexCommand('darwin')({ resumeSessionId: 'abc', resumePrompt: '이어서 작업 진행해 줘' }).args
     ).toEqual(['resume', 'abc', '이어서 작업 진행해 줘'])
-    expect(buildCodexCommand('win32')({ resumeSessionId: 'abc', resumePrompt: ' && ' }).args).toEqual([
-      '/c', 'codex', 'resume', 'abc'
+    expect(buildCodexCommand('win32', shim)({ resumeSessionId: 'abc', resumePrompt: ' && ' }).args).toEqual([
+      '/d', '/c', 'call', shim('codex'), 'resume', 'abc'
     ])
   })
 
@@ -359,10 +368,17 @@ describe('SessionManager', () => {
   })
 
   it('ambient codex 계정(~/.codex)은 CODEX_HOME을 주입하지 않는다', () => {
-    const ambient: Account = { ...codexAccount, configDir: absPath('Users', 'Tester', '.CODEX') }
+    const ambient: Account = { ...codexAccount, configDir: absPath('Users', 'tester', '.codex') }
     const { manager, spawned } = setup(100, 20, absPath('Users', 'tester'))
     manager.spawn({ account: ambient, cwd: process.cwd() })
     expect('CODEX_HOME' in spawned[0].opts.env).toBe(false)
+  })
+
+  it('ambient codex 판정도 대소문자는 접는 플랫폼에서만 무시한다', () => {
+    const ambient: Account = { ...codexAccount, configDir: absPath('Users', 'Tester', '.CODEX') }
+    const { manager, spawned } = setup(100, 20, absPath('Users', 'tester'))
+    manager.spawn({ account: ambient, cwd: process.cwd() })
+    expect('CODEX_HOME' in spawned[0].opts.env).toBe(!foldsCaseHere)
   })
 
   it('codex 세션에는 statusLine provider를 태우지 않는다', () => {
@@ -447,6 +463,21 @@ describe('SessionManager', () => {
     expect(spawned[0].opts.env.ASTERA_HOOK_OUT).toContain(info.id)
     expect(info.slackNotify).toBe(true)
     expect(manager.list()[0].slackNotify).toBe(true)
+  })
+
+  it('builds the child env from the base it was given, not from process.env', () => {
+    const spawned: PtySpawnOptions[] = []
+    const factory: PtyFactory = (_f, _a, opts) => { spawned.push(opts); return new FakePty() }
+    const m = new SessionManager(factory, makeDescriptors(process.platform), undefined, undefined, undefined, undefined, [],
+      { PATH: process.env.PATH, ONLY_IN_BASE: 'yes' })
+    m.spawn({ account, cwd: process.cwd() })
+    expect(spawned[0].env.ONLY_IN_BASE).toBe('yes')
+    // a key only process.env has does not leak in
+    process.env.ASTERA_TEST_ONLY_PROCESS = '1'
+    try {
+      m.spawn({ account, cwd: process.cwd() })
+      expect('ASTERA_TEST_ONLY_PROCESS' in spawned[1].env).toBe(false)
+    } finally { delete process.env.ASTERA_TEST_ONLY_PROCESS }
   })
 
   // slackNotify 도 롤링도 없는 평범한 세션이다. 도구 캡처(toolHooks)는 안 들어가지만
@@ -672,18 +703,32 @@ describe('SessionManager', () => {
   describe('orchEnv 주입', () => {
     const orchEnv = {
       cliPath: 'C:/cli/astera.cmd',
-      infoPath: 'C:/u/info.json',
-      skillsPath: 'C:/u/skills'
+      skillsPath: 'C:/u/skills',
+      profileDir: 'C:/u'
     }
 
-    it('ASTERA_* 네 개를 주입한다 (CLI·INFO·SKILLS·SESSION)', () => {
+    it('ASTERA_* 네 개를 주입한다 (CLI·PROFILE_DIR·SKILLS·SESSION)', () => {
       const { manager, spawned } = setup()
       manager.spawn({ account, cwd: process.cwd(), orchEnv })
       expect(spawned[0].opts.env.ASTERA_CLI).toBe('C:/cli/astera.cmd')
-      expect(spawned[0].opts.env.ASTERA_INFO).toBe('C:/u/info.json')
+      expect(spawned[0].opts.env.ASTERA_PROFILE_DIR).toBe('C:/u')
       // help가 이 디렉토리에서 orchestration-guide.md를 읽는다 (src/cli/run.ts resolveGuidePath)
       expect(spawned[0].opts.env.ASTERA_SKILLS).toBe('C:/u/skills')
       expect(spawned[0].opts.env.ASTERA_SESSION).toBeTruthy()
+    })
+
+    // **F43.** 세션의 astera 는 이제 Host 와 말하고, Host 의 주소도 못 보낸 보고를 적는 큐도 전부
+    // 프로필 폴더에서 나온다. 그 폴더를 CLI 가 스스로 계산하면 개발본이 설치본으로 샌다 —
+    // `-dev` 접미사는 `app.isPackaged` 에서 오고 그것을 내보내는 환경변수가 없었다. 그래서 앱이
+    // 자기가 실제로 쓰고 있는 폴더를 실어 보낸다.
+    it('앱이 실제로 쓰는 프로필 폴더를 실어 보낸다', () => {
+      const { manager, spawned } = setup()
+      manager.spawn({
+        account,
+        cwd: process.cwd(),
+        orchEnv: { ...orchEnv, profileDir: 'C:/Users/x/AppData/Roaming/astera-dev' }
+      })
+      expect(spawned[0].opts.env.ASTERA_PROFILE_DIR).toBe('C:/Users/x/AppData/Roaming/astera-dev')
     })
 
     it('같은 orchEnv로 두 세션을 띄우면 ASTERA_SESSION만 서로 다르다', () => {
@@ -705,7 +750,9 @@ describe('SessionManager', () => {
      *  그래서 상속 값을 직접 심고 "지워지는지"까지 본다. */
     const INHERITED = {
       ASTERA_CLI: 'C:/other-instance/orch/astera.cmd',
-      ASTERA_INFO: 'C:/other-instance/orch/orch-info.json',
+      // 남의 인스턴스의 프로필이 새면 이 세션의 워커가 남의 Host 에 보고하고 남의 큐에 적는다 —
+      // 없어진 ASTERA_INFO 가 하던 누수를 그대로 물려받는 변수다.
+      ASTERA_PROFILE_DIR: 'C:/other-instance',
       ASTERA_SKILLS: 'C:/other-instance/skills',
       ASTERA_SESSION: 'inherited-session-id'
     }
@@ -716,8 +763,8 @@ describe('SessionManager', () => {
 
     it('orchEnv가 없으면 상속된 ASTERA_*까지 지운다', () => {
       // 앱을 Astera 세션의 셸에서 띄우면(`npm run dev`가 그 경로다) 앱 프로세스가 **다른
-      // 인스턴스의** ASTERA_CLI·INFO를 물고 시작한다. 그것이 그대로 새 세션에 상속되면
-      // orchestration을 끈 세션의 에이전트가 남의 인스턴스 서버와 토큰을 쥐게 되고,
+      // 인스턴스의** ASTERA_CLI·PROFILE_DIR 을 물고 시작한다. 그것이 그대로 새 세션에 상속되면
+      // orchestration을 끈 세션의 에이전트가 남의 인스턴스의 Host 와 큐를 쥐게 되고,
       // 상속된 ASTERA_SESSION은 남의 세션 신원으로 보고하게 만든다.
       // 넣지 않는 것으로는 부족하고 지워야 한다 — configDirEnv와 main/core.ts의 규약이 같다.
       stubInherited()
@@ -756,7 +803,7 @@ describe('SessionManager', () => {
       const { manager, spawned } = setup()
       const info = manager.spawn({ account, cwd: process.cwd(), orchEnv })
       expect(spawned[0].opts.env.ASTERA_CLI).toBe('C:/cli/astera.cmd')
-      expect(spawned[0].opts.env.ASTERA_INFO).toBe('C:/u/info.json')
+      expect(spawned[0].opts.env.ASTERA_PROFILE_DIR).toBe('C:/u')
       expect(spawned[0].opts.env.ASTERA_SKILLS).toBe('C:/u/skills')
       expect(spawned[0].opts.env.ASTERA_SESSION).toBe(info.id) // 상속된 남의 세션 id가 아니다
     })
@@ -836,6 +883,28 @@ describe('SessionManager', () => {
         rollAccountIds: ['acc_1', 'acc_2']
       }
     })
+  })
+
+  // A rolling respawn is born with where it came from and its chain's snapshot (S6 R6). The manager's
+  // own keys are written after, so nothing a caller slips in can rename the account the pty runs on.
+  it('merges restoreExtra into the note after its own keys (S6 R6)', () => {
+    const { manager, spawned } = setup()
+    const roll: RollSnapshot = {
+      v: 1, provider: 'claude', accountIds: ['a'], currentIndex: 0, streak: 0, recovery: [null], blocks: {},
+      wait: null, inPlaceUsed: false, rolledAt: null, awaitingPrompt: true,
+      claude: { sessionId: null, transcriptPath: null, tailOffset: null, tailSince: null }, writtenAt: 0
+    }
+    manager.spawn({
+      account,
+      cwd: process.cwd(),
+      rollAccountIds: ['a'],
+      // The type refuses a manager key here; the cast is how this test forges one anyway, to pin the
+      // runtime precedence that still stands behind the type.
+      restoreExtra: { rolledFrom: 's0', roll, accountId: 'forged' } as RollSpawnExtra
+    })
+    const restore = spawned[0].opts.meta?.restore as Record<string, unknown>
+    expect(restore).toMatchObject({ rolledFrom: 's0', roll: { v: 1, provider: 'claude' } })
+    expect(restore.accountId).toBe(account.id) // the manager's own keys win
   })
 
   describe('adopt', () => {
@@ -1000,6 +1069,16 @@ describe('SessionManager', () => {
   // which the app makes some of its own before the Host answers. Splitting the running sessions by
   // who owns their pty is what lets the quit path end the app's own children — which die with the
   // app anyway — while leaving the Host's alone.
+  it('forgets an exited session and keeps a running one', () => {
+    const ptys: FakePty[] = []
+    const m = new SessionManager((_f, _a, _o) => { const p = new FakePty(); ptys.push(p); return p }, makeDescriptors(process.platform))
+    const a = m.spawn({ account, cwd: process.cwd() }); const b = m.spawn({ account, cwd: process.cwd() })
+    ptys[0].emitExit(0)
+    expect(m.forget(a.id)).toBe(true)
+    expect(m.forget(b.id)).toBe(false)
+    expect(m.list().map((s) => s.id)).toEqual([b.id])
+  })
+
   describe('who a running session belongs to', () => {
     it('splits the running sessions into the ones the app owns and the ones that outlive it', () => {
       const { manager, spawned } = setup()
@@ -1023,5 +1102,177 @@ describe('SessionManager', () => {
       expect(manager.runningAppOwned()).toEqual([])
       expect(manager.runningOutlivingApp()).toEqual([])
     })
+  })
+})
+
+describe('SessionManager.prepare — the spawn path never waits on a sync probe', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function withChecks(checks: Partial<SpawnChecks>) {
+    const spawned: { file: string; opts: PtySpawnOptions }[] = []
+    const factory: PtyFactory = (file, _args, opts) => {
+      spawned.push({ file, opts })
+      return new FakePty()
+    }
+    // Every sync look at the disk goes through this one function, so counting it proves none ran.
+    const syncExists = vi.fn(() => true)
+    const log = vi.fn()
+    const full: SpawnChecks = {
+      cwd: async () => 'present',
+      gitBash: createGitBashResolver(async () => 'absent'),
+      platform: process.platform,
+      now: Date.now,
+      syncExists,
+      log,
+      ...checks
+    }
+    const manager = new SessionManager(factory, makeDescriptors('win32'), 100, 20, 'C:\\Users\\tester', undefined, [], { PATH: 'C:\\a' }, full)
+    return { manager, spawned, syncExists: full.syncExists as typeof syncExists, log: full.log as typeof log }
+  }
+
+  it('a folder whose probe never answers fails at 1.5 s with "folder not reachable", and nothing is spawned', async () => {
+    vi.useFakeTimers()
+    const cwd = '\\\\offline-server\\share\\proj'
+    const { manager, spawned } = withChecks({
+      cwd: createProber({ access: () => new Promise<void>(() => {}), log: () => {}, pool: createProbePool(), skipQueue: true })
+    })
+    const outcome = manager.prepare({ account, cwd }).then(
+      () => 'resolved',
+      (e: Error) => e.message
+    )
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS - 1)
+    let settled = false
+    void outcome.then(() => (settled = true))
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await outcome).toBe(`CWD_UNREACHABLE: folder not reachable: ${cwd}`)
+    expect(spawned).toHaveLength(0)
+  })
+
+  it('a local folder is confirmed while four PATH probes hang on an offline drive', async () => {
+    vi.useFakeTimers()
+    const pool = createProbePool(PROBE_CONCURRENCY)
+    const access = (p: string) => (p.startsWith('Z:') ? new Promise<void>(() => {}) : Promise.resolve())
+    const pathProbe = createProber({ access, pool, log: () => {} })
+    const cwdProbe = createProber({ access, pool, log: () => {}, skipQueue: true })
+    const hung = ['Z:\\a\\pwsh.exe', 'Z:\\b\\pwsh.exe', 'Z:\\a\\powershell.exe', 'Z:\\b\\powershell.exe', 'Z:\\c\\cmd.exe'].map((p) =>
+      pathProbe(p)
+    )
+    const { manager } = withChecks({ cwd: cwdProbe, platform: 'linux' })
+    // No time passes: the folder's answer does not wait for a slot.
+    await expect(manager.prepare({ account, cwd: 'C:\\work\\proj' })).resolves.toBeUndefined()
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS)
+    await Promise.all(hung)
+  })
+
+  it('a folder that is not there is still CWD_MISSING, in the wording the caller asks for', async () => {
+    const { manager } = withChecks({ cwd: async () => 'absent' })
+    await expect(manager.prepare({ account, cwd: 'Z:\\gone' })).rejects.toThrow('CWD_MISSING: Z:\\gone')
+    await expect(manager.prepare({ account, cwd: 'Z:\\gone', missing: 'CWD_MISSING: Z:\\gone does not exist' })).rejects.toThrow(
+      'CWD_MISSING: Z:\\gone does not exist'
+    )
+  })
+
+  it('after prepare, spawn trusts the checked folder and the Git Bash it found — nothing sync runs, nothing is warned', async () => {
+    let resolves = 0
+    const gitBash = createGitBashResolver(async (p) => {
+      resolves++
+      return p === 'C:\\Program Files\\Git\\bin\\bash.exe' ? 'present' : 'absent'
+    })
+    const cwd = 'Z:\\prepared\\but\\not\\on\\this\\disk'
+    const { manager, spawned, syncExists, log } = withChecks({ gitBash, platform: 'win32' })
+    await manager.prepare({ account, cwd })
+    const before = resolves
+    manager.spawn({ account, cwd })
+    expect(spawned[0].opts.cwd).toBe(cwd)
+    expect(spawned[0].opts.env.CLAUDE_CODE_GIT_BASH_PATH).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+    expect(resolves).toBe(before)
+    expect(syncExists).not.toHaveBeenCalled()
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  it('the Git Bash cache expiring between prepare and spawn does not send spawn back to the sync search', async () => {
+    let t = 0
+    const gitBash = createGitBashResolver(
+      async (p) => (p === 'C:\\Program Files\\Git\\bin\\bash.exe' ? 'present' : 'absent'),
+      new PathKeyedCache(PROBE_CACHE_TTL_MS, () => t)
+    )
+    const { manager, spawned, syncExists, log } = withChecks({ gitBash, platform: 'win32', now: () => t })
+    // The cache entry was made just before the 5-minute mark; prepare reads it at 4:59.999...
+    await gitBash.resolve({ PATH: 'C:\\a' })
+    t = PROBE_CACHE_TTL_MS - 1
+    await manager.prepare({ account, cwd: 'C:\\w' })
+    // ...and by the spawn it has expired.
+    t = PROBE_CACHE_TTL_MS + 1
+    expect(gitBash.peek({ PATH: 'C:\\a' })).toBeUndefined()
+    manager.spawn({ account, cwd: 'C:\\w' })
+    expect(spawned[0].opts.env.CLAUDE_CODE_GIT_BASH_PATH).toBe('C:\\Program Files\\Git\\bin\\bash.exe')
+    expect(syncExists).not.toHaveBeenCalled()
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  // Without Git Bash the session's statusLine capture never runs for its whole life, so the app never
+  // learns its usage. When a timeout is why, the owner's log (sessions.log, host.log) must say so,
+  // once per such spawn.
+  it('a spawn that gets no Git Bash because the lookup timed out says so once in the log', async () => {
+    const gitBash = createGitBashResolver(async (p) => (p.startsWith('C:\\Program Files') ? 'timeout' : 'absent'))
+    const { manager, spawned, log } = withChecks({ gitBash, platform: 'win32' })
+    await manager.prepare({ account, cwd: 'C:\\w' })
+    manager.spawn({ account, cwd: 'C:\\w' })
+    expect(spawned[0].opts.env.CLAUDE_CODE_GIT_BASH_PATH).toBeUndefined()
+    const lines = log.mock.calls.map((c) => String(c[0])).filter((m) => /Git Bash/.test(m))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/timed out/)
+  })
+
+  it('a spawn with no Git Bash on a clean lookup (nothing timed out) logs nothing', async () => {
+    const { manager, log } = withChecks({ gitBash: createGitBashResolver(async () => 'absent'), platform: 'win32' })
+    await manager.prepare({ account, cwd: 'C:\\w' })
+    manager.spawn({ account, cwd: 'C:\\w' })
+    expect(log).not.toHaveBeenCalled()
+  })
+
+  it('a spawn nobody prepared falls back to the sync checks and says so in the log', () => {
+    const { manager, syncExists, log } = withChecks({ platform: 'win32' })
+    manager.spawn({ account, cwd: 'C:\\unprepared' })
+    expect(syncExists).toHaveBeenCalled()
+    expect(log).toHaveBeenCalled()
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/without prepare/)
+  })
+
+  it('a second prepare of the same folder reuses the first check, and does not probe for Git Bash again', async () => {
+    let resolves = 0
+    let cwdProbes = 0
+    const gitBash = createGitBashResolver(async () => {
+      resolves++
+      return 'absent'
+    })
+    const { manager } = withChecks({
+      gitBash,
+      platform: 'win32',
+      cwd: async () => {
+        cwdProbes++
+        return 'present'
+      }
+    })
+    await manager.prepare({ account, cwd: 'C:\\one' })
+    const first = resolves
+    await manager.prepare({ account, cwd: 'C:\\one' })
+    await manager.prepare({ account, cwd: 'C:\\two' })
+    expect(resolves).toBe(first)
+    expect(cwdProbes).toBe(2)
+  })
+
+  it('a folder checked long ago is not trusted without a new check', async () => {
+    let t = 0
+    const { manager, syncExists } = withChecks({ now: () => t })
+    syncExists.mockReturnValue(false)
+    const cwd = 'Z:\\prepared\\but\\not\\on\\this\\disk'
+    await manager.prepare({ account, cwd })
+    t += 10 * 60_000
+    expect(() => manager.spawn({ account, cwd })).toThrow(/CWD_MISSING/)
   })
 })

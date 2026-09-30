@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Account, CliStatus, HistoryEntry, HostHoldings, HostStatus, RollStateEvent, SchedStateEvent, ScheduleConfig, SessionInfo, SessionKind, SessionUsage, UpdateStatus, UpdateCampaignInfo } from '../../core/types'
+import type { Account, CliStatus, HistoryEntry, HostDriverReport, HostHoldings, HostStatus, HostRuntimeInstallState, RollStateEvent, SchedStateEvent, ScheduleConfig, SessionInfo, SessionKind, SessionUsage, UpdateStatus, UpdateCampaignInfo, InstallOutcome } from '../../core/types'
+import type { UnattendedPermission } from '../../core/chat/types'
 import type { Lang, MessageKey } from '../../core/i18n'
 import { CATALOGS, LANGS } from '../../core/i18n'
 import logoUrl from './assets/logo.png'
@@ -10,6 +11,7 @@ import { HistoryBrowser } from './components/HistoryBrowser'
 import { Select } from './components/Select'
 import { type BrowserTab, type FileTab, type RecordTab } from './components/WorkbenchTabs'
 import { BrowserPane, type BrowserStatePatch } from './components/BrowserPane'
+import { AppMirrorPane } from './components/AppMirrorPane'
 import type { AgentPointerState } from './components/agentOverlay'
 import { FileEditor } from './components/FileEditor'
 import { MarkdownSplit } from './components/MarkdownSplit'
@@ -17,8 +19,10 @@ import { invalidateImageCache } from './components/MarkdownPreview'
 import type { EditorState, StateEffect } from '@codemirror/state'
 import type { EditorView } from '@codemirror/view'
 import { EditorStateCache } from './lib/editorStateCache'
+import { applyWorkspaceEvent, mirrorsFromList, newlyOpened, openSessionIds, placeAppTabs, removeAppTab, type Mirrors } from './lib/workspaceMirror'
 import { FileExplorer, type ExplorerTreeState } from './components/FileExplorer'
 import { JobsView } from './components/JobsView'
+import { jobsStall, jobsStallRecheckInMs } from '../../core/orchestration/jobsView'
 import { UnderstandingView } from './components/UnderstandingView'
 import { RecordDetailHost } from './components/RecordDetail'
 import { RunDetail } from './components/RunDetail'
@@ -34,6 +38,7 @@ import { ShortcutSettings } from './components/ShortcutSettings'
 import { TerminalFontSettings } from './components/TerminalFontSettings'
 import { ThemeSettings } from './components/ThemeSettings'
 import { GeneratorSettings } from './components/GeneratorSettings'
+import { CliSettings } from './components/CliSettings'
 import { ResumeStrategySettings } from './components/ResumeStrategySettings'
 import { GithubSettings } from './components/GithubSettings'
 import { NotificationSettings } from './components/NotificationSettings'
@@ -43,6 +48,7 @@ import { CliInstallRows } from './components/CliInstallRows'
 import { FirstRunDialog } from './components/FirstRunDialog'
 import type {
   OpenSessionTask,
+  OrchHostGate,
   OrchSnapshot,
   RunConfig,
   RunContext,
@@ -68,21 +74,24 @@ import {
   shouldNotifyDownloaded,
   showChecking
 } from '../../core/update/checkFeedback'
+import { installOutcomeNotice } from '../../core/update/manualInstallNotice'
 import { applyEol, classifyExternalChange, detectEol, toLf, type Eol } from '../../core/files/edit'
 import { isSubPath, rebasePath } from '../../core/files/ops'
-import { parentDir } from '../../core/files/paths'
+import { foldPathCase, parentDir } from '../../core/files/paths'
 import { cycleViewMode, isMdViewMode, type MdViewMode } from '../../core/files/markdownView'
 import type { UndoEntry } from '../../core/files/undo'
 import * as sessionBus from './lib/sessionBus'
 import * as sticky from './lib/stickyProject'
 import { dismiss, toast } from './lib/toast'
 import { spawnNotice } from './lib/spawnNotice'
+import { announceSettingsRecovery } from './lib/settingsRecoveryNotice'
 import { confirmModal, confirmModalWithChoices, isConfirmOpen } from './lib/confirm'
 import { quitConfirmBody, updateConfirmBody } from './lib/quitConfirm'
 import { toggleSidebarView, type SidebarView } from '../../core/ui/sidebar'
 import { terminalsWithCreated } from './lib/terminalTabs'
 import * as hiddenProjects from './lib/hiddenProjects'
-import { worktreeErrorMessage } from './lib/worktreeErrors'
+import { isCancelled as isWorktreeCancelled } from './lib/worktreeErrors'
+import { spawnErrorMessage } from './lib/spawnErrors'
 import { notifyCreated as notifyWorktreeCreated } from './lib/worktreeBus'
 import { useI18n } from './i18n/I18nProvider'
 import {
@@ -114,9 +123,17 @@ import { displayHostOf, linkDestination, normalizeUrl, previewTargetOf } from '.
 import { isWaitingOnDialog, POST_PASTE_SUBMIT_DELAY_MS } from '../../core/preview/pick/send'
 import { PaneGrid } from './components/PaneGrid'
 import { ContextMenu, type MenuItem } from './components/ContextMenu'
+import { onFileChanges } from './lib/fileChanges'
+import type { FileChange } from '../../core/files/changeBatch'
+import { HostRuntimeNotice } from './components/HostRuntimeNotice'
 import { House, PanelLeft, Settings, X } from 'lucide-react'
+import { deleteKey, isMac as isMacPlatform, modKey } from './lib/platformKeys'
 
 sessionBus.init()
+
+/** Whether this renderer has shown the astera command offer (see where it is used). Module scope,
+ *  not a ref: StrictMode's dev-only remount would reset a ref and show a second toast. */
+let cliOfferedThisRun = false
 
 /** The key a record tab's narrowed-flow-step memory (scopedNode) uses. Carries both the project and
  *  the record — a tab id (`record:<id>`) has no project in it, so two projects sharing a record id
@@ -136,8 +153,9 @@ const scopeKey = (rec: RecordTab): string => `${rec.projectRoot}::${rec.recordId
 // explorer save/select-all/cut/copy/paste/undo are all Cmd on macOS (see MOD below), so they are
 // built with MOD rather than a literal 'Ctrl'. The one deliberate exception is 'Ctrl+Enter' (terminal
 // newline) — TerminalView.tsx leaves that one alone on both platforms because Claude Code reads
-// Ctrl+Enter as a newline regardless of OS. F2 and Delete are also unchanged across platforms.
-const MOD = window.api.platform === 'darwin' ? 'Cmd' : 'Ctrl'
+// Ctrl+Enter as a newline regardless of OS. F2 is unchanged across platforms; delete is Cmd+Backspace
+// on macOS, whose keyboard has no forward Delete without fn (lib/platformKeys.ts).
+const MOD = modKey()
 const SHORTCUTS: Array<{
   group: MessageKey
   items: Array<{ keys: string[]; desc: MessageKey; gestureKey?: MessageKey }>
@@ -167,7 +185,7 @@ const SHORTCUTS: Array<{
     items: [
       { keys: [`${MOD}+S`], desc: 'shortcut.explorer.saveFile' },
       { keys: ['F2'], desc: 'shortcut.explorer.rename' },
-      { keys: ['Delete'], desc: 'shortcut.explorer.delete' },
+      { keys: [isMacPlatform() ? deleteKey() : 'Delete'], desc: 'shortcut.explorer.delete' },
       { keys: [`${MOD}+A`], desc: 'shortcut.explorer.selectAll' },
       { keys: [`${MOD}+X`], desc: 'shortcut.explorer.cut' },
       { keys: [`${MOD}+C`], desc: 'shortcut.explorer.copy' },
@@ -194,6 +212,15 @@ function UpdateIndicator({
     return (
       <button className="tb-update-btn" onClick={onInstall}>
         {t('update.tb.restartInstallVersion', { version: update.version ?? '' })}
+      </button>
+    )
+  // The same build, and the same button, but restarting will not install it — so the titlebar must
+  // not say it will. Without this branch 'manual' falls through to the error text below, which is
+  // both wrong and unactionable.
+  if (update.state === 'manual')
+    return (
+      <button className="tb-update-btn" onClick={onInstall}>
+        {t('update.tb.manualInstallVersion', { version: update.version ?? '' })}
       </button>
     )
   const text =
@@ -349,6 +376,8 @@ function formatResetHud(resetsAt: string | null | undefined): string | null {
  *  asking is the Host replacing itself, which happens the first moment it holds nothing, and a notice
  *  that clears within half a minute of that is prompt enough for something nobody is waiting on. */
 const HOST_STATUS_POLL_MS = 30_000
+/** 저널이 바빠 상세가 마지막으로 읽은 줄을 받았을 때, 다시 묻기까지 기다리는 시간(stage 3 T1) */
+const DETAIL_BUSY_RETRY_MS = 2_000
 
 /** "7m", "2h" — a coarse uptime is all this row needs; it is a sign of life, not a metric, which is
  *  also why the unit is not translated. */
@@ -481,20 +510,66 @@ export default function App(): React.JSX.Element {
     }
     read()
     const timer = setInterval(read, HOST_STATUS_POLL_MS)
+    // The poll is the floor, not the source. A Host that stops answering has to reach the screen at
+    // once — the person is already looking at it, waiting for a session that is not coming — so main
+    // pushes every transition and the poll is left in as a backstop for anything that never does.
+    const off = window.api.host.onStatus((s) => {
+      if (current) setHostStatus(s)
+    })
     return () => {
       current = false
       clearInterval(timer)
+      off()
     }
   }, [])
+  /** Putting the Host's own runtime in place (stage 3 task 2), as main last said it. Read once at mount
+   *  and then pushed; the notice it drives sits in the status bar beside the other Host notices. */
+  const [hostRuntime, setHostRuntime] = useState<HostRuntimeInstallState | null>(null)
+  useEffect(() => {
+    let current = true
+    void window.api.host
+      .runtimeInstall()
+      .then((s) => {
+        if (current) setHostRuntime(s)
+      })
+      .catch(() => {})
+    const off = window.api.host.onRuntimeInstall((s) => {
+      if (current) setHostRuntime(s)
+    })
+    return () => {
+      current = false
+      off()
+    }
+  }, [])
+  /** The clock the notice's elapsed seconds read, ticked once a second only while a slow install is on
+   *  screen — the count moving is what tells a long antivirus scan from a hang. */
+  const [hostRuntimeNow, setHostRuntimeNow] = useState(() => Date.now())
+  const hostRuntimeSlow = hostRuntime?.phase === 'preparing' && hostRuntime.slow
+  useEffect(() => {
+    if (!hostRuntimeSlow) return
+    setHostRuntimeNow(Date.now())
+    const timer = setInterval(() => setHostRuntimeNow(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [hostRuntimeSlow])
   const [hostRestarting, setHostRestarting] = useState(false)
   /** The Info tab's *Restart now*: confirm with what ends, replace, then re-read the row. */
   const restartHost = async (): Promise<void> => {
     const h = hostHolding
-    const body = h
-      ? t('settings.info.hostRestartConfirmBody', { sessions: h.sessions, chats: h.chats, terminals: h.terminals, runs: h.runs })
-      : t('settings.info.hostRestartConfirmBodyNone')
+    // **A Host that is not answering cannot be asked what it holds**, so `hostHolding` is null there
+    // and staying silent about it would be the wrong kind of quiet — something does end. The app's own
+    // count of sessions that outlive it is the honest answer: it is this app's record of what it
+    // handed to that Host, which is exactly what goes away with it.
+    const unresponsive = hostStatus?.unresponsive === true
+    const kept = unresponsive ? await window.api.host.sessionsOutlivingApp().catch(() => 0) : 0
+    const body = unresponsive
+      ? kept > 0
+        ? t('settings.info.hostRestartUnresponsiveConfirmBody', { kept })
+        : t('settings.info.hostRestartUnresponsiveConfirmBodyNone')
+      : h
+        ? t('settings.info.hostRestartConfirmBody', { sessions: h.sessions, chats: h.chats, terminals: h.terminals, runs: h.runs })
+        : t('settings.info.hostRestartConfirmBodyNone')
     const ok = await confirmModal({
-      title: t('settings.info.hostRestartConfirmTitle'),
+      title: t(unresponsive ? 'settings.info.hostRestartUnresponsiveConfirmTitle' : 'settings.info.hostRestartConfirmTitle'),
       body,
       confirmLabel: t('settings.info.hostRestartNow')
     })
@@ -559,6 +634,7 @@ export default function App(): React.JSX.Element {
     | 'appearance'
     | 'accounts'
     | 'agent'
+    | 'cli'
     | 'hiw'
     | 'info'
     | 'shortcuts'
@@ -582,19 +658,15 @@ export default function App(): React.JSX.Element {
   // preserving undefined protected the rest; that is no longer the case.)
   const [slackLoaded, setSlackLoaded] = useState(false)
   const [wtRoot, setWtRoot] = useState('') // the worktree root in the settings modal
-  const [orchEnabled, setOrchEnabled] = useState(false) // the agent orchestration toggle
   // 에이전트 권한 모드. **기본이 yolo 라 초기값도 true 다** — false 로 두면 모달이 열리는 순간
   // 꺼진 체크박스가 잠깐 보였다가 켜지고, 그 깜빡임은 사용자가 끈 것으로 읽힌다.
   const [agentYolo, setAgentYolo] = useState(true)
-  // The rail button for Jobs is gated on this, so the shortcut must be too — a key that opens a view
-  // whose control is not on screen leaves the user somewhere they cannot get back from. Read through a
-  // ref for the same reason as jobsOpenRef.
-  const orchEnabledRef = useRef(orchEnabled)
-  orchEnabledRef.current = orchEnabled
   const [workUnitTrackingEnabled, setWorkUnitTrackingEnabled] = useState(false) // the work unit tracking toggle
   const [agentBrowserEnabled, setAgentBrowserEnabled] = useState(false) // the agent browser toggle
+  const [agentAppEnabled, setAgentAppEnabled] = useState(false) // the agent app workspace toggle
   // Which kind the new-session and resume dialogs open on. Needed outside the settings modal — both
-  // dialogs seed their own selection from it — so it is loaded at mount like orchEnabled above.
+  // dialogs seed their own selection from it — so it is loaded at mount rather than only while the
+  // modal is open.
   const [defaultSessionKind, setDefaultSessionKind] = useState<SessionKind>('terminal')
   /** Whether the one first-run question has been put to this person — null until main has said.
    *  False only on a machine with no settings file at all, so an update never sees the modal
@@ -781,7 +853,7 @@ export default function App(): React.JSX.Element {
   // 탭 트리에서 파생시킨다 — activeFileId 와 같은 이유다: 따로 상태를 두면 다른 페인의 탭을
   // 누르는 순간 트리와 갈라진다
   closableTabIdRef.current =
-    activeTab?.kind === 'file' || activeTab?.kind === 'record' || activeTab?.kind === 'browser' ? activeTabId : null
+    activeTab?.kind === 'file' || activeTab?.kind === 'record' || activeTab?.kind === 'browser' || activeTab?.kind === 'app' ? activeTabId : null
   /** The close function itself. `closeWorkbenchTab` is recreated every render and its body reads
    *  render-time values (via closeFileTab), so a key listener registered once that called a captured
    *  stale closure would act on outdated tabs — same place, same reason as selectWorkbenchTabRef. */
@@ -799,6 +871,49 @@ export default function App(): React.JSX.Element {
   // onKey is registered once at mount, so values and callbacks recreated on every render are read through refs
   const tRef = useRef(t)
   tRef.current = t
+
+  // The astera command, offered (2026-09-30): while this app holds an account and the command is not
+  // installed, a toast says sessions and Jobs can be run from a terminal too, even with the app closed,
+  // and opens Settings → CLI, where Install and its PATH checkbox are. **Settled by the person, not
+  // by being shown**: the mark is written when they close it or press the button (or the command turns
+  // out installed), so a renderer reload right after it appeared does not lose it for good (measured in
+  // the dev app). `cliOfferedThisRun` keeps StrictMode's second run from showing a second one.
+  useEffect(() => {
+    if (accounts.length === 0 || cliOfferedThisRun) return
+    const settle = (): void => {
+      try {
+        localStorage.setItem('cm.cliOffered', '1')
+      } catch {
+        /* storage refused: it may be offered again, which is the lesser harm */
+      }
+    }
+    try {
+      if (localStorage.getItem('cm.cliOffered') === '1') return
+    } catch {
+      return
+    }
+    cliOfferedThisRun = true
+    void window.api.cli
+      .status()
+      .then((s) => {
+        if (s.installed) return settle()
+        const id = toast.info(tRef.current('settings.cli.offer'), {
+          onDismiss: settle,
+          action: {
+            label: tRef.current('settings.cli.offer.open'),
+            onClick: () => {
+              settle()
+              dismiss(id)
+              setSettingsTab('cli')
+              setShowSettings(true)
+            }
+          }
+        })
+      })
+      .catch(() => {
+        cliOfferedThisRun = false
+      })
+  }, [accounts.length])
   const cliRef = useRef(cli)
   cliRef.current = cli
   // The install button on the toast is pressed later — it has to see the real number of running sessions at that moment
@@ -829,7 +944,38 @@ export default function App(): React.JSX.Element {
       })
       if (!ok) return
     }
-    await window.api.update.install()
+
+    // **The outcome is read now, because on macOS the app does not always leave.** Squirrel.Mac
+    // refuses a build whose signature it cannot match against the running app's, and on an
+    // ad-hoc-signed release that refusal is permanent (src/main/manualInstall.ts). Before this,
+    // main answered nothing and the renderer waited for a quit that never came: the button was
+    // indistinguishable from a dead one. A rejection is folded into the same shape rather than
+    // thrown away — an updater that failed to load never registers this handler at all.
+    let outcome: InstallOutcome
+    try {
+      outcome = await window.api.update.install()
+    } catch (e) {
+      outcome = { mode: 'failed', message: (e as Error)?.message ?? String(e) }
+    }
+    const notice = installOutcomeNotice(outcome)
+    if (!notice) return // the automatic path — the app is already on its way out
+
+    if (outcome.mode === 'failed') {
+      await confirmModal({
+        title: tRef.current('update.manual.title'),
+        body: tRef.current(notice.key, notice.params),
+        confirmLabel: tRef.current('common.close')
+      })
+      return
+    }
+    // Quitting is confirmed rather than done: the new app is sitting in Finder, and a window that
+    // vanished on its own would take the only explanation of what to do next with it.
+    const move = await confirmModal({
+      title: tRef.current('update.manual.title'),
+      body: tRef.current(notice.key, notice.params),
+      confirmLabel: tRef.current('update.manual.quit')
+    })
+    if (move) window.api.app.quit()
   }
   // When Ctrl+\ had no spare session and opened the new-session dialog instead, the split goes in this
   // direction once creation succeeds. Cancelling the dialog discards it, so no empty pane is left.
@@ -856,13 +1002,10 @@ export default function App(): React.JSX.Element {
     void window.api.system.checkCli().then(setCli)
     void window.api.system.checkCliInstalled().then(setCliInstalled)
     void window.api.system.appVersion().then(setAppVersion)
-    // The rail draws the Jobs button only while this is on, so it has to be read at startup. Reading it
-    // only when the settings modal opens (the showSettings effect below) meant the button was missing
-    // from a cold start until someone opened settings once — not late, absent.
-    void window.api.settings.getOrchestrationEnabled().then(setOrchEnabled)
     void window.api.settings.getAgentBrowserEnabled().then(setAgentBrowserEnabled)
+    void window.api.settings.getAgentAppEnabled().then(setAgentAppEnabled)
     // Both session dialogs seed their kind from this, so it has to be loaded before either can open —
-    // the same reason orchEnabled above is loaded at mount rather than only while the modal is open.
+    // it cannot wait for the settings modal.
     void window.api.settings.getDefaultSessionKind().then(setDefaultSessionKind)
     // Read here with the rest: the modal below is drawn from it, and it must not flash in front of
     // someone who has used the app for months while an answer is in flight.
@@ -870,6 +1013,9 @@ export default function App(): React.JSX.Element {
       .getFirstRunAsked()
       .then(setFirstRunAsked)
       .catch(() => setFirstRunAsked(true)) // could not tell — the quiet answer is the right one
+    // A damaged settings file was reset at load, with permission prompts on. An error toast, because
+    // it does not auto-dismiss: the person has to see that their settings changed.
+    void announceSettingsRecovery(window.api.settings.takeRecoveryNotice, (key) => toast.error(tRef.current(key)))
     // The schedule banner's one-shot read. 'session:schedState' is pushed on changes only, so a session
     // whose schedule was registered before this renderer existed — a reload, or main re-arming a
     // session while the window was still coming up — would wear no banner until its next due tick.
@@ -906,7 +1052,12 @@ export default function App(): React.JSX.Element {
       const wanted = (list.find((s) => s.status === 'running') ?? list[0]).id
       const act = activateTab(root, sessionTab(wanted))
       if (!act) return
-      setLayout(act.root)
+      // This tree is built from scratch, so the mirror tabs a workspace.list that answered first has
+      // already placed go back in (fix round 1: they were wiped). The ref moves now, so a list that
+      // answers after this, before the render, builds on this tree.
+      const withMirrors = placeAppTabs(act.root, openSessionIds(mirrorsRef.current), act.paneId)
+      layoutRef.current = withMirrors
+      setLayout(withMirrors)
       setActivePaneId(act.paneId)
     })
     const offAccounts = window.api.on('accounts:changed', (p) => setAccounts(p.accounts))
@@ -1068,19 +1219,16 @@ export default function App(): React.JSX.Element {
       setSlackLoaded(true)
     })
     void window.api.worktrees.getRoot().then(setWtRoot)
-    // Re-syncs the orchestration toggle whenever the modal opens. The initial value comes from the mount
-    // effect above (the rail needs it before anyone opens this modal); this is what keeps the checkbox
-    // honest if the stored value ever diverges from what the renderer is holding.
-    void window.api.settings.getOrchestrationEnabled().then(setOrchEnabled)
-    // Same re-sync for work unit tracking. Unlike orchestration, nothing outside this modal reads it yet,
-    // so there is no mount-time fetch to keep honest — this is the only read.
+    // Work unit tracking. Nothing outside this modal reads it, so there is no mount-time fetch to keep
+    // honest — this is the only read.
     void window.api.settings.getWorkUnitTrackingEnabled().then(setWorkUnitTrackingEnabled)
     // 권한 모드도 같은 갈래다 — 이 모달 밖에서 읽는 곳이 없으므로 마운트 시점 읽기는 두지 않는다.
     void window.api.settings
       .getAgentPermissionMode()
       .then((m) => setAgentYolo(m === 'yolo'))
     void window.api.settings.getAgentBrowserEnabled().then(setAgentBrowserEnabled)
-    // Re-syncs the new-session default too, for the same reason as orchestration above.
+    void window.api.settings.getAgentAppEnabled().then(setAgentAppEnabled)
+    // Re-syncs the new-session default too — the mount-time read above is what it keeps honest.
     void window.api.settings.getDefaultSessionKind().then(setDefaultSessionKind)
     // Re-read on open beside the effect below, which is what keeps it current the rest of the time:
     // the Info row wants the freshest answer at the moment it is drawn, and this costs nothing.
@@ -1160,10 +1308,6 @@ export default function App(): React.JSX.Element {
       // The two sidebar views the rail can open. Pressed again they close, which is what the rail
       // button does — so the key is the button, not a second way in.
       //
-      // Jobs is gated on the orchestration setting because its rail button is: with the setting off the
-      // button is not drawn, and a key that opens a view whose only control is missing strands the user
-      // in it. How It Works has no such flag.
-      //
       // Not blocked while a text field has focus, unlike the tab-cycling actions below: the default
       // chords are Ctrl+Shift+J/H, which no input of ours uses, and switching sidebars while reading a
       // file is exactly when it is wanted.
@@ -1172,7 +1316,6 @@ export default function App(): React.JSX.Element {
       // bodies are all refs and setters, so a stale closure still acts on the latest state — the same
       // convention toggleExplorer and closeFileTab already rely on.
       if (action === 'sidebar.home' || action === 'sidebar.jobs' || action === 'sidebar.howItWorks') {
-        if (action === 'sidebar.jobs' && !orchEnabledRef.current) return
         e.preventDefault()
         e.stopPropagation()
         if (e.repeat) return // holding the key would flap the sidebar
@@ -1436,9 +1579,14 @@ export default function App(): React.JSX.Element {
     rollPrompt?: string
     slackNotify?: boolean
     bypassPermissions?: boolean
+    /** chat takeover P8: the New Session dialog's pick for a chat session, forwarded to sessions.spawn
+     *  unchanged. Absent for a terminal session, which has no such policy at all. */
+    unattendedPermission?: UnattendedPermission
     useWorktree?: boolean
     worktreeName?: string
     worktreeBaseRef?: string
+    /** The new-session dialog's id for this creation — its progress and Cancel go by it */
+    worktreeOpId?: string
     repoRoot?: string | null
     schedule?: ScheduleConfig
     /** The old session id, for when an existing tab's session id has to be swapped, as on a restart */
@@ -1454,7 +1602,8 @@ export default function App(): React.JSX.Element {
         const created = await window.api.worktrees.create({
           repoPath: opts.repoRoot,
           name: opts.worktreeName,
-          baseRef: opts.worktreeBaseRef
+          baseRef: opts.worktreeBaseRef,
+          ...(opts.worktreeOpId ? { opId: opts.worktreeOpId } : {})
         })
         createdWorktreeName = created.info.name
         created.warnings.forEach((w) => toast.info(t(w.key, w.params)))
@@ -1477,6 +1626,7 @@ export default function App(): React.JSX.Element {
         rollPrompt: rolling ? opts.rollPrompt : undefined,
         slackNotify: opts.slackNotify, // Slack progress notifications
         bypassPermissions: opts.bypassPermissions, // start without permission prompts
+        unattendedPermission: opts.unattendedPermission, // chat takeover P8: hold, or deny after 60 s
         schedule: opts.schedule
       })
       // The default account mapping is keyed on the original repo — a worktree path is new every time and mappings must not pile up
@@ -1525,7 +1675,13 @@ export default function App(): React.JSX.Element {
           }
         }
       }
-      const msg = worktreeErrorMessage(err instanceof Error ? err.message : String(err))
+      const raw = err instanceof Error ? err.message : String(err)
+      // Cancelled and fully rolled back: what the person asked for, said as a notice rather than a failure
+      if (isWorktreeCancelled(raw)) {
+        toast.info(t('worktree.error.cancelled'))
+        return
+      }
+      const msg = spawnErrorMessage(raw)
       const message = t(msg.key, msg.params)
       // On a failure after the worktree was created, the user is also told that it remains, unrolled-back
       toast.error(
@@ -1725,6 +1881,14 @@ export default function App(): React.JSX.Element {
       dropTabFromTree(tabId)
       return
     }
+    if (ref.kind === 'app') {
+      // A picture, not a process: dropping the tab is the whole close. The workspace itself is closed
+      // only by the pane's Close button (workspace-close). The mirror entry stays, so the next frame of
+      // a workspace that is still open does not put the tab back: only a workspace that opens again
+      // does (newlyOpened reads a transition, not a presence).
+      dropTabFromTree(tabId)
+      return
+    }
     closeSession(ref.id)
   }
   // Ctrl+W 가 이 함수를 타도록 — 위 selectWorkbenchTabRef 와 같은 자리, 같은 이유다
@@ -1798,7 +1962,7 @@ export default function App(): React.JSX.Element {
   // cheap (invalidateImageCache's own comment), so nothing here needs to guess whether c.path is actually
   // an image before calling it.
   useEffect(() => {
-    const off = window.api.on('files:changed', (c) => {
+    const onChange = (c: FileChange): void => {
       if (c.kind === 'add' || c.kind === 'change' || c.kind === 'unlink') invalidateImageCache(c.path)
       const id = `file:${c.path}`
       const buf = fileBuffersRef.current[id]
@@ -1826,6 +1990,10 @@ export default function App(): React.JSX.Element {
           // A failed re-read (permissions, a race) is quietly ignored — the next event retries
         }
       )
+    }
+    // One message per watcher window; each path appears once in it, with its latest kind (core/files/changeBatch.ts)
+    const off = onFileChanges((batch) => {
+      for (const c of batch.changes) onChange(c)
     })
     return off
   }, [])
@@ -1922,7 +2090,8 @@ export default function App(): React.JSX.Element {
     setSessions(rest)
     const cur = layoutRef.current
     if (cur) {
-      const next = removeTab(cur, sessionTab(id))
+      // The session's mirror tab goes with it (fix round 1): left behind, it would name a gone session.
+      const next = removeAppTab(removeTab(cur, sessionTab(id)), id)
       if (next) {
         // If the active group is gone, focus moves to the first remaining group
         const p = activePaneIdRef.current
@@ -2187,6 +2356,21 @@ export default function App(): React.JSX.Element {
   // The Jobs sidebar snapshot for the open project — orch.list's initial payload, then every
   // 'orch:state' push after it (see the subscription effect below). null until orch.list first resolves.
   const [orchSnapshot, setOrchSnapshot] = useState<OrchSnapshot | null>(null)
+  /** Why the Jobs sidebar has nothing to draw, when the Host is the reason — null in the ordinary
+   *  case. **Kept apart from the snapshot above, and that separation is the fix for ruling F41.** The
+   *  snapshot is per project and this state deliberately substitutes an empty one whenever there is
+   *  none open; a gate carried inside it was therefore erased in exactly the window that needs it —
+   *  a fresh install, or any window before its first session. */
+  const [orchHostGate, setOrchHostGate] = useState<OrchHostGate | null>(null)
+  /** Who drives Jobs, as the Host last said it (limits L3) — null when nothing is known. With
+   *  `hostStatus` it tells the Jobs sidebar why nothing moves (jobsStall). One fact about the app's
+   *  Host, like the gate above, so it is not carried in the snapshot either. */
+  const [hostDriver, setHostDriver] = useState<HostDriverReport | null>(null)
+  /** When this window first saw the Host parked with no gate read yet (S6-11), null otherwise. A first
+   *  settings read that hangs past JOBS_STALL_READING_MS then shows as "still reading" (jobsStall). */
+  const [parkedSinceMs, setParkedSinceMs] = useState<number | null>(null)
+  /** Bumped when that threshold comes due, so the sidebar draws again with no other change. */
+  const [, setStallTick] = useState(0)
   /** 상세 창이 열려 있는 Run. null 이면 닫혀 있다.
    *
    *  **runId 만 들지 않고 프로젝트를 함께 든다.** 프로젝트가 바뀌는 커밋에서는 리셋 효과의
@@ -2198,6 +2382,12 @@ export default function App(): React.JSX.Element {
   /** 그 Run 의 이벤트와 의존 그래프. null 은 아직 도착하지 않았다는 뜻이고 빈 배열과 다르다 — 모달은
    *  전자에 아무것도 그리지 않고 후자에만 빈 상태를 그린다. 읽는 효과는 currentProject 선언 아래에 있다. */
   const [detail, setDetail] = useState<RunDetailData | null>(null)
+  /** 상세 창이 저널 줄을 몇 쪽까지 읽는가(stage 3 T1) — "이전 저널 기록 더 보기" 가 한 쪽씩 늘린다.
+   *  runId 와 함께 든다: 다른 Run 을 열면 따로 되돌리지 않아도 1 쪽에서 시작한다. */
+  const [journalPagesFor, setJournalPagesFor] = useState<{ runId: string; pages: number } | null>(null)
+  /** 저널이 바빠 마지막으로 읽은 줄을 받았을 때 다시 묻는 횟수 — 바뀔 때마다 아래 효과가 상세를 다시
+   *  부른다. 스냅샷이 움직이지 않는 Run 이면 그것 말고는 다시 물을 계기가 없다. */
+  const [detailRetry, setDetailRetry] = useState(0)
   /** 홈 디렉터리 — 프로젝트가 없을 때 아래쪽 패널의 터미널이 열릴 자리. 프로세스 수명 동안 바뀌지
    *  않으므로 한 번만 읽는다. 도착하기 전에는 null 이고, 그동안 패널은 그려지지 않는다. */
   const [homeDir, setHomeDir] = useState<string | null>(null)
@@ -2260,8 +2450,12 @@ export default function App(): React.JSX.Element {
   }
 
   /** 관리자가 사라진 Run 에 코디네이터를 다시 붙인다. **`run-start` 를 다시 부른다** — 그 명령의
-   *  뜻이 "이 Run 에 관리자가 있게 하라" 이고, 이미 붙어 있으면 아무것도 하지 않는다(server.ts).
+   *  뜻이 "이 Run 에 관리자가 있게 하라" 이고, 이미 붙어 있으면 아무것도 하지 않는다(command.ts).
    *  그래서 새 명령을 만들지 않았다.
+   *
+   *  `runId` 는 그 줄의 id 다: 펼치지 않은 Job 줄이면 Job 의 id(그 최신 회차를 뜻한다), 펼쳐진 회차
+   *  줄이면 회차의 id 다(view.ts 의 rowFor). run-start 는 둘 다 받는다 — 한때 Job id 만 받아서
+   *  예약 회차 줄과, 회차가 둘 이상인 Job 의 회차 줄에서 이 버튼이 언제나 실패했다.
    *
    *  앱이 스스로 되띄우지 않는 이유는 Run.coordinatorSessionId 의 주석에 있다 — 탭을 닫는 것은
    *  사람의 결정이고, 곧바로 다시 여는 것은 그 결정을 무시하는 일이다. 그래서 되돌리는 자리가
@@ -2298,7 +2492,9 @@ export default function App(): React.JSX.Element {
         : activeTab?.kind === 'browser'
           ? // A browser tab names its project the same way a file tab does
             browserTabs.find((t) => t.id === activeTabId)?.projectRoot
-          : sessions.find((s) => s.id === activeTab?.id)?.cwd) ?? null
+          : activeTab?.kind === 'app' || activeTab?.kind === 'session'
+            ? sessions.find((s) => s.id === activeTab.id)?.cwd
+            : undefined) ?? null
 
   /** 탭이 하나도 없을 때의 현재 프로젝트. 마운트에서 한 번 복원하고, 그 뒤로는 활성 탭이 갱신한다.
    *  영속 규칙은 lib/stickyProject.ts 에 있다(렌더러에 테스트가 없어 App.tsx 안에서는 확인할 수 없다). */
@@ -2364,7 +2560,7 @@ export default function App(): React.JSX.Element {
   // 잡지 못한다).
   //
   // orchSnapshot 을 의존성에 두는 것이 요점이다: 그 값이 바뀌는 것이 곧 "이 프로젝트의 오케스트레이션
-  // 상태가 움직였다"이고, JobRun.eventCount 가 스냅샷에 실려 있으므로 Task 상태를 하나도 옮기지 않는
+  // 상태가 움직였다"이고, JobRow.eventCount 가 스냅샷에 실려 있으므로 Task 상태를 하나도 옮기지 않는
   // 메시지도 그 신호에 포함된다. 폴링을 두지 않는 이유가 그것이다.
   useEffect(() => {
     // 짝이 맞지 않으면 부르지 않는다 — 프로젝트 A→B 커밋에서 이 효과는 아직 A 의 runId 를 들고
@@ -2381,7 +2577,8 @@ export default function App(): React.JSX.Element {
     let cancelled = false
     // 거부 팔을 반드시 둔다 — 위의 가드가 걸러도 main 은 저장소를 읽다 던질 수 있고, 그러면
     // DevTools 에 Uncaught (in promise) 가 뜬다. 빈 모양으로 접으면 모달은 빈 상태를 그린다.
-    void window.api.orch.runDetail(openRun.projectPath, openRun.runId).then(
+    const journalPages = journalPagesFor?.runId === openRun.runId ? journalPagesFor.pages : 1
+    void window.api.orch.runDetail(openRun.projectPath, openRun.runId, { journalPages }).then(
       (d) => {
         if (!cancelled) setDetail(d)
       },
@@ -2392,7 +2589,14 @@ export default function App(): React.JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [openRun, currentProject, orchSnapshot])
+  }, [openRun, currentProject, orchSnapshot, journalPagesFor, detailRetry])
+  // 저널이 바빴다(stage 3 T1) — main 은 기다리지 않고 마지막으로 읽은 줄을 줬다. 잠시 뒤에 다시 묻는다.
+  // 답이 여전히 바쁘면 다음 답이 또 한 번을 잡는다. 창을 닫거나 답이 바뀌면 타이머를 걷는다.
+  useEffect(() => {
+    if (!detail?.journal?.busy) return
+    const timer = setTimeout(() => setDetailRetry((n) => n + 1), DETAIL_BUSY_RETRY_MS)
+    return () => clearTimeout(timer)
+  }, [detail])
   // 프로젝트가 바뀌면 닫는다 — 다른 프로젝트의 Run 을 열어 둔 채로 둘 이유가 없다
   useEffect(() => {
     setOpenRun(null)
@@ -2599,6 +2803,26 @@ export default function App(): React.JSX.Element {
   }
   const openAgentTabRef = useRef(openAgentTab)
   openAgentTabRef.current = openAgentTab
+  const [mirrors, setMirrors] = useState<Mirrors>({})
+  const mirrorsRef = useRef<Mirrors>({})
+  /** The Host showed workspaces for these sessions: their mirror tabs, placed once and in the
+   *  background, the openAgentTab rule (the agent's work must not take the tab the person is on). The
+   *  ref moves with the tree (dropTabFromTree's rule), so two workspaces that open before a render both
+   *  keep their tab (fix round 1: the second placement overwrote the first). */
+  const openAppTabs = (sessionIds: string[]): void => {
+    const root = placeAppTabs(layoutRef.current, sessionIds, activePaneIdRef.current)
+    if (root === layoutRef.current) return
+    layoutRef.current = root
+    setLayout(root)
+  }
+  const openAppTabsRef = useRef(openAppTabs)
+  openAppTabsRef.current = openAppTabs
+  const takeMirrors = (next: Mirrors, prev: Mirrors): void => {
+    mirrorsRef.current = next
+    setMirrors(next)
+    const opened = newlyOpened(prev, next)
+    if (opened.length > 0) openAppTabsRef.current(opened)
+  }
   const closeAgentTab = (sessionId: string): void => {
     const b = browserTabsRef.current.find((x) => x.agentSessionId === sessionId)
     if (b) closeWorkbenchTab(b.id)
@@ -2762,6 +2986,45 @@ export default function App(): React.JSX.Element {
     )
   }
 
+  /** An app mirror tab's body (AppMirrorPane). The session's title names it; Stop and Close go to the
+   *  Host through main. */
+  const renderApp = (appTabId: string): React.ReactNode => {
+    const ref = parseTab(appTabId)
+    if (ref?.kind !== 'app') return null
+    const s = sessions.find((x) => x.id === ref.id)
+    const fail = (err: unknown): void => {
+      toast.error(t('workspace.pane.failed', { detail: err instanceof Error ? err.message : String(err) }))
+    }
+    return (
+      <AppMirrorPane
+        sessionTitle={s?.title ?? ref.id}
+        mirror={mirrors[ref.id] ?? null}
+        onStop={() =>
+          void window.api.workspace
+            .stop(ref.id)
+            .then((stopped) => {
+              if (!stopped) toast.info(t('workspace.pane.nothingToStop'))
+            })
+            .catch(fail)
+        }
+        onClose={() =>
+          void window.api.workspace
+            .close(ref.id)
+            .then((closed) => {
+              if (!closed) toast.info(t('workspace.pane.nothingToClose'))
+            })
+            .catch(fail)
+        }
+      />
+    )
+  }
+  const appTabInfo = (sessionId: string): { title: string; running: boolean; open: boolean } | null => {
+    const s = sessions.find((x) => x.id === sessionId)
+    const m = mirrors[sessionId]
+    if (!s && !m) return null
+    return { title: s?.title ?? sessionId, running: m?.running === true, open: m?.open === true }
+  }
+
   /** A browser tab's body. `serverPending` is derived from this project's runs — the tab's run is
    *  still alive — so the pane knows whether a refused connection means "not up yet" or "gone". */
   const renderBrowser = (browserTabId: string): React.ReactNode => {
@@ -2810,9 +3073,6 @@ export default function App(): React.JSX.Element {
 
   // 사이드바에 그릴 뷰 하나 — 네 갈래 삼항보다 이 값 하나가 어느 뷰가 열려 있는지를 더 분명히 읽힌다.
   // 탐색기·Jobs·How It Works는 서로 배타적이다(toggleExplorer/toggleJobs/toggleHiw가 나머지를 끈다).
-  // orchEnabled가 꺼지면 jobsOpen이 내부적으로 true로 남아 있어도 Jobs를 그리지 않고 세션 목록으로
-  // 돌아간다 — 레일의 진입점이 사라지는 시점에 사이드바도 조용히 원래 모습으로 돌아가야 어색해지지
-  // 않는다. How It Works에는 그런 기능 플래그가 없다.
   //
   // **아래 효과들과 Run 콘솔의 렌더가 이 값을 공유한다.** 그래서 선언이 렌더 본문 끝이 아니라 여기에
   // 있다 — 효과의 의존성 배열은 렌더 중에 평가되므로 선언이 그보다 아래면 TDZ 로 터진다.
@@ -2820,7 +3080,7 @@ export default function App(): React.JSX.Element {
   // 어긋날 수 있다.
   const sidebarPane: 'explorer' | 'jobs' | 'understanding' | 'sessions' = explorerOpen
     ? 'explorer'
-    : jobsOpen && orchEnabled
+    : jobsOpen
       ? 'jobs'
       : hiwOpen
         ? 'understanding'
@@ -2936,17 +3196,58 @@ export default function App(): React.JSX.Element {
     }
   }, [currentProject, sessionTasksSeq])
 
-  // Turning the setting off makes the rail button — the only control that can close the Jobs view —
-  // disappear along with it (it is gated on the same orchEnabled), so a view left open past that point
-  // is one the user has no way left to reach the control for. Closing it here is what lets the
-  // subscription effect below run its own cleanup (unwatch): that effect does not depend on
-  // orchEnabled, and adding it to that dependency list alone would not help — jobsOpen would still be
-  // true and the effect would just re-arm. Setting jobsOpen to false here is what actually tears the
-  // subscription down, and it does not spring back open when the setting is turned back on (this
-  // effect only ever closes, never opens).
+  // The Host gate, read once and then listened for. **Its own effect with no dependencies**, because
+  // it is one fact about the app rather than about a project (ruling F41): tying it to jobsOpen or to
+  // currentProject is what hid it, and the read is what covers a window that mounts after main had
+  // already given up on the Host. It costs one IPC call per window.
   useEffect(() => {
-    if (!orchEnabled) setJobsOpen(false)
-  }, [orchEnabled])
+    let cancelled = false
+    void window.api.orch
+      .hostGate()
+      .then((gate) => {
+        if (!cancelled) setOrchHostGate(gate)
+      })
+      .catch(() => {})
+    const off = window.api.on('orch:host', (gate) => {
+      if (!cancelled) setOrchHostGate(gate)
+    })
+    return () => {
+      cancelled = true
+      off()
+    }
+  }, [])
+
+  // S6-11: time a parked Host with no gate read yet, and draw again when it has lasted long enough to name.
+  const parkedUnread = hostDriver?.driver === 'parked' && hostDriver.gate === null
+  useEffect(() => {
+    setParkedSinceMs(parkedUnread ? Date.now() : null)
+  }, [parkedUnread])
+  useEffect(() => {
+    const wait = jobsStallRecheckInMs({ driver: hostDriver, parkedSinceMs, nowMs: Date.now() })
+    if (wait === null) return
+    // A little past the threshold, so a timer that fires a millisecond early still finds it crossed.
+    const timer = setTimeout(() => setStallTick((n) => n + 1), wait + 50)
+    return () => clearTimeout(timer)
+  }, [hostDriver, parkedSinceMs])
+
+  // Who drives Jobs (limits L3): read once, then listened for, the same shape and the same reason as
+  // the gate above.
+  useEffect(() => {
+    let cancelled = false
+    void window.api.host
+      .driver()
+      .then((r) => {
+        if (!cancelled) setHostDriver(r)
+      })
+      .catch(() => {})
+    const off = window.api.on('host:driver', (r) => {
+      if (!cancelled) setHostDriver(r)
+    })
+    return () => {
+      cancelled = true
+      off()
+    }
+  }, [])
 
   // Loads the Jobs sidebar snapshot and subscribes to further changes, the same shape as the run.list
   // effect above. orch.list doubles as the subscription (OrchApi's doc comment): its return value is
@@ -2972,7 +3273,7 @@ export default function App(): React.JSX.Element {
     // whole <aside> and JobsView with it, but jobsOpen stays true, so without this no unwatch is sent
     // and main goes on folding a snapshot on every orchestration write — inside the awaited setState,
     // i.e. in the CLI request's critical path — and pushing it to a component that is not mounted.
-    // The fourth teardown trigger, after unmount, orch.unwatch and the orchEnabled effect above.
+    // The third teardown trigger, after unmount and orch.unwatch.
     if (!jobsOpen || !sidebarOpen || !currentProject) return
     let cancelled = false
     void window.api.orch.list(currentProject).then((snapshot) => {
@@ -3121,6 +3422,11 @@ export default function App(): React.JSX.Element {
   // The agent browser: main asks for a session's tab, asks it closed, and reports whether a script is
   // running in it — see CoreEvents' preview:agentTab / preview:agentTabClose / preview:agentBusy.
   useEffect(() => window.api.on('preview:agentTab', ({ sessionId, cwd, url }) => openAgentTabRef.current(sessionId, cwd, url)), [])
+  // The agent app workspaces (agent workspace design): the live ones once at mount, then every change.
+  useEffect(() => {
+    void window.api.workspace.list().then((list) => takeMirrors({ ...mirrorsRef.current, ...mirrorsFromList(list) }, mirrorsRef.current))
+  }, [])
+  useEffect(() => window.api.on('workspace:event', (e) => takeMirrors(applyWorkspaceEvent(mirrorsRef.current, e), mirrorsRef.current)), [])
   useEffect(() => window.api.on('preview:agentTabClose', ({ sessionId }) => closeAgentTabRef.current(sessionId)), [])
   useEffect(() => window.api.on('preview:agentBusy', ({ sessionId, busy }) => {
     setAgentBusy((prev) => (busy ? { ...prev, [sessionId]: true } : (({ [sessionId]: _b, ...rest }) => rest)(prev)))
@@ -3159,12 +3465,16 @@ export default function App(): React.JSX.Element {
       // Same situation for 'dockerfile' — no seed, but its presence flips the picker's detection (hasDockerfile)
       'Dockerfile'
     ])
-    const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase()
-    const off = window.api.on('files:changed', (c) => {
+    const norm = (p: string): string => foldPathCase(p.replace(/\\/g, '/'), window.api.platform)
+    // A batch is one watcher window — seed files touched together (a git checkout) re-read the run list once
+    const off = onFileChanges((batch) => {
       const root = currentProjectRef.current
       if (!root) return
-      const base = c.path.split(/[\\/]/).pop() ?? ''
-      if (!SEED_FILES.has(base) || norm(parentDir(c.path)) !== norm(root)) return
+      const touchesSeed = batch.changes.some((c) => {
+        const base = c.path.split(/[\\/]/).pop() ?? ''
+        return SEED_FILES.has(base) && norm(parentDir(c.path)) === norm(root)
+      })
+      if (!touchesSeed) return
       void window.api.run.list(root).then((r) => {
         setRunConfigs(r.configs)
         setRunIsSpringBoot(r.isSpringBoot)
@@ -3177,7 +3487,7 @@ export default function App(): React.JSX.Element {
           root,
           pickRunSelection(r.configs, runSelectedByProject.current[root], r.runs.find((x) => x.status !== 'exited')?.configId)
         )
-      })
+      }).catch((err: unknown) => console.warn('Run config refresh after a seed file change failed', err))
     })
     return off
   }, [])
@@ -3336,7 +3646,7 @@ export default function App(): React.JSX.Element {
    *  탭 활성화로 끝나므로 이 줄에 도달하지 않는다 — 즉 이기지 못하는 자리에서 이기려 하지 않는다.
    *  경로는 run.listActive 가 준 것이라 main 의 가드가 이미 허용한 값이다. */
   const runJump = (projectPath: string): void => {
-    const norm = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    const norm = (p: string): string => foldPathCase(p.replace(/\\/g, '/').replace(/\/+$/, ''), window.api.platform)
     const target = norm(projectPath)
     const session = sessionsRef.current.find((s) => norm(s.cwd) === target)
     if (session) {
@@ -3595,37 +3905,34 @@ export default function App(): React.JSX.Element {
               </g>
             </svg>
           </button>
-          {/* Jobs 사이드바 토글. 오케스트레이션 설정이 꺼져 있으면 아예 그리지 않는다 — 뒤에 아무것도
-              없는 진입점을 보여줄 이유가 없다(App.tsx 의 orchEnabled, 설정 모달의 토글이 mirror한다) */}
-          {orchEnabled && (
-            <button
-              className={jobsOpen ? 'rail-btn on' : 'rail-btn'}
-              aria-label={t('jobs.rail.open')}
-              title={t('jobs.rail.open')}
-              onClick={toggleJobs}
+          {/* Jobs 사이드바 토글. 오케스트레이션은 Astera 가 늘 갖고 있는 것이므로 조건 없이 그린다. */}
+          <button
+            className={jobsOpen ? 'rail-btn on' : 'rail-btn'}
+            aria-label={t('jobs.rail.open')}
+            title={t('jobs.rail.open')}
+            onClick={toggleJobs}
+          >
+            {/* Jobs — 체크리스트. 앱의 SVG 관례대로 16 viewBox 에 currentColor 하나, 바깥 사각형은
+                1.4, 안쪽 체크와 줄은 1.2 */}
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.4"
+              strokeLinejoin="round"
             >
-              {/* Jobs — 체크리스트. 앱의 SVG 관례대로 16 viewBox 에 currentColor 하나, 바깥 사각형은
-                  1.4, 안쪽 체크와 줄은 1.2 */}
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 16 16"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.4"
-                strokeLinejoin="round"
-              >
-                <rect x="2.6" y="1.8" width="10.8" height="12.4" rx="1.4" />
-                <g strokeWidth="1.2" strokeLinecap="round">
-                  <path d="M4.8 5.2 5.7 6.1 7.3 4.3" />
-                  <line x1="9" y1="5.4" x2="11.4" y2="5.4" />
-                  <path d="M4.8 9.6 5.7 10.5 7.3 8.7" />
-                  <line x1="9" y1="9.8" x2="11.4" y2="9.8" />
-                </g>
-              </svg>
-            </button>
-          )}
-          {/* How It Works 사이드바 토글. Jobs 와 달리 기능 플래그가 없어 늘 그린다. */}
+              <rect x="2.6" y="1.8" width="10.8" height="12.4" rx="1.4" />
+              <g strokeWidth="1.2" strokeLinecap="round">
+                <path d="M4.8 5.2 5.7 6.1 7.3 4.3" />
+                <line x1="9" y1="5.4" x2="11.4" y2="5.4" />
+                <path d="M4.8 9.6 5.7 10.5 7.3 8.7" />
+                <line x1="9" y1="9.8" x2="11.4" y2="9.8" />
+              </g>
+            </svg>
+          </button>
+          {/* How It Works 사이드바 토글. */}
           <button
             className={hiwOpen ? 'rail-btn on' : 'rail-btn'}
             aria-label={t('hiw.rail.open')}
@@ -3713,6 +4020,9 @@ export default function App(): React.JSX.Element {
             ) : sidebarPane === 'jobs' ? (
               <JobsView
                 snapshot={orchSnapshot}
+                hostGate={orchHostGate}
+                // 아무것도 움직이지 않을 때 그 까닭(한도 L3): 멈춰 둔 Host, 응답하지 않는 Host.
+                stall={jobsStall({ hostStatus, driver: hostDriver, parkedSinceMs, nowMs: Date.now() })}
                 // 빈 상태의 "+ 새 작업" 버튼을 가리는 신호 — snapshot 만으로는 프로젝트가 없는
                 // 경우와 프로젝트가 있는데 Run 이 없는 경우를 구별할 수 없다(JobsView 의
                 // hasProject 주석). onNewRun 의 가드(아래)와 함께 newRunOpen 이 프로젝트 없이
@@ -3758,7 +4068,7 @@ export default function App(): React.JSX.Element {
                     // 집합으로 지우므로(server.ts), 템플릿 자신의 total·eventCount 만 적으면
                     // 확인 창의 숫자가 실제로 사라지는 것보다 적다 — 되돌릴 수 없는 동작에서
                     // 축소해 말하는 것이 가장 나쁜 방향이다. 예약이 아닌 Run 에는 children 이
-                    // 아예 없어 합이 그대로다(JobRun 의 주석).
+                    // 아예 없어 합이 그대로다(JobRow 의 주석).
                     const kids = run.children ?? []
                     const tasks = kids.reduce((n, k) => n + k.total, run.total)
                     const events = kids.reduce((n, k) => n + k.eventCount, run.eventCount)
@@ -3839,6 +4149,13 @@ export default function App(): React.JSX.Element {
                             : t('jobs.run.deleteBusy')
                         )
                       else if (reply.status >= 400) toast.error(t('jobs.run.deleteFailed'))
+                      else {
+                        // 병합 뒤에도 커밋되지 않은 변경이 남았거나 상태를 확인하지 못한 폴더는 명령이
+                        // 지우지 않고 남겼다. 사라지지 않고 남는 알림으로 그 사실을 알린다
+                        const kept = (reply.body as { worktreesKept?: unknown } | null)?.worktreesKept
+                        if (Array.isArray(kept) && kept.length > 0)
+                          toast.error(t('jobs.run.deleteKeptWorktrees', { count: kept.length }))
+                      }
                     } catch {
                       toast.error(t('jobs.run.deleteFailed'))
                     }
@@ -3958,6 +4275,8 @@ export default function App(): React.JSX.Element {
                 renderEditor={renderEditor}
                 renderRecord={renderRecord}
                 renderBrowser={renderBrowser}
+                appTabInfo={appTabInfo}
+                renderApp={renderApp}
                 rollStates={rollStates}
                 schedStates={schedStates}
                 busy={busy}
@@ -4129,6 +4448,10 @@ export default function App(): React.JSX.Element {
 
             Outside the `active` branches above on purpose: the Host's state is the same fact whether or
             not a session is showing, and the two branches would otherwise each need their own copy. */}
+        {/* The Host's own runtime being put in place after an update (stage 3 task 2): the copy used to
+            freeze the window with nothing on screen. Beside the other Host notices, for the same reason
+            they are outside the session branches. */}
+        <HostRuntimeNotice state={hostRuntime} nowMs={hostRuntimeNow} />
         {hostStatus?.connected && hostStatus.outdated && (
           <button
             type="button"
@@ -4141,6 +4464,22 @@ export default function App(): React.JSX.Element {
             })}
           >
             {hostRestarting ? t('settings.info.hostRestarting') : t('status.hostOutdated')}
+          </button>
+        )}
+        {/* The Host stopped answering. The same place and the same amber as the notice above, because
+            it is the same kind of fact and a person should not have to learn two — but it is the more
+            urgent of the two: sessions started from here on end with the app, and the only way back is
+            this button (docs/2026-09-22-host-unresponsive-recovery-design.md F5). Before this, the one
+            place that said anything was Settings > Info, and what it said was "연결 안 됨". */}
+        {hostStatus?.unresponsive && (
+          <button
+            type="button"
+            className="status-host-outdated"
+            disabled={hostRestarting}
+            onClick={() => void restartHost()}
+            title={t('status.hostUnresponsiveTitle')}
+          >
+            {hostRestarting ? t('settings.info.hostRestarting') : t('status.hostUnresponsive')}
           </button>
         )}
       </div>
@@ -4186,6 +4525,9 @@ export default function App(): React.JSX.Element {
                     // 제자리다: 어느 계정으로 무엇을 띄울지 정한 다음에 오는 이야기다.
                     // How It Works 의 이름은 사이드바·탭과 같은 키를 쓴다(새 문구를 만들지 않는다).
                     ['agent', t('settings.tab.agent')],
+                    // The astera command has a tab of its own (2026-09-30): it is for a person's own
+                    // terminal, not a setting of the agents the app runs. A name like GitHub's, untranslated.
+                    ['cli', 'CLI'],
                     ['hiw', t('hiw.title')],
                     ['shortcuts', t('settings.tab.shortcuts')],
                     ['slack', 'Slack'],
@@ -4264,40 +4606,17 @@ export default function App(): React.JSX.Element {
                     <p className="settings-hint">{t('settings.defaultKind.hint')}</p>
                   </div>
                 )}
+                {settingsTab === 'cli' && (
+                  <div className="settings-stack">
+                    {/* The astera command: installing it, and on Windows the user PATH (CliSettings). */}
+                    <CliSettings />
+                  </div>
+                )}
                 {settingsTab === 'agent' && (
                   <div className="settings-stack">
-                    {/* Agent orchestration — reuses the same settings-row plus settings-hint
-                        combination as the language row. Turning it on starts the server immediately, but
-                        sessions that are already running do not get the CLI path (environment variables
-                        are fixed at spawn time) — the hint text says so.
-                        Why the container is a label rather than a div: pressing the text has to toggle it
-                        too (the same wrapping approach the checkboxes in NewSessionDialog use). The flex
-                        and colour rules of settings-row apply regardless of the tag. */}
-                    <div className="settings-group">
-                      <label className="settings-row">
-                        <span>{t('settings.orchestration.label')}</span>
-                        <input
-                          type="checkbox"
-                          checked={orchEnabled}
-                          onChange={(e) => {
-                            const next = e.target.checked
-                            setOrchEnabled(next) // an optimistic update — reverted below on failure
-                            void window.api.settings.setOrchestrationEnabled(next).catch((err) => {
-                              setOrchEnabled(!next)
-                              toast.error(
-                                t('settings.orchestration.saveFailed', {
-                                  detail: err instanceof Error ? err.message : String(err)
-                                })
-                              )
-                            })
-                          }}
-                        />
-                      </label>
-                      <span className="settings-hint">{t('settings.orchestration.hint')}</span>
-                    </div>
-                    {/* 권한 모드 — 오케스트레이션 바로 아래. 위 토글이 켜는 것이 워커를 띄우는 일이고,
-                        이 토글이 정하는 것은 그 워커가 승인을 묻는가이기 때문이다. 같은
-                        optimistic-update-then-revert 관례를 쓴다. */}
+                    {/* 권한 모드 — 이 탭의 첫 칸이다. 이 토글이 정하는 것은 Job 워커가 승인을
+                        묻는가이다. 같은 optimistic-update-then-revert 관례를 쓴다. 명령줄 도구는
+                        CLI 탭으로 옮겼다. */}
                     <div className="settings-group">
                       <label className="settings-row">
                         <span>{t('settings.agentPermission.label')}</span>
@@ -4322,8 +4641,8 @@ export default function App(): React.JSX.Element {
                       </label>
                       <span className="settings-hint">{t('settings.agentPermission.hint')}</span>
                     </div>
-                    {/* 작업 이어가기와 재개 전략 — 오케스트레이션 바로 아래에 둔다. 이어가기는 Job 이
-                        재시작을 건너 살아남게 하는 것이라 위 토글과 한 갈래이고, 재개 전략은 그것이
+                    {/* 작업 이어가기와 재개 전략 — 권한 모드 바로 아래에 둔다. 이어가기는 Job 이
+                        재시작을 건너 살아남게 하는 것이라 위 칸과 한 갈래이고, 재개 전략은 그것이
                         켜질 때 함께 움직인다(spec §3). 그 둘이 한 컴포넌트인 이유는 그 파일에 있다. */}
                     <ResumeStrategySettings />
                     {/* Agent browser — same settings-row/settings-hint/label shape and the same
@@ -4350,6 +4669,31 @@ export default function App(): React.JSX.Element {
                         />
                       </label>
                       <span className="settings-hint">{t('settings.agentBrowser.hint')}</span>
+                    </div>
+                    {/* Agent app workspace: the same shape and the same optimistic update as the
+                        agent browser above. Off by default: it installs a skill into every account
+                        and lets the agent launch this project's app on a hidden desktop. */}
+                    <div className="settings-group">
+                      <label className="settings-row">
+                        <span>{t('settings.agentApp.label')}</span>
+                        <input
+                          type="checkbox"
+                          checked={agentAppEnabled}
+                          onChange={(e) => {
+                            const next = e.target.checked
+                            setAgentAppEnabled(next)
+                            void window.api.settings.setAgentAppEnabled(next).catch((err) => {
+                              setAgentAppEnabled(!next)
+                              toast.error(
+                                t('settings.agentApp.saveFailed', {
+                                  detail: err instanceof Error ? err.message : String(err)
+                                })
+                              )
+                            })
+                          }}
+                        />
+                      </label>
+                      <span className="settings-hint">{t('settings.agentApp.hint')}</span>
                     </div>
                   </div>
                 )}
@@ -4443,6 +4787,13 @@ export default function App(): React.JSX.Element {
                                 })}
                               </span>
                             )}
+                            {/* The files this Host runs from are missing some of what it needs. It is
+                                running now and will stall at its next spawn, which is a state nobody
+                                could see before (2026-09-22) — so it is said here, in the same amber,
+                                beside the version it belongs to. */}
+                            {hostStatus.runtimeIncomplete && (
+                              <span className="host-row-outdated">{t('settings.info.hostRuntimeIncomplete')}</span>
+                            )}
                             {/* Drawn only once the Host has answered. Until then the row is the
                                 connection facts alone, which is the whole truth it has: a count here
                                 before the answer would be an invented one. */}
@@ -4457,6 +4808,17 @@ export default function App(): React.JSX.Element {
                               </span>
                             )}
                           </>
+                        ) : hostStatus?.unresponsive ? (
+                          <>
+                            {/* Two sentences, not one. The first is what is wrong and the second is
+                                what is happening about it — work is continuing inside the app, and it
+                                ends with the app. A person reading only "응답 없음" would not know
+                                either half, which is what the 2026-09-22 morning looked like. */}
+                            <span className="host-row-outdated">
+                              {t('settings.info.hostUnresponsive', { detail: hostStatus.problem ?? '' })}
+                            </span>
+                            <span>{t('settings.info.hostUnresponsiveWhat')}</span>
+                          </>
                         ) : (
                           <span>
                             {hostStatus?.problem
@@ -4468,8 +4830,13 @@ export default function App(): React.JSX.Element {
                       {/* A sibling of the text, not its tail — .settings-row's space-between then keeps
                           it at the row's right edge whether the text above it runs to one line or
                           three. Not waiting for the automatic replacement; confirms with the holdings,
-                          because the count is the only honest part of the offer (design §6). */}
-                      {hostStatus?.connected && hostStatus.outdated && (
+                          because the count is the only honest part of the offer.
+
+                          Three reasons to offer it now, and the third is the one that cannot wait:
+                          an unresponsive Host has no automatic replacement behind it, because every
+                          rule that would replace one needs the Host to answer what it is holding
+                          first (design F5). */}
+                      {((hostStatus?.connected && (hostStatus.outdated || hostStatus.runtimeIncomplete)) || hostStatus?.unresponsive) && (
                         <button type="button" disabled={hostRestarting} onClick={() => void restartHost()}>
                           {hostRestarting ? t('settings.info.hostRestarting') : t('settings.info.hostRestartNow')}
                         </button>
@@ -4498,6 +4865,19 @@ export default function App(): React.JSX.Element {
                               <button onClick={() => void installUpdate()}>
                                 {t('update.info.restartInstallVersion', { version: update.version ?? '' })}
                               </button>
+                            )}
+                            {/* 'manual' follows 'downloaded' on macOS when Squirrel turns the build
+                                down. The label has to change with it: offering "restart and install"
+                                for something restarting cannot install is what made this look broken
+                                — and the reason goes next to it, because a button that quietly does
+                                something else than it says is no better than one that does nothing. */}
+                            {update?.state === 'manual' && (
+                              <>
+                                <button onClick={() => void installUpdate()}>
+                                  {t('update.info.manualInstallVersion', { version: update.version ?? '' })}
+                                </button>
+                                <span className="update-note">{t('update.info.manualWhy')}</span>
+                              </>
                             )}
                             <button
                               disabled={updateChecking}
@@ -4562,7 +4942,7 @@ export default function App(): React.JSX.Element {
                               ))
                             )}
                           </span>
-                          <span className="shortcut-desc">{t(it.desc)}</span>
+                          <span className="shortcut-desc">{t(it.desc, { mod: MOD })}</span>
                         </div>
                       ))}
                     </div>
@@ -4851,6 +5231,12 @@ export default function App(): React.JSX.Element {
             setOpenRun(null) // 탭으로 가면서 닫는다
             selectWorkbenchTab(sessionTab(sessionId))
           }}
+          onShowOlderJournal={() =>
+            setJournalPagesFor((prev) => ({
+              runId: openRun.runId,
+              pages: (prev?.runId === openRun.runId ? prev.pages : 1) + 1
+            }))
+          }
           onClose={() => setOpenRun(null)}
         />
       )}

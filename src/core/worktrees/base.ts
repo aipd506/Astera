@@ -43,6 +43,31 @@ export function reconcileBaseRef(opts: {
 }
 
 /**
+ * What the new-session worktree picker should show for one listBranches answer.
+ *
+ * - `unavailable`: git did not answer (listBranches gave null — an error, a timeout, an output limit).
+ *   That is "could not check", not "no branches": the picker is hidden, the dialog says so, and creation
+ *   falls back to the automatic base detection. Reading it as `noBase` would claim the repository has
+ *   no commits and switch the worktree option off.
+ * - `noBase`: git answered and there is nothing to fork from (see resolveInitialBase).
+ * - `ready`: the branches to offer and the base to preselect (see reconcileBaseRef).
+ */
+export type BranchPickerState =
+  | { kind: 'unavailable' }
+  | { kind: 'noBase' }
+  | { kind: 'ready'; branches: BranchRef[]; base: string }
+
+export function branchPickerState(opts: {
+  branches: BranchRef[] | null
+  detected: string | null
+  current: string
+}): BranchPickerState {
+  if (opts.branches === null) return { kind: 'unavailable' }
+  const base = reconcileBaseRef({ branches: opts.branches, detected: opts.detected, current: opts.current })
+  return base === null ? { kind: 'noBase' } : { kind: 'ready', branches: opts.branches, base }
+}
+
+/**
  * Orders branches for the picker: the current branch, then every remote-tracking one, then the rest of the
  * locals. Within each run the incoming order is kept, and listBranches hands them over newest commit first.
  *

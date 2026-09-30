@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { AppSettingsStore } from './appSettingsStore'
+import { AppSettingsStore, readSkillSettings } from './appSettingsStore'
+import { RepairNeeded } from '../core/settings/repairNeeded'
 import type { DesktopNotifySettings } from '../core/notify/settings'
 
 let dir: string
@@ -67,7 +68,7 @@ describe('AppSettingsStore', () => {
     await store.load()
     await store.setLang('en')
     // persist는 falsy 값을 생략한다(정해진 관례) — load가 `=== true`로 읽으므로
-    // orchestrationEnabled:false를 파일에 남기지 않아도 결과가 같다.
+    // workUnitTrackingEnabled:false를 파일에 남기지 않아도 결과가 같다.
     // firstRunAsked 는 그 관례의 반대편이라 여기 남는다: 없는 키가 "이미 물었다"를 뜻하므로,
     // 아직 묻지 않았다는 사실은 파일이 직접 말해야 한다(필드 주석 참조)
     expect(JSON.parse(await fs.readFile(nested, 'utf8'))).toEqual({
@@ -156,56 +157,134 @@ describe('lang — System은 null이다', () => {
   })
 })
 
-describe('orchestrationEnabled', () => {
-  it('기본값은 false다', async () => {
+// 오케스트레이션이 설정이 아니게 된 첫 실행에서 한 번만 도는 일시 중지 (ruling F62).
+// **키는 옛 필드가 아니라 자기 표식이다** — 옛 필드는 켜져 있을 때만 파일에 적혔으므로, 없다는
+// 것이 곧 꺼져 있었다는 뜻이고 거기에 "했음" 을 적을 자리가 없다.
+describe('orchAlwaysOnMigration', () => {
+  it('토글이 켜져 있던 적 없는 프로필은 한 번 세우라고 답한다', async () => {
+    await fs.writeFile(file(), JSON.stringify({ lang: 'en' }), 'utf8')
     const store = new AppSettingsStore(file())
     await store.load()
-    expect(store.getOrchestrationEnabled()).toBe(false)
+    expect(store.orchAlwaysOnMigration()).toEqual({ pause: true })
   })
 
-  it('설정하고 새 인스턴스가 다시 읽는다', async () => {
+  // **켜져 있던 프로필도 마이그레이션 대상이다 — 세울 것이 없을 뿐이다**(ruling F64).
+  it('토글이 켜져 있던 프로필은 세우지 말라고 답한다 — 그래도 null 은 아니다', async () => {
+    await fs.writeFile(file(), JSON.stringify({ orchestrationEnabled: true }), 'utf8')
+    const store = new AppSettingsStore(file())
+    await store.load()
+    expect(store.orchAlwaysOnMigration()).toEqual({ pause: false })
+  })
+
+  it('표식을 적고 나면 새 인스턴스에서도 null 이다', async () => {
+    await fs.writeFile(file(), JSON.stringify({ lang: 'en' }), 'utf8')
     const a = new AppSettingsStore(file())
     await a.load()
-    await a.setOrchestrationEnabled(true)
+    await a.markOrchAlwaysOnMigrated()
+    expect(a.orchAlwaysOnMigration()).toBeNull()
     const b = new AppSettingsStore(file())
     await b.load()
-    expect(b.getOrchestrationEnabled()).toBe(true)
+    expect(b.orchAlwaysOnMigration()).toBeNull()
+    expect(JSON.parse(await fs.readFile(file(), 'utf8')).orchAlwaysOnMigrated).toBe(true)
   })
 
-  it('lang과 함께 저장돼도 서로를 지우지 않는다', async () => {
+  // **순서 하나: 마이그레이션이 끝나면 옛 키는 다시 쓰이지 않는다.** 표식과 키가 함께 움직인다는
+  // 말의 절반이고, 나머지 절반이 아래 테스트다.
+  it('켜져 있던 프로필: 표식을 적고 나면 옛 키는 파일에서 사라지고 돌아오지 않는다', async () => {
+    await fs.writeFile(file(), JSON.stringify({ orchestrationEnabled: true, lang: 'en' }), 'utf8')
+    const first = new AppSettingsStore(file())
+    await first.load()
+    expect(first.orchAlwaysOnMigration()).toEqual({ pause: false })
+    await first.markOrchAlwaysOnMigrated()
+
+    // 표식을 적는 persist 자신이 이미 키를 떨어뜨린다.
+    expect(JSON.parse(await fs.readFile(file(), 'utf8')).orchestrationEnabled).toBeUndefined()
+
+    // 그 뒤의 평범한 저장도 다시 쓰지 않는다.
+    await first.setTheme('umbra')
+    const onDisk = JSON.parse(await fs.readFile(file(), 'utf8'))
+    expect(onDisk.orchestrationEnabled).toBeUndefined()
+    expect(onDisk.orchAlwaysOnMigrated).toBe(true)
+
+    const later = new AppSettingsStore(file())
+    await later.load()
+    expect(later.orchAlwaysOnMigration()).toBeNull()
+  })
+
+  // **순서 둘, ruling F67.** 마이그레이션에 닿지 못한 실행(Host 를 읽지 못해 bootOrch 가 일찍 돌아온
+  // 경우가 그것이다)에서 상관없는 설정 저장이 신호를 지우면, 다음 실행은 켜 두고 쓰던 사람의 회차를
+  // 세운다. 그래서 질문이 열려 있는 동안에는 키를 그대로 들고 간다. **디스크에서 확인한다** — 살아
+  // 남는지가 요점이므로 store 의 기억으로는 아무것도 증명되지 않는다.
+  it('켜져 있던 프로필: 표식을 적기 전에는 상관없는 저장이 옛 키를 지우지 못한다', async () => {
+    await fs.writeFile(file(), JSON.stringify({ orchestrationEnabled: true, lang: 'en' }), 'utf8')
+    const first = new AppSettingsStore(file())
+    await first.load()
+    await first.setTheme('umbra') // 마이그레이션에 닿지 못한 실행에서의 평범한 저장
+    expect(JSON.parse(await fs.readFile(file(), 'utf8')).orchestrationEnabled).toBe(true)
+
+    // 그래서 다음 실행도 여전히 "켜져 있었다" 를 읽는다 — 세우라고 답하지 않는다.
+    const later = new AppSettingsStore(file())
+    await later.load()
+    expect(later.orchAlwaysOnMigration()).toEqual({ pause: false })
+  })
+
+  // 여러 번 반복해도 쌓이는 것이 없다 — 같은 키 하나가 다시 쓰일 뿐이다. 'vega' 를 쓰는 것은
+  // 기본 테마가 파일에 적히지 않기 때문이다: 기본값으로 저장하면 "상관없는 저장이 일어났다" 자체를
+  // 이 테스트가 보여 주지 못한다.
+  it('마이그레이션에 끝내 닿지 못해도 파일은 자라지 않는다', async () => {
+    await fs.writeFile(file(), JSON.stringify({ orchestrationEnabled: true, lang: 'en' }), 'utf8')
+    for (let i = 0; i < 3; i++) {
+      const s = new AppSettingsStore(file())
+      await s.load()
+      await s.setTheme('vega')
+    }
+    expect(JSON.parse(await fs.readFile(file(), 'utf8'))).toEqual({
+      lang: 'en',
+      orchestrationEnabled: true,
+      theme: 'vega'
+    })
+  })
+
+  // 꺼져 있던 프로필에는 애초에 키가 없었다. 보존이 "없던 키를 만든다" 가 되어서는 안 된다 —
+  // false 를 적으면 그다음 load 가 그것을 읽고, 마이그레이션 판정은 같아도 파일이 거짓말을 한다.
+  it('꺼져 있던 프로필에는 옛 키를 만들어 넣지 않는다', async () => {
+    await fs.writeFile(file(), JSON.stringify({ lang: 'en' }), 'utf8')
+    const s = new AppSettingsStore(file())
+    await s.load()
+    await s.setTheme('vega')
+    expect('orchestrationEnabled' in JSON.parse(await fs.readFile(file(), 'utf8'))).toBe(false)
+  })
+
+  it('설정 파일이 없던 프로필에도 만들어 넣지 않는다', async () => {
+    const s = new AppSettingsStore(file())
+    await s.load()
+    await s.setTheme('vega')
+    expect('orchestrationEnabled' in JSON.parse(await fs.readFile(file(), 'utf8'))).toBe(false)
+  })
+
+  // 설정 파일이 아예 없다 = 이 기계에서 앱을 쓴 적이 없다. 세울 것도 없고 세워서도 안 된다.
+  it('설정 파일이 없으면 세우지 말라고 답한다', async () => {
     const store = new AppSettingsStore(file())
     await store.load()
-    await store.setLang('en')
-    await store.setOrchestrationEnabled(true)
-    const b = new AppSettingsStore(file())
-    await b.load()
-    expect(b.getLang()).toBe('en')
-    expect(b.getOrchestrationEnabled()).toBe(true)
+    expect(store.orchAlwaysOnMigration()).toEqual({ pause: false })
   })
 
-  it('불리언이 아닌 값은 false로 떨어진다', async () => {
-    await fs.writeFile(file(), JSON.stringify({ orchestrationEnabled: 'yes' }), 'utf8')
-    const store = new AppSettingsStore(file())
-    await store.load()
-    expect(store.getOrchestrationEnabled()).toBe(false)
-  })
-
-  it('손상 파일 복구 뒤에는 false로 기동한다 — 이전 인스턴스 값이 남지 않는다', async () => {
-    const a = new AppSettingsStore(file())
-    await a.load()
-    await a.setOrchestrationEnabled(true)
+  // 읽지 못한 파일은 토글이 무엇이었는지 말해 주지 않는다. 짐작으로 Run 을 세우지 않는다.
+  it('손상 파일 복구 뒤에는 세우지 말라고 답한다 — 없는 근거로 세우지 않는다', async () => {
     await fs.writeFile(file(), '{ not json', 'utf8')
-    await a.load()
-    expect(a.getOrchestrationEnabled()).toBe(false)
+    const store = new AppSettingsStore(file())
+    await store.load()
+    expect(store.orchAlwaysOnMigration()).toEqual({ pause: false })
   })
 
-  it('파일이 없으면(ENOENT) false로 기동한다', async () => {
+  it('표식은 다른 설정을 지우지 않는다', async () => {
     const a = new AppSettingsStore(file())
     await a.load()
-    await a.setOrchestrationEnabled(true)
-    await fs.rm(file())
-    await a.load()
-    expect(a.getOrchestrationEnabled()).toBe(false)
+    await a.setLang('ko')
+    await a.markOrchAlwaysOnMigrated()
+    const b = new AppSettingsStore(file())
+    await b.load()
+    expect(b.getLang()).toBe('ko')
   })
 })
 
@@ -244,6 +323,35 @@ describe('agentBrowserEnabled', () => {
     await fs.rm(file())
     await a.load()
     expect(a.getAgentBrowserEnabled()).toBe(false)
+  })
+})
+
+describe('agentAppEnabled', () => {
+  it('defaults to off, round trips, and does not disturb the agent browser toggle', async () => {
+    const store = new AppSettingsStore(file())
+    await store.load()
+    expect(store.getAgentAppEnabled()).toBe(false)
+    await store.setAgentBrowserEnabled(true)
+    await store.setAgentAppEnabled(true)
+    const b = new AppSettingsStore(file())
+    await b.load()
+    expect(b.getAgentAppEnabled()).toBe(true)
+    expect(b.getAgentBrowserEnabled()).toBe(true)
+  })
+
+  it('a value that is not true reads as off, and a repaired or missing file starts off', async () => {
+    await fs.writeFile(file(), JSON.stringify({ agentAppEnabled: 1 }), 'utf8')
+    const a = new AppSettingsStore(file())
+    await a.load()
+    expect(a.getAgentAppEnabled()).toBe(false)
+    await a.setAgentAppEnabled(true)
+    await fs.writeFile(file(), '{ not json', 'utf8')
+    await a.load()
+    expect(a.getAgentAppEnabled()).toBe(false)
+    await a.setAgentAppEnabled(true)
+    await fs.rm(file())
+    await a.load()
+    expect(a.getAgentAppEnabled()).toBe(false)
   })
 })
 
@@ -651,11 +759,43 @@ describe('agentPermissionMode', () => {
     expect(store.getAgentPermissionMode()).toBe('yolo')
   })
 
-  it('a corrupt file resets it to yolo', async () => {
+  // I2: a file that cannot be read may have said 'manual'. Recovering to the 'yolo' default would
+  // turn the person's permission prompts off without their knowing, so recovery takes the narrower
+  // side for this one field. Every other field keeps its recovery default.
+  it('a corrupt file recovers to manual, not to the yolo default', async () => {
     await fs.writeFile(file(), '{ not json', 'utf8')
+    const store = new AppSettingsStore(file())
+    expect(await store.load()).toEqual({ recovered: true })
+    expect(store.getAgentPermissionMode()).toBe('manual')
+    expect(store.getResumeStrategy()).toBe('original')
+    expect(store.getGithubPolling()).toBe(true)
+  })
+
+  // The repair the CLI's and the Host's message points to ("open Astera to repair it") has to be on
+  // disk, or the Host keeps refusing and the next app start recovers all over again.
+  it('writes the recovered settings back, so the next reader sees a valid file that says manual', async () => {
+    await fs.writeFile(file(), '{ not json', 'utf8')
+    await new AppSettingsStore(file()).load()
+    const b = new AppSettingsStore(file())
+    expect(await b.load()).toEqual({ recovered: false })
+    expect(b.getAgentPermissionMode()).toBe('manual')
+    expect(await fs.readFile(file() + '.bak', 'utf8')).toBe('{ not json')
+  })
+
+  it('a missing file is still the yolo default, and nothing is announced', async () => {
     const store = new AppSettingsStore(file())
     await store.load()
     expect(store.getAgentPermissionMode()).toBe('yolo')
+    expect(store.takeRecoveryNotice()).toBe(false)
+  })
+
+  // The person is told once per recovery: the renderer asks at mount, and a reload must not repeat it.
+  it('a recovery is announced once', async () => {
+    await fs.writeFile(file(), '{ not json', 'utf8')
+    const store = new AppSettingsStore(file())
+    await store.load()
+    expect(store.takeRecoveryNotice()).toBe(true)
+    expect(store.takeRecoveryNotice()).toBe(false)
   })
 })
 
@@ -702,5 +842,42 @@ describe('AppSettingsStore first-run question', () => {
     const store = new AppSettingsStore(file())
     expect(await store.load()).toEqual({ recovered: true })
     expect(store.getFirstRunAsked()).toBe(true)
+  })
+
+  // 첫 실행에서 두 설정이 한꺼번에 저장되면(이전 처리의 표시와 첫 실행 질문의 답) 두 쓰기가 한
+  // 파일에 겹쳐 짧은 내용 뒤에 긴 내용의 꼬리가 남았다. 다음 실행은 그 파일을 깨진 것으로 보고
+  // .bak 으로 옮긴 뒤 모든 설정을 기본값으로 되돌린다 — 사람이 켠 것이 조용히 꺼진다.
+  it('동시에 저장해도 파일이 깨지지 않고 마지막 상태를 담는다', async () => {
+    const store = new AppSettingsStore(file())
+    await store.load()
+    for (let i = 0; i < 20; i++) {
+      await Promise.all([
+        store.setLang(i % 2 === 0 ? 'en' : null),
+        store.setDismissedCampaignId('campaign-' + 'x'.repeat(i % 7) + String(i)),
+        store.setAgentBrowserEnabled(i % 3 === 0)
+      ])
+      const raw = await fs.readFile(file(), 'utf8')
+      expect(() => JSON.parse(raw), `round ${i}: ${raw}`).not.toThrow()
+    }
+    const b = new AppSettingsStore(file())
+    expect(await b.load()).toEqual({ recovered: false })
+    expect(b.getLang()).toBe(store.getLang())
+    expect(b.getAgentBrowserEnabled()).toBe(store.getAgentBrowserEnabled())
+  })
+})
+
+describe('readSkillSettings on a corrupt file', () => {
+  it('is refused as a RepairNeeded naming the file, with the repair message', async () => {
+    const dirX = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-skillset-'))
+    try {
+      const f = path.join(dirX, 'app-settings.json')
+      await fs.writeFile(f, '{ not json', 'utf8')
+      const err = await readSkillSettings(f).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(RepairNeeded)
+      expect((err as RepairNeeded).file).toBe('app-settings.json')
+      expect((err as Error).message).toMatch(/open Astera to repair it/)
+    } finally {
+      await fs.rm(dirX, { recursive: true, force: true })
+    }
   })
 })

@@ -10,7 +10,7 @@
 // **One at a time.** The agent process is expensive (tens of seconds); two running for the same
 // project would let the later one overwrite the earlier one's result. A single queue serializes
 // them, for the same reason as collector.ts's enqueue.
-import { existsSync, statSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import type { Account, Provider } from '../../core/types'
@@ -22,10 +22,11 @@ import { verificationOf } from '../../core/workUnit/verification'
 import { sessionLabelOf } from '../../core/understanding/changeRecord'
 import { buildRecordPrompt } from '../../core/understanding/prompt'
 import type { Lang } from '../../core/i18n'
-import { validateRecord } from '../../core/understanding/validate'
+import { validateRecord, type ValidationResult } from '../../core/understanding/validate'
 import { evidenceIdOf } from '../../core/understanding/evidence'
 import type { UnderstandingStore } from './store'
 import { runAgent } from './agent'
+import { createProber, type ProbeResult } from '../../core/sessions/pathProbe'
 
 export interface PipelineDeps {
   store: UnderstandingStore
@@ -44,6 +45,10 @@ export interface PipelineDeps {
    *  이것이 없으면 그 결과는 사용자가 프로젝트를 바꿔 돌아올 때까지 화면에 없다 */
   onChanged?: (projectRoot: string) => void
   log?: (m: string) => void
+  /** Whether an absolute path is a file: `present` for a file, `absent` for anything else, `timeout`
+   *  when it did not answer in time. Defaults to a stat through the budgeted session-folder probe
+   *  (defaultFileProbe); a test seam. */
+  fileProbe?: (abs: string) => Promise<ProbeResult>
 }
 
 export interface RunRecordInput {
@@ -216,7 +221,7 @@ export class UnderstandingPipeline {
       await this.patch(projectRoot, recordId, (r) => ({ ...r, status: 'failed', reason: run.reason }))
       return
     }
-    const v = validateRecord(run.value, isProjectFile(projectRoot))
+    const v = await this.validate(projectRoot, run.value)
     if (!v.ok) {
       await this.patch(projectRoot, recordId, (r) => ({ ...r, status: 'failed', reason: v.reason }))
       return
@@ -276,6 +281,32 @@ export class UnderstandingPipeline {
     }))
   }
 
+  /**
+   * validateRecord, with its file question answered **asynchronously beforehand** (stage 4 T1). The
+   * validator is pure and asks a synchronous predicate; answering it with statSync froze the Electron
+   * main thread for 20 to 60 s on a project on an offline share. So it runs twice: first with only the
+   * path rule (inside the project — no fs), which also lists every cited path; then each of those is
+   * asked through the budgeted probe; then the validator runs again on those answers, so its reasons
+   * are what they always were.
+   *
+   * A path that did not answer is **not** a ghost path: the record fails with EVIDENCE_UNREACHABLE —
+   * "could not check" — and the person can regenerate once the folder is back.
+   */
+  private async validate(projectRoot: string, raw: unknown): Promise<ValidationResult> {
+    const inside = insideProject(projectRoot)
+    const first = validateRecord(raw, inside)
+    if (!first.ok) return first
+    const probe = this.deps.fileProbe ?? defaultFileProbe
+    const cited = first.value.evidencePaths
+    const answers = await Promise.all(cited.map((p) => probe(path.resolve(projectRoot, p))))
+    if (answers.includes('timeout')) {
+      this.deps.log?.(`understanding: evidence files of ${projectRoot} did not answer in time, the record is not checked`)
+      return { ok: false, reason: 'EVIDENCE_UNREACHABLE' }
+    }
+    const isFile = new Set(cited.filter((_, i) => answers[i] === 'present'))
+    return validateRecord(raw, (p) => inside(p) && isFile.has(p))
+  }
+
   private async commitsOf(projectRoot: string, r: WorkRecord): Promise<string[]> {
     if (!this.deps.readCommits) return []
     try {
@@ -306,33 +337,34 @@ export class UnderstandingPipeline {
   }
 }
 
-/** 저장소 **안에** 실제로 있는 경로인가.
+/** 저장소 **안의** 경로인가 — fs 없이, 경로만으로.
  *
- *  **`path.join` 만으로는 부족하다:** `../outside/secret.ts` 는 프로젝트 밖으로 풀리는데도
- *  존재하므로 통과한다(실측). 그러면 근거 검증(§24-12)이 막으려던 바로 그것 — 근거 아닌 것을
- *  근거로 대는 일 — 이 통과하고, 그 경로는 화면에 뜨며 다음 재생성의 "여기서부터 읽어라"
- *  목록에도 실린다. 그래서 푼 뒤에 저장소 안인지 다시 묻는다. */
-/** 저장소 안에 있고, **디렉터리가 아니라 파일**인가.
- *
- *  첫 분석이 기능마다 파일을 최소 하나 대야 하는 이유는 validate.ts 에 적혀 있다 — 여기서는 그
- *  물음에 fs 로 답할 뿐이다. insideProject 를 먼저 거쳐 저장소 밖을 배제한다. */
-function isProjectFile(projectRoot: string): (p: string) => boolean {
-  const inside = insideProject(projectRoot)
-  return (p) => {
-    if (!inside(p)) return false
-    try {
-      return statSync(path.resolve(projectRoot, p)).isFile()
-    } catch {
-      return false
-    }
-  }
-}
-
+ *  **`path.join` 만으로는 부족하다:** `../outside/secret.ts` 는 프로젝트 밖으로 풀린다. 그러면
+ *  근거 검증(§24-12)이 막으려던 바로 그것 — 근거 아닌 것을 근거로 대는 일 — 이 통과하고, 그 경로는
+ *  화면에 뜨며 다음 재생성의 "여기서부터 읽어라" 목록에도 실린다. 그래서 푼 뒤에 저장소 안인지
+ *  다시 묻는다. 실재하는지, 디렉터리가 아니라 **파일**인지는 validate 가 probe 로 따로 묻는다
+ *  (첫 분석이 기능마다 파일을 최소 하나 대야 하는 이유는 validate.ts 에 적혀 있다). */
 function insideProject(projectRoot: string): (p: string) => boolean {
   return (p) => {
     const abs = path.resolve(projectRoot, p)
     const rel = path.relative(projectRoot, abs)
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return false
-    return existsSync(abs)
+    return !(rel === '' || rel.startsWith('..') || path.isAbsolute(rel))
   }
+}
+
+let fileProber: ((p: string) => Promise<ProbeResult>) | null = null
+/** A stat through the session-folder probe lane, inside the process-wide budget: `present` only for a
+ *  file. One call per root at a time, cut at PROBE_TIMEOUT_MS; a root already stuck answers `timeout`
+ *  without a call. */
+function defaultFileProbe(abs: string): Promise<ProbeResult> {
+  fileProber ??= createProber({
+    access: (p) =>
+      fs.stat(p).then((st) => {
+        if (!st.isFile()) throw new Error('not a file')
+      }),
+    // Its own kind: a folder is present to an access probe and absent here, so the two never share
+    kind: 'stat-is-file',
+    skipQueue: true
+  })
+  return fileProber(abs)
 }

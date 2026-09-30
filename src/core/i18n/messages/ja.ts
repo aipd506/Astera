@@ -15,15 +15,6 @@ export const ja: Catalog = {
   // {lang} is the language the OS locale resolves to
   'settings.general.language.system': 'システム設定 ({lang})',
   'settings.general.language.saveFailed': '言語設定を保存できませんでした: {detail}',
-  // Agent orchestration
-  'settings.orchestration.label': 'エージェントオーケストレーション (実験)',
-  'settings.orchestration.hint':
-    'オンにすると、アプリが起動したエージェントセッションが別ベンダーのワーカーセッションを起動できます。' +
-    'エージェントがアプリのどのアカウントでもセッションを作成できるようになるため、必要なときだけオンにしてください。' +
-    'git リポジトリのプロジェクトでのみ動作します。' +
-    'すでに開いているセッションには適用されません — 新しいセッションから有効になります。' +
-    'オーケストレーターとして使うセッションで astera help を実行させると、詳しい使い方が得られます。',
-  'settings.orchestration.saveFailed': 'オーケストレーション設定を保存できませんでした: {detail}',
   // エージェント権限モード
   'settings.agentPermission.label': '権限確認なしでエージェントを実行',
   'settings.agentPermission.hint':
@@ -49,6 +40,13 @@ export const ja: Catalog = {
     'すべてのアカウントに astera-browser スキルをインストールします。localhost のみ開けます。' +
     '既に開いているセッションには適用されません。新しいセッションから有効です。',
   'settings.agentBrowser.saveFailed': 'エージェントブラウザ設定を保存できませんでした: {detail}',
+  // エージェントアプリ作業スペース
+  'settings.agentApp.label': 'エージェントアプリ作業スペース（実験的）',
+  'settings.agentApp.hint':
+    'オンにすると、エージェントがこのプロジェクトのアプリを、あなたには見えない場所 (Windows では隠れたデスクトップ、Linux では仮想ディスプレイ、macOS ではバックグラウンド) で起動し、操作し、撮影できます。' +
+    '画面とポインターには触れません。Windows と macOS ではクリップボードを共有します。すべてのアカウントに astera-app スキルをインストールします。' +
+    '既に開いているセッションには適用されません。新しいセッションから有効です。',
+  'settings.agentApp.saveFailed': 'エージェントアプリ作業スペースの設定を保存できませんでした: {detail}',
   // 説明生成 (How It Works)
   'settings.gen.label': '説明生成アカウント',
   'settings.gen.hint': '作業が終わると、このアカウントが機能の説明を書きます。選ぶまでは生成しません。',
@@ -86,6 +84,7 @@ export const ja: Catalog = {
   'files.error.alreadyExistsInDest': '「{name}」は移動先フォルダにすでに存在します',
   'files.error.renameStranded':
     '名前の変更に失敗し、元に戻すこともできませんでした。ファイルは「{tmp}」にあります',
+  'files.error.unreachable': 'フォルダーが応答しなかったため、何も変更していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
   // worktrees/include.ts, worktrees/create.ts — worktree creation warnings
   'worktree.include.tooManyEntries':
     '.worktreeinclude の項目が {max} 件を超えたため、以降の行は無視しました',
@@ -97,7 +96,13 @@ export const ja: Catalog = {
   'worktree.include.missing': '存在しないためスキップしました: {entry}',
   'worktree.include.notIgnored': 'gitignore されていないためスキップしました: {entry}',
   'worktree.include.sizeFailed': '容量の計算に失敗しました: {entry} ({detail})',
+  'worktree.include.unreachable': 'プロジェクトのフォルダーが応答しなかったため、.worktreeinclude の項目をコピーしていません: {path}',
   'worktree.include.overLimit': 'コピー上限 (200MB) を超えたためスキップしました: {entry}',
+  'worktree.include.linkFailed': 'リンクを再作成できなかったためスキップしました: {entry} ({detail})',
+  'worktree.include.unsafeDest': '{path} はリンクのため、その下はコピーしませんでした (worktree の外に書き込むため): {entry}',
+  'worktree.include.linkTargetMissing': 'フォルダーリンクの指すリポジトリ内の場所が worktree にないため、リンクを再作成しませんでした: {path} ({entry})',
+  'worktree.include.outsideLinkSkipped': 'リポジトリの外を指すフォルダーリンクをシンボリックリンクとして作成できなかったため、スキップしました ({detail})。必要なら手動で作成してください: {path} ({entry})',
+  'worktree.include.overFileCount': '項目数が {max} を超えたためスキップしました: {entry}',
   'worktree.include.copyFailed': 'コピーに失敗しました: {entry} ({detail})',
   'worktree.create.fetchFailed':
     'リモートの更新に失敗したため、ローカルの {baseRef} を基準に作成しました',
@@ -122,7 +127,16 @@ export const ja: Catalog = {
   'worktree.error.orphanUnverifiable':
     'git がこのフォルダを追跡していないため、未コミットの変更の有無を確認できません。',
   'worktree.error.gitAddFailed': 'git worktree の作成に失敗しました。',
+  'worktree.error.cancelled': 'worktree の作成をキャンセルしました。作成途中のものはすべて元に戻しました。',
+  'worktree.error.rollbackIncomplete': 'worktree の作成を元に戻せませんでした。フォルダー {path} とブランチ {branch} を手動で削除してください。',
   'worktree.error.gitRemoveFailed': 'git worktree の削除に失敗しました。',
+  'worktree.error.unreachable': 'worktree のフォルダーに到達できないか確認できなかったため、何も削除していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
+  'worktree.error.linksUnverified': 'worktree フォルダー内のリンクをすべて確認して取り除けなかったため、何も削除していません。このまま削除するとジャンクションを通じてフォルダーの外のファイルまで削除される可能性があります。再試行するか、リンクを手動で削除してください。',
+  'worktree.error.locked': 'worktree がロックされているため (git worktree lock)、何も削除していません。先にロックを解除するか、強制的に削除してください。',
+  'worktree.error.hasSubmodules': 'worktree にサブモジュールがあるため、何も削除していません。git はサブモジュールのある worktree を強制的にしか削除しません。強制的に削除してください。',
+  'worktree.error.rootUnreachable': 'worktree のフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
+  'worktree.error.repoUnreachable': 'プロジェクトのフォルダーに到達できないか確認できなかったため、worktree を作成していません（ネットワークドライブが切断されている可能性があります）。到達できるようになってから再試行してください。',
+  'worktree.error.noGit': 'git を実行できなかったため、worktree を作成していません（git がインストールされ PATH に含まれているか確認してください）。',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
     '実行中のセッション「{title}」がこの worktree を使用中です。先にセッションを閉じてください。',
@@ -131,6 +145,7 @@ export const ja: Catalog = {
   'worktree.inUse.unknown': 'この worktree は使用中です。',
   // ROLL_MIXED_PROVIDER in sessions/manager.ts — a session-rolling constraint unrelated to worktrees
   'session.roll.mixedProvider': 'Claude と Codex のアカウントを混在させてローリングはできません',
+  'session.resume.hostChatNotAdopted': 'この会話はまだ Astera Host で動いていて、このウィンドウはまだ引き継いでいません。しばらくしてからもう一度お試しください。',
   // App.tsx — shared window controls, resizer, separator
   'common.minimize': '最小化',
   'common.maximize': '最大化',
@@ -150,6 +165,8 @@ export const ja: Catalog = {
   'session.rail.toggleSidebar': 'サイドバーの折りたたみ/展開',
   'session.rail.openSessions': 'アカウントと履歴',
   'session.spawn.failed': 'セッションの開始に失敗しました: {message}',
+  'session.spawn.cwdMissing': 'フォルダーが見つかりません: {path}。フォルダーを選び直してください。',
+  'session.spawn.cwdUnreachable': 'フォルダーが時間内に応答しません: {path}。ネットワークドライブの場合は接続を確認してください。',
   'session.spawn.failedWorktreeKept':
     'セッションの開始に失敗しました: {message} (worktree "{name}" は残っているので Worktrees パネルから削除してください)',
   // Rolling-resume guard hit — tells the user the tab was just focused and their chosen options were dropped
@@ -211,6 +228,13 @@ export const ja: Catalog = {
   'settings.info.hostConnected': '接続済み · プロトコル {protocol} · {uptime} 前から',
   'settings.info.hostNotConnected': '未接続',
   'settings.info.hostNotConnectedWhy': '未接続 · {detail}',
+  'status.hostPreparing': 'Astera Host を準備しています…',
+  'status.hostPreparingSlow': 'Astera Host を準備しています… まだ処理中です ({seconds}秒)',
+  'status.hostPrepareFailed': 'Astera Host を準備できませんでした',
+  'status.hostPrepareFailedTitle': '{reason} ({detail}) 今回は Host をアプリの実行ファイルから起動し、次回の起動時にもう一度準備します。',
+  'status.hostPrepareReason.copy': 'Host のファイルをコピーできませんでした。',
+  'status.hostPrepareReason.timeout': '準備が 2 分以内に終わりませんでした。',
+  'status.hostPrepareReason.unknown': '準備中に予期しないエラーが発生しました。',
   'settings.slack.save': '保存',
   'settings.slack.saved': '保存しました',
   'settings.slack.saveFailed': 'Slack 設定を保存できませんでした: {detail}',
@@ -290,10 +314,12 @@ export const ja: Catalog = {
   'settings.font.loadingList': 'インストール済みフォントを読み込み中…',
   // App.tsx — update status (the title-bar UpdateIndicator / the settings Info tab)
   'update.tb.restartInstallVersion': '再起動して v{version} をインストール',
+  'update.tb.manualInstallVersion': 'v{version} を手動でインストール',
   'update.tb.checking': 'アップデートを確認中…',
   'update.tb.available': '新しいバージョン {version} を検出',
   'update.tb.downloading': 'ダウンロード中 {percent}%',
   'update.tb.error': 'アップデートエラー',
+  'update.checkTimedOut': 'アップデートの確認が {seconds} 秒以内に応答しませんでした。ネットワークを確認してもう一度お試しください。',
   // index.ts — diagnostic message for when the electron-updater module does not export properly
   'update.tb.autoUpdaterMissing': 'autoUpdater の export が見つかりません',
   'update.info.downloading': 'ダウンロード中 {percent}%…',
@@ -305,6 +331,14 @@ export const ja: Catalog = {
   'update.info.available': '新しいバージョン {version} があります',
   'update.info.downloadVersion': '{version} をダウンロード',
   'update.info.checkFailed': '確認に失敗',
+  'update.info.manualInstallVersion': 'v{version} を手動でインストール',
+  'update.info.manualWhy': 'このビルドは自動インストールできないため、手動で移動してください',
+  'update.manual.title': '手動インストール',
+  'update.manual.done':
+    '新しいバージョンを Finder で開きました。Astera をアプリケーションフォルダにドラッグしてから、もう一度起動してください。\n\n{path}',
+  'update.manual.failed': 'インストーラーを準備できませんでした: {message}',
+  'update.manual.noFile': 'ダウンロード済みのインストーラーがありません',
+  'update.manual.quit': '終了して移動する',
   // App.tsx — the toast for a downloaded new version, and the session-kill confirmation when installing now
   'update.toast.available': '新しいバージョン v{version} が公開されました',
   'update.toast.download': 'ダウンロード',
@@ -377,7 +411,7 @@ export const ja: Catalog = {
   'shortcut.explorer.cut': '切り取り',
   'shortcut.explorer.copy': 'コピー',
   'shortcut.gesture.itemDrag': '項目をドラッグ',
-  'shortcut.explorer.move': '移動 · Ctrl を押すとコピー',
+  'shortcut.explorer.move': '移動 · {mod} を押すとコピー',
   'shortcut.explorer.undo': '元に戻す',
   'shortcut.run.run': '実行',
   'shortcut.run.stop': '実行を停止',
@@ -397,7 +431,7 @@ export const ja: Catalog = {
   'files.commit.failed': '{action}に失敗しました: {detail}',
   // useFileOps.ts — delete confirmation modal
   'files.delete.undoHint':
-    'Ctrl+Z または Local History から復元できます (最大30日間保管 · 50MB を超える項目は除く)。',
+    '{mod}+Z または Local History から復元できます (最大30日間保管 · 50MB または 5,000 項目を超えるものは除く)。',
   'files.delete.confirmOne': '「{name}」を削除しますか？\n{undoHint}',
   'files.delete.confirmDirWithCount':
     'フォルダ「{name}」と配下の {count} 件の項目を削除しますか？\n{undoHint}',
@@ -405,7 +439,14 @@ export const ja: Catalog = {
   'files.delete.confirmMany': '{shown}{more} — {total} 件の項目を削除しますか？{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' フォルダ {count} 件の配下の項目も一緒に削除されます。',
   'files.delete.moreNames': ' ほか {count} 件',
-  'files.delete.skippedTooLarge': '項目が大きすぎるため Local History に残しませんでした',
+  'files.delete.skippedTooLarge': '項目が大きすぎるため (50MB または 5,000 項目超) Local History に残しませんでした',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': '削除中… {count} 項目',
+  'files.op.snapshotting': 'Local History に保存中… {count} 項目',
+  'files.op.copying': 'コピー中… {count} 項目',
+  'files.op.deletingNoCount': '削除中…',
+  'files.op.copyingNoCount': 'コピー中…',
+  'files.op.busy': '処理中…',
   'files.delete.skippedFailed':
     'Local History のスナップショットに失敗しました — 削除は完了しています',
   // useFileOps.ts — cut/copy and paste
@@ -426,7 +467,7 @@ export const ja: Catalog = {
   'files.undo.partialFail': '元に戻す {attempted} 件中 {failed} 件が失敗しました: {shown}{more}',
   'files.undo.partialMissing': '元に戻す {total} 件中 {missing} 件が失敗しました: {shown}{more}',
   'files.undo.permanentTooLarge':
-    '元に戻す操作で完全に削除されました — 容量が大きく Local History に残していないため復元できません',
+    '元に戻す操作で完全に削除されました — 容量が大きく (50MB または 5,000 項目超) Local History に残していないため復元できません',
   'files.undo.permanentSnapshotFailed':
     '元に戻す操作で削除されました — Local History のスナップショットに失敗したため復元できません',
   'files.undo.done': '{desc}を元に戻しました',
@@ -453,6 +494,7 @@ export const ja: Catalog = {
   'explorer.noActiveSession': 'アクティブなセッションがありません',
   // Folder state shown inside the tree (the .fx-note row)
   'explorer.dir.loading': '読み込み中…',
+  'explorer.dir.reading': 'フォルダーを読み込み中…',
   'explorer.dir.readFailed': '読み込みに失敗しました: {detail}',
   'explorer.dir.empty': '空です',
   'explorer.refresh': '更新',
@@ -460,21 +502,23 @@ export const ja: Catalog = {
   'explorer.menu.newFile': '新しいファイル',
   'explorer.menu.newFolder': '新しいフォルダ',
   'explorer.menu.rename': '名前の変更 (F2)',
-  'explorer.menu.delete': '削除 (Del)',
-  'explorer.menu.deleteCount': '削除 ({count} 件, Del)',
+  'explorer.menu.delete': '削除 ({del})',
+  'explorer.menu.deleteCount': '削除 ({count} 件, {del})',
   'explorer.menu.duplicateCount': '複製 ({count} 件)',
-  'explorer.menu.cut': '切り取り (Ctrl+X)',
-  'explorer.menu.copy': 'コピー (Ctrl+C)',
-  'explorer.menu.paste': '貼り付け (Ctrl+V)',
+  'explorer.menu.cut': '切り取り ({mod}+X)',
+  'explorer.menu.copy': 'コピー ({mod}+C)',
+  'explorer.menu.paste': '貼り付け ({mod}+V)',
   'explorer.menu.copyPath': 'パスをコピー',
   'explorer.menu.copyRelativePath': '相対パスをコピー',
   'explorer.menu.reveal': 'エクスプローラーで開く',
+  'explorer.menu.revealMac': 'Finder で表示',
   // FileExplorer.tsx — git status on a tree row (tooltip, aria-label)
   'explorer.git.new': '新しいファイル',
   'explorer.git.modified': '変更あり',
   'explorer.git.deleted': '削除済み',
   'explorer.git.conflict': '競合',
   'explorer.git.folderCount': '変更 {count} 件',
+  'explorer.git.unavailable': 'git の状態を確認できません — 前回の結果を表示しています',
   'explorer.rail.toggle': 'ファイルエクスプローラー',
   // WorkbenchTabs.tsx — the dirty marker on a file tab
   'explorer.tab.unsaved': '未保存',
@@ -583,6 +627,13 @@ export const ja: Catalog = {
   'session.new.useWorktree': 'worktree に分離して開始',
   'session.new.worktreeNoBase':
     'このリポジトリには基準にできるブランチがないため worktree を作成できません。コミットを1つ作成してから再試行してください。',
+  'session.new.worktreeBranchesUnavailable': 'ブランチ一覧を確認できませんでした（git が応答しません）。基準ブランチは自動で決まります。',
+  'session.new.worktreeRepoUnknown': 'このフォルダが git リポジトリか確認できませんでした（git が時間内に応答しません — ネットワークや WSL のパスは遅いことがあります）。ここでセッションは開始できますが、worktree に分離しては開始できません。',
+  'session.new.worktreeRepoNoGit': 'git を実行できず、このフォルダがリポジトリか確認できませんでした（git はインストールされ PATH にありますか？）。ここでセッションは開始できますが、worktree に分離しては開始できません。',
+  'session.new.worktreeRepoNoFolder': 'このフォルダが見つかりません。フォルダを選び直してください。',
+  'session.new.worktreeRepoError': 'このフォルダが git リポジトリか確認できませんでした。ここでセッションは開始できますが、worktree に分離しては開始できません。',
+  'session.new.checkingCli': 'このフォルダで CLI を確認しています…',
+  'pr.create.branchesUnavailable': 'ブランチ一覧を確認できませんでした（git が応答しません）。',
   'session.new.worktreeBaseRef': '基準ブランチ',
   'session.new.worktreeBaseCurrent': '(現在のブランチ)',
   'session.new.worktreeBaseRemote': 'リモート',
@@ -606,9 +657,15 @@ export const ja: Catalog = {
   'session.new.blocked.noAccount': 'アカウントを選んでください',
   'session.new.blocked.cliMissing': 'このアカウントの CLI が見つかりません',
   'session.new.blocked.noSchedule': '予約時刻を決めてください',
-  'session.new.blocked.checkingFolder': 'プロジェクトフォルダを確認しています',
+  'session.new.blocked.checkingFolder': 'リポジトリを確認しています…',
+  'startup.readingShellEnv': 'シェル環境を読み込んでいます…',
   'session.new.starting': 'セッションを開始しています…',
   'session.new.startingWorktree': 'worktree を作成しています…',
+  'session.new.stage.fetch': 'ベースブランチを取得しています…',
+  'session.new.stage.checkout': 'ファイルをチェックアウトしています…',
+  'session.new.stage.copyIncludes': 'インクルードファイルをコピーしています…',
+  'session.new.stage.copyCount': '{copied} / {total} · ファイル {files} / {filesTotal}',
+  'session.new.cancelling': 'キャンセルしています…',
   // NewSessionDialog.tsx scheduler UI
   'session.new.schedLabel': 'スケジューラー — 定期的にコマンドを自動実行',
   'session.new.schedMode.interval': 'N分ごと',
@@ -636,6 +693,8 @@ export const ja: Catalog = {
   'session.pane.maxReached': 'パネルは最大4つまで分割できます',
   // ConversationPane.tsx — exited banner (session-failure-visibility design D2/F2). この部分カタログには
   // 他の conversation.* キーがまだ無く(en/ko で代替される)、この3つだけを先に入れる。
+  'conversation.indexingFiles': 'ファイル一覧を作成しています…',
+  'conversation.filesUnavailable': 'このフォルダーのファイル一覧を取得できません。',
   'conversation.exited.withCode': 'このセッションは終了しました (コード {code})',
   'conversation.exited.detail': '詳細',
   'conversation.exited.restart': '再開',
@@ -697,6 +756,7 @@ export const ja: Catalog = {
   'history.panel.title': '履歴',
   'history.panel.empty': '記録なし',
   'history.loading': '読み込み中…',
+  'history.scan.codex': 'Codex の履歴をスキャンしています… {done}/{total}',
   'history.filter.deletedSuffix': ' (削除済み)',
   'session.resume.originAccount': '元のアカウント',
   'session.resume.originDeleted': '削除されたアカウント',
@@ -714,6 +774,8 @@ export const ja: Catalog = {
   'history.resume.pickFolder': 'フォルダを選択',
   // WorktreePanel.tsx — status labels
   'worktree.status.orphanDir': 'git 登録が消失',
+  'worktree.status.unreachable': 'フォルダーに接続できません',
+  'worktree.status.gitUnchecked': 'git を確認できません',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'worktree の削除',
   'worktree.remove.body':
@@ -944,13 +1006,28 @@ export const ja: Catalog = {
   'preview.agent.stop': 'エージェントのスクリプトを中断',
   'preview.agent.stopped': 'エージェントのスクリプトを中断しました',
   'preview.agent.inUse': 'エージェントがコンピューターを使用中です  ·  Esc でキャンセル',
+  // エージェントアプリ作業スペースのミラータブ
+  'workspace.tab.tag': 'アプリ',
+  'workspace.tab.running': 'エージェントが見えないデスクトップでアプリを操作しています',
+  'workspace.pane.title': '{session} のアプリ',
+  'workspace.pane.running': '実行中: {helper}',
+  'workspace.pane.launching': 'アプリを起動しています… {seconds}秒',
+  'workspace.pane.idle': '待機中（アプリは起動したままです）',
+  'workspace.pane.closed': '閉じました',
+  'workspace.pane.waiting': '最初の画面を待っています',
+  'workspace.pane.stop': '停止',
+  'workspace.pane.close': '閉じる',
+  'workspace.pane.alt': 'エージェントのアプリ画面',
+  'workspace.pane.failed': '作業スペースに届きませんでした: {detail}',
+  'workspace.pane.nothingToStop': '中断するスクリプトはありません',
+  'workspace.pane.nothingToClose': '閉じる作業スペースはありません',
   // BottomPanel, the rail terminal button. The Run tab and the terminal tabs share the bottom panel.
   'terminal.rail.open': 'ターミナル',
   'terminal.tab.label': 'ターミナル {n}',
   'terminal.tab.new': '新しいターミナル',
   'terminal.tab.close': 'ターミナルを閉じる',
   'terminal.open.failed': 'ターミナルの起動に失敗しました: {detail}',
-  // rolling.ts and codexRolling.ts — the default resume prompt sent after a limit.
+  // claudeCoordinator.ts and codexCoordinator.ts — the default resume prompt sent after a limit.
   // Must stay identical to session.new.rollPromptPlaceholder, which shows this value as its placeholder.
   'rolling.continuePrompt': '続けて作業を進めて',
   // slack.ts — the notification text that goes out to Slack. Follows the app language.
@@ -977,7 +1054,7 @@ export const ja: Catalog = {
   'slack.choice.singleOnlyAt': '{index} 番目の質問: 1つだけ選べます',
   'slack.choice.outOfRange': '{n} 番はありません (1〜{max})',
   'slack.choice.outOfRangeAt': '{index} 番目の質問: {n} 番はありません (1〜{max})',
-  // slackInbox.ts — the notice left in the thread when a reply could not be injected
+  // core/slack/inbox.ts — the notice left in the thread when a reply could not be injected
   'slack.inbox.tooLong': '⚠️ 返信が長すぎるため転送しませんでした ({max} 文字以下のみ)',
   'slack.inbox.sessionEnded': '⚠️ このセッションは終了しているため入力を転送できませんでした',
   'slack.inbox.injectFailed': '⚠️ 入力を転送できませんでした',
@@ -1029,6 +1106,7 @@ export const ja: Catalog = {
   'jobs.run.mergeConfirmBody': 'ワーカーがワークツリーにコミットした作業をプロジェクトフォルダーに取り込みます (ワークツリー {count} 個)。\n\nプロジェクトフォルダーの現在のブランチにコミットとして追加されます。',
   'jobs.run.mergeNothing': 'マージするものが残っていません — ワークツリーのフォルダーはすでにありません',
   'jobs.run.mergeUncommitted': 'コミットされていない変更 {count} 件はマージされていません — ワークツリーに残っており、フォルダーを削除すると失われます',
+  'jobs.run.mergeUncommittedUnknown': 'ワークツリー {count} 件のコミットされていない変更を確認できませんでした — フォルダーを削除する前にご自身で確認してください',
   'jobs.run.mergeFailed': 'マージできませんでした: {reason}',
   'jobs.run.notStarted': '実行待ち',
   'jobs.run.notStartedHint': 'まだ実行していません — 詳細ウィンドウで実行を押すと開始します',
@@ -1043,6 +1121,7 @@ export const ja: Catalog = {
   'jobs.run.deleteRetained': 'worker-retain で保持中のセッションがあるため削除できません — まず解放してください',
   'jobs.run.deleteBusy': 'この作業でワーカーが動いているため削除できません — 先に停止してください',
   'jobs.run.deleteFailed': '作業を削除できませんでした',
+  'jobs.run.deleteKeptWorktrees': 'ワークツリーのフォルダーを {count} 個残しました。コミットされていない変更があるか、状態を確認できませんでした。中身を確認してから、ワークツリーパネルで削除してください。',
   'jobs.run.sharedFolder': 'フォルダ共有',
   'jobs.run.sharedFolderHint': '別の作業のワーカーと同じフォルダで動いています — 互いの編集が混ざることがあり、アプリはそれを防ぐことも気づくこともできません',
   'jobs.run.scheduled': '予約',
@@ -1153,6 +1232,9 @@ export const ja: Catalog = {
   'jobs.detail.cycle': '依存が互いを指しているため順序を決められません — これらの Task は永久に始まりません',
   'jobs.detail.hidden': '他の Task のイベント {count} 件 — ノードをもう一度押すと解除',
   'jobs.detail.clearFilter': 'フィルターを解除',
+  'jobs.detail.journalOlder': '以前のジャーナル記録をさらに表示',
+  'jobs.detail.journalCapped': 'これより古いジャーナル記録はここには表示されません。このウィンドウは最近の記録のみを表示します。',
+  'jobs.detail.journalBusy': 'ジャーナルが使用中のため、最後に読み込んだ記録を表示しています。次の更新で再度読み込みます。',
   'jobs.detail.edgeWaiting': '待っている依存',
   'jobs.detail.edgeResolved': 'すでに解けた依存',
   'jobs.detail.layer': '{n} 層',
@@ -1180,6 +1262,7 @@ export const ja: Catalog = {
   'jobs.new.failed': '作業を作れませんでした',
   'jobs.gate.noAccountAssigned': 'この Task にアカウントが指定されていないため、どのエージェントで起動するか判断できません — アカウントを指定してください',
   'jobs.gate.noAccount': '{provider} アカウントにログインしていないため、この Task を開始できません',
+  'jobs.gate.workerLostNoApp': 'この Task のワーカーは、復旧できる Astera が開いていない間に失われました（dispatch {dispatch}）。この Gate を解決すると、もう一度開始します。',
   'jobs.gate.assignedAccountUnusable':
     'この Task に指定された最初のアカウントが使用できず、その後ろのアカウントは後で切り替えるための順番にすぎません — そのアカウントに再ログインするか、この Task のアカウント一覧を変更してください',
   // NewTaskModal.tsx — Task を組み立てている間、詳細ウィンドウの下段(.detail-events)が変わるフォーム。
@@ -1222,6 +1305,7 @@ export const ja: Catalog = {
   'jobs.node.answerLabel': '決定',
   'jobs.node.gateQuestion': 'なぜ止めるのか',
   'jobs.node.failed': 'この操作を行えませんでした',
+  'jobs.node.stopFailed': 'ワーカーを停止できませんでした: {detail}',
   // How It Works — プロジェクト理解
   'hiw.rail.open': 'How It Works',
   'hiw.title': 'How It Works',
@@ -1236,6 +1320,7 @@ export const ja: Catalog = {
     'これを書いている途中でアプリが終了しました — 下のボタンを押すともう一度作成します。',
   'hiw.record.reason.checkFailed': 'エージェントが行った検査が通りませんでした — 内容を確認してください。',
   'hiw.record.reason.checkFailedJob': 'アプリが行った検査が通りませんでした — 内容を確認してください。',
+  'hiw.record.reason.evidenceUnreachable': 'プロジェクトのフォルダーが応答しなかったため、この説明が根拠とするファイルを確認できませんでした。フォルダーに到達できるようになってから再生成してください。',
   'hiw.pane.overview': '何をしますか',
   'hiw.pane.userVisible': '何が変わったか',
   'hiw.pane.flow': 'どう動きますか',

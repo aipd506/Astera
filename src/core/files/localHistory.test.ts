@@ -7,8 +7,14 @@ import {
   selectEvictions,
   snapshotId,
   tooLarge,
+  TOO_MANY_ENTRIES,
+  snapshotSkipNotices,
   type HistoryEntry
 } from './localHistory'
+import { ko } from '../i18n/messages/ko'
+import { en } from '../i18n/messages/en'
+import { ja } from '../i18n/messages/ja'
+import { es } from '../i18n/messages/es'
 
 const E = (id: string, deletedAt: number, size: number): HistoryEntry => ({
   id,
@@ -25,6 +31,11 @@ describe('projectKey', () => {
 
   it('구분자·대소문자 차이를 무시한다 (win32)', () => {
     expect(projectKey('d:/PROJ')).toBe(projectKey('D:\\proj'))
+  })
+
+  it('디스크의 디렉터리 이름이라 모든 플랫폼에서 대소문자를 접는다 — 예전 스냅샷을 그 자리에서 찾는다', () => {
+    // 플랫폼 인자가 없다: linux 에서도 /home/u/Proj 의 스냅샷은 예전 빌드가 만든 그 디렉터리에 있다
+    expect(projectKey('/home/u/Proj')).toBe(projectKey('/home/u/proj'))
   })
 
   it('끝 구분자를 무시한다', () => {
@@ -72,6 +83,61 @@ describe('tooLarge', () => {
 
   it('50MB를 넘으면 스냅샷하지 않는다', () => {
     expect(tooLarge(50 * 1024 * 1024 + 1)).toBe(true)
+  })
+})
+
+describe('TOO_MANY_ENTRIES — 스냅샷의 항목 수 상한', () => {
+  it('상한은 5,000개다', () => {
+    expect(TOO_MANY_ENTRIES).toBe(5000)
+  })
+})
+
+// 세는 것은 파일만이 아니라 항목(파일·폴더·링크)이다 — 문구도 "항목"이라 말하고, 수는 undoHint 와
+// 같이 자릿수 구분(5,000 / es 5.000)으로 적는다. 알림은 같은 문구를 삭제·되돌리기·확인 안내에 쓴다.
+describe('스냅샷 상한 문구', () => {
+  const keys = ['files.delete.skippedTooLarge', 'files.undo.permanentTooLarge', 'files.delete.undoHint'] as const
+  const expected: [string, Record<string, string | undefined>, string][] = [
+    ['ko', ko, '5,000개 항목'],
+    ['en', en, '5,000 items'],
+    ['ja', ja as Record<string, string | undefined>, '5,000 項目'],
+    ['es', es as Record<string, string | undefined>, '5.000 elementos']
+  ]
+  for (const [lang, cat, phrase] of expected) {
+    it(`${lang}: 세 문구 모두 "${phrase}" 를 말하고 "파일" 이라 하지 않는다`, () => {
+      for (const k of keys) {
+        const v = cat[k] ?? ''
+        expect(v, `${lang}:${k}`).toContain(phrase)
+        expect(v, `${lang}:${k}`).not.toMatch(/files|파일|ファイル|archivos|{maxFiles}/)
+      }
+    })
+  }
+})
+
+// 스냅샷을 남기지 못한 삭제는 사람에게 알린다 — 크기든 파일 수든 같은 "너무 커서" 알림이고, 문구가
+// 두 상한을 함께 말한다(파일 수 때문에 빠졌는데 50MB 만 말하면 사람이 이유를 알 수 없다).
+describe('snapshotSkipNotices', () => {
+  it('삭제에서 too-large 는 skippedTooLarge 를 알린다(문구가 두 상한을 적는다)', () => {
+    expect(snapshotSkipNotices({ tooLarge: true, failed: false }, 'delete')).toEqual([
+      {
+        level: 'info',
+        message: { key: 'files.delete.skippedTooLarge' }
+      }
+    ])
+  })
+
+  it('되돌리기에서 too-large 는 영구 삭제를 오류로 알린다', () => {
+    const n = snapshotSkipNotices({ tooLarge: true, failed: true }, 'undo')
+    expect(n.map((x) => [x.level, x.message.key])).toEqual([
+      ['error', 'files.undo.permanentTooLarge'],
+      ['error', 'files.undo.permanentSnapshotFailed']
+    ])
+  })
+
+  it('건너뛴 것이 없으면 알리지 않는다', () => {
+    expect(snapshotSkipNotices({ tooLarge: false, failed: false }, 'delete')).toEqual([])
+    expect(snapshotSkipNotices({ tooLarge: false, failed: true }, 'delete')).toEqual([
+      { level: 'info', message: { key: 'files.delete.skippedFailed' } }
+    ])
   })
 })
 
@@ -129,8 +195,14 @@ describe('selectEvictions', () => {
 })
 
 describe('normalizeProjectPath', () => {
-  it('구분자·대소문자·끝 구분자를 정규화한다 — index.json의 키가 된다', () => {
-    expect(normalizeProjectPath('d:/PROJ\\')).toBe(normalizeProjectPath('D:\\proj'))
+  it('구분자·대소문자·끝 구분자를 정규화한다 — index.json의 키가 된다 (win32, darwin)', () => {
+    expect(normalizeProjectPath('d:/PROJ\\', 'win32')).toBe(normalizeProjectPath('D:\\proj', 'win32'))
+    expect(normalizeProjectPath('/Users/u/PROJ/', 'darwin')).toBe(normalizeProjectPath('/users/u/proj', 'darwin'))
+  })
+
+  it('linux 에서는 대소문자를 접지 않는다 — 구분자와 끝 구분자만 정규화한다', () => {
+    expect(normalizeProjectPath('/home/u/Proj/', 'linux')).toBe(normalizeProjectPath('/home/u/Proj', 'linux'))
+    expect(normalizeProjectPath('/home/u/Proj', 'linux')).not.toBe(normalizeProjectPath('/home/u/proj', 'linux'))
   })
 
   it('다른 프로젝트는 다른 키 (해시와 달리 충돌하지 않는다)', () => {

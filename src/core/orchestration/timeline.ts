@@ -8,7 +8,7 @@
 // view.ts 와 달리 node: 모듈을 끌고 오지 않지만, 그래도 tsconfig.web.json 에 넣지 않는다 —
 // 렌더러는 이미 접힌 값(JobEvent[])만 IPC 로 받는다.
 import type { JobEvent, JobEventKind } from '../types'
-import type { OrchState } from './state'
+import { jobOf, type OrchState } from './state'
 import type { MessageType } from './types'
 
 /** 같은 시각을 가진 이벤트들의 두 번째 정렬 기준. 한 번의 쓰기가 여러 레코드에 같은 now 를 찍으므로
@@ -52,7 +52,7 @@ function collect(
   const tasks = state.tasks.filter((t) => t.runId === runId)
   const titleOf = new Map(tasks.map((t) => [t.id, t.title]))
   const events: JobEvent[] = [
-    { at: run.createdAt, kind: 'run-created', sourceId: run.id, summary: run.objective }
+    { at: run.createdAt, kind: 'run-created', sourceId: run.id, summary: jobOf(state, run)?.objective ?? '' }
   ]
   for (const t of tasks) {
     events.push({
@@ -153,18 +153,28 @@ function collect(
   return events
 }
 
+/** The timeline's order: time, then KIND_RANK, then sourceId. Exported so rows from elsewhere (the
+ *  journal's, Host journal J7) sort by the same rule as the derived ones. */
+export const byTimeline = (a: JobEvent, b: JobEvent): number =>
+  a.at.localeCompare(b.at) || KIND_RANK[a.kind] - KIND_RANK[b.kind] || a.sourceId.localeCompare(b.sourceId)
+
 /** Run 하나의 이벤트, 시각 오름차순. 모달이 열릴 때만 불린다(orch.runDetail). */
 export function timelineFor(
   state: OrchState,
   runId: string,
   isKnownSession: (sessionId: string) => boolean
 ): JobEvent[] {
-  return collect(state, runId, isKnownSession).sort(
-    (a, b) =>
-      a.at.localeCompare(b.at) ||
-      KIND_RANK[a.kind] - KIND_RANK[b.kind] ||
-      a.sourceId.localeCompare(b.sourceId)
-  )
+  return collect(state, runId, isKnownSession).sort(byTimeline)
+}
+
+/** timelineFor with rows from elsewhere (the journal's, J7) merged in by the same order. */
+export function timelineWith(
+  state: OrchState,
+  runId: string,
+  isKnownSession: (sessionId: string) => boolean,
+  extra: readonly JobEvent[]
+): JobEvent[] {
+  return [...collect(state, runId, isKnownSession), ...extra].sort(byTimeline)
 }
 
 /** 이벤트 개수. snapshotFor 가 매 쓰기마다 부르므로 정렬을 건너뛴다.

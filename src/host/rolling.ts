@@ -1,0 +1,502 @@
+// The Host's rolling (S6 design §2, §3; plan R1, R10, R12, R20–R24): the two coordinators the app runs,
+// built over this Host's registry, statusline reader, hook events, accounts and state. The Host's own
+// sessions are registered at spawn (adoptSpawned); an app's are restored at takeover (restore).
+// Chat chains are rolled here too since the chat takeover, fed by `HostChats` through `chatRollFeed.ts`.
+//
+// Imports only core modules, node builtins and the Host's own modules: this bundles into the Host.
+import path from 'node:path'
+import { RollingCoordinator } from '../core/rolling/claudeCoordinator'
+import { CodexRollingCoordinator } from '../core/rolling/codexCoordinator'
+import { BlockRegistry } from '../core/rolling/blockRegistry'
+import { RollConfigStore, hostRollConfigPath } from '../core/rolling/config'
+import { HookEventWatcher } from '../core/hooks/eventWatcher'
+import { hookEventsDirIn } from '../core/hooks/sessionState'
+import { readAccountEntries } from '../core/accounts/accountsFile'
+import { isLoggedIn as isLoggedInWith } from '../core/accounts/loginCheck'
+import { memoiseLoginStatus } from '../core/accounts/loginStatusCache'
+import { makeDescriptors } from '../core/providers/descriptor'
+import { providerOf } from '../core/providers/meta'
+import { readResumeStrategy } from '../core/settings/resumeStrategy'
+import { RateLimitFetcher, USAGE_GATE_MAX_AGE_MS } from '../core/usage/rateLimitFetcher'
+import { findClaudeTranscript } from '../core/history/strategies/claude'
+import type { RollSnapshot, RollSpawnExtra } from '../core/rolling/snapshot'
+import type { Lang } from '../core/i18n'
+import type { Account, RateLimitPeak, ResumeStrategy, RollStateEvent, SessionInfo, SessionKind } from '../core/types'
+import type { PtyRegistry } from './registry'
+import type { HostChats } from './hostChats'
+import { createChatRollFeed } from './chatRollFeed'
+import { hostRollingLog } from './rollingLog'
+
+export type HostRollEvent =
+  | { t: 'roll-state'; event: RollStateEvent }
+  | { t: 'session-rolled'; oldSessionId: string; info: SessionInfo; dest?: string; procId?: string }
+
+/** What a roll's respawn is given (the spawner implements it in Task 10). */
+export interface RollSpawnOpts {
+  account: Account
+  cwd: string
+  resumeSessionId?: string
+  resumePrompt?: string
+  initialPrompt?: string
+  rollAccountIds?: string[]
+  rollPrompt?: string
+  slackNotify?: boolean
+  bypassPermissions?: boolean
+  title?: string
+  /** The coordinators' closed shape (Task 7), with `rolledBy: 'host'` always set here (R6). */
+  restoreExtra?: RollSpawnExtra
+  /** The chain's kind (chat takeover): 'chat' goes to HostChats, anything else to the spawner. */
+  kind?: SessionKind
+  /** Chat only, claude only: the model the chain carries (claudeCoordinator's chosenModelOf). */
+  model?: string | null
+  /** The toolchain bypass the chain was granted (design F5). */
+  startWithBypass?: boolean
+}
+
+/** What the rolling asks of the Host's chat sessions (chat takeover Task 6). `info` answers the session's
+ *  account and thread for the feed. */
+export type HostChatsForRolling = Pick<
+  HostChats,
+  'has' | 'info' | 'procOf' | 'spawn' | 'started' | 'kill' | 'deliver' | 'hasOpenRequest' | 'chosenModelOf' | 'bypassedOf' | 'subscribe'
+> &
+  Partial<Pick<HostChats, 'note'>>
+
+/** The three spawner members rolling needs; `HostSpawner` implements them (Task 10). */
+export interface HostRollSpawner {
+  /** Everything a roll's respawn can wait on or be refused by, done while the old session still lives
+   *  (R5). Rejects with HostRetiring, a RepairNeeded settings or accounts file, CWD_MISSING, or an
+   *  unknown account. */
+  prepareRollSpawn(account: Account, cwd: string): Promise<void>
+  /** The respawn itself, synchronous (constraint 12). Throws until the first prepareRollSpawn has
+   *  succeeded. */
+  rollSpawn(opts: RollSpawnOpts): SessionInfo
+  /** The session's last statusline capture, or null when there is none. */
+  statusLinePayload(sessionId: string): Promise<unknown | null>
+}
+
+export interface HostRollingDeps {
+  profileDir: string
+  platform: NodeJS.Platform
+  registry: Pick<PtyRegistry, 'onData' | 'onExit' | 'metaOf' | 'sessionPty' | 'write' | 'kill' | 'list' | 'note'>
+  spawner: HostRollSpawner
+  /** R1 for the pty this session runs in (the wiring asks hostMayAct over exits and server). */
+  mayAct(ptyId: string): boolean
+  /** The Host's roll tap (Task 11). */
+  tap: { onRolled(oldSessionId: string, info: { id: string; accountId: string }): Promise<void>; onRollState(e: RollStateEvent): void }
+  /** R22: the Job packet or note over the Host's state; null for a session with no open Dispatch. */
+  resumeText(sessionId: string, form: 'handover' | 'update'): Promise<string | null>
+  onNativeSession(sessionId: string, nativeSessionId: string): void
+  /** What an attached app is told (Task 13 broadcasts it). */
+  onEvent(e: HostRollEvent): void
+  lang(): Lang
+  /** Test seams. */
+  readAccounts?(): Promise<Account[]>
+  readStrategy?(): Promise<ResumeStrategy>
+  isLoggedIn?(account: Account): Promise<boolean>
+  /** R28 (preflight R1): the account usage lookup. Default: a RateLimitFetcher on the global fetch,
+   *  read as index.ts reads it (USAGE_GATE_MAX_AGE_MS, then the peak when status is ok). */
+  fetchUsage?(configDir: string): Promise<RateLimitPeak | null>
+  copy?(src: string, dest: string): Promise<void>
+  log?(m: string): void
+  logCodex?(m: string): void
+  watchHooks?: boolean
+  /** The Host's chat sessions (chat takeover Task 6). Absent: chat chains are not this Host's. */
+  chats?: HostChatsForRolling | null
+  /** R1 for a chat proc: every holder yielded chat-takeover (the wiring asks hostMayAct). */
+  chatMayAct?(procId: string): boolean
+  /** Test seam; default findClaudeTranscript. */
+  findTranscript?(configDir: string, threadId: string): Promise<string | null>
+  /** Every hook event, after the coordinators have it (Slack in the Host Task 6: the Host's Slack reads
+   *  the same watcher). Its own try: a tap that throws costs the coordinators nothing. */
+  hookTap?(sessionId: string, payload: unknown): void
+  /** Every roll event the moment a coordinator sends it (Slack in the Host: the Host's own rolls are its
+   *  Slack's source). Not `onEvent`: a chat roll is announced only once its new proc has started, and the
+   *  carry-on turn runs inside that wait, so a tap that heard the roll then would get that turn's notices
+   *  for an id it did not know yet. Its own try: a tap that throws costs neither the apps nor the journal. */
+  onRollHeard?(e: HostRollEvent): void
+}
+
+export interface HostRolling {
+  /** A session this Host just spawned (spawner.onSpawned, Task 10). */
+  adoptSpawned(info: SessionInfo, account: Account): void
+  /** A snapshotted session taken over (Task 12). */
+  restore(info: SessionInfo, snap: RollSnapshot): boolean
+  /** A fresh codex session's rollout, found by the spawner's locate (R12). */
+  attachFresh(sessionId: string, codexSessionId: string, rolloutPath: string): void
+  has(sessionId: string): boolean
+  unregister(sessionId: string): void
+  stateOf(sessionId: string): RollStateEvent | null
+  /** The dev hook: whether the chain acted, false when it was rolling, waiting, settling or quiet. */
+  forceRoll(sessionId: string): Promise<boolean>
+  /** The accounts snapshot and the resume strategy, read again (the tick, and at start). */
+  refresh(): Promise<void>
+  /** Whether accounts.json has ever been read (R23). Until it has, no account resolves, and a takeover's
+   *  restore would map nothing (Task 16 review): the wiring holds the takeover until this is true. */
+  accountsRead(): boolean
+  onHookEvent(sessionId: string, payload: unknown): void
+  /** The account from the snapshot `refresh` keeps, or null (before the first read, or no such account).
+   *  The Host's Slack reads it (Slack in the Host Task 6), so the profile's accounts are read once. */
+  account(accountId: string): Account | null
+  /** The one block registry both coordinators share (S6 D3). The wiring sends its changes to the apps
+   *  and absorbs theirs into it (Task 3). */
+  readonly blocks: BlockRegistry
+  dispose(): void
+}
+
+export function createHostRolling(d: HostRollingDeps): HostRolling {
+  const log = d.log ?? hostRollingLog(d.profileDir, '[host]')
+  const logCodex = d.logCodex ?? hostRollingLog(d.profileDir, '[host][codex]')
+  let accounts: Account[] = []
+  let accountsRead = false
+  let strategy: ResumeStrategy = 'original'
+  const readAccounts = d.readAccounts ?? (() => readAccountEntries(path.join(d.profileDir, 'accounts.json')))
+  const readStrategy = d.readStrategy ?? (() => readResumeStrategy(path.join(d.profileDir, 'app-settings.json')))
+  // The real probes are built only when no seam replaces them, so a test that injects both reads nothing
+  // of this machine's accounts, keychain or network.
+  let descriptors: ReturnType<typeof makeDescriptors> | null = null
+  const loggedIn =
+    d.isLoggedIn ?? ((a: Account) => isLoggedInWith(a, (descriptors ??= makeDescriptors(d.platform))))
+  const loginStatus = memoiseLoginStatus(
+    async (id: string) => {
+      const a = accounts.find((x) => x.id === id)
+      return a ? loggedIn(a) : false
+    },
+    { ttlMs: 10_000 }
+  )
+  // R28 (preflight R1): the Host asks the account itself, as the app does; Q4 accepts when it fails.
+  let usage: RateLimitFetcher | null = null
+  const fetchUsage =
+    d.fetchUsage ??
+    (async (configDir: string): Promise<RateLimitPeak | null> => {
+      const u = await (usage ??= new RateLimitFetcher()).get(configDir, USAGE_GATE_MAX_AGE_MS)
+      return u.status === 'ok' ? u.peak : null
+    })
+  /** R29 (preflight R3): a dependency the coordinators call as `void this.x()` must never reject, or the
+   *  Host (no unhandledRejection handler) ends with every pty. Each answers its "nothing known" value.
+   *  **Two are left rejecting on purpose**: `prepareSpawn` and `copy` are awaited only inside roll()'s own
+   *  try, whose catch reschedules — a copy that could not reject would let a roll kill and respawn onto a
+   *  transcript that was never copied. */
+  const safe =
+    <A extends unknown[], R>(name: string, fn: (...a: A) => Promise<R>, fallback: R) =>
+    async (...a: A): Promise<R> => {
+      try {
+        return await fn(...a)
+      } catch (err) {
+        log(`${name} failed: ${String(err)}`)
+        return fallback
+      }
+    }
+  const configs = new RollConfigStore(hostRollConfigPath(d.profileDir))
+  const configsLoaded = configs.load().catch(() => ({ recovered: true }))
+  const blocks = new BlockRegistry()
+  const ptyOf = (sessionId: string): string | null => d.registry.sessionPty(sessionId)
+  const chats = d.chats ?? null
+  /** A chat session the Host holds an adapter for: every route below sends it to `chats`, never a pty. */
+  const isChat = (id: string): boolean => chats?.has(id) ?? false
+  const write = (id: string, data: string): void => {
+    if (isChat(id)) {
+      // A chat session takes a turn, not keys: the text goes through the writer (the Host adapter, or the
+      // app's chatSend), and the Enter that follows it on a pty is a no-op (the turn already went).
+      if (data === '\r') return
+      chats!.deliver(id, data)
+      return
+    }
+    const p = ptyOf(id)
+    if (!p) return
+    try {
+      d.registry.write(p, data)
+    } catch (err) {
+      log(`write refused session=${id}: ${String(err)}`)
+    }
+  }
+  const kill = (id: string): void => {
+    if (isChat(id)) {
+      chats!.kill(id)
+      return
+    }
+    const p = ptyOf(id)
+    if (p) d.registry.kill(p)
+  }
+  /** A session with no live pty here is not this Host's to act on. A chat session acts only while every
+   *  holder of its proc yielded chat-takeover and no prompt is open (spec §3.5: while a prompt is open the
+   *  chain neither resumes in place nor rolls; the S6 requeue looks again every tick). */
+  const mayAct = (id: string): boolean => {
+    if (isChat(id)) {
+      const proc = chats!.procOf(id)
+      // A limit that arrives while a prompt is open is dropped here, not deferred: the CLI reports the
+      // limit again on its next call once the prompt is answered.
+      return proc !== null && (d.chatMayAct?.(proc) ?? false) && !chats!.hasOpenRequest(id)
+    }
+    const p = ptyOf(id)
+    return p !== null && d.mayAct(p)
+  }
+  /** The Slack tap, isolated (constraint 11). */
+  const heard = (e: HostRollEvent): void => {
+    try {
+      d.onRollHeard?.(e)
+    } catch (err) {
+      log(`the Slack roll tap failed: ${String(err)}`)
+    }
+  }
+  /** The fan-out of a coordinator's send (§1.6): the tap, then the apps. Each isolated (constraint 11). */
+  const send = (channel: 'session:rolled' | 'session:rollState', payload: unknown): void => {
+    try {
+      if (channel === 'session:rolled') {
+        const p = payload as { oldSessionId: string; info: SessionInfo; dest?: string }
+        void d.tap.onRolled(p.oldSessionId, { id: p.info.id, accountId: p.info.accountId }).catch((err) => log(`roll tap failed: ${String(err)}`))
+        // R30 (preflight R7): a codex roll resumes on the copy it made, so the new pty's note names it —
+        // the spawner's claimed() then keeps it out of a later fresh scan, and a returning app's watcher
+        // can attach to it. A blank-slate respawn carries no dest and re-locates through its own chain.
+        if (p.dest !== undefined) {
+          try {
+            const pty = ptyOf(p.info.id)
+            if (pty) d.registry.note(pty, { rolloutPath: p.dest, codexSessionId: p.info.resumeSessionId })
+          } catch (err) {
+            log(`the rolled session's rollout could not be noted session=${p.info.id}: ${String(err)}`)
+          }
+        }
+        const event: HostRollEvent = { t: 'session-rolled', oldSessionId: p.oldSessionId, info: p.info, ...(p.dest !== undefined ? { dest: p.dest } : {}) }
+        heard(event)
+        if (isChat(p.info.id)) {
+          // CT-16: the codex copy this roll resumed onto goes into the new proc's note as well, before
+          // the push. An app that re-points the old tab from the note (its sweep beat the push, or it was
+          // away through the roll) reads it back and hands it on as the push would, so the rollout
+          // watcher tails that copy instead of searching until the chat's own `ready`. Its own try: a
+          // note that fails costs the announcement nothing.
+          if (p.dest !== undefined) {
+            try {
+              chats!.note?.(p.info.id, { rollDest: p.dest })
+            } catch (err) {
+              log(`the rolled chat's rollout could not be noted session=${p.info.id}: ${String(err)}`)
+            }
+          }
+          // P5: a Host-spawned chat proc is announced once its handshake and carry-on settled, so an
+          // app adopting it never becomes its writer mid-handshake. started() never rejects; the catch
+          // is the net under onEvent (R3).
+          chats!
+            .started(p.info.id)
+            .then((settled) => {
+              // A start that did not settle in time was ended there, with its mark left (final review
+              // I1): nothing to hand over.
+              if (!settled) {
+                log(`the chat roll is not announced: its new proc did not finish starting session=${p.info.id}`)
+                return
+              }
+              // A proc that died between its spawn and its start leaves nothing to adopt: a push with
+              // neither a pty nor a proc would name nothing, so it is not sent.
+              if (chats!.procOf(p.info.id) === null) {
+                log(`the chat roll is not announced: its new proc ended before it started session=${p.info.id}`)
+                return
+              }
+              d.onEvent(event)
+            })
+            .catch((err: unknown) => log(`the chat roll could not be announced session=${p.info.id}: ${String(err)}`))
+        } else d.onEvent(event)
+      } else {
+        d.tap.onRollState(payload as RollStateEvent)
+        const event: HostRollEvent = { t: 'roll-state', event: payload as RollStateEvent }
+        heard(event)
+        d.onEvent(event)
+      }
+    } catch (err) {
+      log(`a roll event could not be delivered: ${String(err)}`)
+    }
+  }
+  /** The respawn is this Host's spawn, marked as its own (R6). A chat chain's goes to the Host's chat
+   *  sessions and never opens a pty (Task 5 review hard carry). Its bypass is the session's own choice
+   *  (`o.bypassPermissions`), never the settings file. */
+  const rollSpawn = (o: RollSpawnOpts): SessionInfo => {
+    const restoreExtra = o.restoreExtra ? { restoreExtra: { ...o.restoreExtra, rolledBy: 'host' as const } } : {}
+    if (o.kind === 'chat') {
+      if (!chats) throw new Error('a chat chain cannot be respawned: this Host holds no chat sessions')
+      return chats.spawn({
+        account: o.account,
+        cwd: o.cwd,
+        ...(o.resumeSessionId !== undefined ? { resumeSessionId: o.resumeSessionId } : {}),
+        ...(o.initialPrompt !== undefined ? { initialPrompt: o.initialPrompt } : {}),
+        ...(o.rollAccountIds !== undefined ? { rollAccountIds: o.rollAccountIds } : {}),
+        ...(o.rollPrompt !== undefined ? { rollPrompt: o.rollPrompt } : {}),
+        ...(o.slackNotify !== undefined ? { slackNotify: o.slackNotify } : {}),
+        bypassPermissions: o.bypassPermissions ?? false,
+        ...(o.title !== undefined ? { title: o.title } : {}),
+        ...(o.model !== undefined ? { model: o.model } : {}),
+        ...(o.startWithBypass !== undefined ? { startWithBypass: o.startWithBypass } : {}),
+        ...restoreExtra
+      })
+    }
+    return d.spawner.rollSpawn({ ...o, ...restoreExtra })
+  }
+  const common = {
+    // Its async half is done first, while the old session lives (R5). Left rejecting (see `safe`).
+    prepareSpawn: (account: Account, cwd: string) => d.spawner.prepareRollSpawn(account, cwd),
+    write,
+    kill,
+    getAccount: (id: string) => accounts.find((a) => a.id === id) ?? null,
+    loginStatus: safe('login status', loginStatus, true),
+    send,
+    lang: d.lang,
+    blocks,
+    persistConfig: (key: string, cfg: { accountIds: string[]; prompt?: string }) => {
+      void configsLoaded.then(() => configs.set(key, cfg)).catch((err) => log(`roll config write failed: ${String(err)}`))
+    },
+    // Called inside the coordinators' own flow (applyMeta, a rekey), so a throw would cut that flow short.
+    onNativeSession: (sessionId: string, nativeSessionId: string) => {
+      try {
+        d.onNativeSession(sessionId, nativeSessionId)
+      } catch (err) {
+        log(`native session report failed session=${sessionId}: ${String(err)}`)
+      }
+      // Task 13: the native id goes into the note too, so a returning app's history guard can see it —
+      // the same reason a codex roll's dest goes in above. Its own try: never lets a note failure cut
+      // the onNativeSession report short, nor the reverse.
+      const p = ptyOf(sessionId)
+      if (p) {
+        try {
+          d.registry.note(p, { nativeSessionId })
+        } catch (err) {
+          log(`native id note failed session=${sessionId}: ${String(err)}`)
+        }
+      }
+    },
+    // R22: the Job packet or note; a tab or a coordinator gets its own chain.prompt. The coordinators'
+    // third argument (the tab fallback) has nothing to fall back to here: the Host has no tab briefing.
+    resumeText: safe('resume text', (sessionId: string, form: 'handover' | 'update') => d.resumeText(sessionId, form), null),
+    resumeStrategy: () => strategy,
+    mayAct,
+    // What a chat roll carries, read off the session before its kill (the chat manager holds both).
+    bypassedOf: (id: string) => (isChat(id) ? chats!.bypassedOf(id) : false),
+    ...(d.copy ? { copy: d.copy } : {})
+  }
+  const claude = new RollingCoordinator({
+    ...common,
+    spawn: rollSpawn,
+    chosenModelOf: (id) => (isChat(id) ? chats!.chosenModelOf(id) : null),
+    // A chat session writes no statusline (as in the app): its facts come in through the feed.
+    readStatusPayload: safe('statusline read', (id: string) => (isChat(id) ? Promise.resolve(null) : d.spawner.statusLinePayload(id)), null),
+    readUsage: safe('usage lookup', fetchUsage, null),
+    log
+  })
+  const codex = new CodexRollingCoordinator({
+    ...common,
+    spawn: rollSpawn,
+    log: logCodex
+  })
+
+  // The chat twin of the pty feed below: the Host's chat adapters' events, as ipc.ts feeds the app's.
+  // Proc exits reach the coordinators through its `exit` branch.
+  const accountOf = (id: string): Account | null => {
+    const i = chats?.info(id)
+    return i ? (accounts.find((x) => x.id === i.accountId) ?? null) : null
+  }
+  const stopChatFeed =
+    chats?.subscribe(
+      createChatRollFeed({
+        claude,
+        codex,
+        providerOf: (id) => {
+          const a = accountOf(id)
+          return a ? providerOf(a) : null
+        },
+        accountOf,
+        threadOf: (id) => chats.info(id)?.threadId ?? null,
+        findTranscript: d.findTranscript ?? findClaudeTranscript,
+        log
+      })
+    ) ?? null
+
+  // Session ptys, by the session id in the note (chat procs come in through the chat feed above).
+  d.registry.onData((ptyId, data) => {
+    const m = d.registry.metaOf(ptyId)
+    if (m?.kind !== 'session') return
+    try {
+      claude.handleData({ sessionId: m.id, data })
+      codex.handleData({ sessionId: m.id, data })
+    } catch (err) {
+      log(`rolling could not read output session=${m.id}: ${String(err)}`)
+    }
+  })
+  d.registry.onExit((ptyId) => {
+    const m = d.registry.metaOf(ptyId)
+    if (m?.kind !== 'session') return
+    // A session still live in another pty did not end: a respawn that keeps the session id opens the new
+    // pty before the old one's exit lands (registry.sessionPty's own note), and that exit is not its end.
+    if (d.registry.sessionPty(m.id) !== null) return
+    try {
+      claude.handleExit({ sessionId: m.id })
+      codex.handleExit({ sessionId: m.id })
+    } catch (err) {
+      log(`rolling could not take an exit session=${m.id}: ${String(err)}`)
+    }
+  })
+  /** One hook event to the claude coordinator, then to the tap; each isolated. */
+  const onHook = (sid: string, p: unknown): void => {
+    try {
+      claude.onHookEvent(sid, p)
+    } catch (err) {
+      log(`a hook event could not be taken session=${sid}: ${String(err)}`)
+    }
+    if (d.hookTap) {
+      try {
+        d.hookTap(sid, p)
+      } catch (err) {
+        log(`the hook tap failed session=${sid}: ${String(err)}`)
+      }
+    }
+  }
+  const hooks =
+    d.watchHooks === false
+      ? null
+      : new HookEventWatcher(hookEventsDirIn(d.profileDir), onHook, log, undefined, { startAtEnd: true })
+  hooks?.start()
+
+  return {
+    blocks,
+    adoptSpawned: (info, account) => {
+      if ((info.rollAccountIds?.length ?? 0) < 1) return
+      // register() replaces a chain outright, so a second hand-off of the same session would orphan the
+      // live chain's timers (a held roll, a wait, the healthy timer). The first registration stands.
+      if (claude.has(info.id) || codex.has(info.id)) {
+        log(`adoptSpawned: session=${info.id} already has a chain — left as it is`)
+        return
+      }
+      // R12: a codex chain is attached by the spawner's own locate (attachFresh), never by a second scan.
+      if (providerOf(account) === 'codex') codex.register(info, undefined, false, false)
+      else claude.register(info)
+    },
+    // `report` (carry C-a): the Host never heard this chain's native id nor wrote its roll config — the
+    // app did, into its own state — so the restore tells onNativeSession and writes hostRollConfigPath.
+    restore: (info, snap) =>
+      snap.provider === 'codex' ? codex.restore(info, snap, { report: true }) : claude.restore(info, snap, { report: true }),
+    attachFresh: (s, c, p) => codex.attachFresh(s, c, p),
+    has: (id) => claude.has(id) || codex.has(id),
+    unregister: (id) => {
+      claude.unregister(id)
+      codex.unregister(id)
+    },
+    stateOf: (id) => claude.stateOf(id) ?? codex.stateOf(id),
+    forceRoll: (id) => (codex.has(id) ? codex.forceRoll(id) : claude.forceRoll(id)),
+    refresh: async () => {
+      try {
+        accounts = await readAccounts()
+        accountsRead = true
+      } catch (err) {
+        // R23: the last good snapshot stands; never read means no account resolves.
+        log(`accounts.json could not be read${accountsRead ? ' — the last good read stands' : ''}: ${String(err)}`)
+      }
+      strategy = await readStrategy().catch(() => 'original' as const)
+    },
+    accountsRead: () => accountsRead,
+    onHookEvent: onHook,
+    account: (id) => accounts.find((x) => x.id === id) ?? null,
+    dispose: () => {
+      try {
+        stopChatFeed?.()
+      } catch (err) {
+        log(`the chat feed could not be stopped: ${String(err)}`)
+      }
+      hooks?.stop()
+      claude.stop()
+      codex.stop()
+    }
+  }
+}

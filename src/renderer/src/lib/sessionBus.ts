@@ -55,18 +55,38 @@ export function init(): void {
       }
     }
   })
+  // 귀가 열렸다고 메인에 알린다 — **리스너를 건 바로 다음 줄이어야 한다.** 메인은 이 신고를
+  // 받고서야 붙잡아 둔 재생 데이터를 흘리고, 그 전에 흘리면 위의 `window.api.on` 이 아직 없어
+  // 그대로 사라진다. 그것이 업데이트 뒤 재시작에서 탭만 남고 속은 검은 터미널이 되던 경로다
+  // (main/rendererGate.ts 에 그 경로와 측정이 적혀 있다).
+  //
+  // 위 버퍼가 있으므로 TerminalView 의 마운트까지 기다릴 필요는 없다: 흘러온 출력은 탭이 아직
+  // 없으면 `buffers` 에 앉았다가 `attach` 가 그대로 받아 간다. 이 버퍼가 세션 스크롤백이 머무는
+  // 유일한 곳이기도 하다 — 터미널과 달리 메인은 세션의 출력을 보관하지 않으므로, 여기서 놓치면
+  // 되물을 데가 없다.
+  window.api.system.rendererReady()
 }
 
 export function attach(sessionId: string, listener: Listener): () => void {
   const buffered = buffers.get(sessionId)
+  // 넘겨준 재생분은 이 차례가 끝날 때까지 쥐고 있는다. StrictMode(dev)는 마운트 직후 effect 를
+  // 걷었다가 다시 거는데, 그 사이에 버려지는 첫 터미널이 재생분을 가져가 버리면 남는 터미널은
+  // 빈 화면이 된다. 같은 차례 안의 detach 는 이것을 버퍼 앞에 되돌려 다음 attach 가 받게 한다.
+  // ack 가 두 번 세어져도 manager.ts 의 ack 는 0 아래로 내려가지 않는다.
+  let handed: string | null = null
   if (buffered) {
     buffers.delete(sessionId)
+    handed = buffered
+    queueMicrotask(() => {
+      handed = null
+    })
     listener(buffered)
   }
   listeners.set(sessionId, listener)
   return () => {
     listeners.delete(sessionId)
     buffers.delete(sessionId)
+    if (handed !== null) buffers.set(sessionId, handed)
   }
 }
 

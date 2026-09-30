@@ -1,13 +1,13 @@
 // Finds the rollout file of a codex session we spawned. At spawn time codex has not created the file
 // yet, so we do not know the session id — the coordinator polls this function and waits for the file
-// to appear. Enumerating all three levels of sessions/ is expensive, so we only look at today's and
-// yesterday's date folders.
+// to appear. Enumerating all three levels of sessions/ is expensive, so we only look at the date folders
+// the file can be in: from the day before `since` forward (scanDays).
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { comparablePath } from '../files/tree'
 import { isExecRollout, parseCodexMeta, ROLLOUT_UUID_RE } from '../history/codexParser'
 
-// win32 first: ignore differences in path case and separators (project-wide rule)
-const norm = (p: string): string => path.resolve(p).toLowerCase()
+// Paths compare through comparablePath (core/files/tree.ts): case folded on win32 and darwin, exact on linux.
 
 // Tolerance between the file timestamp and Date.now(). codex always creates the rollout after spawn
 // (=since), but the file time can lag by as much as the system clock resolution (measured ~1ms on
@@ -16,11 +16,61 @@ const norm = (p: string): string => path.resolve(p).toLowerCase()
 // "someone else's session created a few seconds ago", and excludePaths filters those out again.
 const CLOCK_SKEW_MS = 2_000
 
-/** epoch ms -> ['2026','07','09'] (local time — codex creates its folders by local date too) */
-function dateParts(ms: number): [string, string, string] {
-  const d = new Date(ms)
+/** How many date folders one search reads at most (limit L5, 2026-09-26). A live locate needs two (the
+ *  day before `since` and today), a restore bounded by `bornBefore` three; the cap only matters for a
+ *  caller that passes an old `since` with no `bornBefore`, and keeps that one from walking months of
+ *  folders on every poll. When the window is longer, the newest folders are kept, the ones ending at
+ *  `end`, and with no `bornBefore` the three folders anchored at `since` replace the oldest of them
+ *  (LP-3): a limit probe of a long worker still reads the folder its rollout was born in, and among the
+ *  files born after `since` the newest wins anyway. The folders between are not read. Two weeks is far
+ *  past any takeover a person waits for. */
+export const ROLLOUT_SCAN_DAYS_MAX = 14
+
+/** One day in ms. Exported for a caller that bounds its own `since` to keep a frequent search cheap
+ *  (the rollout watcher's rescan). */
+export const DAY_MS = 24 * 60 * 60_000
+
+/** Date -> ['2026','07','09'] (local time — codex creates its folders by local date too) */
+function dateParts(d: Date): [string, string, string] {
   const pad = (n: number): string => String(n).padStart(2, '0')
   return [String(d.getFullYear()), pad(d.getMonth() + 1), pad(d.getDate())]
+}
+
+/** How many folders a long window with no `bornBefore` keeps anchored at `since` (LP-3): the day before
+ *  `since`, its own day and the day after, the same slack a live locate reads. */
+const SINCE_ANCHOR_DAYS = 3
+
+/** The date folders a file born in [since, bornBefore ?? now] can sit in, oldest first: from the day
+ *  before `since` (midnight and time zone slack, as the old "yesterday" folder was) to the day after
+ *  `bornBefore`, or to today when there is none. Walking forward from `since` and not back from today
+ *  is the point of L5: a restore taking over days after a blank-slate spawn looks where that spawn's
+ *  rollout was born, not in today's and yesterday's folders, which cannot hold it. At most
+ *  ROLLOUT_SCAN_DAYS_MAX folders, the newest ones, so a long window still ends at today (or at
+ *  `bornBefore`'s next day). Steps by calendar day, so a 23- or 25-hour day at a DST change neither
+ *  skips nor repeats a folder. When the window is empty (a `since` ahead of the clock), today's and
+ *  yesterday's folders are read as before. */
+function scanDays(since: number, now: number, bornBefore: number | undefined): [string, string, string][] {
+  const end = Math.min(now, bornBefore !== undefined ? bornBefore + DAY_MS : now)
+  const start = since - DAY_MS
+  if (start > end) return [dateParts(new Date(now - DAY_MS)), dateParts(new Date(now))]
+  const first = dateParts(new Date(start)).join('/')
+  const last = new Date(end)
+  const days: [string, string, string][] = []
+  for (let i = 0; i < ROLLOUT_SCAN_DAYS_MAX; i++) {
+    const day = dateParts(new Date(last.getFullYear(), last.getMonth(), last.getDate() - i))
+    days.unshift(day)
+    if (day.join('/') === first) break
+  }
+  // LP-3: a window longer than the cap with no `bornBefore` (a limit probe of a worker started weeks
+  // ago) also keeps the SINCE_ANCHOR_DAYS folders anchored at `since`, where that worker's rollout was
+  // born, in place of the oldest of the newest ones. Still ROLLOUT_SCAN_DAYS_MAX folders in all.
+  if (bornBefore === undefined && days[0].join('/') !== first) {
+    const s = new Date(start)
+    const head: [string, string, string][] = []
+    for (let i = 0; i < SINCE_ANCHOR_DAYS; i++) head.push(dateParts(new Date(s.getFullYear(), s.getMonth(), s.getDate() + i)))
+    return [...head, ...days.slice(SINCE_ANCHOR_DAYS)]
+  }
+  return days
 }
 
 async function jsonlIn(dir: string): Promise<string[]> {
@@ -44,7 +94,7 @@ const createdAt = (st: { birthtimeMs: number; mtimeMs: number }): number =>
   st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs
 
 /**
- * The one `<configDir>/sessions/<today|yesterday>/**\/rollout-*.jsonl` that was 'created' after since
+ * The one `<configDir>/sessions/<y>/<m>/<d>/rollout-*.jsonl` (the days scanDays names) that was 'created' after since
  * and whose session_meta.cwd matches cwd. If there are several, the most recently created one. null if
  * there is none.
  *
@@ -71,22 +121,22 @@ export async function findRollout(opts: {
   // second session in the same folder would otherwise mislead. Absent keeps the newest-wins rule, which
   // is every pty caller.
   sessionId?: string
+  // When set, a file born after this (less the same skew margin) is not a candidate either. A restore
+  // looking for a blank-slate respawn's rollout long after that spawn (S6 Task 12, carry C-b) passes
+  // the moment the spawn's own locate would have given up, so a session started later in the same
+  // folder is not taken for it. Absent keeps every file born after since, which is every live locate.
+  bornBefore?: number
 }): Promise<{ path: string; sessionId: string } | null> {
   const now = (opts.now ?? Date.now)()
   const root = path.join(opts.configDir, 'sessions')
-  const days = [dateParts(now), dateParts(now - 24 * 60 * 60_000)] // today + yesterday
   const files: string[] = []
-  const seen = new Set<string>()
-  for (const [y, m, d] of days) {
-    const key = `${y}/${m}/${d}`
-    if (seen.has(key)) continue // same day (e.g. in tests) — avoid scanning it twice
-    seen.add(key)
+  for (const [y, m, d] of scanDays(opts.since, now, opts.bornBefore)) {
     files.push(...(await jsonlIn(path.join(root, y, m, d))))
   }
-  const excluded = new Set((opts.excludePaths ?? []).map(norm))
+  const excluded = new Set((opts.excludePaths ?? []).map((p) => comparablePath(p)))
   let best: { path: string; sessionId: string; bornAt: number } | null = null
   for (const file of files) {
-    if (excluded.has(norm(file))) continue
+    if (excluded.has(comparablePath(file))) continue
     let bornAt: number
     try {
       bornAt = createdAt(await fs.stat(file))
@@ -94,13 +144,14 @@ export async function findRollout(opts: {
       continue
     }
     if (bornAt < opts.since - CLOCK_SKEW_MS) continue
+    if (opts.bornBefore !== undefined && bornAt > opts.bornBefore + CLOCK_SKEW_MS) continue
     let meta
     try {
       meta = await parseCodexMeta(file)
     } catch {
       continue
     }
-    if (!meta.cwd || norm(meta.cwd) !== norm(opts.cwd)) continue
+    if (!meta.cwd || comparablePath(meta.cwd) !== comparablePath(opts.cwd)) continue
     // This app's own `codex exec` runs land in the same account and folder and are newer than the
     // session that is looking for its file, so without this they win the "newest wins" contest below
     // (see isExecRollout). A session is never spawned through exec, so no real candidate is lost.

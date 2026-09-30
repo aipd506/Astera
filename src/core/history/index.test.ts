@@ -6,6 +6,7 @@ import type { Account, Provider } from '../types'
 import { HistoryIndex } from './index'
 import { SessionCwdCache } from './sessionCwdCache'
 import { makeDescriptors, type ProviderDescriptor } from '../providers/descriptor'
+import { foldsCaseHere } from '../testPaths'
 
 /** 워처의 디바운스 상한 테스트는 이벤트가 append마다 오는 native 경로에서만 뜻이 있다. chokidar
  *  폴백은 awaitWriteFinish 로 쓰는 중에는 아예 조용하므로(그것이 폴백인 이유이기도 하다) 건너뛴다. */
@@ -211,15 +212,16 @@ describe('HistoryIndex (lazy)', () => {
      *  전량 재읽기를 만들지 않는다" 로 잘못 적어 두었다가 macOS CI 가 codex: 3 을 냈다.
      *
      *  기다림을 고정 시간이 아니라 **활동이 멎는 것**으로 판정한다. 고정 예산은 한가한 머신에서만
-     *  충분해서 2코어 CI 러너에서 모자랐던 선례가 있다(main/codexRolling.test.ts 의 settleIo). */
+     *  충분해서 2코어 CI 러너에서 모자랐던 선례가 있다(core/rolling/codexCoordinator.test.ts 의 settleIo). */
     const drainWatcher = async (dirs: string[]): Promise<void> => {
       let hits = 0
       index!.onUpdated = (): void => {
         hits += 1
       }
-      // 조용함의 기준을 넉넉히 잡는다 — 100ms×5 = 0.5초 동안 새 통지가 없어야 재생이 끝난 것으로
-      // 본다. 상한은 라운드 수로 센다(최대 6초): 넘으면 기다림이 부족한 것이 아니라 다른 일이다.
-      for (let quiet = 0, round = 0; quiet < 5 && round < 60; round += 1) {
+      // 조용함의 기준을 넉넉히 잡는다 — 100ms×15 = 1.5초 동안 새 통지가 없어야 재생이 끝난 것으로
+      // 본다(macOS FSEvents 는 부하 아래 0.5초 뒤에도 앞 폴더의 생성 통지를 늦게 재생했다). 상한은
+      // 라운드 수로 센다(최대 15초): 넘으면 기다림이 부족한 것이 아니라 다른 일이다.
+      for (let quiet = 0, round = 0; quiet < 15 && round < 150; round += 1) {
         const before = hits
         await new Promise((r) => setTimeout(r, 100))
         quiet = hits === before ? quiet + 1 : 0
@@ -568,8 +570,9 @@ describe('HistoryIndex (lazy)', () => {
     index = new HistoryIndex(() => [a])
 
     const target = (await index.projectsPage()).projects[0].projectPath
+    // 대소문자를 접는 것은 win32 와 darwin 뿐 — linux 에서 대문자로 바꾼 경로는 다른 프로젝트라 숨기지 않는다
     const shouted = await index.projectsPage({ hiddenPaths: [target.toUpperCase()] })
-    expect(shouted.total).toBe(0)
+    expect(shouted.total).toBe(foldsCaseHere ? 0 : 1)
 
     // 구분자 바꿔치기는 win32에서만 같은 경로다. POSIX에서 `\`는 이름에 쓸 수 있는 글자라, 슬래시로
     // 바꾼 문자열은 같은 경로가 아니라 아예 다른 경로가 된다

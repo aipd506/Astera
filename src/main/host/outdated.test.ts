@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { hostIsOutdated, hostSpeaksProcs } from './outdated'
+import { hostIsOutdated, hostSpeaksProcs, hostSpeaksPing, hostSpeaksSpawn, hostSpeaksWorktrees, hostSpeaksDispatch, hostSpeaksRolling, hostSpeaksBlocks, hostSpeaksRollJournal, hostSpeaksChatTakeover, hostSpeaksSlackOwner, hostSpeaksJournal } from './outdated'
+import { HOST_FEATURE_CHAT_TAKEOVER, HOST_FEATURE_SLACK_OWNER } from '../../core/host/protocol'
 
 describe('hostIsOutdated', () => {
   it('is true when the Host is strictly older than the app', () => {
@@ -37,5 +38,113 @@ describe('hostSpeaksProcs', () => {
   // Nothing to ask, whatever the last hello said: there is no connection to send proc-list on.
   it('is false while disconnected, even if the last hello named the feature', () => {
     expect(hostSpeaksProcs({ connected: false, features: ['proc'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksPing', () => {
+  it('is true for a connected Host that named the ping feature', () => {
+    expect(hostSpeaksPing({ connected: true, features: ['proc', 'ping'] })).toBe(true)
+  })
+
+  // A Host from before the heartbeat logs a ping as an unknown message and says nothing back. Sending
+  // one anyway and reading that silence as a fault would call a perfectly well Host unresponsive.
+  it('is false for a Host that predates the heartbeat', () => {
+    expect(hostSpeaksPing({ connected: true, features: ['proc'] })).toBe(false)
+    expect(hostSpeaksPing({ connected: true, features: [] })).toBe(false)
+  })
+
+  it('is false while disconnected — there is nothing to ping on', () => {
+    expect(hostSpeaksPing({ connected: false, features: ['ping'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksSpawn', () => {
+  it('hostSpeaksSpawn is the spawn feature on a connected Host', () => {
+    expect(hostSpeaksSpawn({ connected: true, features: ['proc', 'spawn'] })).toBe(true)
+    expect(hostSpeaksSpawn({ connected: true, features: ['proc'] })).toBe(false)
+    expect(hostSpeaksSpawn({ connected: false, features: ['spawn'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksWorktrees', () => {
+  it('hostSpeaksWorktrees is the worktrees feature on a connected Host', () => {
+    expect(hostSpeaksWorktrees({ connected: true, features: ['spawn', 'worktrees'] })).toBe(true)
+    expect(hostSpeaksWorktrees({ connected: true, features: ['spawn'] })).toBe(false)
+    expect(hostSpeaksWorktrees({ connected: false, features: ['spawn', 'worktrees'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksDispatch', () => {
+  it('hostSpeaksDispatch needs a connected Host that announced dispatch', () => {
+    expect(hostSpeaksDispatch({ connected: true, features: ['spawn', 'worktrees', 'dispatch'] })).toBe(true)
+    expect(hostSpeaksDispatch({ connected: true, features: ['spawn', 'worktrees'] })).toBe(false) // an S3 Host (D5)
+    expect(hostSpeaksDispatch({ connected: false, features: ['dispatch'] })).toBe(false)
+  })
+  // Task 14 review I1: an unresponsive Host still drives (it sees a yielding app attached), so the app
+  // keeps yielding until it answers, is replaced, or the connection drops.
+  it('hostSpeaksDispatch stays true while a Host that announced dispatch is unresponsive', () => {
+    expect(hostSpeaksDispatch({ connected: false, unresponsive: true, features: ['spawn', 'worktrees', 'dispatch'] })).toBe(true)
+    expect(hostSpeaksDispatch({ connected: false, unresponsive: true, features: ['spawn', 'worktrees'] })).toBe(false)
+    expect(hostSpeaksDispatch({ connected: false, unresponsive: false, features: ['spawn', 'worktrees', 'dispatch'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksRolling', () => {
+  it('hostSpeaksRolling needs a connected Host that announced rolling', () => {
+    expect(hostSpeaksRolling({ connected: true, features: ['spawn', 'worktrees', 'dispatch', 'rolling'] })).toBe(true)
+    expect(hostSpeaksRolling({ connected: true, features: ['spawn', 'worktrees', 'dispatch'] })).toBe(false) // an S4+S5 Host
+    expect(hostSpeaksRolling({ connected: false, features: ['rolling'] })).toBe(false)
+  })
+  // The hostSpeaksDispatch rule: an unresponsive Host still rolls what it owns, so the app keeps yielding.
+  it('hostSpeaksRolling stays true while a Host that announced rolling is unresponsive', () => {
+    expect(hostSpeaksRolling({ connected: false, unresponsive: true, features: ['rolling'] })).toBe(true)
+    expect(hostSpeaksRolling({ connected: false, unresponsive: true, features: ['dispatch'] })).toBe(false)
+    expect(hostSpeaksRolling({ connected: false, unresponsive: false, features: ['rolling'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksChatTakeover', () => {
+  it('hostSpeaksChatTakeover follows hostSpeaksRolling: connected or unresponsive, with the feature', () => {
+    const f = [HOST_FEATURE_CHAT_TAKEOVER]
+    expect(hostSpeaksChatTakeover({ connected: true, features: f })).toBe(true)
+    expect(hostSpeaksChatTakeover({ connected: false, unresponsive: true, features: f })).toBe(true)
+    expect(hostSpeaksChatTakeover({ connected: false, features: f })).toBe(false)
+    expect(hostSpeaksChatTakeover({ connected: true, features: [] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksBlocks', () => {
+  it('needs a Host that announced blocks, connected or unresponsive (the hostSpeaksRolling rule)', () => {
+    expect(hostSpeaksBlocks({ connected: true, features: ['rolling', 'blocks'] })).toBe(true)
+    expect(hostSpeaksBlocks({ connected: true, features: ['spawn', 'worktrees', 'dispatch', 'rolling'] })).toBe(false) // an S6 Host before Task 3
+    expect(hostSpeaksBlocks({ connected: false, features: ['blocks'] })).toBe(false)
+    expect(hostSpeaksBlocks({ connected: false, unresponsive: true, features: ['blocks'] })).toBe(true)
+  })
+})
+
+describe('hostSpeaksRollJournal', () => {
+  it('needs a connected Host that announced roll-journal; an unresponsive one is not asked', () => {
+    expect(hostSpeaksRollJournal({ connected: true, features: ['rolling', 'blocks', 'roll-journal'] })).toBe(true)
+    expect(hostSpeaksRollJournal({ connected: true, features: ['rolling', 'blocks'] })).toBe(false) // an S6 Host before Task 4
+    expect(hostSpeaksRollJournal({ connected: false, features: ['roll-journal'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksSlackOwner (Slack in the Host, P5)', () => {
+  it('holds while connected or unresponsive with the feature, and not after a close', () => {
+    const f = [HOST_FEATURE_SLACK_OWNER]
+    expect(hostSpeaksSlackOwner({ connected: true, features: f })).toBe(true)
+    expect(hostSpeaksSlackOwner({ connected: false, unresponsive: true, features: f })).toBe(true)
+    expect(hostSpeaksSlackOwner({ connected: false, features: [] })).toBe(false)
+    expect(hostSpeaksSlackOwner({ connected: true, features: ['rolling'] })).toBe(false)
+  })
+})
+
+describe('hostSpeaksJournal (Host journal J2)', () => {
+  it('holds for a connected or unresponsive Host that announced journal, and nothing else', () => {
+    expect(hostSpeaksJournal({ connected: true, features: ['journal'] })).toBe(true)
+    expect(hostSpeaksJournal({ connected: false, unresponsive: true, features: ['journal'] })).toBe(true)
+    expect(hostSpeaksJournal({ connected: false, features: ['journal'] })).toBe(false)
+    expect(hostSpeaksJournal({ connected: true, features: ['spawn'] })).toBe(false)
   })
 })

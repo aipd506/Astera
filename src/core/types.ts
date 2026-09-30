@@ -13,6 +13,7 @@ export type { PythonInterpreter } from './run/python'
 // an alias. A deletion snapshot entry (originalPath, deletedAt, size, isDir) merely shares the name
 // with that session history entry; the two types are unrelated.
 import type { HistoryEntry as LocalHistoryEntry } from './files/localHistory'
+import type { FileChangeBatch } from './files/changeBatch'
 export type { HistoryEntry as LocalHistoryEntry } from './files/localHistory'
 import type { Lang, LangPreference, Message } from './i18n'
 import type { ScheduleRule, ScheduleConfig } from './scheduler/rule'
@@ -29,7 +30,14 @@ import type { TerminalFont } from './terminal/font'
 import type { GeneratorSettings } from './understanding/generatorSettings'
 import type { DesktopNotifySettings } from './notify/settings'
 import type { ModelDescriptor, ModelListResult } from './models/types'
-import type { ChatAnswer, ChatEvent, ChatState, PermissionMode, PermissionModeChoice } from './chat/types'
+import type {
+  ChatAnswer,
+  ChatEvent,
+  ChatState,
+  PermissionMode,
+  PermissionModeChoice,
+  UnattendedPermission
+} from './chat/types'
 import type { ThemeId } from './theme/themes'
 import type { ConvTurn } from './history/convTypes'
 export type { ConvTurn } from './history/convTypes'
@@ -44,12 +52,25 @@ export type { ConvTurn } from './history/convTypes'
 // the renderer typecheck every Node global, which is the guard this note stands to protect.
 import type { CheckResult, GateKind, MessageType, Outcome, RepairReason, TaskStatus } from './orchestration/types'
 import type { CompletionDetail } from './orchestration/completion'
+import type { WorkspaceEvent, WorkspaceSummary } from './host/protocol'
 export type { CompletionDetail, CompletionCheckDetail } from './orchestration/completion'
 export type { MessageType, TaskStatus } from './orchestration/types'
 
 // providers/meta.ts owns Provider. It is re-exported here so that the files which already imported
 // Provider from types can stay as they are.
 export type { Provider } from './providers/meta'
+
+/** The new-session dialog's repository check (core/worktrees/git.ts probeRepoRoot). `unknown` is git
+ *  not answering in time — a slow share, not a verdict — so Start stays open and only the worktree
+ *  option, which needs the root, is held back. */
+export type RepoProbe =
+  | { kind: 'repo'; root: string }
+  | { kind: 'none' }
+  | { kind: 'unknown'; reason: RepoUnknownReason }
+/** Why the repository check could not answer: git ran past its deadline (a slow share), git could not
+ *  be started (not installed), the folder is not there, or something else failed (IPC, an odd spawn
+ *  error). Each gets its own hint — blaming a slow share for a missing git sends people the wrong way. */
+export type RepoUnknownReason = 'timeout' | 'no-git' | 'no-folder' | 'error'
 
 export interface Account {
   id: string
@@ -110,10 +131,13 @@ export interface ResumeDefaults {
   schedule: ScheduleConfig | null
 }
 
-/** 워크트리 항목의 상태. **'missing' 은 없다** — 폴더가 사라진 항목은 listWithStatus 가 목록을
- *  만들면서 레지스트리에서 걷으므로(그쪽 주석) 화면까지 오지 않는다. 남는 질문은 "git 이 이 폴더를
- *  아는가" 하나다. */
-export type WorktreeStatus = 'ok' | 'orphan-dir'
+/** 워크트리 항목의 상태. **'missing' 은 없다** — 폴더가 사라졌다고 확인된 항목은 listWithStatus 가
+ *  목록을 만들면서 레지스트리에서 걷으므로(그쪽 주석) 화면까지 오지 않는다. 'unreachable' 은 폴더
+ *  확인이 확답을 주지 못한 항목이다(멈춘 네트워크 드라이브, 빠진 드라이브, 권한 오류) — 잊지 않고
+ *  그대로 보여 준다. 나머지 질문은 "git 이 이 폴더를 아는가" 하나다. 'git-unchecked' 는 그 질문에
+ *  git 이 답하지 못한 항목이다(시간 초과, 출력 한도, 닿지 않는 저장소) — 'orphan-dir' 과 달리 지워도
+ *  되는 잔해라는 뜻이 아니다. */
+export type WorktreeStatus = 'ok' | 'orphan-dir' | 'unreachable' | 'git-unchecked'
 
 /** A git worktree record the app created — persisted in worktrees.json */
 export interface WorktreeInfo {
@@ -124,6 +148,44 @@ export interface WorktreeInfo {
   branch: string // <username>/<slug>[-N]
   baseRef: string // short form of the base at creation time (e.g. origin/main)
   createdAt: string // ISO 8601
+}
+
+/** The stage worktree creation is in (core/worktrees/create.ts): fetching the base, `worktree add`,
+ *  then copying the .worktreeinclude entries (only when there is such a file). */
+export type WorktreeCreateStage = 'fetch' | 'checkout' | 'copy-includes'
+
+/** One progress report from createWorktree. The counts only appear during copy-includes, and only once
+ *  the entries have been measured — before that the stage alone is known. */
+export interface WorktreeCreateProgress {
+  stage: WorktreeCreateStage
+  bytesCopied?: number
+  bytesTotal?: number
+  filesCopied?: number
+  filesTotal?: number
+}
+
+/** main → renderer, for a worktrees.create call that carried an opId. `progress: null` means the
+ *  worktree is made — cancelling is no longer possible, the session is starting. */
+export interface WorktreeCreateEvent {
+  opId: string
+  progress: WorktreeCreateProgress | null
+}
+
+/** What a long explorer operation is doing right now: copying the target into Local History before a
+ *  delete, removing it, or copying (paste, duplicate, a move across drives). */
+export type FileOpStage = 'snapshot' | 'delete' | 'copy'
+
+/** One progress report for an explorer file operation. count is the entries done so far in this
+ *  stage (files, folders and links alike) — it starts again from 1 when the stage changes. */
+export interface FileOpProgress {
+  stage: FileOpStage
+  count: number
+}
+
+/** main → renderer, for a files.remove / copy / importExternal / move call that carried an opId. */
+export interface FileOpEvent {
+  opId: string
+  progress: FileOpProgress
 }
 
 export interface WorktreeListItem extends WorktreeInfo {
@@ -519,15 +581,37 @@ export interface RunDetail {
   deps: Record<string, string[]>
   /** 깊이를 정할 수 없는 Task — deps 에 순환이 있다 */
   cyclic: string[]
+  /** 이벤트 가운데 Job Journal 에서 온 줄(잃은 시도, 복구 결정)에 대한 것. 저널이 꺼져 있거나 아직
+   *  읽지 않았으면 없다. */
+  journal?: RunDetailJournal
+}
+
+/** 상세 창이 저널 줄에 대해 알아야 하는 두 가지(stage 3 T1). 저널은 메인 스레드에서 읽으므로 한 번에
+ *  가장 최근 한 쪽만 읽고, Host 가 파일을 잡고 있으면 기다리지 않고 마지막으로 읽은 줄을 준다. */
+export interface RunDetailJournal {
+  /** Host 가 파일을 잡고 있어 이번에는 읽지 못했다 — 줄은 마지막으로 읽은 것이다. 다음 갱신 때 다시 읽는다 */
+  busy: boolean
+  /** 더 오래된 저널 줄이 남아 있다 — "이전 기록 더 보기" 가 한 쪽을 더 읽는다 */
+  older: boolean
+  /** 더 오래된 줄이 남았지만 한 번에 읽을 수 있는 쪽 수의 끝에 닿았다 — 버튼 대신 그렇다고 적는다 */
+  capped: boolean
 }
 
 /** Run 이 끝났는지 — Task 상태에서 계산된다. 저장되지 않는다.
  *
- *  여기(web 포함 파일)에 선언하는 이유: JobRun 이 이 타입을 필드로 갖고, 그것을 계산하는
+ *  여기(web 포함 파일)에 선언하는 이유: JobRow 이 이 타입을 필드로 갖고, 그것을 계산하는
  *  core/orchestration/view.ts 는 node:path 를 끌고 와서 tsconfig.web.json 에 넣을 수 없다.
  *  그래서 타입은 이쪽이 선언하고 view.ts 가 가져간다 — TaskStatus 와 같은 방향이다. */
 export type RunOutcome = 'running' | 'completed' | 'failed'
-export interface JobRun {
+
+/** Jobs 목록의 한 줄. **도메인 타입이 아니라 화면이 읽는 모양이다** — view.ts 가 OrchState 에서
+ *  계산해 내려보내고 저장되지 않는다.
+ *
+ *  **이름이 JobRun 이 아닌 이유.** 그 이름은 도메인의 "한 Job 의 한 회차" 가 가져간다
+ *  (docs/2026-09-21-job-run-split-and-projects-design.md §4.2). 그리고 `Run`,
+ *  `RunConfig`, `RunStatus`, `runId` 는 실행 구성(core/run/)의 것이라 도메인이 쓸 수 없다. 한
+ *  단어를 세 가지가 두고 부딪히므로, 화면의 것은 화면의 말로 부른다. */
+export interface JobRow {
   id: string
   objective: string
   /** 관리자가 있어야 하는데 없다 — 코디네이터 계정이 지정돼 있지만 붙어 있는 세션이 없다.
@@ -600,11 +684,39 @@ export interface JobRun {
    *
    *  **예약이 아닌 Run 에는 이 칸이 아예 없다.** 빈 배열을 달면 sameSnapshot 의 문자열이 이유
    *  없이 길어지고, 화면에서 "회차가 아직 없는 템플릿"과 "템플릿이 아님"이 같아 보인다. */
-  children?: JobRun[]
+  children?: JobRow[]
   tasks: JobTask[]
 }
+/** Why the Jobs view has nothing to draw, when the reason is the Host rather than the state.
+ *
+ *  **The app no longer owns `orchestration.json`** (host control plane design §6): with no Host
+ *  reachable there is no state to read, so `bootOrch` does not start — and the four features that
+ *  share that startup stop with it. Before this plan none of them needed a Host at all, so a person
+ *  meeting this has no way to guess what is missing. The four are named on this one surface and in
+ *  the log line beside it (`jobs.host.features`), rather than growing four separate surfaces of
+ *  their own (ruling F35).
+ *
+ *  Absent once orchestration is up, which is the ordinary case — then the snapshot's own emptiness
+ *  means what it always meant.
+ *
+ *  **Not part of `OrchSnapshot`, and that is the whole of ruling F41.** A snapshot is per project and
+ *  is only ever asked for and pushed with one open; this is one fact about the app's Host. Carried in
+ *  the snapshot it vanished in exactly the state that needs it — a fresh install, or any window that
+ *  has not opened a session, where the renderer substitutes an empty snapshot of its own. It travels
+ *  on `orch.hostGate` / `orch:host` instead, neither of which knows what a project is. */
+export interface OrchHostGate {
+  /** `waiting` — the app is still trying to reach the Host. `unreachable` — it has given up for now;
+   *  a toggle change or an app restart tries again from the top. */
+  state: 'waiting' | 'unreachable'
+  /** What went wrong, verbatim from the failure. Only on `unreachable`. */
+  reason?: string
+  /** The log file that carries the whole story. Named on screen because the reason above is one
+   *  line and the person who needs more has no way to find this file otherwise. */
+  logPath: string
+}
+
 export interface OrchSnapshot {
-  runs: JobRun[]
+  runs: JobRow[]
   /** 이 프로젝트 폴더에서 지금 일하는 워커가 하나라도 있는가. **새 Run 을 만드는 창이 읽는다.**
    *
    *  위의 Run 별 값으로는 이 질문에 답할 수 없다 — 만들 때 그 Run 은 아직 없고, 기존 Run 하나가
@@ -625,10 +737,19 @@ export interface CoreEvents {
   'session:busy': { sessionId: string; busy: boolean } // session working/idle — the spinner dot on the tab
   'session:schedState': SchedStateEvent // schedule banner
   'history:updated': { total: number }
+  /** Rollout heads the codex index does not know yet, being read (core/history/scanProgress.ts).
+   *  `active: false` closes it. Only a scan of 20 files or more is reported. */
+  'history:scan': { active: boolean; done: number; total: number }
   'accounts:changed': { accounts: Account[] }
   // The unregistered history sources were re-scanned (fires after an account is added or removed)
   'accounts:ghostsChanged': { accounts: Account[] }
-  'files:changed': { path: string; kind: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir' } // watcher
+  'files:changed': { path: string; kind: 'add' | 'change' | 'unlink' | 'addDir' | 'unlinkDir' } // watcher, one event (the older shape — still accepted by the renderer's subscribeFileChanges)
+  /** The watcher's events, one message per FILE_CHANGE_BATCH_MS window (core/files/changeBatch.ts). */
+  'files:changedBatch': FileChangeBatch
+  /** Stage and copy progress of one worktrees.create, throttled to about 4 a second (core/worktrees/progress.ts). */
+  'worktree:createProgress': WorktreeCreateEvent
+  /** Progress of one explorer delete or copy that carried an opId, about 4 a second (core/files/fileOpProgress.ts). */
+  'files:opProgress': FileOpEvent
   'git:changed': void // index/HEAD changes in the git dir, e.g. a commit from a session terminal — triggers a tree state refresh
   /** One repository's PR snapshot was refreshed (or marked stale by the rate-limit breaker).
    *  The whole snapshot rides along — the renderer replaces, never merges. */
@@ -698,6 +819,18 @@ export interface CoreEvents {
   // main's worktree-to-repository resolution (see OrchApi) — that call is the only thing that tells
   // main what the renderer has open.
   'orch:state': OrchSnapshot
+  /** The Host gate changed, or was cleared (null). **Not scoped to a project and not conditional on
+   *  one** — see `OrchHostGate` for what carrying it in the snapshot cost. Sent whenever it moves;
+   *  `orch.hostGate` answers the same value for a window that mounts after the change. */
+  'orch:host': OrchHostGate | null
+  /** Who drives Jobs, as the Host last said it (limits L3), or null when nothing is known: no Host, a
+   *  connection that went, or a Host too old to say. The Jobs sidebar reads it with the Host status to
+   *  say why nothing moves (jobsStall). `host.driver` answers the same value for a window that mounts later. */
+  'host:driver': HostDriverReport | null
+  /** An agent app workspace changed, as the Host said it (agent workspace design): a state, with
+   *  `open: false` when its desktop is gone, or the latest frame. `workspace.list` answers the live ones
+   *  for a window that mounts later. */
+  'workspace:event': WorkspaceEvent
 
   /** How It Works 의 저장 파일이 바뀌었다. **실린 값은 프로젝트 키이고, 받는 쪽은 그것을 쓰지
    *  않는다** — main 은 그 키를 원 저장소로 접어 두는데(설계 D1) 렌더러는 그 접기를 모른다.
@@ -732,7 +865,7 @@ export interface CoreEvents {
   /** A session's waiting tool call changed (main/pendingPrompt.ts's `subscribe`): captured, replaced, or
    *  cleared (`prompt: null`). Not gated on an open conversation, like 'conversation:attention'. */
   'conversation:pendingPrompt': { sessionId: string; prompt: PendingToolPrompt | null }
-  /** A chat session's adapter reported something (main/chat/manager.ts's `subscribe`). Not gated on an
+  /** A chat session's adapter reported something (core/chat/manager.ts's `subscribe`). Not gated on an
    *  open conversation, like conversation:attention. */
   'chat:event': { sessionId: string; event: ChatEvent }
 }
@@ -769,12 +902,62 @@ export interface HostStatus {
   problem: string | null
   /** The Host is running an older build than this app — it outlived an update and still runs the
    *  previous host.js. The app replaces it on its own the first moment it holds nothing, and the Info
-   *  tab offers to do it now (docs/superpowers/specs/2026-09-14-host-replacement-design.md). False
-   *  whenever the version cannot be compared, and false for a Host *newer* than the app. */
+   *  tab offers to do it now (docs/2026-09-22-host-unresponsive-recovery-design.md F5 — the original
+   *  host-replacement design is not in this repository). False whenever the version cannot be
+   *  compared, and false for a Host *newer* than the app. */
   outdated: boolean
+  /** **A Host is there and it is not answering.** Not the same as `connected: false`, which also
+   *  covers "there is no Host" and "the connection dropped" — both of which have a way forward on
+   *  their own, and this one does not: nothing closes, so nothing retries, and the Host holds a
+   *  person's sessions while answering none of them (measured 2026-09-22, when a pty spawn stuck
+   *  inside node-pty took the Host's whole event loop with it).
+   *
+   *  Set when the heartbeat goes unanswered, when a peer accepts the connection and never says hello,
+   *  or when a Host too old for the heartbeat runs a request's deadline out. Cleared by any message
+   *  from the Host at all. While it is true new ptys go to the app's own factory so work can continue,
+   *  and the Info tab offers to end that Host and start another
+   *  (docs/2026-09-22-host-unresponsive-recovery-design.md F1). */
+  unresponsive: boolean
+  /** The runtime directory this Host was started from is missing files. It runs on what it already
+   *  loaded and will stall at its next spawn, so it is replaced the first moment it holds nothing —
+   *  the same rule `outdated` gets, for a different reason (design F6). */
+  runtimeIncomplete: boolean
   /** What the Host announced it can do (protocol.ts HOST_FEATURE_*); empty until a hello, and for a
    *  Host that predates the field. */
   features: string[]
+}
+
+/** Putting the Host's own runtime in place (win32), as the window shows it (stage 3 task 2).
+ *
+ *  `preparing` only while something is actually being written: a runtime that is already whole is
+ *  checked without ever leaving `idle`, so an ordinary launch shows nothing. `slow` turns true once the
+ *  install has run past about a second — a first install copies an 87 MB `node.exe` that an antivirus
+ *  then scans — so the status bar can say it is still working rather than sit on the same words.
+ *  `failed` stays until a later install succeeds; the Host then runs from the app executable, as every
+ *  version before the runtime did, and the next start tries again. */
+export type HostRuntimeInstallState =
+  | { phase: 'idle' }
+  | { phase: 'preparing'; slow: boolean; startedAt: number }
+  | {
+      phase: 'failed'
+      /** Which short, translated sentence the status bar shows: the files could not be copied, the
+       *  install ran past its two-minute deadline, or something else threw. `detail` keeps the raw
+       *  error for the log and the tooltip. */
+      reason: 'copy' | 'timeout' | 'unknown'
+      detail: string
+    }
+
+/** Who drives Jobs, as a Host that announced HOST_FEATURE_DRIVER says it (limits pass L3). The app
+ *  keeps the last one it was told on this connection and forgets it when the connection drops; an
+ *  older Host says nothing, and then nothing is known. Written out here rather than imported from
+ *  core/host/driver.ts because the renderer compiles this file and not that one.
+ *
+ *  `gate` is what the Host last read from the profile's settings file: `not-migrated` and
+ *  `unreadable` are the two things that park it (driverOf), and null means it has not read the file
+ *  yet (a Host that has just started is parked until it has, N2). */
+export interface HostDriverReport {
+  driver: 'host' | 'app' | 'parked'
+  gate: 'no-settings' | 'migrated' | 'not-migrated' | 'unreadable' | null
 }
 
 /** How much of this app's work the Host is holding right now — the fact that makes the Info tab's
@@ -834,6 +1017,9 @@ export interface CoreApi {
       schedule?: ScheduleConfig // recurring command schedule
       kind?: SessionKind // default 'terminal'
       resumeThreadId?: string // chat only: resume this protocol thread instead of starting one
+      /** chat takeover P8: the new chat session's unattended-permission policy (hold, the default, or
+       *  deny after 60 s). Ignored for a terminal session, which has no such policy. */
+      unattendedPermission?: UnattendedPermission
     }): Promise<SessionInfo>
     write(id: string, data: string): void
     resize(id: string, cols: number, rows: number): void
@@ -867,12 +1053,21 @@ export interface CoreApi {
       repoPath: string
       name?: string
       baseRef?: string // the branch to fork from, short form. Absent falls back to automatic detection
+      /** Set by a caller that shows progress and offers Cancel: progress arrives on
+       *  'worktree:createProgress' under this id, and cancelCreate(opId) stops it. */
+      opId?: string
     }): Promise<{ info: WorktreeInfo; warnings: Message[] }>
+    /** Stops the creation started with this opId (WORKTREE_CANCELLED, after rolling back what it made).
+     *  false when nothing by that id is running — it finished, or never started. */
+    cancelCreate(opId: string): Promise<boolean>
     /** Base-branch candidates for the picker, newest commit first. `detected` is what the automatic path
-     *  would have chosen, so the select can preselect it and leave behaviour unchanged when untouched. */
-    listBranches(repoPath: string): Promise<{ branches: BranchRef[]; detected: string | null }>
+     *  would have chosen, so the select can preselect it and leave behaviour unchanged when untouched.
+     *  `branches` is null when git could not be asked (error, timeout, output limit) — "could not
+     *  check", which the picker must not show as an empty list. */
+    listBranches(repoPath: string): Promise<{ branches: BranchRef[] | null; detected: string | null }>
     remove(id: string, opts?: { force?: boolean }): Promise<WorktreeRemoveResult>
-    isGitRepo(dir: string): Promise<string | null> // returns the repo root, or null
+    /** The repository check behind the new-session dialog (probeRepoRoot: short deadline, `unknown` on timeout). */
+    isGitRepo(dir: string): Promise<RepoProbe>
     getRoot(): Promise<string>
     setRoot(root: string | null): Promise<void>
     /** Branch push state for one repository, one git call per distinct base, keyed base then
@@ -994,15 +1189,19 @@ export interface CoreApi {
       memberId?: string | null
     }): Promise<void>
   }
+  /** `astera` 명령을 사람의 PATH 에서 닿는 자리에 깔아 둔다(공개 CLI 설계 §10). */
+  cli: {
+    status(): Promise<CliInstallStatus>
+    /** 셔틀 파일을 그 자리에 쓰고 바뀜 상태를 돌려준다. `addToPath` (win32): 그 폴더를 사용자 PATH 에도
+     *  넣는다 — 사람이 체크박스로 동의했을 때만 (main/userPath.ts). */
+    install(opts?: { addToPath?: boolean }): Promise<CliInstallStatus>
+    /** 그 자리에서 앱이 쓴 셔틀 파일만 지우고 바뀐 상태를 돌려준다. 폴더와 이웃 파일은 남긴다. */
+    uninstall(): Promise<CliInstallStatus>
+  }
   settings: {
     // App language. `stored: null` is System — the OS locale decides, and `resolved` is what it decided.
     getLang(): Promise<LangPreference>
     setLang(lang: Lang | null): Promise<void>
-    // The agent orchestration toggle. Turning it on makes the app run a local HTTP server and plant
-    // access to the astera CLI in newly created sessions — it does not apply to sessions that are
-    // already open (environment variables are fixed at spawn time).
-    getOrchestrationEnabled(): Promise<boolean>
-    setOrchestrationEnabled(enabled: boolean): Promise<void>
     // Work unit tracking: groups a session's activity into goal-sized units. Off by default, and reads
     // nothing from before the moment it is turned on.
     getWorkUnitTrackingEnabled(): Promise<boolean>
@@ -1012,6 +1211,11 @@ export interface CoreApi {
     // `astera browser js`. Sessions already open do not see it until restarted.
     getAgentBrowserEnabled(): Promise<boolean>
     setAgentBrowserEnabled(enabled: boolean): Promise<void>
+    // The agent app workspace (docs/superpowers/specs/2026-09-27-agent-workspace-isolation-design.md).
+    // Off by default; on, the astera-app skill is installed for every account and sessions may run
+    // `astera app js`, which the Host answers whether or not this app is open.
+    getAgentAppEnabled(): Promise<boolean>
+    setAgentAppEnabled(enabled: boolean): Promise<void>
     // Whether the worktree PR badges poll GitHub in the background. Off leaves the cache as-is —
     // refresh only happens on an explicit github.refresh call.
     getGithubPolling(): Promise<boolean>
@@ -1054,6 +1258,9 @@ export interface CoreApi {
     getFirstRunAsked(): Promise<boolean>
     /** It has been put to them. Answering and dismissing are the same thing here: it asks once. */
     markFirstRunAsked(): Promise<void>
+    /** True once after main's load recovered app-settings.json from a damaged file (settings reset,
+     *  permission prompts on); asking clears it. */
+    takeRecoveryNotice(): Promise<boolean>
     /** Which kind the new-session and resume dialogs open on. Seeds the dialog's selection only —
      *  changing the kind inside the dialog is that session's business and is not written back. */
     getDefaultSessionKind(): Promise<SessionKind>
@@ -1075,7 +1282,9 @@ export interface CoreApi {
     unwatch(): Promise<void>
     create(parentDir: string, name: string, isDir: boolean): Promise<string> // returns the created path
     rename(from: string, newName: string): Promise<string> // returns the new path
-    move(from: string, destDir: string): Promise<string>
+    // opId (optional, here and on remove/copy/importExternal): the running entry count arrives on
+    // 'files:opProgress' under this id while the call works — see FileOpEvent.
+    move(from: string, destDir: string, opId?: string): Promise<string>
     // Delete. projectRoot is the project root the explorer is showing (useFileOps' root) — it is
     // required so the snapshot's key lines up with that root exactly. Using the matching root that
     // assertAllowedPath finds internally instead would, with nested cwds, differ from the explorer
@@ -1087,14 +1296,15 @@ export interface CoreApi {
     // (see useFileOps.removeSelection).
     remove(
       path: string,
-      projectRoot: string
+      projectRoot: string,
+      opId?: string
     ): Promise<{ snapshotSkipped: 'too-large' | 'failed' | null; snapshotId: string | null }>
-    copy(from: string, destDir: string): Promise<string> // duplicate — suffixes ' copy' on a collision
+    copy(from: string, destDir: string, opId?: string): Promise<string> // duplicate — suffixes ' copy' on a collision
     /** Copy in something that was copied outside the app (the OS clipboard, via a paste event).
      *  Identical to copy but for the source check: these paths are outside every allowed root by
      *  definition, so requiring one would reject the whole feature. The destination is checked as
      *  always, so nothing lands outside a project. */
-    importExternal(from: string, destDir: string): Promise<string>
+    importExternal(from: string, destDir: string, opId?: string): Promise<string>
     /** Where a File handed over by a paste lives on disk. Empty for a File that is not a file on disk
      *  (an image copied from a web page). Synchronous — Electron's webUtils, not an IPC call. */
     pathForFile(file: File): string
@@ -1255,6 +1465,14 @@ export interface SystemApi {
    *  process cannot be told about it. The Host keeps the sessions. */
   relaunch(): Promise<void>
   appVersion(): Promise<string>
+  /** 세션 출력을 받을 리스너가 걸렸다고 메인에 알린다 — `sessionBus.init()` 이 부른다.
+   *
+   *  메인의 `send` 는 `webContents.send` 라 들을 사람이 없으면 그대로 버린다. 평소에는 드러나지
+   *  않지만 Host 에서 세션을 되찾을 때는 다르다: 재부착이 끝나면 Host 가 보관하던 스크롤백을
+   *  단 한 번 돌려주는데, 그 일이 앱이 켜진 지 130ms 만에 끝나 렌더러가 아직 번들을 실행하기도
+   *  전이다. 놓치면 되물을 길이 없어 탭만 남고 속은 빈 터미널이 된다. 이 신고가 올 때까지
+   *  메인이 그 출력을 붙잡아 둔다(main/rendererGate.ts). */
+  rendererReady(): void
   /** 프로젝트가 지정되지 않았을 때 아래쪽 패널의 터미널이 열릴 자리 — 셸을 직접 띄웠을 때와 같은 곳 */
   homeDir(): Promise<string>
   /** 기본 브라우저로 링크를 연다. http/https/mailto 만 통과한다 — 렌더러도 같은 검사를 하지만
@@ -1285,11 +1503,38 @@ export interface ClipboardApi {
 
 /** Auto-update progress (main to renderer, for the title bar) */
 export interface UpdateStatus {
-  state: 'init' | 'checking' | 'available' | 'uptodate' | 'downloading' | 'downloaded' | 'error'
+  /**
+   * `manual` is macOS-only and follows `downloaded`: the build arrived and passed its checksum, but
+   * Squirrel.Mac refused to stage it, so restarting cannot install it and the person has to drag the
+   * new app in themselves. See src/main/manualInstall.ts for why that refusal is permanent on an
+   * ad-hoc-signed release rather than something a retry fixes.
+   */
+  state:
+    | 'init'
+    | 'checking'
+    | 'available'
+    | 'uptodate'
+    | 'downloading'
+    | 'downloaded'
+    | 'manual'
+    | 'error'
   version?: string
   percent?: number
   message?: string
 }
+
+/**
+ * What pressing the install button actually did.
+ *
+ * `auto` means the app is quitting to let the installer run — there is nothing more to say, because
+ * the window is about to disappear. The other two exist because on macOS it may not: see
+ * src/main/manualInstall.ts.
+ */
+export type InstallOutcome =
+  | { mode: 'auto' }
+  /** The new app was unpacked and revealed in Finder; the person drags it into /Applications. */
+  | { mode: 'manual'; appPath: string }
+  | { mode: 'failed'; message: string }
 
 /**
  * An update campaign. A value is present only when this app falls inside the target version range
@@ -1316,7 +1561,8 @@ export interface UpdateApi {
   check(): Promise<void>
   /** autoDownload starts the download on its own — this is the manual fallback */
   download(): Promise<void>
-  install(): Promise<void>
+  /** Resolves with what actually happened — on macOS the app does not always quit. See InstallOutcome. */
+  install(): Promise<InstallOutcome>
 }
 
 /** The rolling coordinators' renderer surface. `forceRoll` is development only — packaged builds do not
@@ -1324,7 +1570,8 @@ export interface UpdateApi {
  *  registered in every build: the roll banner's one-shot snapshot, read as the renderer adopts a session
  *  (`session:rollState` is pushed on changes only). */
 export interface RollingApi {
-  forceRoll(sessionId?: string): Promise<void>
+  /** Whether a chain acted: false when it was rolling, waiting, settling or quiet (nothing happened). */
+  forceRoll(sessionId?: string): Promise<boolean>
   state(sessionId: string): Promise<RollStateEvent | null>
 }
 
@@ -1388,9 +1635,16 @@ export interface AppControlApi {
  */
 export interface OrchApi {
   list(projectPath: string): Promise<OrchSnapshot>
+  /** Why the Jobs sidebar has nothing to draw, when the Host is the reason — null in the ordinary
+   *  case. **Its own call rather than a field on `list`** (ruling F41): `list` names a project and is
+   *  only ever made with one open, while this is one fact about the app's Host — and the window with
+   *  no project open is the one most likely to meet it. Read once per window; changes arrive on
+   *  `'orch:host'`. */
+  hostGate(): Promise<OrchHostGate | null>
   /** 한 Run 의 이벤트와 의존 그래프. 스냅샷과 달리 **요청할 때만** 온다 — Message.body 에는
-   *  검증 출력 꼬리가 실리므로 매 쓰기마다 밀 수 있는 크기가 아니다. */
-  runDetail(projectPath: string, runId: string): Promise<RunDetail>
+   *  검증 출력 꼬리가 실리므로 매 쓰기마다 밀 수 있는 크기가 아니다. `journalPages` 는 저널 줄을
+   *  가장 최근 몇 쪽까지 읽을지다(없으면 1, "이전 기록 더 보기" 가 하나씩 늘린다). */
+  runDetail(projectPath: string, runId: string, opts?: { journalPages?: number }): Promise<RunDetail>
   /** 한 Task 가 왜 완료 정책을 못 넘었는가 — 실패한 검사의 출력 꼬리, 막는 리뷰 이슈, 의심
    *  파일. 이것도 **펼칠 때만** 온다: 스냅숏이 이 셋을 싣지 않는 이유(변경마다 푸시된다)가
    *  한 번 가져가는 이 호출에는 걸리지 않는다(UI 2조각 설계 W1).
@@ -1450,6 +1704,41 @@ export interface SessionTaskApi {
   cancel(projectPath: string, id: string): Promise<void>
 }
 
+/** 명령줄 도구가 지금 어떤 상태인가 (공개 CLI 설계 §10). */
+export interface CliInstallStatus {
+  /** 셔틀을 둔 폴더. 화면이 사람에게 보여 준다 — 어디에 놓았는지 말하지 않는 설치는
+   *  되돌릴 수 없는 설치다. */
+  dir: string
+  installed: boolean
+  onPath: boolean
+  /** PATH 에 없을 때 사람이 직접 실행할 한 줄. 앱은 셸 프로필을 고치지 않는다. */
+  hint: string
+  /** win32: the Install and Uninstall buttons can put the folder on the user Path themselves, with the
+   *  person's consent (the checkbox beside Install; main/userPath.ts). Absent elsewhere. */
+  canEditUserPath?: true
+  /** Install or Uninstall only: what they did to the user Path, and why not when they could not. A
+   *  change reaches shells opened after it, not one already open. */
+  userPath?: 'added' | 'present' | 'removed'
+  userPathError?: string
+  /** 설치 응답에만. `.cmd` 가 정션을 거쳐야 했는데 못 해서 진짜 경로를 적은 까닭들
+   *  (core/orchestration/exec/shuttle.ts 의 ShuttleWarning). 있으면 cmd·PowerShell 의 astera 가
+   *  돌지 않을 수 있다. */
+  warnings?: ShuttleWarning[]
+}
+
+/**
+ * Why the public `.cmd` shuttle was written with the raw path after all, which cmd.exe may not be able
+ * to run (core/orchestration/exec/shuttle.ts, CmdLink). `junction-failed`: the junction could not be
+ * made (a network drive, a FAT volume). `link-path-taken`: something that is not a junction already sits
+ * where it goes, and is left alone. `junction-unsuitable`: the paths cannot go through one (the entry is
+ * not below the executable's folder, or the part below it is not ASCII either). `detail` is for a log or
+ * a person, in English. Declared here because the renderer reads it and cannot see shuttle.ts.
+ */
+export interface ShuttleWarning {
+  code: 'junction-failed' | 'link-path-taken' | 'junction-unsuitable'
+  detail: string
+}
+
 export type RendererApi = CoreApi & {
   system: SystemApi
   preview: PreviewApi
@@ -1477,6 +1766,18 @@ export type RendererApi = CoreApi & {
    *  open, so the slice can be checked by a person rather than only by tests. */
   host: {
     status(): Promise<HostStatus>
+    /** Every change of that status, pushed as it happens; returns an unsubscribe.
+     *
+     *  **The Info tab polls as well, and the poll is not enough on its own.** It runs every thirty
+     *  seconds, which suits a Host that is merely outdated and does not suit one that has stopped
+     *  answering: the person is looking at the screen at that exact moment, because a session did not
+     *  open, and half a minute of a stale "connected" is the silence this exists to end
+     *  (docs/2026-09-22-host-unresponsive-recovery-design.md F1). */
+    onStatus(cb: (s: HostStatus) => void): () => void
+    /** Where putting the Host's own runtime in place stands (stage 3 task 2) — read once at mount. */
+    runtimeInstall(): Promise<HostRuntimeInstallState>
+    /** Every change of that, pushed as it happens; returns an unsubscribe. */
+    onRuntimeInstall(cb: (s: HostRuntimeInstallState) => void): () => void
     /** How many of the running sessions would keep running if the app quit — the ones whose ptys the
      *  Host owns. Asked at the moment the window-close confirmation is about to tell the person what
      *  quitting costs them, because the answer changes during a run (the Host connects some
@@ -1499,6 +1800,9 @@ export type RendererApi = CoreApi & {
      *  Ends everything the Host holds, so the caller has already shown what that is. Resolves with
      *  the status the new connection settled at (docs/superpowers/specs/2026-09-14-host-replacement-design.md). */
     replace(): Promise<HostStatus>
+    /** Who drives Jobs, as the Host last said it (limits L3); null when nothing is known. Changes
+     *  arrive on the 'host:driver' event. */
+    driver(): Promise<HostDriverReport | null>
     /** What the Host says it is holding, or **null when it did not say** — there is no Host, the
      *  connection is down, or it did not answer in time. Null and `{ sessions: 0, terminals: 0 }` are
      *  opposite answers and the caller must not merge them: zero is the Host telling you nothing of
@@ -1507,6 +1811,14 @@ export type RendererApi = CoreApi & {
      *  Never rejects, and never blocks the caller for longer than the one round trip's own deadline.
      *  The Info tab reads it beside `status()` and draws the row without waiting for it. */
     holdings(): Promise<HostHoldings | null>
+  }
+  /** The agent app workspaces the Host runs (agent workspace design). */
+  workspace: {
+    list(): Promise<WorkspaceSummary[]>
+    /** The mirror's Stop: ends the running script, leaves the app running. */
+    stop(sessionId: string): Promise<boolean>
+    /** The mirror's Close: kills the app and closes its desktop. */
+    close(sessionId: string): Promise<boolean>
   }
   /** The conversation view's IPC surface (main/conversation.ts). `open` and `more` fail soft: null
    *  means the session has no transcript path yet, or the file could not be read — never an error,
@@ -1563,8 +1875,12 @@ export type RendererApi = CoreApi & {
      *  runs when it is typed in full. */
     commands(sessionId: string): Promise<SlashCommand[]>
     /** Project files matching what follows an `@`, best first, already capped. Root-relative with
-     *  forward slashes. Empty for a session with no project, or one whose folder cannot be read. */
-    files(sessionId: string, query: string): Promise<string[]>
+     *  forward slashes. Empty for a session with no project, or one whose folder cannot be read.
+     *  `indexing` is true while the project's first walk is still under way (main/fileIndex.ts
+     *  lookup): `paths` is then what it has found so far, and the pane asks again shortly.
+     *  `unavailable` (set only when true) means the walk failed or ran out of time, a dead share say:
+     *  there is no list to wait for, and the pane stops asking and says so. */
+    files(sessionId: string, query: string): Promise<{ paths: string[]; indexing: boolean; unavailable?: true }>
   }
   /** A chat session's own IPC surface, the counterpart of `conversation` above for sessions whose kind
    *  is 'chat'. Every method takes a session id and is a no-op (or null) for an id the chat manager
@@ -1575,6 +1891,10 @@ export type RendererApi = CoreApi & {
     answer(sessionId: string, requestId: string, answer: ChatAnswer): Promise<void>
     setModel(sessionId: string, model: string, effort: string | null): Promise<void>
     setPermissionMode(sessionId: string, mode: PermissionMode): Promise<void>
+    /** chat takeover P8: what this session does with a permission prompt nobody answers while a Host
+     *  holds it as the writer — hold (the default) or deny after 60 s. `false` for an id the chat
+     *  manager does not hold. */
+    setUnattendedPermission(sessionId: string, value: UnattendedPermission): Promise<boolean>
     /** The rows the composer's mode menu draws for this session. Empty for a session whose CLI never
      *  answered a list (codex, when `collaborationMode/list` was refused) — the control then has
      *  nothing to open. */

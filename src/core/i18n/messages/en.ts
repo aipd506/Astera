@@ -14,14 +14,34 @@ export const en: Record<keyof typeof ko, string> = {
   'settings.general.language': 'Language',
   'settings.general.language.system': 'System ({lang})',
   'settings.general.language.saveFailed': 'Could not save the language setting: {detail}',
-  'settings.orchestration.label': 'Agent orchestration (experimental)',
-  'settings.orchestration.hint':
-    'When on, agent sessions started by the app can start worker sessions on another vendor. ' +
-    'An agent can then create sessions under any of your accounts, so turn this on only when you need it. ' +
-    'It only works in a project that is a git repository. ' +
-    'It does not apply to sessions that are already open — only new sessions get it. ' +
-    'Ask the session you want to orchestrate with to run astera help for the full usage guide.',
-  'settings.orchestration.saveFailed': 'Could not save the orchestration setting: {detail}',
+  // The command line tool.
+  'settings.cli.label': 'Command line tool (astera)',
+  'settings.cli.hint':
+    'Installing it lets you type astera in an ordinary shell. ' +
+    'The app does not edit your shell profile. If the folder is not on PATH, it shows you the line to add.',
+  'settings.cli.hint.win32':
+    'Installing it lets you type astera in PowerShell or Command Prompt. ' +
+    'With the box below on, the folder goes on your user PATH, and Uninstall takes that entry out again. Windows opened after that have it.',
+  'settings.cli.addToPath': 'Add this folder to my user PATH',
+  'settings.cli.offer': 'You can start and drive sessions and Jobs from a terminal too, with the astera command. It works with the app closed.',
+  'settings.cli.offer.open': 'Open Settings',
+  'settings.cli.installed.pathAdded.toast': 'The astera command is installed and on your user PATH. Shells you open from now on have it.',
+  'settings.cli.pathFailed': 'The astera command is installed, but the folder could not be put on PATH: {detail}. Run the line below yourself.',
+  'settings.cli.uninstalled.pathRemoved.toast': 'The astera command is removed, and its folder is off your user PATH.',
+  'settings.cli.installed': 'Installed',
+  'settings.cli.notInstalled': 'Not installed',
+  'settings.cli.install': 'Install the astera command',
+  'settings.cli.reinstall': 'Install again',
+  'settings.cli.installed.toast': 'The astera command is installed.',
+  'settings.cli.failed': 'Could not install the astera command: {detail}',
+  'settings.cli.uninstall': 'Uninstall',
+  'settings.cli.uninstalled.toast': 'The astera command is removed. The folder and anything else in it are left as they were.',
+  'settings.cli.uninstallFailed': 'Could not remove the astera command: {detail}',
+  // The one line a person runs themselves is shown below
+  'settings.cli.pathMissing': 'This folder is not on PATH. Running the line below once adds it.',
+  'settings.cli.onPath': 'This folder is on PATH.',
+  'settings.cli.copy': 'Copy',
+  'settings.cli.cmdRawPath': 'Astera is installed in a folder whose name is not ASCII, and astera from cmd or PowerShell may not run: {detail}. It still runs from Git Bash. Reinstalling Astera into a folder with an ASCII name fixes it.',
   // Agent permission mode
   'settings.agentPermission.label': 'Run agents without permission checks',
   'settings.agentPermission.hint':
@@ -32,6 +52,10 @@ export const en: Record<keyof typeof ko, string> = {
     'follow it there, so with this off a worker stalls on its first command. ' +
     'Sessions already running are unaffected. It applies from the next session.',
   'settings.agentPermission.saveFailed': 'Could not save the permission mode: {detail}',
+  'settings.recovered.toast':
+    'The settings file (app-settings.json) was damaged, so settings were reset to their defaults. ' +
+    'The damaged file is kept as app-settings.json.bak. To be safe, permission prompts are on: ' +
+    'turn on "Run agents without permission checks" in Settings > Agents to skip them again.',
   // Work unit tracking
   'settings.workUnit.label': 'Work unit tracking (experimental)',
   'settings.workUnit.hint':
@@ -48,6 +72,13 @@ export const en: Record<keyof typeof ko, string> = {
     'Installs the astera-browser skill for every account. Only localhost can be opened. ' +
     'Sessions already open are not affected; new sessions are.',
   'settings.agentBrowser.saveFailed': 'Could not save the agent browser setting: {detail}',
+  // Agent app workspace
+  'settings.agentApp.label': 'Agent app workspace (experimental)',
+  'settings.agentApp.hint':
+    'On, an agent can launch this project’s app where you never see it (a hidden desktop on Windows, a virtual display on Linux, the background on macOS), drive it and photograph it. ' +
+    'It never takes your screen or pointer. On Windows and macOS it shares your clipboard. Installs the astera-app skill for every account. ' +
+    'Sessions already open are not affected; new sessions are.',
+  'settings.agentApp.saveFailed': 'Could not save the agent app workspace setting: {detail}',
   // Explanation generation (How It Works)
   'settings.gen.label': 'Explanation account',
   'settings.gen.hint': 'When a piece of work finishes, this account writes the feature explanation. Nothing is generated until you pick one.',
@@ -83,6 +114,7 @@ export const en: Record<keyof typeof ko, string> = {
   'files.error.alreadyExists': '“{name}” already exists',
   'files.error.alreadyExistsInDest': '“{name}” already exists in the destination folder',
   'files.error.renameStranded': 'Rename failed and could not be rolled back. The file is at “{tmp}”',
+  'files.error.unreachable': 'The folder did not answer (an offline network drive?), so nothing was changed. Try again once it is reachable.',
   'worktree.include.tooManyEntries': '.worktreeinclude has more than {max} entries; the rest were ignored',
   'worktree.include.globUnsupported': 'Glob and negation patterns are not supported: {line}',
   'worktree.include.absolutePath': 'Absolute paths are not allowed: {line}',
@@ -92,7 +124,13 @@ export const en: Record<keyof typeof ko, string> = {
   'worktree.include.missing': 'Skipped, does not exist: {entry}',
   'worktree.include.notIgnored': 'Skipped, not gitignored: {entry}',
   'worktree.include.sizeFailed': 'Failed to measure size: {entry} ({detail})',
+  'worktree.include.unreachable': 'The project folder did not answer, so no .worktreeinclude entries were copied: {path}',
   'worktree.include.overLimit': 'Skipped, over the 200MB copy limit: {entry}',
+  'worktree.include.linkFailed': 'Skipped, a link in it could not be recreated: {entry} ({detail})',
+  'worktree.include.unsafeDest': 'Not copied under {path}: it is a link, and writing through it would land outside the worktree ({entry})',
+  'worktree.include.linkTargetMissing': 'A folder link was not recreated, because what it points at inside the repository is not in the worktree: {path} ({entry})',
+  'worktree.include.outsideLinkSkipped': 'A folder link to outside the repository was not recreated, because a symbolic link could not be made ({detail}). Make it by hand if you need it: {path} ({entry})',
+  'worktree.include.overFileCount': 'Skipped, more than {max} entries: {entry}',
   'worktree.include.copyFailed': 'Copy failed: {entry} ({detail})',
   'worktree.create.fetchFailed': 'Could not refresh from remote; created from local {baseRef}',
   'worktree.create.baseRecordFailed': 'Failed to record branch.base — merge detection on delete will use HEAD',
@@ -108,12 +146,22 @@ export const en: Record<keyof typeof ko, string> = {
   'worktree.error.orphanUnproven': 'Not deleted — ownership could not be verified. Check it manually before deleting.',
   'worktree.error.orphanUnverifiable': 'git does not track this folder, so uncommitted changes cannot be checked.',
   'worktree.error.gitAddFailed': 'Failed to create the git worktree.',
+  'worktree.error.cancelled': 'Worktree creation cancelled. Everything it made was removed.',
+  'worktree.error.rollbackIncomplete': 'Could not undo the worktree creation. Remove the folder {path} and the branch {branch} by hand.',
   'worktree.error.gitRemoveFailed': 'Failed to remove the git worktree.',
+  'worktree.error.unreachable': 'The worktree folder could not be reached or checked (an offline network drive?), so nothing was removed. Try again once it is reachable.',
+  'worktree.error.linksUnverified': 'The links inside the worktree folder could not all be checked and taken out, so nothing was removed. Removing it anyway could delete files outside it through a junction. Try again, or remove the links by hand.',
+  'worktree.error.locked': 'The worktree is locked (git worktree lock), so nothing was removed. Unlock it first, or remove it with force.',
+  'worktree.error.hasSubmodules': 'The worktree has submodules, which git removes only with force, so nothing was removed. Remove it with force.',
+  'worktree.error.rootUnreachable': 'The worktree folder could not be reached or checked (an offline network drive?), so no worktree was created. Try again once it is reachable.',
+  'worktree.error.repoUnreachable': 'The project folder could not be reached or checked (an offline network drive?), so no worktree was created. Try again once it is reachable.',
+  'worktree.error.noGit': 'git could not be run (is it installed and on PATH?), so no worktree was created.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session': 'Session “{title}” is running and using this worktree. Close the session first.',
   'worktree.inUse.run': 'Process “{name}” is running and using this worktree. Stop it first.',
   'worktree.inUse.unknown': 'This worktree is in use.',
   'session.roll.mixedProvider': 'Rolling cannot mix Claude and Codex accounts.',
+  'session.resume.hostChatNotAdopted': 'This conversation is still running in the Astera Host and this window has not taken it back yet. Try again in a moment.',
   // ---- github ----
   'github.settings.status': 'Connection',
   'github.settings.connected': 'Connected — {account}',
@@ -194,6 +242,8 @@ export const en: Record<keyof typeof ko, string> = {
   'session.rail.toggleSidebar': 'Toggle sidebar',
   'session.rail.openSessions': 'Accounts and history',
   'session.spawn.failed': 'Failed to start session: {message}',
+  'session.spawn.cwdMissing': 'The folder cannot be found: {path}. Choose the folder again.',
+  'session.spawn.cwdUnreachable': 'The folder did not answer in time: {path}. If it is on a network drive, check the connection.',
   'session.spawn.failedWorktreeKept':
     'Failed to start session: {message} (the worktree “{name}” was kept — delete it from the Worktrees panel)',
   // Rolling-resume guard hit — tells the user the tab was just focused and their chosen options were dropped
@@ -264,6 +314,26 @@ export const en: Record<keyof typeof ko, string> = {
   'settings.info.hostRestartConfirmBodyNone': 'The Host is ended now and started again on the new version. It is holding nothing. Continue?',
   'settings.info.hostNotConnected': 'Not connected',
   'settings.info.hostNotConnectedWhy': 'Not connected · {detail}',
+  'settings.info.hostUnresponsive': 'Not answering · {detail}',
+  'settings.info.hostUnresponsiveWhat': 'New sessions are opening inside the app. Those end when the app closes.',
+  'settings.info.hostRuntimeIncomplete':
+    'Some of the files this Host runs from are gone. Left alone it will stop answering at the next session. It is repaired on its own once it is holding nothing, and restarting now does the same.',
+  'settings.info.hostRestartUnresponsiveConfirmTitle': 'End the Host and start another',
+  'settings.info.hostRestartUnresponsiveConfirmBody':
+    'The Host that is not answering is ended and another is started. The {kept} session(s) it was holding end with it. Continue?',
+  'settings.info.hostRestartUnresponsiveConfirmBodyNone':
+    'The Host that is not answering is ended and another is started. It was holding nothing. Continue?',
+  'status.hostUnresponsive': 'Host not answering',
+  'status.hostUnresponsiveTitle':
+    'The Host is not answering. New sessions open inside the app and end when it closes. Press to restart the Host.',
+  'status.hostPreparing': 'Preparing the Astera Host…',
+  'status.hostPreparingSlow': 'Preparing the Astera Host… still working ({seconds}s)',
+  'status.hostPrepareFailed': 'Could not prepare the Astera Host',
+  'status.hostPrepareFailedTitle':
+    '{reason} ({detail}) The Host runs from the app executable this time, and it is prepared again on the next start.',
+  'status.hostPrepareReason.copy': 'The Host files could not be copied.',
+  'status.hostPrepareReason.timeout': 'Preparing did not finish within two minutes.',
+  'status.hostPrepareReason.unknown': 'An unexpected error stopped the preparation.',
   'settings.slack.save': 'Save',
   'settings.slack.saved': 'Saved',
   'settings.slack.saveFailed': 'Could not save the Slack settings: {detail}',
@@ -348,10 +418,12 @@ export const en: Record<keyof typeof ko, string> = {
   'settings.font.checkingHangul': 'checking installed fonts…',
   'settings.font.loadingList': 'reading installed fonts…',
   'update.tb.restartInstallVersion': 'Restart to install v{version}',
+  'update.tb.manualInstallVersion': 'Install v{version} by hand',
   'update.tb.checking': 'Checking for updates…',
   'update.tb.available': 'New version {version} found',
   'update.tb.downloading': 'Downloading {percent}%',
   'update.tb.error': 'Update error',
+  'update.checkTimedOut': 'The update check did not answer within {seconds} s. Check your network and try again.',
   'update.tb.autoUpdaterMissing': 'Could not find autoUpdater export',
   'update.info.downloading': 'Downloading {percent}%…',
   'update.info.restartInstallVersion': 'Restart to install v{version}',
@@ -361,6 +433,14 @@ export const en: Record<keyof typeof ko, string> = {
   'update.info.available': 'New version {version} available',
   'update.info.downloadVersion': 'Download {version}',
   'update.info.checkFailed': 'Check failed',
+  'update.info.manualInstallVersion': 'Install v{version} by hand',
+  'update.info.manualWhy': 'This build cannot install itself — you have to move it across',
+  'update.manual.title': 'Install by hand',
+  'update.manual.done':
+    'The new version is open in Finder. Drag Astera into your Applications folder, then start it again.\n\n{path}',
+  'update.manual.failed': 'Could not prepare the installer: {message}',
+  'update.manual.noFile': 'No downloaded installer to use',
+  'update.manual.quit': 'Quit and move it',
   'update.toast.available': 'Version v{version} is available',
   'update.toast.download': 'Download',
   'update.toast.ready': 'Update v{version} is ready',
@@ -425,7 +505,7 @@ export const en: Record<keyof typeof ko, string> = {
   'shortcut.explorer.cut': 'Cut',
   'shortcut.explorer.copy': 'Copy',
   'shortcut.gesture.itemDrag': 'Drag item',
-  'shortcut.explorer.move': 'Move · hold Ctrl to copy',
+  'shortcut.explorer.move': 'Move · hold {mod} to copy',
   'shortcut.explorer.undo': 'Undo',
   'shortcut.run.run': 'Run',
   'shortcut.run.stop': 'Stop run',
@@ -441,14 +521,21 @@ export const en: Record<keyof typeof ko, string> = {
   'files.batch.moreCount': ', and {count} more',
   'files.commit.failed': '{action} failed: {detail}',
   'files.delete.undoHint':
-    'You can recover this via Ctrl+Z or Local History (kept for up to 30 days · items over 50MB are excluded).',
+    'You can recover this via {mod}+Z or Local History (kept for up to 30 days · anything over 50MB or 5,000 items is excluded).',
   'files.delete.confirmOne': 'Delete “{name}”?\n{undoHint}',
   'files.delete.confirmDirWithCount': 'Delete the folder “{name}” and its {count} items inside?\n{undoHint}',
   'files.delete.confirmDirAll': 'Delete the folder “{name}” and everything inside it?\n{undoHint}',
   'files.delete.confirmMany': '{shown}{more} — delete {total} items?{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' {count} of them are folders — their contents will be deleted too.',
   'files.delete.moreNames': ', and {count} more',
-  'files.delete.skippedTooLarge': 'The item was too large to keep in Local History',
+  'files.delete.skippedTooLarge': 'The item was too large to keep in Local History (over 50MB or 5,000 items)',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': 'Deleting… {count} items',
+  'files.op.snapshotting': 'Keeping a Local History copy… {count} items',
+  'files.op.copying': 'Copying… {count} items',
+  'files.op.deletingNoCount': 'Deleting…',
+  'files.op.copyingNoCount': 'Copying…',
+  'files.op.busy': 'Working…',
   'files.delete.skippedFailed': 'Failed to snapshot to Local History — the delete still completed',
   'files.clipboard.cutDone': 'Cut {count} items',
   'files.clipboard.copyDone': 'Copied {count} items',
@@ -466,7 +553,7 @@ export const en: Record<keyof typeof ko, string> = {
   'files.undo.partialFail': 'Undo failed on {failed} of {attempted} items: {shown}{more}',
   'files.undo.partialMissing': 'Undo failed on {missing} of {total} items: {shown}{more}',
   'files.undo.permanentTooLarge':
-    'Permanently deleted by undo — it was too large to keep in Local History, so it cannot be recovered',
+    'Permanently deleted by undo — it was too large to keep in Local History (over 50MB or 5,000 items), so it cannot be recovered',
   'files.undo.permanentSnapshotFailed':
     'Deleted by undo — the Local History snapshot failed, so it cannot be recovered',
   'files.undo.done': 'Undid {desc}',
@@ -490,6 +577,7 @@ export const en: Record<keyof typeof ko, string> = {
   'explorer.title': 'Explorer',
   'explorer.noActiveSession': 'No active session',
   'explorer.dir.loading': 'Loading…',
+  'explorer.dir.reading': 'Reading folder…',
   'explorer.dir.readFailed': 'Read failed: {detail}',
   'explorer.dir.empty': 'Empty',
   'explorer.refresh': 'Refresh',
@@ -497,20 +585,22 @@ export const en: Record<keyof typeof ko, string> = {
   'explorer.menu.newFile': 'New File',
   'explorer.menu.newFolder': 'New Folder',
   'explorer.menu.rename': 'Rename (F2)',
-  'explorer.menu.delete': 'Delete (Del)',
-  'explorer.menu.deleteCount': 'Delete ({count}, Del)',
+  'explorer.menu.delete': 'Delete ({del})',
+  'explorer.menu.deleteCount': 'Delete ({count}, {del})',
   'explorer.menu.duplicateCount': 'Duplicate ({count})',
-  'explorer.menu.cut': 'Cut (Ctrl+X)',
-  'explorer.menu.copy': 'Copy (Ctrl+C)',
-  'explorer.menu.paste': 'Paste (Ctrl+V)',
+  'explorer.menu.cut': 'Cut ({mod}+X)',
+  'explorer.menu.copy': 'Copy ({mod}+C)',
+  'explorer.menu.paste': 'Paste ({mod}+V)',
   'explorer.menu.copyPath': 'Copy Path',
   'explorer.menu.copyRelativePath': 'Copy Relative Path',
   'explorer.menu.reveal': 'Reveal in Explorer',
+  'explorer.menu.revealMac': 'Reveal in Finder',
   'explorer.git.new': 'New file',
   'explorer.git.modified': 'Modified',
   'explorer.git.deleted': 'Deleted',
   'explorer.git.conflict': 'Conflict',
   'explorer.git.folderCount': '{count} changed',
+  'explorer.git.unavailable': 'Git status unavailable — showing the last result',
   'explorer.rail.toggle': 'File explorer',
   'explorer.tab.unsaved': 'Unsaved',
   'explorer.find.placeholder': 'Find in file',
@@ -618,6 +708,13 @@ export const en: Record<keyof typeof ko, string> = {
   'session.new.pickFolder': 'Select…',
   'session.new.useWorktree': 'Start in a separate worktree',
   'session.new.worktreeNoBase': 'This repository has no branch to fork from, so a worktree cannot be created. Make a commit first.',
+  'session.new.worktreeBranchesUnavailable': 'Could not check the branch list (git did not respond). The base branch will be detected automatically.',
+  'session.new.worktreeRepoUnknown': 'Could not check whether this folder is a git repository (git did not respond in time — a network or WSL path can be slow). You can still start a session here, but not in a separate worktree.',
+  'session.new.worktreeRepoNoGit': 'git could not be run, so this folder could not be checked for a repository (is git installed and on PATH?). You can still start a session here, but not in a separate worktree.',
+  'session.new.worktreeRepoNoFolder': 'This folder could not be found. Pick the folder again.',
+  'session.new.worktreeRepoError': 'Could not check whether this folder is a git repository. You can still start a session here, but not in a separate worktree.',
+  'session.new.checkingCli': 'Checking the CLI in this folder…',
+  'pr.create.branchesUnavailable': 'Could not check the branch list (git did not respond).',
   'session.new.worktreeBaseRef': 'Base branch',
   'session.new.worktreeBaseCurrent': '(current branch)',
   'session.new.worktreeBaseRemote': 'Remote',
@@ -665,9 +762,15 @@ export const en: Record<keyof typeof ko, string> = {
   'session.new.blocked.noAccount': 'Choose an account',
   'session.new.blocked.cliMissing': "This account's CLI was not found",
   'session.new.blocked.noSchedule': 'Set a schedule time',
-  'session.new.blocked.checkingFolder': 'Checking the project folder',
+  'session.new.blocked.checkingFolder': 'Checking the repository…',
+  'startup.readingShellEnv': 'Reading your shell environment…',
   'session.new.starting': 'Starting session…',
   'session.new.startingWorktree': 'Creating worktree…',
+  'session.new.stage.fetch': 'Fetching the base branch…',
+  'session.new.stage.checkout': 'Checking out files…',
+  'session.new.stage.copyIncludes': 'Copying included files…',
+  'session.new.stage.copyCount': '{copied} / {total} · {files} / {filesTotal} files',
+  'session.new.cancelling': 'Cancelling…',
   'session.new.schedLabel': 'Scheduler — run a command periodically',
   'session.new.schedMode.interval': 'Every N minutes',
   'session.new.schedMode.daily': 'Daily',
@@ -728,6 +831,7 @@ export const en: Record<keyof typeof ko, string> = {
   'history.panel.title': 'History',
   'history.panel.empty': 'No history',
   'history.loading': 'Loading…',
+  'history.scan.codex': 'Scanning Codex history… {done}/{total}',
   'history.filter.deletedSuffix': ' (deleted)',
   'session.resume.originAccount': 'Original account',
   'session.resume.originDeleted': 'Deleted account',
@@ -744,6 +848,8 @@ export const en: Record<keyof typeof ko, string> = {
     'The original project folder does not exist:\n{cwd}\n\nChoose a new folder to resume in?',
   'history.resume.pickFolder': 'Choose folder',
   'worktree.status.orphanDir': 'Git registration lost',
+  'worktree.status.unreachable': 'Folder not reachable',
+  'worktree.status.gitUnchecked': 'Could not check Git',
   'worktree.remove.title': 'Delete worktree',
   'worktree.remove.body':
     '{name} ({branch})\n{path}\n\nDelete this worktree? The folder and the branch are deleted together. A branch that has not been merged is kept so its commits are not lost.',
@@ -965,6 +1071,21 @@ export const en: Record<keyof typeof ko, string> = {
   'preview.agent.stop': 'Stop the agent\'s script',
   'preview.agent.stopped': 'Stopped the agent\'s script',
   'preview.agent.inUse': 'The agent is using your computer  ·  Esc to cancel',
+  // Agent app workspace mirror tab
+  'workspace.tab.tag': 'App',
+  'workspace.tab.running': 'The agent is driving its app on a hidden desktop',
+  'workspace.pane.title': "{session}'s app",
+  'workspace.pane.running': 'Running: {helper}',
+  'workspace.pane.launching': 'Starting the app… {seconds}s',
+  'workspace.pane.idle': 'Idle (the app is still running)',
+  'workspace.pane.closed': 'Closed',
+  'workspace.pane.waiting': 'Waiting for the first picture',
+  'workspace.pane.stop': 'Stop',
+  'workspace.pane.close': 'Close',
+  'workspace.pane.alt': "The agent's app",
+  'workspace.pane.failed': 'Could not reach the workspace: {detail}',
+  'workspace.pane.nothingToStop': 'There is no script to stop',
+  'workspace.pane.nothingToClose': 'There is no workspace to close',
   'terminal.rail.open': 'Terminal',
   'terminal.tab.label': 'Terminal {n}',
   'terminal.tab.new': 'New terminal',
@@ -1005,10 +1126,18 @@ export const en: Record<keyof typeof ko, string> = {
   'slack.chat.turnFailed': '⚠️ Turn failed — {message}',
   'slack.limitNoResume': '⛔ Limit reached — no auto-resume',
   'slack.limitNoResumeAt': '⛔ Limit reached — no auto-resume (resets {at})',
+  'slack.offline.summary': '🕘 While Astera was away from the Host: {events}',
+  'slack.offline.limit': 'hit the limit at {time}',
+  'slack.offline.limitUntil': 'hit the limit at {time} (resuming {at})',
+  'slack.offline.switched': 'switched to {label}',
+  'slack.offline.switchedAnon': 'switched account',
+  'slack.offline.resumed': 'resumed at {time}',
+  'slack.offline.stalled': 'stuck at {time}, needs a look',
   'notify.inputNeeded': 'Needs your confirmation',
   'notify.limitWaiting': 'Stopped on a limit, waiting to resume',
   'notify.accountSwitched': 'Switched to {label}',
   'notify.fallbackTitle': 'Astera',
+  'notify.offlineRolls': 'While Astera was away from the Host, {n} session(s) hit a usage limit',
   // JobsView.tsx, App.tsx — the read-only Jobs sidebar (the orchestration Run/Task list)
   'jobs.rail.open': 'Jobs',
   'jobs.empty': 'No jobs started yet',
@@ -1017,6 +1146,19 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.empty.hint': 'Create one right here, or start it from a coordinator session — either way it lands here',
   'jobs.noProject': 'No project is open',
   'jobs.noProject.hint': 'Open a session and its folder becomes this window project — jobs can be created here from then on',
+  // The two screens that exist now the Host owns the state file. An empty sidebar makes "still
+  // trying" and "gave up" look the same, and both read as "no jobs".
+  'jobs.host.waiting': 'Connecting to the Host',
+  'jobs.host.unreachable': 'Cannot reach the Host',
+  'jobs.host.features': 'Jobs, work-unit tracking, the agent browser and Smart Resume are all waiting on this connection',
+  'jobs.host.retry': 'It tries again when a setting changes or the app restarts',
+  'jobs.host.reason': 'Reason: {reason}',
+  'jobs.host.log': 'Full record: {path}',
+  'jobs.stall.parked': 'The Host has paused Jobs: {reason}',
+  'jobs.stall.gate.unreadable': 'the settings file cannot be read. Restarting Astera repairs it',
+  'jobs.stall.gate.notMigrated': 'the settings migration has not finished yet. It finishes while Astera is open',
+  'jobs.stall.unresponsive': 'The Host is not answering, so Jobs do not move. You can restart it from Settings, Info',
+  'jobs.stall.reading': 'The Host is still reading its settings, so Jobs do not move yet',
   // Tooltips for the eight state glyphs (JobIcons.tsx). The sidebar no longer spells a state out, so
   // these are not on screen all the time — they are where someone meeting the icons learns them.
   // pending and blocked have to read differently: a dependency holds the first, a person the second.
@@ -1055,6 +1197,7 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.run.mergeConfirmBody': 'Folds what the workers committed in their worktrees into the project folder ({count} worktree(s)).\n\nThe commits are added to the current branch of the project folder.',
   'jobs.run.mergeNothing': 'Nothing left to merge — the worktree folders are already gone',
   'jobs.run.mergeUncommitted': '{count} uncommitted change(s) were not merged — they stay in the worktree and are lost if the folder is deleted',
+  'jobs.run.mergeUncommittedUnknown': 'Could not check uncommitted changes in {count} worktree(s) — check them yourself before deleting the folders',
   'jobs.run.mergeFailed': 'Could not merge: {reason}',
   'jobs.run.notStarted': 'Not started',
   'jobs.run.notStartedHint': 'Not started yet — press Run in the detail window to start it',
@@ -1069,6 +1212,7 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.run.deleteRetained': 'A session is held by worker-retain, so this cannot be deleted — release it first',
   'jobs.run.deleteBusy': 'A worker is running in this job, so it cannot be deleted — stop it first',
   'jobs.run.deleteFailed': 'Could not delete the job',
+  'jobs.run.deleteKeptWorktrees': 'Kept {count} worktree folder(s): they hold uncommitted changes, or their status could not be checked. Look at them, then delete them from the worktree panel.',
   'jobs.run.sharedFolder': 'shared folder',
   'jobs.run.sharedFolderHint': 'Running in the same folder as another job worker — their edits can mix, and the app neither prevents it nor notices it',
   'jobs.run.scheduled': 'Scheduled',
@@ -1182,6 +1326,11 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.detail.cycle': 'Their dependencies point at each other, so there is no order to draw — these Tasks will never start',
   'jobs.detail.hidden': '{count} events from other Tasks — click the node again to clear',
   'jobs.detail.clearFilter': 'Clear filter',
+  // Stage 3 T1: the journal's rows are read one page at a time, and a journal the Host holds locked shows
+  // the rows last read rather than freezing the window
+  'jobs.detail.journalOlder': 'Show older journal entries',
+  'jobs.detail.journalCapped': 'Older journal entries are not shown here. This window shows the most recent ones only.',
+  'jobs.detail.journalBusy': 'The journal is busy right now, so these entries are the last ones read. They refresh with the next update.',
   // What an edge colour means. Unlike an icon, a line has nowhere to hang a tooltip
   'jobs.detail.edgeWaiting': 'waiting on this dependency',
   'jobs.detail.edgeResolved': 'dependency already met',
@@ -1211,6 +1360,9 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.new.failed': 'Could not create the job',
   'jobs.gate.noAccountAssigned': 'This Task has no account, so there is no way to tell which agent should run it — assign one',
   'jobs.gate.noAccount': 'No {provider} account is logged in, so this Task cannot start',
+  // The Host's lost-worker Gate (R16): a worker that ended unreported while no app was attached, in a Run
+  // with no coordinator. Nobody else will look after that Task, so a person is asked.
+  'jobs.gate.workerLostNoApp': 'The worker for this Task was lost (dispatch {dispatch}) while no Astera was open to recover it. Resolve this Gate to start it again.',
   // Fires when the **first** account in this Task's list cannot be used, and when nothing in the list
   // can — the first one is unusable either way, so one message covers both. The accounts after it are
   // never promoted into its place (dispatchAccount.ts: listing one later is consent to roll onto it
@@ -1260,6 +1412,7 @@ export const en: Record<keyof typeof ko, string> = {
   'jobs.node.answerLabel': 'Decision',
   'jobs.node.gateQuestion': 'Why it is held',
   'jobs.node.failed': 'Could not do that',
+  'jobs.node.stopFailed': 'Could not stop the worker: {detail}',
   // How It Works — project understanding
   'hiw.rail.open': 'How It Works',
   'hiw.title': 'How It Works',
@@ -1274,6 +1427,7 @@ export const en: Record<keyof typeof ko, string> = {
     'The app closed while this was being written up — press the button below to try again.',
   'hiw.record.reason.checkFailed': 'A check the agent ran did not pass — the write-up is worth a look.',
   'hiw.record.reason.checkFailedJob': 'A check the app ran did not pass — the write-up is worth a look.',
+  'hiw.record.reason.evidenceUnreachable': 'The project folder did not answer, so the files this write-up cites could not be checked. Regenerate once the folder is reachable.',
   'hiw.pane.overview': 'What it does',
   'hiw.pane.userVisible': 'What you will notice',
   'hiw.pane.flow': 'How it works',
@@ -1371,6 +1525,8 @@ export const en: Record<keyof typeof ko, string> = {
   'conversation.model.change': 'Change model and effort (in the terminal)',
   'conversation.model.aria': 'Model and effort',
   'conversation.model.unknown': 'Model',
+  'conversation.indexingFiles': 'Indexing files…',
+  'conversation.filesUnavailable': 'The file list is not available for this folder.',
   'conversation.unavailable': 'This session has no transcript yet',
   'conversation.empty': 'Nothing has been said yet',
   'conversation.composer.placeholder': 'What should it do',
@@ -1389,5 +1545,11 @@ export const en: Record<keyof typeof ko, string> = {
   'chat.mode.aria': 'Permission mode',
   'chat.mode.default': 'Default',
   'chat.mode.acceptEdits': 'Accept edits',
-  'chat.mode.plan': 'Plan'
+  'chat.mode.plan': 'Plan',
+  // chat takeover Task 10 — the mode menu's unattended-policy section and the New Session dialog's
+  // matching control (P8): what a chat session does with a permission prompt nobody answers while a
+  // Host holds the process as its writer.
+  'chat.unattended.heading': 'With nobody there',
+  'chat.unattended.hold': 'Hold the prompt',
+  'chat.unattended.deny60': 'Deny after 60 s'
 }

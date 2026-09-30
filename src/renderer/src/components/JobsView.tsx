@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import type { JobRun, JobTask, OrchSnapshot, Provider, TaskStatus } from '../../../core/types'
+import type { JobRow, JobTask, OrchHostGate, OrchSnapshot, Provider, TaskStatus } from '../../../core/types'
 import type { MessageKey, MessageParams } from '../../../core/i18n'
 import { formatElapsed, formatRemaining } from '../../../core/orchestration/elapsed'
 import { isStoppedWorker, runningCount } from '../../../core/orchestration/running'
+import { jobsViewScreen, type JobsStall } from '../../../core/orchestration/jobsView'
 import { schedRuleSummary } from '../../../core/scheduler/summary'
 import { convergenceChipOf, type ConvergenceChip } from '../../../core/orchestration/nodeMeta'
 import { useI18n } from '../i18n/I18nProvider'
@@ -63,7 +64,7 @@ const ROUNDS_PAGE = 5
  *  "도는 Task 가 있으면 running" 을 startedAt 으로 여기서 다시 계산하지 않는 이유: 아직 아무것도
  *  뜨지 않은 Run(모든 Task 가 pending)에는 도는 것도 실패한 것도 없어서 done 으로 떨어지고, 시작도
  *  하지 않은 Run 에 체크 표시가 붙는다. */
-function runKind(run: JobRun): RunIconKind {
+function runKind(run: JobRow): RunIconKind {
   if (run.tasks.some((t) => t.status === 'blocked')) return 'blocked'
   if (run.outcome === 'running') return 'running'
   return run.outcome === 'failed' ? 'failed' : 'done'
@@ -141,7 +142,7 @@ function RunCard({
   onDeleteRun,
   onRestartCoordinator
 }: {
-  run: JobRun
+  run: JobRow
   open: boolean
   onToggle: () => void
   /** 예약 회차라면 그 번호. 평범한 Run 에는 없다 */
@@ -364,7 +365,7 @@ function RunCard({
 }
 
 /** 다음 발화 시각. TerminalView 의 fmtDateTime 과 같은 형식이다 — 주는 값이 epoch ms 라
- *  (JobRun.nextFireAt) 그쪽처럼 ISO 를 받지 않는다. */
+ *  (JobRow.nextFireAt) 그쪽처럼 ISO 를 받지 않는다. */
 const fmtNext = (ms: number): string =>
   new Date(ms).toLocaleString([], {
     month: 'numeric',
@@ -394,7 +395,7 @@ function ScheduleCard({
   onDeleteRun,
   onRestartCoordinator
 }: {
-  run: JobRun
+  run: JobRow
   open: boolean
   onToggle: () => void
   collapsed: Set<string>
@@ -421,27 +422,38 @@ function ScheduleCard({
         <span className="jobs-objective" title={run.objective}>
           {run.objective}
         </span>
-        <span className="jobs-tmpl-badge" title={t('jobs.new.scheduleHint')}>
-          {t('jobs.run.scheduled')}
-        </span>
+        {/* 예약에만 붙는다 — 손으로 다시 돌린 Job 도 이 카드를 쓰지만 예약은 아니다.
+            그 Job 이 무엇인지는 아래 "N회 실행" 과 회차 목록이 이미 말한다. */}
+        {run.schedule && (
+          <span className="jobs-tmpl-badge" title={t('jobs.new.scheduleHint')}>
+            {t('jobs.run.scheduled')}
+          </span>
+        )}
         {/* **멈추고 싶어지는 순간은 이 줄에서 온다** — 회차가 쌓이는 것도, 워커가 계정 한도를 먹는
             것도 여기서 보인다. 상세 창을 열어야 멈출 수 있다면 정확히 급한 순간에 마찰이 생긴다.
             휴지통이 이미 이 줄에 있으므로(그보다 파괴적이다) 밀도의 문제는 아니고, 오클릭은 확인
             창이 받는다. 회차 줄에는 두지 않는다: 회차는 읽기 전용 기록이고, 거기 두면 "이 회차만
             멈추나, 예약 전체가 멈추나" 가 모호해진다.
-            stopPropagation: 이 줄 자체가 접기·펴기다 */}
-        <button
-          className="jobs-more"
-          title={run.paused ? t('jobs.run.resumeHint') : t('jobs.run.pauseHint')}
-          aria-label={run.paused ? t('jobs.run.resume') : t('jobs.run.pause')}
-          onClick={(e) => {
-            e.stopPropagation()
-            if (run.paused) onResumeRun(run.id)
-            else onPauseRun(run.id)
-          }}
-        >
-          {run.paused ? <PlayIcon /> : <PauseIcon />}
-        </button>
+            stopPropagation: 이 줄 자체가 접기·펴기다
+
+            **예약에만 둔다.** 멈출 것이 있는 쪽은 발화다 — 손으로 다시 돌린 Job 에는 멈출 다음
+            회차가 없고, `run-pause` 가 "예약이 아니다" 로 거절한다(server.ts). 누를 수 있는데
+            아무 일도 일어나지 않는 버튼을 두지 않는다. 그 Job 의 워커를 멈추는 것은 회차 안에서
+            Dispatch 하나씩 하는 일이다. */}
+        {run.schedule && (
+          <button
+            className="jobs-more"
+            title={run.paused ? t('jobs.run.resumeHint') : t('jobs.run.pauseHint')}
+            aria-label={run.paused ? t('jobs.run.resume') : t('jobs.run.pause')}
+            onClick={(e) => {
+              e.stopPropagation()
+              if (run.paused) onResumeRun(run.id)
+              else onPauseRun(run.id)
+            }}
+          >
+            {run.paused ? <PlayIcon /> : <PauseIcon />}
+          </button>
+        )}
         {/* 상세 창으로 가는 입구 — 템플릿에서는 **Task 를 짜는 자리**다. 정의를 고치는 곳이
             여기뿐이라(회차는 읽기 전용 기록) 이 버튼이 회차보다 더 중요하다.
             stopPropagation: 이 줄 자체가 접기·펴기라서, 없으면 창을 열면서 동시에 접는다 */}
@@ -457,8 +469,10 @@ function ScheduleCard({
           ›
         </button>
       </div>
+      {/* 규칙과 다음 발화 시각은 예약의 것이다 — 손으로 다시 돌린 Job 에는 그것이 없다.
+          "N회 실행" 은 둘 다에 뜻이 있다(몇 번 돌았나). */}
       <div className="jobs-tmpl-meta">
-        <span>{schedRuleSummary(t, run.schedule)}</span>
+        {run.schedule && <span>{schedRuleSummary(t, run.schedule)}</span>}
         {/* **멈춘 것이 보여야 한다.** 일시 중지하면 무장하지 않으므로(firesDue) '다음 …' 줄이 그냥
             사라진다 — 그러면 멈춘 예약과 도는 예약이 화면에서 거의 같아 보이고, 멈춘 것을 잊은
             사람이 "왜 안 도는지" 를 찾게 된다. 한 번도 돌리지 않은 것도 같은 자리에 선다: 둘 다
@@ -564,6 +578,8 @@ function ScheduleCard({
  *  it has no test of its own because the renderer has no jsdom (vitest runs environment: 'node'). */
 export function JobsView({
   snapshot,
+  hostGate,
+  stall,
   hasProject,
   canOpenSession,
   onOpenSession,
@@ -575,6 +591,17 @@ export function JobsView({
   onRestartCoordinator
 }: {
   snapshot: OrchSnapshot | null
+  /** Why there is nothing to draw, when the Host is the reason — null in the ordinary case.
+   *
+   *  **A prop of its own, not a field on the snapshot** (ruling F41). It is one fact about the app's
+   *  Host, and a snapshot is per project: App substitutes a synthetic one whenever no project is open,
+   *  so a gate carried inside it disappeared in exactly the state most likely to meet it. App reads it
+   *  once (`orch.hostGate`) and listens on `orch:host` after that. */
+  hostGate: OrchHostGate | null
+  /** Why nothing moves, when the Host still answers the gate's question but will not or cannot start
+   *  work (limits L3): a parked Host and its reason, or a Host that is not answering. Null when a Host
+   *  or the app drives normally. Decided in core (jobsStall); this view only draws it. */
+  stall: JobsStall | null
   /** Whether the caller currently has a project open. snapshot alone cannot answer that — with no
    *  project App.tsx deliberately still hands this component `{ runs: [] }` rather than null (its
    *  own comment: null would leave an unexplained blank sidebar for as long as the view stays open,
@@ -639,11 +666,55 @@ export function JobsView({
     return () => clearInterval(id)
   }, [anyRunning])
 
+  // 넷 중 어느 화면인가. **순서는 core 가 정한다**(jobsViewScreen) — 이 순서가 틀렸던 것을 어떤
+  // 테스트도 보지 못했고, 사람이 화면을 보고서야 잡았다(ruling F41).
+  const screen = jobsViewScreen({ hostGate, snapshot })
+
+  // **The Host is why there is nothing, and saying so is the whole point of this state.** The app no
+  // longer owns orchestration.json (host control plane design §6), so with no Host there is no state
+  // — and the empty state below would tell a person with a dozen Jobs that they have none. The four
+  // features that stop with it are named here rather than each growing a surface of its own (F35).
+  //
+  // **프로젝트가 열려 있든 아니든 그린다.** 열린 프로젝트가 없는 창이야말로 이 화면을 만날 가능성이
+  // 가장 높은 쪽이다(갓 설치한 앱, 아직 세션을 안 연 창) — 그래서 이 값은 스냅샷을 타고 오지 않는다.
+  if (screen === 'host' && hostGate) {
+    const waiting = hostGate.state === 'waiting'
+    return (
+      <div className="jobs-empty">
+        <p>{t(waiting ? 'jobs.host.waiting' : 'jobs.host.unreachable')}</p>
+        <p className="jobs-empty-hint">{t('jobs.host.features')}</p>
+        {/* 못 붙은 뒤에만 사유와 기록을 적는다 — 아직 시도 중일 때는 적을 사유가 없고, 있지도
+            않은 실패를 화면에 두면 기다리는 중을 실패로 읽는다. */}
+        {!waiting && hostGate.reason && (
+          <p className="jobs-empty-hint">{t('jobs.host.reason', { reason: hostGate.reason })}</p>
+        )}
+        {!waiting && (
+          <>
+            <p className="jobs-empty-hint">{t('jobs.host.retry')}</p>
+            <p className="jobs-empty-hint">{t('jobs.host.log', { path: hostGate.logPath })}</p>
+          </>
+        )}
+      </div>
+    )
+  }
+
   // Before the first orch.list response — nothing is known yet, so nothing is drawn (not even the
   // empty state, which would otherwise flash "no jobs" for a frame on every project switch).
-  if (snapshot === null) return <></>
+  if (screen === 'blank' || snapshot === null) return <></>
 
-  if (snapshot.runs.length === 0) {
+  // 아무것도 움직이지 않는 까닭(한도 L3). 목록과 빈 화면 둘 다의 맨 위에 한 줄로 선다 — Run 이 있든
+  // 없든 새로 만든 Job 도 움직이지 않으니 두 화면 모두 이것을 알아야 한다.
+  const stallLine = stall && (
+    <p className="jobs-stall" role="status">
+      {stall.kind === 'unresponsive'
+        ? t('jobs.stall.unresponsive')
+        : stall.kind === 'reading'
+          ? t('jobs.stall.reading')
+          : t('jobs.stall.parked', { reason: t(stall.gate === 'unreadable' ? 'jobs.stall.gate.unreadable' : 'jobs.stall.gate.notMigrated') })}
+    </p>
+  )
+
+  if (screen === 'empty') {
     // **프로젝트가 없을 때와 있을 때가 다른 화면이다.** 이 빈 상태는 둘 다에서 그려진다(App.tsx 가
     // 프로젝트 없을 때 일부러 `{ runs: [] }` 를 넣는다 — 빈 사이드바보다 낫다는 판단). 그런데
     // '+ 새 작업' 버튼은 프로젝트가 없으면 그릴 수 없다(아래 가드): 그때 두 문구를 그대로 두면
@@ -651,6 +722,7 @@ export function JobsView({
     // 함께 갈라, 무엇을 하면 되는지 그 자리에서 말한다.
     return (
       <div className="jobs-empty">
+        {stallLine}
         <p>{hasProject ? t('jobs.empty') : t('jobs.noProject')}</p>
         <p className="jobs-empty-hint">
           {hasProject ? t('jobs.empty.hint') : t('jobs.noProject.hint')}
@@ -669,12 +741,16 @@ export function JobsView({
 
   return (
     <section className="jobs-view">
+      {stallLine}
       {/* 목록 위, 첫 자식 — 아이콘을 새로 만들지 않는다: '+' 글자로 충분하다 */}
       <button className="jobs-new" onClick={onNewRun}>
         + {t('jobs.new.open')}
       </button>
+      {/* **회차가 여럿이면 예약이 아니어도 펼치는 카드다.** 접히는 카드를 예약에만 쓰던 것은 회차가
+          예약에서만 생겼기 때문이고, 이제는 끝난 Job 을 다시 돌려도 생긴다 — 조건을 `schedule` 로
+          두면 그 회차들이 화면에서 통째로 사라진다(상태에는 있는데 그리는 곳이 없다). */}
       {snapshot.runs.map((run) =>
-        run.schedule ? (
+        run.schedule || (run.children?.length ?? 0) > 0 ? (
           <ScheduleCard
             key={run.id}
             run={run}

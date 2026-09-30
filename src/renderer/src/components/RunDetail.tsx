@@ -3,7 +3,7 @@ import type {
   Account,
   JobCheck,
   JobEvent,
-  JobRun,
+  JobRow,
   JobTask,
   MessageType,
   Provider,
@@ -24,6 +24,7 @@ import { useI18n } from '../i18n/I18nProvider'
 import { confirmModal } from '../lib/confirm'
 import { CompletionBlock } from './CompletionBlock'
 import { toast } from '../lib/toast'
+import { errText } from '../hooks/useFileOps'
 import {
   LockIcon,
   RunIcon,
@@ -34,6 +35,7 @@ import {
   UnlockIcon
 } from './JobIcons'
 import { NewTaskModal } from './NewTaskModal'
+import { JournalBusy, JournalOlder } from './RunDetailJournal'
 import { ArrowUpRight, Play, Square, WrenchOff, X } from 'lucide-react'
 
 /** 종류 배지의 문구. message 는 messageType 이 정한다.
@@ -60,7 +62,7 @@ const KIND_LABEL: Record<Exclude<JobEvent['kind'], 'message'>, MessageKey> = {
   recovery: 'jobs.event.recovery'
 }
 
-/** A recovery line's summary is the strategy as the journal stored it (main/continuity/recorder.ts
+/** A recovery line's summary is the strategy as the journal stored it (core/continuity/timelineRows.ts
  *  carries the row through verbatim) — the journal is the source of truth, so the data stays raw and
  *  the wording happens here. A strategy this map does not know falls back to the raw string: a new
  *  strategy showing as `resume-native` reads better than showing as nothing. */
@@ -221,11 +223,12 @@ export function RunDetail({
   runId,
   canOpenSession,
   onOpenSession,
+  onShowOlderJournal,
   onClose
 }: {
   /** 스냅샷에 있는 그 Run. 노드의 제목·상태·세션은 전부 여기서 온다(detail 은 id 만 준다).
    *  스냅샷과 detail 은 서로 다른 호출이라 어긋날 수 있으므로, 한쪽에만 있는 Task 는 그리지 않는다. */
-  run: JobRun | undefined
+  run: JobRow | undefined
   /** null 은 아직 도착하지 않았다는 뜻 — 빈 상태와 구분한다(JobsView 의 snapshot === null 과 같다) */
   detail: RunDetailData | null
   /** Task 짓기(task-create)와 그 검증 구성 조회(run.list)가 쓴다. App.tsx 의 openRun 이 이미 이
@@ -235,6 +238,8 @@ export function RunDetail({
   runId: string
   canOpenSession: (sessionId: string) => boolean
   onOpenSession: (sessionId: string) => void
+  /** "이전 저널 기록 더 보기" — 저널 줄을 한 쪽 더 읽게 한다(stage 3 T1). 쪽 수는 App.tsx 가 든다 */
+  onShowOlderJournal: () => void
   onClose: () => void
 }): React.JSX.Element {
   const { t } = useI18n()
@@ -363,7 +368,7 @@ export function RunDetail({
   /** 띄우기 버튼을 보일 조건 — **넷 다** 참이어야 한다. 한 자리에 모아 두는 것은 하나만
    *  보고 고치면 나머지 조건을 깨뜨리기 쉬워서다.
    *
-   *  1) 이 Run 의 동시 실행 한도(없으면 DEFAULT_CONCURRENCY, JobRun 의 주석과 같다)가 1 이하다.
+   *  1) 이 Run 의 동시 실행 한도(없으면 DEFAULT_CONCURRENCY, JobRow 의 주석과 같다)가 1 이하다.
    *     한도가 2 이상인 Run 은 모든 워커가 각자의 워크트리에서 돌고, 사람이 여기서 하나를 띄우면
    *     그것은 Run 워크트리로 간다(worker-start 의 기본값) — 통합 Task 가 도는 바로 그 폴더다.
    *     "병렬인데 한 폴더"라는 금지된 조합이 되고(coordinator/runScheduler 주석), 그 워커가 합칠
@@ -452,7 +457,7 @@ export function RunDetail({
     setSelected((prev) => (prev === id ? null : id))
   }
 
-  /** 계정을 고른다 — 스케줄러(src/main/ipc.ts 의 runScheduler)와 같은 방법이다: 계정 목록과
+  /** 계정을 고른다 — 스케줄러(src/core/orchestration/exec/dispatchLoop.ts 의 runScheduler)와 같은 방법이다: 계정 목록과
    *  로그인 여부를 병렬로 확인한 뒤 defaultAccountIdOf(그 규칙을 정하는 단 하나의 함수)에게
    *  넘긴다. 로그인 조회를 계정마다 차례로 기다리면 계정 수만큼 느려지므로 Promise.all 로 편다. */
   const accountFor = async (
@@ -558,6 +563,14 @@ export function RunDetail({
           : 0
       if (typeof uncommitted === 'number' && uncommitted > 0)
         toast.error(t('jobs.run.mergeUncommitted', { count: uncommitted }))
+      // git status did not answer for these worktrees — their uncommitted changes are unknown, not 0,
+      // and the same folder-deletion risk applies, so this is said just as loudly.
+      const unchecked =
+        typeof reply.body === 'object' && reply.body !== null && 'uncommittedUnchecked' in reply.body
+          ? (reply.body as { uncommittedUnchecked: unknown }).uncommittedUnchecked
+          : undefined
+      if (Array.isArray(unchecked) && unchecked.length > 0)
+        toast.error(t('jobs.run.mergeUncommittedUnknown', { count: unchecked.length }))
     } catch {
       toast.error(t('jobs.run.mergeFailed', { reason: '' }))
     } finally {
@@ -623,9 +636,14 @@ export function RunDetail({
         return
       }
       const reply = await window.api.orch.command(projectPath, 'worker-stop', { dispatch: open.id })
-      if (reply.status >= 400) toast.error(t('jobs.node.failed'))
-    } catch {
-      toast.error(t('jobs.node.failed'))
+      // The refusal's own words, not only "could not": a stop refused because the worker is still
+      // starting, or because the Host could not confirm the kill, says what to do next.
+      if (reply.status >= 400) {
+        const why = (reply.body as { error?: unknown } | null)?.error
+        toast.error(typeof why === 'string' ? t('jobs.node.stopFailed', { detail: why }) : t('jobs.node.failed'))
+      }
+    } catch (err) {
+      toast.error(t('jobs.node.stopFailed', { detail: errText(err) }))
     } finally {
       setBusy(null)
     }
@@ -1053,7 +1071,10 @@ export function RunDetail({
                 {selectedTask && (
                   <CompletionBlock projectPath={projectPath} runId={runId} taskId={selectedTask.id} />
                 )}
+                <JournalBusy journal={detail?.journal} />
                 <div className="detail-list">
+                  {/* 목록은 오래된 것이 위다 — 더 오래된 저널 줄을 부르는 자리도 맨 위다 */}
+                  <JournalOlder journal={detail?.journal} onShowOlder={onShowOlderJournal} />
                   {events !== null && shown.length === 0 && (
                     <p className="modal-hint">{t('jobs.timeline.empty')}</p>
                   )}

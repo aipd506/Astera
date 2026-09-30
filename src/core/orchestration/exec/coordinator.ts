@@ -1,0 +1,964 @@
+// Dispatch execution. Brings up a session (or reuses one via --terminal) and writes the spec file.
+//
+// **The server owns OrchState. The coordinator neither reads nor writes state at all.**
+// openDispatch and closeDispatch now live only in server.ts — the server creates the dispatchId up
+// front and passes it in as an argument, and on failure the coordinator simply throws (cleanup is
+// the server's job). handleExit (where closeDispatch used to be called) touches state too, so it
+// moved to server.ts as well.
+//
+// The first injection hands the spec file path over as a CLI positional argument; a reuse
+// (--terminal) injects it with a PTY write. A positional argument needs no readiness detection.
+//
+// The spec file is written **outside the user's repository** — into the injected specsDir (the
+// wiring passes <userData>/orch/specs). It used to sit inside the worker cwd, but the spec body
+// carries the work instructions the orchestrator wrote, and leaving it in the user's repository
+// makes it show up in git status and leak once committed.
+// The path is injected so that this class does not depend on the Electron app (it stays purely
+// testable).
+import { promises as fs } from 'node:fs'
+import path from 'node:path'
+import { isSamePath } from '../../files/tree'
+import type { Provider } from '../../providers/meta'
+import { KNOWLEDGE_DIRS, knowledgeFilesFrom, type KnowledgeFiles } from '../../knowledge/detect'
+import type { CheckResult, RepairReason, ReviewIssue } from '../types'
+
+/** Job Continuity's two prompt events (P0 design §5): 'requested' right before the prompt leaves
+ *  the app, 'confirmed' once it has — the spawned process holds it as argv, or the typed prompt's
+ *  Enter was written. Never the prompt text: its length and where the spec file is. */
+export interface PromptWriteEvent {
+  dispatchId: string
+  taskId: string
+  phase: 'requested' | 'confirmed'
+  via: 'argv' | 'typed'
+  promptLength: number
+  specPath: string
+}
+
+export interface CoordinatorDeps {
+  spawnSession(o: {
+    accountId: string
+    cwd: string
+    bypassPermissions?: boolean
+    /** Optional because a codex resume (below) carries its phrase as resumePrompt instead — the two
+     *  are mutually exclusive per call, never both set (see the spawn call in startWorker). Every
+     *  other caller — an ordinary start, and a claude resume — still sets this. */
+    initialPrompt?: string
+    /** Set together with resumePrompt/resumeSessionId by a resumed startWorker call (see `resume`
+     *  below) — claude takes the resume phrase as this positional prompt after `--resume <id>`
+     *  (core/sessions/commands.ts); codex takes it as `resumePrompt` instead. Both already exist on
+     *  SessionManager.spawn. */
+    resumeSessionId?: string
+    /** codex's own field for the resume phrase — `codex resume <id> <resumePrompt>`
+     *  (core/sessions/commands.ts). Unset for claude, which takes the phrase as initialPrompt instead. */
+    resumePrompt?: string
+    /** Title of the worker tab = task.title. Deliberately not optional — the coordinator always has
+     *  a title (it is a required argument of startWorker), and if it were optional the wiring could
+     *  omit it and still compile. */
+    title: string
+    /** 이 워커 세션의 롤링 체인 — **첫 원소가 그 Dispatch 가 실제로 쓰는 계정**이고, 나머지는
+     *  한도에 걸렸을 때 갈아탈 순서다(원천은 Task.accountIds).
+     *  이 필드는 프로바이더에 무관하고, 이제 둘의 동작도 같은 모양이다. 양쪽 다 한 원소 체인에서는
+     *  계정을 갈아타지 않고 리셋까지 기다린 뒤 같은 세션에서 재개한다(claudeCoordinator.ts·codexCoordinator.ts 의
+     *  resumeInPlace). 각각 세션을 죽이는 경로로 되돌아가는 예외가 있다 — claude 는 한도 선택지
+     *  목록이 아직 화면에 남아 있을 때(choicePending), codex 는 응답 못한 모델 전환 목록이 남아
+     *  있을 때와 직전 제자리 재개가 턴을 만들지 못했을 때다. 계정이 바뀌는 재개는 양쪽 다 세션을
+     *  죽이고 새 세션 id 로 재기동한다. 어느 쪽이든 이 값을 넘기는 것 자체가, 한도에 걸린
+     *  워커를 사람이 다시 띄우지 않고도 스스로 이어지게 만든다.
+     *
+     *  **위 title 과 같은 이유로 optional 이 아니다.** 이 기능의 on 스위치는 startWorker 의 한
+     *  줄(`rollAccountIds: a.rollAccountIds`)이고, optional 이면 그 줄을 지워도 typecheck 와 전체
+     *  테스트가 그대로 통과한다 — 기능만 조용히 꺼진다. `satisfies typeof o`(ipc.ts 의 배선)는
+     *  **철자 오류를 잡을 뿐 누락은 잡지 못한다**: optional 필드가 없는 객체도 그 타입을 만족한다.
+     *  required 로 두면 지운 자리가 곧 컴파일 오류다. */
+    rollAccountIds: string[]
+    /** 롤링이 재개할 때 이 세션에 보낼 문구. 넘기지 않으면 롤링이 **앱의 UI 언어** 기본값
+     *  (`rolling.continuePrompt`)을 쓴다 — 영어로 쓰인 spec 을 받은 워커가 한국어로 재개될 수 있고,
+     *  그 문구("이어서 작업 진행해 줘")는 끝내고 보고하라는 말이 아니라 계속하라는 말이다. 그래서
+     *  워커에게는 워커용 문구를 준다(startWorker 의 호출 자리). optional 인 이유는 넘기지 않아도
+     *  롤링이 기본값으로 돌기 때문이다 — rollAccountIds 처럼 지우면 기능이 꺼지는 값이 아니다. */
+    rollPrompt?: string
+  }): Promise<{ id: string }>
+  writeToSession(sessionId: string, data: string): void
+  /** Is that session working. **null = it cannot be decided for this provider** (codex — a
+   *  decorative spinner keeps running in the window title and child processes overwrite the title,
+   *  which makes the signal meaningless; measured directly). The coordinator does not need to know
+   *  which providers can be decided — the wiring knows that. */
+  isBusy(sessionId: string): boolean | null
+  /** Is that session still alive (the reuse target). SessionManager.write does not throw on a dead
+   *  session, it silently no-ops (core/sessions/manager.ts) — which is why the reuse path has to
+   *  check this first, before injecting. Otherwise the prompt goes nowhere and the Task stays locked
+   *  with worker_done never arriving. */
+  isAlive(sessionId: string): boolean
+  /** May be asynchronous and may refuse: the app has to put a kill to the Host for a session it
+   *  does not hold (main/orchestration/stopWorker.ts). `releaseWorker` waits for it, so a refusal
+   *  reaches worker-stop before it marks anything stopped. */
+  killSession(sessionId: string): void | Promise<void>
+  createWorktree(a: { repoPath: string; name: string }): Promise<{ path: string }>
+  accountProvider(accountId: string): Provider | null
+  /** Directory to write spec files into (absolute path). It has to be outside the user's repository
+   *  — the spec body carries the work instructions the orchestrator wrote, and inside the repository
+   *  it would leak once committed. The wiring passes `<userData>/orch/specs` (the same convention as
+   *  `statusline/`). */
+  specsDir: string
+  /** Diagnostic log for things such as exceeding the idle wait limit. The wiring decides where it goes (console, file, ...) */
+  log(message: string): void
+  /** Optional: without Job Continuity nothing listens. */
+  onPromptWrite?(e: PromptWriteEvent): void
+  /** Limit on waiting for the busy -> idle transition (ms). Defaults to 30s
+   *  (DEFAULT_IDLE_WAIT_TIMEOUT_MS) — tests inject a short value so they do not depend on timing. */
+  idleWaitTimeoutMs?: number
+}
+
+/** Characters that break quoting under win32's cmd.exe /c wrapping if they reach the launch prompt —
+ *  the rule lives beside sanitizeResumePrompt now, and `sessions create` checks it too */
+import { LAUNCH_FORBIDDEN } from '../../sessions/commands'
+export { LAUNCH_FORBIDDEN }
+/** Gap between the prompt and Enter when injecting into a reused session. Same value as rolling and the scheduler */
+const ENTER_DELAY_MS = 150
+/** Polling interval while waiting for the busy -> idle transition. Same value as the server's check/ask polling (POLL_MS) */
+const IDLE_POLL_MS = 50
+/** Default limit for waitUntilIdle. BusyScanner.busy (core/terminal/busy.ts) is a sticky value that
+ *  only updates when a new, complete OSC title arrives — if the last complete title was a busy frame
+ *  and nothing repaints after it, it can stay true forever. An unbounded wait would then hold this
+ *  function forever, the worker-start HTTP response above it would never finish either, and one of
+ *  the orchestrator's shell commands would hang with no output. 30s is generous compared to a normal
+ *  busy frame (a few seconds) while still always elapsing before the user's next turn starts. */
+export const DEFAULT_IDLE_WAIT_TIMEOUT_MS = 30_000
+
+/** Limit on the whole knowledgeIn scan (below). The scan is a handful of readdir calls on local
+ *  disk — sub-millisecond in the healthy case — so 2s is far past anything a working repository
+ *  should ever hit. If six directory listings cannot finish inside that, the knowledge section is
+ *  not worth delaying a worker launch for. */
+const KNOWLEDGE_SCAN_TIMEOUT_MS = 2_000
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** taskId 와 dispatchId 만으로 이미 고유하다 — startWorker 가 spec 파일을 이 이름으로 쓴다.
+ *  **두 자리가 이 이름에 동의해야 한다**: 여기서 쓰고, ipc.ts 의 검토 Dispatch 배선은 코디네이터가
+ *  돌기(그래서 진짜 specPath 를 알기) 전에 판정 파일 경로(`<이 이름>.review.json`)를 먼저 정해서
+ *  검토자의 spec 에 실어야 한다 — 그 자리가 각자 리터럴을 다시 적으면 오늘은 우연히 같아도 한쪽만
+ *  바뀌는 날 조용히 갈라진다: 검토자는 아무도 읽지 않는 파일에 쓰고, 서버는 malformed 도 아니고
+ *  "이슈 없음"도 아닌 채 그냥 아무것도 읽지 못한다. */
+export const specFileName = (taskId: string, dispatchId: string): string => `${taskId}-${dispatchId}.md`
+
+/** specPath is an absolute path normalized to forward slashes (see startWorker below) */
+export const launchPrompt = (specPath: string): string =>
+  `Read ${specPath} and follow the instructions in it`
+
+/** What a resumed worker is told. The conversation is still there — `claude --resume` / `codex resume`
+ *  bring it back — so this does not repeat the task; it points at the spec file, which the recovery
+ *  path has just rewritten, and it restates the reporting command because the **dispatch id is new**:
+ *  the attempt the agent remembers is closed, and a report against it would be refused.
+ *
+ *  No character from LAUNCH_FORBIDDEN appears here: codex passes this as a CLI argument. */
+export const resumeWorkerPrompt = (specPath: string, taskId: string, dispatchId: string): string =>
+  `Continue this task. Your instructions are at ${specPath} — read it again, including the resume ` +
+  `briefing at the end if one is there. When the work is finished, report exactly once with ` +
+  `astera send --type worker_done --task-id ${taskId} --dispatch-id ${dispatchId}.`
+
+/** 같은 세션에 fix 요청을 써넣을 때의 한 줄(설계 §6.2). 대화가 이어지므로 일을 다시 말하지 않고 파일을
+ *  가리킨다 — resumeWorkerPrompt 와 같은 모양이고, LAUNCH_FORBIDDEN 을 피한다(따옴표·&·|·<·>·^·% 없음). */
+export const repairWorkerPrompt = (specPath: string): string =>
+  `Your previous report did not satisfy the completion checks. Read ${specPath} — it says what failed and how to report`
+
+export interface RepairSection {
+  reason: RepairReason
+  /** 몇 번째 수리인가 / 상한 — "This is repair 2 of 3" */
+  repair: number
+  maxFixAttempts: number
+  checks?: CheckResult[]
+  issues?: ReviewIssue[]
+  /** 소진 Gate 를 retry-once 로 풀어 예산 **밖에** 연 repair 다(설계 §5.2, repair.ts 의
+   *  repairOnce). 이 Dispatch 를 세면 repairCountOf 가 이미 maxFixAttempts 를 넘어 있으므로,
+   *  "repair {repair} of {maxFixAttempts}" 로 적으면 예산보다 큰 번호("4 of 3")가 나가 워커가
+   *  그것을 오류로 읽는다. true 면 그 대신 "사람이 예산이 다 쓰인 뒤 하나 더 허락했다" 로 적는다 —
+   *  숫자를 지우는 것이 아니라 그 숫자가 뜻하는 것을 바꾸는 것이다. */
+  extra?: true
+}
+
+/** spec 파일의 "## Repair request" 절(설계 §6.1, 명세 §9·§16·§35·§39). 보고 의무 앞에 선다 — 무엇이 틀렸는지
+ *  읽은 다음에 어떻게 보고할지가 온다. check 는 실패한 것과 돌지 않은 것만 말한다: 통과한 것은 고칠 일이
+ *  없고, 목록이 길면 실패가 묻힌다. 이슈는 blocking 만 — non-blocking 은 고치라고 보낸 것이 아니다.
+ *
+ *  **이름 것이 없으면 절 자체를 붙이지 않는다** — checks 가 전부 통과했고 issues 가 전부 non-blocking
+ *  이면 `### What failed` 가 비게 되는데, 아무것도 이름 없는 "무엇이 실패했다" 절은 절이 없는 것보다
+ *  나쁘다(리뷰 fix 1차, Minor). */
+function repairSection(a: RepairSection): string {
+  const lines: string[] = []
+  for (const c of a.checks ?? []) {
+    if (c.status === 'passed') continue
+    if (c.status === 'not-run') lines.push(`- Check "${c.name}" — not run (stopped at the first failure).`)
+    else {
+      lines.push(`- Check "${c.name}" — exit ${c.exitCode ?? '?'}${c.status === 'timed-out' ? ' (timed out)' : ''}.`)
+      // outputTail 이 없거나 빈 문자열이면 아무것도 싣지 않는다 — 예전에는 "Output tail:" 뒤에 빈
+      // 들여쓰기 줄 하나가 남았다. 40줄로 자를 때는 몇 줄이 잘렸는지도 남긴다 — 안 그러면 잘린
+      // 사실 자체가 안 보인다.
+      if (c.outputTail) {
+        const tail = c.outputTail.split('\n')
+        const kept = tail.slice(-40)
+        lines.push('  Output tail:')
+        if (kept.length < tail.length) lines.push(`    … (${tail.length - kept.length} earlier line(s) cut)`)
+        for (const l of kept) lines.push(`    ${l}`)
+      }
+    }
+  }
+  const blocking = (a.issues ?? []).filter((i) => i.blocking)
+  if (blocking.length) {
+    lines.push(`- Review found ${blocking.length} blocking issue${blocking.length === 1 ? '' : 's'}:`)
+    blocking.forEach((i, n) => {
+      lines.push(`  ${n + 1}. ${i.severity.toUpperCase()} — ${i.title}${i.file ? ` — ${i.file}${i.line !== undefined ? `:${i.line}` : ''}` : ''}`)
+      if (i.description) lines.push(`     ${i.description}`)
+      if (i.suggestedFix) lines.push(`     Suggested fix: ${i.suggestedFix}`)
+    })
+  }
+  if (!lines.length) return ''
+  const reasonText = a.reason === 'review-failure' ? 'review found blocking issues' : 'a completion check failed'
+  // extra 는 소진된 뒤 사람이 하나 더 허락한 repair 다 — repairCountOf 는 이미 maxFixAttempts 를
+  // 넘은 값을 낸다("4 of 3"), 그래서 분수 대신 "예산이 다 쓰인 뒤 허락됐다" 로 적는다.
+  const roundText = a.extra
+    ? `This is an extra repair, granted by a person after the budget of ${a.maxFixAttempts} was already spent.`
+    : `This is repair ${a.repair} of ${a.maxFixAttempts}.`
+  return `
+---
+## Repair request (assembled by the app — do not delete)
+
+Your previous report for this task did not satisfy the completion checks — ${reasonText}. ${roundText}
+
+### What failed
+${lines.join('\n')}
+
+### Rules
+Do not redefine the objective. Do not remove, skip or weaken failing tests unless the objective
+explicitly requires it. Do not disable lint rules, bypass the build, or change how the checks run.
+Fix the failing completion conditions with the smallest correct change — correctness before size.
+Astera, not you, decides whether the completion conditions are met: after your fix it re-runs every
+check, then review. Report \`--outcome succeeded\` for this repair attempt once you have made the fix
+— that reports the attempt, not the task. Do not declare the task complete in your report: whether the
+task itself is done is still Astera's call, decided only once the checks and review have run again. A
+repair reported as \`--outcome failed\` ends the task without ever re-running them, so use it only when
+you cannot make the fix at all.
+`
+}
+
+/** 워커가 일할 폴더에서 지식 파일을 모은다.
+ *
+ *  **Exported for testing.** This is the only code in the knowledge feature that touches the
+ *  filesystem. The relative-path requirement must be protected by automated tests — a one-off
+ *  manual scan cannot preserve the failure case. Do not remove this export.
+ *
+ *  **`runCwd` 가 아니라 워커의 `cwd` 를 훑는다.** 워크트리는 같은 저장소의 다른 체크아웃이므로 그
+ *  파일들이 거기에도 있고, 그 트리에서 얻은 경로여야 워커가 자기가 고칠 코드와 같은 트리의 결정을
+ *  읽는다.
+ *
+ *  **읽지 못하면 빈 목록이다.** 권한이 없거나 경로가 사라졌을 때 지식을 못 읽는 것이 워커를 못
+ *  띄우는 이유가 되어서는 안 된다 — loadRunConfigs(core/run/load.ts)가 readdir 실패를 같은
+ *  방식으로 접는다.
+ *
+ *  깊이는 관례 디렉터리 자신과 그 바로 아래 한 층까지다. 이 저장소의 knowledge/ 가 그 모양이고
+ *  (README.md 는 바로 아래, decisions/*.md 는 한 층 더) docs/adr/ 은 평평하다. 더 깊이 들어가면
+ *  큰 저장소에서 비용이 예측되지 않는다.
+ *
+ *  **이 함수는 launch 경로 위에 있다 — startWorker 가 세션을 띄우기(spawnSession) 전에 이 함수를
+ *  기다린다.** 네트워크 마운트가 멈춰 있으면 그만큼 launch 가 늦어지고, readdir 중 하나가 끝내
+ *  반환하지 않으면 startWorker 자체가 반환하지 않는다. 그러면 server.ts 의 handleCommand 안
+ *  worker-start 분기가 startWorker 호출을 감싸 둔 실패 rollback(catch) 도 돌 기회를 못 얻는다 —
+ *  그 rollback 이 있는 이유가 바로 "dispatched 에서 실패하면 재시도할 길이 없다"(dispatched Task
+ *  는 --ready 목록에 나오지 않는다)였는데, catch 조차 못 돌면 Task 는 그 무엇에도 잡히지 않고
+ *  그대로 박힌다 — 사람이 손으로 task-update 를 칠 때까지.
+ *
+ *  **그래서 훑기 전체를 KNOWLEDGE_SCAN_TIMEOUT_MS 로 묶는다(race, 아래).** 예전에는 이 함수도
+ *  loadRunConfigs(core/run/load.ts), jdkScanner, dotnetScanner, core/history/strategies 의
+ *  codex.ts·claude.ts 를 근거로 제한을 두지 않았다 — 그것들도 readdir 를 하나같이 제한 없이
+ *  부르니까. 하지만 그 넷은 다른 부류다: 전부 **사람이 켠 작업**이다. 설정 화면을 열거나 목록을
+ *  조회할 때만 도는 코드라, 멈춰도 사람이 보는 스피너로 나타나고 그 사람이 자리를 뜨면 그만이다.
+ *  이 함수는 반대로 **스케줄러의 경로** 위, 워커를 띄울 때마다 지켜보는 사람 없이 돈다 — 멈추면
+ *  바로 위 문단이 적은 실패가 그대로 일어난다. 이 파일 안에 이미 같은 이유로 시간 제한을 둔 자리가
+ *  있다 — DEFAULT_IDLE_WAIT_TIMEOUT_MS 의 주석이 적은 그대로, 제한 없는 대기는 함수를 영원히
+ *  붙들고 그 위의 셸 명령을 출력 없이 매달아 둔다. 같은 논리가 여기에도 적용된다.
+ *
+ *  시간을 넘기면 지식이 없는 저장소가 받는 것과 같은 값(knowledgeFilesFrom([]))을 돌려준다 —
+ *  그리고 그 사실을 log 로 남긴다. 로그가 없으면 시간 초과로 빠진 절과 원래 지식이 없는 저장소를
+ *  구별할 방법이 없어, 누군가 증거 없이 사라진 절을 쫓아다니게 된다.
+ *
+ *  **KNOWLEDGE_MAX 만큼 모았다고 훑기를 멈추지 않는다.** docs/architecture/ 아래 서브디렉터리가
+ *  500개면 40개를 채운 뒤로도 나머지 460번을 계속 읽는다는 뜻이지만, 채워지는 대로 멈추면 "어느
+ *  파일이 살아남는가"가 readdir 가 돌려주는 순서 — 플랫폼과 파일시스템이 정하는, 이 코드가 통제할
+ *  수 없는 순서 — 에 달리게 된다. 그러면 같은 저장소가 실행마다 다른 spec 을 받는다. 다 모아서
+ *  순수 계층(knowledgeFilesFrom)이 정렬하고 자르게 하는 것이 결정성을 지키는 유일한 방법이다.
+ *  누군가 이것을 "최적화"하려 들 것이다 — 그 전에 이 문단을 읽으라고 남긴다. */
+export async function knowledgeIn(
+  cwd: string,
+  log: (message: string) => void
+): Promise<KnowledgeFiles> {
+  const scan = (async (): Promise<KnowledgeFiles> => {
+    const found: string[] = []
+    for (const dir of KNOWLEDGE_DIRS) {
+      const entries = await fs
+        .readdir(path.join(cwd, dir), { withFileTypes: true })
+        .catch(() => null)
+      if (!entries) continue // 그 관례를 쓰지 않는 저장소다 — 흔한 경우이고 오류가 아니다
+      for (const e of entries) {
+        // 경로는 항상 슬래시로 적는다 — spec 을 읽는 것이 사람이 아니라 에이전트이고, win32 의
+        // 역슬래시는 그 글에서 이스케이프로 읽힐 수 있다
+        if (e.isFile()) found.push(`${dir}/${e.name}`)
+        else if (e.isDirectory()) {
+          const inner = await fs
+            .readdir(path.join(cwd, dir, e.name), { withFileTypes: true })
+            .catch(() => null)
+          if (!inner) continue // 한 층 아래를 못 읽으면 그것만 건너뛴다
+          for (const f of inner) if (f.isFile()) found.push(`${dir}/${e.name}/${f.name}`)
+        }
+      }
+    }
+    return knowledgeFilesFrom(found)
+  })()
+
+  // 훑기 전체를 하나로 묶어 race 한다 — readdir 호출마다 따로 타이머를 걸면 여섯 번이 곱해져
+  // KNOWLEDGE_SCAN_TIMEOUT_MS 하나로는 전체 예산을 표현할 수 없다. 진 쪽이 남아도 다음 turn에
+  // fs 콜백이 다시 도는 것은 해가 없다 — found 는 이 스코프에 갇혀 있고 아무도 그 결과를 읽지 않는다.
+  let timer!: ReturnType<typeof setTimeout>
+  const timedOut = new Promise<KnowledgeFiles>((resolve) => {
+    timer = setTimeout(() => {
+      log(
+        `orch: knowledge scan timed out after ${KNOWLEDGE_SCAN_TIMEOUT_MS}ms for cwd=${cwd} — dropping knowledge section`
+      )
+      resolve(knowledgeFilesFrom([]))
+    }, KNOWLEDGE_SCAN_TIMEOUT_MS)
+  })
+
+  try {
+    return await Promise.race([scan, timedOut])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export function buildSpecFile(a: {
+  title: string
+  spec: string
+  taskId: string
+  dispatchId: string
+  /** True when this dispatch runs in its own worktree, not the project folder (startWorker derives
+   *  it from `!isSamePath(cwd, a.runCwd)` at its call site below — see the comment there for
+   *  why the derivation lives at that one call site and not here too). **Not** `a.worktree !==
+   *  'current'` — that was the original formula, and it is wrong for a --terminal reuse: the
+   *  --terminal branch sets cwd to a.terminalCwd regardless of what a.worktree says (server.ts
+   *  fills a.worktree in on its own when the caller omits --worktree — the run's worktree, or
+   *  'current' for a run that has none), so a worktree session reused through
+   *  --terminal read as committing:false and shipped its work with no commit obligation at all —
+   *  a real defect this branch hit and fixed, not a hypothetical one. A worktree is merge material;
+   *  an uncommitted change in it is invisible to the merge and is thrown away with the worktree. The
+   *  commit has to be the coding agent's own act — a coding agent can end a turn without
+   *  committing, and the app committing on
+   *  its behalf would be committing content it never reviewed. Requiring it through the spec is the
+   *  same shape as the reporting obligation below: the app assembles the instruction, the worker
+   *  cannot edit it out. */
+  committing?: boolean
+  /** 이 프로젝트가 자기 결정을 적어 둔 파일들(core/knowledge/detect.ts 의 knowledgeFilesFrom).
+   *  없거나 비면 이 절이 아예 붙지 않는다 — 지식이 없는 저장소에서 spec 이 달라지지 않아야 한다.
+   *
+   *  **경로는 상대 경로여야 한다.** 워커는 워크트리에서 돌고 그 cwd 는 프로젝트 폴더가 아니다.
+   *  절대 경로를 받으면 워커가 자기 트리 밖의 문서를 읽어, 자기가 고칠 코드와 다른 트리의 결정을
+   *  본다 — 조용히 어긋나고 결과물에만 나타난다. 상대 경로로 만드는 일은 부르는 쪽(startWorker)이
+   *  한다. */
+  knowledge?: KnowledgeFiles
+  /** 이 Dispatch 가 수리(repair) 라운드일 때만 채워진다. state.ts 의 판정 함수가 연다 — 이 함수는
+   *  그것을 spec 파일의 절로 옮겨 적을 뿐이다. 없으면 파일은 지금까지와 같다. */
+  repair?: RepairSection
+}): string {
+  // 커밋·보고 의무보다 앞에 둔다 — 그 둘은 일이 끝난 뒤의 의무이고 이것은 시작하기 전에 읽을
+  // 것이다. spec 본문 뒤인 이유: 무엇을 하는 일인지 읽은 다음에야 "그 결정이 어디 있는지"가
+  // 쓸모를 갖는다.
+  // 본문을 싣지 않고 경로만 싣는다 — 파일은 저장소에 이미 있고 에이전트에게는 파일 도구가 있다.
+  // 본문을 박으면 spec 이 커지고 그 파일이 바뀌는 순간 낡는다.
+  const knowledgeSection =
+    a.knowledge && a.knowledge.paths.length > 0
+      ? `
+---
+## Project knowledge (assembled by the app — do not delete)
+
+This repository records its own decisions and architecture notes in the files below. Read the ones
+that touch your task **before** you change anything: they say which alternatives were already
+rejected and why, and reopening a closed decision is work that gets thrown away.
+
+Paths are relative to the directory you are working in.
+
+${a.knowledge.paths.map((p) => `  ${p}`).join('\n')}
+${a.knowledge.more > 0 ? `\n  … and ${a.knowledge.more} more file(s) in the project's knowledge directories.\n` : ''}`
+      : ''
+
+  // Inserted before the reporting obligation, not after — a worker that reports first and commits
+  // second can still end its turn (the spec never told it not to) between the two, leaving the
+  // report and the commit racing each other for no reason. Requiring the commit first removes that
+  // race instead of relying on the agent to read ahead.
+  const commitObligation = a.committing
+    ? `
+---
+## Commit obligation (assembled by the app — do not delete)
+
+You are working in a git worktree, not in the project folder. When the work is finished you must
+commit it here: committing is the only way this work leaves this folder. Everything the app does with
+it afterwards — merging it into the project, or into the folder a later task works in — reads
+commits, and an uncommitted change is invisible to all of it. Whatever you do not commit is thrown
+away with this worktree, and nothing else is left of it.
+
+  git add -A
+  git commit -m "<one-line summary of the change>"
+
+Commit before you report below.
+`
+    : ''
+
+  return `# ${a.title}
+
+${a.spec}
+${knowledgeSection}${commitObligation}${a.repair ? repairSection(a.repair) : ''}
+---
+## Reporting obligation (assembled by the app — do not delete)
+
+When the work is finished you must run the following exactly once to report. Without a report the
+orchestrator has no way to know how this task ended.
+
+If \`astera\` in the commands below comes back as command not found, call it as \`"$ASTERA_CLI"\`
+instead — that is the absolute path to the same program, and the variable is always present in this
+session.
+
+  astera send --type worker_done \\
+    --task-id ${a.taskId} --dispatch-id ${a.dispatchId} \\
+    --outcome succeeded --subject "<one-line status>" --body - \\
+    --files-modified "path/a,path/b" --json
+  (body through stdin: three sentences on what you did, what you found, and what is left)
+
+Failure is a terminal report too — use --outcome failed.
+Do not record a failure in the body alone.
+
+After reporting, end your turn and wait at the agent prompt. Do not start more work and do not close
+the terminal yourself. If the orchestrator reuses this terminal, new instructions arrive as input.
+
+### When stuck — ask (blocking)
+
+If a judgement call, missing information, or a permissions problem is preventing progress, do not
+guess:
+
+  astera ask --task-id ${a.taskId} --dispatch-id ${a.dispatchId} \\
+    --question - --options "<choice1,choice2>" --json
+
+It blocks until an answer arrives. On {"answered": true, "answer": "…"}, proceed accordingly. On
+{"timedOut": true} the question is still alive, so do not ask again — keep waiting with the command
+below, as many times as needed.
+
+  astera ask --resume <questionId> --json
+
+If ownership is still valid but the orchestrator needs to step in (notify without blocking):
+
+  astera send --type escalation --task-id ${a.taskId} \\
+    --dispatch-id ${a.dispatchId} --subject "<summary>" --body - --json
+
+Do not copy the code itself into the body — you share a working directory with the orchestrator.
+For files you changed, give the paths through --files-modified.
+`
+}
+
+/** 검토 워커의 spec 파일. buildSpecFile 의 형제이고, 다른 것은 두 가지다 — 판정 기준이 원래 Task 의
+ *  요구라는 것, 그리고 **코드를 바꾸지 말라는 것.**
+ *
+ *  검토자가 고치기 시작하면 그것은 구현이고 그 변경은 아무도 검증하지 않는다: 검증은 이미 지나갔고
+ *  검토자를 검토하는 층은 없다. */
+export function buildReviewSpecFile(a: {
+  title: string
+  spec: string
+  taskId: string
+  dispatchId: string
+  implReport?: string
+  filesModified?: string[]
+  /** 검증 구성이 걸려 있었고 통과했는가. 검토자가 컴파일·테스트를 다시 판정하지 않게 하는 근거다 */
+  validated: boolean
+  /** 이 프로젝트가 자기 결정을 적어 둔 파일들. 구현자의 spec 과 **같은 목록**을 받는다
+   *  (knowledgeIn). 검토자에게 이것을 주는 이유: 이 기능이 있는 목적이 에이전트가 닫힌 결정을 다시
+   *  열지 않게 하는 것이고, **다시 열렸는지 잡는 것이 검토자의 일**이다. 목록을 안 주면 그 자리가
+   *  빈다. 없거나 비면 이 절이 붙지 않는다. */
+  knowledge?: KnowledgeFiles
+  /** 통과한 check 들(설계 §8.1). 없거나 비면 절이 붙지 않는다 */
+  checks?: CheckResult[]
+  /** 직전 라운드의 이슈. blocking 만 싣는다 — 리뷰어가 "고쳐졌는지" 확인할 것들이다 */
+  previousIssues?: ReviewIssue[]
+  /** check 의 동작을 바꾸는 파일들(설계 §8.3) */
+  suspiciousFiles?: string[]
+  /** 완료 정책의 지문이 라운드 사이에 달라졌다(2조각 설계 G3, 명세 §36·§37). 의심 파일과 같은 자리,
+   *  같은 이유로 실린다 — 앱은 표시만 하고 판정은 리뷰어의 몫이다 */
+  policyChanged?: boolean
+  /** 구조화된 판정을 쓸 파일. `<specPath>.review.json` — 서버가 같은 규칙으로 읽는다(server.ts).
+   *  **convergence Run에서만 있다.** 그 파일을 읽는 것은 server.ts 가 policyOf(...) !== null 일
+   *  때뿐이므로(applyReviewResult 로 넘어가는 그 한 경로), 없는 Run 에 이 절을 실으면 "파싱 실패는
+   *  사람에게 간다"는 거짓말을 하게 된다(전체 브랜치 리뷰, Important 1) — 그래서 없으면 절 자체가
+   *  붙지 않는다. */
+  resultPath?: string
+}): string {
+  // 구현자용 문구를 그대로 쓰지 않는다. 구현자는 "고치기 전에 읽어라"를 받고, 검토자는 "다시 열린
+  // 결정은 구체적 결함이다"를 받아야 한다 — 같은 글을 두 번 실으면 이 자리가 값을 못 낸다.
+  // **좁혀 둔 판정 기준을 넓히지 않는다.** 아래 "The one question you answer" 가 취향으로 반려하는
+  // 것을 일부러 막아 두었으므로, 이 절도 "결정을 다시 연 것"만 결함이라 말하고 그 결정 자체와
+  // 다투는 것은 범위 밖이라고 못박는다.
+  const knowledgeSection =
+    a.knowledge && a.knowledge.paths.length > 0
+      ? `
+## The project's own decisions (assembled by the app — do not delete)
+
+This repository records its decisions and architecture notes in the files below. The implementer was
+handed the same list. They bind this work the way the requirement above does.
+
+Read the ones this change touches. **A decision that was reopened is a concrete finding, not a matter
+of taste** — if the work takes a path one of these files rejected, name the file and what it settled.
+That is the same kind of ground as a change contradicting the spec.
+
+What is **not** ground for rejection is disagreeing with a decision yourself. These are the project's
+settled positions; re-litigating one is outside this review.
+
+${a.knowledge.paths.map((p) => `  ${p}`).join('\n')}
+${a.knowledge.more > 0 ? `\n  … and ${a.knowledge.more} more file(s) in the project's knowledge directories.\n` : ''}`
+      : ''
+
+  // 아래 "## What is already decided" 의 validated:false 문장과 공유한다 — 그 문장은 "빌드·테스트에
+  // 대해 아무것도 증명되지 않았다"고 말하는데, checks 에 통과한 것이 있으면 같은 파일 안에서 그
+  // 말과 이 절이 서로 부딪힌다(리뷰 fix 1차, Important 1). 그래서 그 문장은 이 목록이 비어 있을
+  // 때만 나온다.
+  const passedChecks = a.checks?.filter((c) => c.status === 'passed') ?? []
+  const checksSection = passedChecks.length
+    ? `
+## Checks that ran
+
+The project's own configurations below were run against this work and passed. Do not re-judge them.
+
+${passedChecks.map((c) => `- ${c.name}`).join('\n')}
+`
+    : ''
+  const previous = (a.previousIssues ?? []).filter((i) => i.blocking)
+  const previousSection = previous.length
+    ? `
+## Previous review round
+
+A reviewer found these blocking issues in the last round and the implementer was sent back to fix them.
+Each one must be **verified as addressed** — an issue that is still there is a finding on its own.
+
+${previous.map((i, n) => `${n + 1}. ${i.severity.toUpperCase()} — ${i.title}${i.file ? ` — ${i.file}${i.line !== undefined ? `:${i.line}` : ''}` : ''}`).join('\n')}
+`
+    : ''
+  const suspiciousSection = a.suspiciousFiles?.length
+    ? `
+## Files that change how the checks run
+
+This attempt touched files that decide what the checks do. Scrutinise these first: a change here can make
+a check pass without making the work correct.
+
+${a.suspiciousFiles.map((f) => `- ${f}`).join('\n')}
+`
+    : ''
+  const policySection = a.policyChanged
+    ? `
+## The completion policy changed while this task was being repaired
+
+What the checks are, or what they run, is not what it was when this task started. That is allowed — a
+person may have fixed a broken check on purpose — but it is also how a task gets "finished" without
+being correct.
+
+Judge the change itself: did it make a check ask for less? If it did, say so as a finding. If it fixed
+a check that was wrong, say that too, so the record shows it was looked at.
+`
+    : ''
+  // "The one question you answer" 뒤에 온다(리뷰 fix 1차, Important 3) — 무엇이 결함인지 먼저 읽은
+  // 다음에야 "판단을 어디에 적을지"가 뜻을 갖는다. 순서를 뒤집으면 리뷰어가 "어떤 심각도로 적을지"를
+  // "무엇이 결함으로 치는지" 보다 먼저 듣는다.
+  //
+  // **resultPath 가 없으면 절 자체가 붙지 않는다(전체 브랜치 리뷰, Important 1).** convergence 가
+  // 없는 Run 에서는 server.ts 가 이 파일을 절대 읽지 않으므로, 여기서 "파싱 실패는 사람에게 간다"고
+  // 말하면 그 Run 에는 거짓이다 — 없는 정책의 흔적을 검토자에게 심지 않는다.
+  const verdictSection = a.resultPath
+    ? `
+## Structured verdict
+
+Before you report, write your findings to this file (create it; the directory exists). The file
+contains that JSON object and nothing else — no fences, no commentary: a parse failure sends this Run
+to a human, so anything you put around the JSON breaks it.
+
+  ${a.resultPath.replace(/\\/g, '/')}
+
+  { "issues": [ { "severity": "critical|high|medium|low|info", "title": "…", "description": "…",
+                  "file": "src/x.ts", "line": 42, "suggestedFix": "…" } ] }
+
+Every finding goes in, at the severity you judge. \`title\` is required; \`description\`, \`file\`,
+\`line\` and \`suggestedFix\` are optional. An empty list means you found nothing. The app decides
+which severities block; you decide the severity.
+Then report as below — \`--outcome failed\` when the requirement is not satisfied.
+`
+    : ''
+
+  return `# Review: ${a.title}
+
+You are reviewing work another agent finished. **Do not change any code.** Read, judge, report.
+
+## The requirement this work has to satisfy
+
+${a.spec}
+
+## What the implementer reported
+
+${a.implReport?.trim() || '(nothing was reported)'}
+
+## Files the implementer says it changed
+
+${a.filesModified?.length ? a.filesModified.map((f) => `- ${f}`).join('\n') : '(none reported)'}
+
+## What is already decided — do not re-judge it
+
+${
+  a.validated
+    ? 'The project\'s own build/test configuration was run against this work and it passed. Whether the code compiles and the tests run is settled.'
+    : passedChecks.length
+      ? ''
+      : 'No automated validation was attached to this task, so nothing has been proven about the build or the tests. Say so in your report if that matters for the requirement, but do not run the build yourself — that is not what you were started for.'
+}
+
+${knowledgeSection}${checksSection}${previousSection}${suspiciousSection}${policySection}
+## The one question you answer
+
+**Was the requirement above satisfied?** Not "is this the code I would have written", not "could this be
+structured better" — those are not grounds for rejecting the work, because a rejection sends this task
+back through the retry flow and a third rejection breaks the circuit and stops the whole dependency
+subtree behind it.
+
+Reject when the work does not do what was asked: a missing case, a requirement addressed in name only, a
+change that contradicts the spec. Say concretely what is missing, because your body text is the only
+record the next attempt gets.
+${verdictSection}
+---
+## Reporting obligation (assembled by the app — do not delete)
+
+When you have made your judgement you must run the following exactly once. Without a report the task
+stays in \`reviewing\` and nothing moves.
+
+If \`astera\` in the commands below comes back as command not found, call it as \`"$ASTERA_CLI"\`
+instead — that is the absolute path to the same program, and the variable is always present in this
+session.
+
+  astera send --type worker_done \\
+    --task-id ${a.taskId} --dispatch-id ${a.dispatchId} \\
+    --outcome succeeded --subject "<one-line verdict>" --body - <<'EOF'
+  <why the requirement is satisfied>
+  EOF
+
+Use \`--outcome failed\` instead when it is not satisfied, and put what is missing in the body.
+`
+}
+
+export class OrchCoordinator {
+  private readonly idleWaitTimeoutMs: number
+
+  constructor(private deps: CoordinatorDeps) {
+    this.idleWaitTimeoutMs = deps.idleWaitTimeoutMs ?? DEFAULT_IDLE_WAIT_TIMEOUT_MS
+  }
+
+  /** Polls while isBusy is true. null (cannot be decided) and false (idle) pass through immediately
+   *  — the tri-state branch lives in this one place only (no per-provider branching in the
+   *  coordinator). Past the limit it does not give up, it just injects anyway — the point is to
+   *  reduce the chance of colliding with the user's input, not to prevent the injection itself (an
+   *  unbounded wait would leave the caller's worker-start permanently unfinished). */
+  private async waitUntilIdle(sessionId: string): Promise<void> {
+    const deadline = Date.now() + this.idleWaitTimeoutMs
+    while (this.deps.isBusy(sessionId) === true) {
+      if (Date.now() >= deadline) {
+        this.deps.log(
+          `orch: idle wait timed out after ${this.idleWaitTimeoutMs}ms for session=${sessionId} — injecting anyway`
+        )
+        return
+      }
+      await sleep(IDLE_POLL_MS)
+    }
+  }
+
+  /**
+   * The server has already created the dispatchId (after committing openDispatch) and passes it in —
+   * this method never touches OrchState and only produces side effects such as the session process,
+   * the worktree and the spec file. On failure it simply throws — cleaning up the state (the
+   * rollback) is the server's job.
+   */
+  async startWorker(a: {
+    dispatchId: string
+    taskId: string
+    title: string
+    spec: string
+    /** The finished spec file, when the caller assembled it itself. `spec` above is a **body** —
+     *  buildSpecFile wraps it in the implementer's template (an H1, then the reporting obligation with
+     *  --files-modified and the escalation boilerplate). A review dispatch needs a different file, not
+     *  a different body: buildReviewSpecFile already carries its own H1 and its own obligation, and
+     *  wrapping it would append "give the paths through --files-modified" underneath a file whose
+     *  first instruction is "do not change any code" — two contradicting instruction sets in one
+     *  file. So the caller hands the whole file over and this skips the builder. Not named specFile:
+     *  specPath in the return value already means a location and the two must not read alike. */
+    specFileContent?: string
+    provider: Provider
+    accountId: string
+    /** 이 워커의 롤링 체인 — 첫 원소가 이 Dispatch 의 계정이고, 나머지는 한도에 걸렸을 때 갈아탈
+     *  순서다. 배선이 accountToDispatchOn 에서 받아 그대로 넘긴다(Task.accountIds 가 원천).
+     *  **required 인 이유는 rollAccountIds 와 같다** — optional 이면 넘기지 않아도 typecheck 가
+     *  통과하고, 그때 워커는 조용히 계정 하나짜리 체인으로 돌아간다. */
+    rollAccountIds: string[]
+    /** Run.cwd — the base cwd when worktree is 'current', and the base a new worktree forks from.
+     *  The commit obligation below derives from `cwd !== runCwd`, which is what makes a worker in a
+     *  worktree commit and a worker standing on runCwd not.
+     *
+     *  **The scheduler's placement no longer sends 'current'** — it sends the run's worktree as an
+     *  explicit path (src/main/ipc.ts). Two callers still do: the review dispatch, which passes the
+     *  implementer's tree as runCwd so 'current' lands the reviewer in exactly that tree with no
+     *  commit obligation, and the CLI, where a person may write `--worktree current` directly. */
+    runCwd: string
+    worktree: string
+    name?: string
+    terminal?: string
+    /** cwd, provider and accountId of the dispatch being reused. Used only when --terminal is given.
+     *  The server is the one that knows about the previous dispatch (the coordinator does not read
+     *  state). */
+    terminalCwd?: string
+    terminalProvider?: Provider
+    terminalAccountId?: string
+    /** Set by recovery (P1 design §6). `nativeSessionId` makes this a provider-native resume rather
+     *  than a fresh conversation; `briefing` is appended to the spec file before the agent is
+     *  launched, which is the Smart Resume path's whole difference from a plain re-dispatch. */
+    resume?: { nativeSessionId?: string; briefing?: string }
+    /** launchPrompt 대신 쓸 문구 — resume 이 아닐 때만이다(provider-native resume 은 언제나
+     *  resumeWorkerPrompt 를 이긴다: 이어지는 대화에는 그 문구가 맞다). 부르는 쪽은 specPath 를
+     *  아직 모르므로(coordinator 가 정한다) 리터럴 토큰 `{specPath}` 를 넣어 넘기고, 여기서
+     *  실제 경로로 치환한다 — repairWorkerPrompt('{specPath}') 가 그렇게 쓰인다. 치환은
+     *  LAUNCH_FORBIDDEN 검사보다 먼저 끝나 있어야 한다: 그 검사는 실제로 보내는 문자열을 봐야
+     *  한다. */
+    launchPhrase?: string
+  }): Promise<{ sessionId: string; cwd: string; specPath: string }> {
+    const actual = this.deps.accountProvider(a.accountId)
+    if (actual === null) throw new Error(`unknown account: ${a.accountId}`)
+    if (actual !== a.provider)
+      throw new Error(`account provider mismatch: account is ${actual}, --agent is ${a.provider}`)
+
+    if (a.terminal) {
+      // A reuse cannot inject under a provider or account different from the one actually running in
+      // that terminal — this blocks mismatches such as recording a claude-account dispatch against a
+      // codex terminal.
+      if (a.terminalProvider !== undefined && a.terminalProvider !== a.provider)
+        throw new Error(
+          `terminal provider mismatch: terminal is ${a.terminalProvider}, --agent is ${a.provider}`
+        )
+      if (a.terminalAccountId !== undefined && a.terminalAccountId !== a.accountId)
+        throw new Error(
+          `terminal account mismatch: terminal is ${a.terminalAccountId}, --account is ${a.accountId}`
+        )
+    }
+
+    // The LAUNCH_FORBIDDEN check runs before any side effect (creating the worktree, writing the spec
+    // file) — it throws before anything has been touched. It used to run after the worktree was
+    // created, which was too late. **The reason it can be computed here has changed**: it used to be
+    // because the prompt was built only from taskId and dispatchId (hex ids the app generates), and
+    // now it is because **specsDir is an injected value too and so is known up front**.
+    //
+    // In exchange, this check can now actually fire — the prompt contains a <userData> absolute path
+    // and that path contains the username (a Windows username may contain `&` or `^`). So the error
+    // has to point at the cause, and the wiring runs the same check at boot to leave a warning
+    // (ipc.ts bootOrch).
+    const specName = specFileName(a.taskId, a.dispatchId)
+    const specPath = path.join(this.deps.specsDir, specName)
+    // Backslashes become forward slashes: the worker also handles this path through its Bash tool,
+    // and `\` is the shell's escape character (the lesson the sh shuttle taught — the same rule as
+    // forSh in shuttle.ts). `C:/Users/...` works with both the Windows API and bash. specPath itself
+    // (the path the file is written to) is left as is.
+    // A provider-native resume (a.resume.nativeSessionId) is told a different, shorter phrase
+    // (resumeWorkerPrompt) instead of the launch prompt — computed here, before the FORBIDDEN check
+    // below, so that check runs against whichever one is actually used. It carries the same specPath
+    // as the launch prompt, so the same win32 cmd.exe /c risk applies to it.
+    const resumeSessionId = a.resume?.nativeSessionId
+    // launchPhrase.split(...).join(...) rather than .replace('{specPath}', specPath) — replace's
+    // string-replacement form parses $&, $`, $', $$ and $<name> out of the *replacement* argument,
+    // and specPath is an arbitrary filesystem path that can legally contain any of those sequences
+    // (none of them are in LAUNCH_FORBIDDEN). split/join treats the replacement as inert text.
+    const prompt = resumeSessionId
+      ? resumeWorkerPrompt(specPath.replace(/\\/g, '/'), a.taskId, a.dispatchId)
+      : a.launchPhrase
+        ? a.launchPhrase.split('{specPath}').join(specPath.replace(/\\/g, '/'))
+        : launchPrompt(specPath.replace(/\\/g, '/'))
+    const forbidden = prompt.match(LAUNCH_FORBIDDEN)
+    if (forbidden)
+      throw new Error(
+        `launch prompt contains forbidden character ${forbidden[0]} — it comes from the spec ` +
+          `directory path (specsDir=${this.deps.specsDir}); win32 cmd.exe /c wrapping breaks ` +
+          `quoting on ["&|<>^%]`
+      )
+
+    const promptWrite = (phase: PromptWriteEvent['phase'], via: PromptWriteEvent['via']): void =>
+      this.deps.onPromptWrite?.({ dispatchId: a.dispatchId, taskId: a.taskId, phase, via, promptLength: prompt.length, specPath })
+
+    let cwd: string
+    if (a.terminal) {
+      // For a reuse the session's own cwd is used as is — a session cannot be moved
+      if (!a.terminalCwd) throw new Error(`unknown terminal: ${a.terminal}`)
+      cwd = a.terminalCwd
+      if (!this.deps.isAlive(a.terminal))
+        throw new Error(`terminal session is not alive: ${a.terminal}`)
+    } else if (a.worktree === 'new') {
+      if (!a.name) throw new Error('--name is required for --worktree new')
+      cwd = (await this.deps.createWorktree({ repoPath: a.runCwd, name: a.name })).path
+    } else if (a.worktree === 'current') {
+      cwd = a.runCwd
+    } else {
+      // A worktree given as a path (an arbitrary string the orchestrator LLM produced) — check that
+      // it exists first. If the fs.mkdir({recursive:true}) below materialized the parents as well it
+      // would defeat SessionManager.spawn's CWD_MISSING guard (core/sessions/manager.ts) and let a
+      // worker boot in an empty directory that is not a repository.
+      const stat = await fs.stat(a.worktree).catch(() => null)
+      if (!stat || !stat.isDirectory())
+        throw new Error(`worktree path does not exist: ${a.worktree}`)
+      cwd = a.worktree
+    }
+
+    // specPath has nothing to do with cwd (it was settled above) — the wiring creates this directory
+    // at boot, but the user can delete it in the meantime, so the mkdir stays.
+    await fs.mkdir(path.dirname(specPath), { recursive: true })
+    // committing asks one question — "does this worker run somewhere other than the project
+    // folder" — and cwd is the only place that question has a single, already-settled answer.
+    // a.worktree looks like the same fact but is not: it is only one of the four inputs that decide
+    // cwd above, and the --terminal branch ignores it outright (cwd becomes a.terminalCwd no matter
+    // what a.worktree says). Deriving from a.worktree would silently disagree with reality for a
+    // --terminal reuse of a worktree session, which is exactly the "call reused, --worktree not
+    // repeated" shape server.ts's default makes the common case, not a rare one (that default is
+    // the run's worktree, or 'current' for a run that has none — either way it is not the tree the
+    // reused session is standing in). cwd !== a.runCwd covers all four branches with one comparison:
+    // 'current' sets cwd = a.runCwd (false), 'new' and an explicit path set cwd to somewhere else
+    // (true unless the explicit path happens to equal runCwd, which is correctly false — it is the
+    // project folder either way), and --terminal carries whatever the original dispatch actually
+    // used.
+    //
+    // isSamePath (not ===) because a.runCwd and a.terminalCwd are recorded independently (Run.cwd
+    // vs a Dispatch's cwd field) and can name the same folder with different casing or separators
+    // (a Windows drive letter typed/stored as `d:` vs `D:`, or `\` vs `/`) without being different
+    // folders. isSamePath already carries this normalization for the same "same folder" question
+    // elsewhere (view.ts's project ownership check, ipc.ts's home-path check), so it is reused here
+    // rather than inventing a fresh comparison: separators unified by path.resolve, case folded where
+    // the filesystem ignores it (win32, darwin — foldPathCase in core/files/paths.ts) and kept on linux.
+    await fs.writeFile(
+      specPath,
+      // The caller may have assembled the file already (a review dispatch does — see
+      // specFileContent). Only when it did not does the implementer's template get built here.
+      a.specFileContent ??
+        buildSpecFile({
+          title: a.title,
+          spec: a.spec,
+          taskId: a.taskId,
+          dispatchId: a.dispatchId,
+          committing: !isSamePath(cwd, a.runCwd),
+          knowledge: await knowledgeIn(cwd, this.deps.log)
+        }),
+      'utf8'
+    )
+    // Recovery's briefing (a.resume.briefing) is appended after the spec file is written and before
+    // the agent is launched — this is the Smart Resume path's whole difference from a plain
+    // re-dispatch, and the resume prompt above tells the agent to read it there.
+    if (a.resume?.briefing)
+      await fs.appendFile(
+        specPath,
+        `\n---\n## Resume briefing (assembled by the app — do not delete)\n\n${a.resume.briefing}\n`,
+        'utf8'
+      )
+
+    let finalSessionId = a.terminal ?? ''
+    if (a.terminal) {
+      // **A reuse inherits the rolling chain of the session it lands in — a.rollAccountIds is not
+      // applied here.** A chain is registered when a session is spawned (the rollAccountIds argument in
+      // the else branch below), and this branch never spawns: it types the prompt into a session that is
+      // already running, so the chain the rolling coordinator holds for that session stays whatever the
+      // dispatch that created it was given.
+      //
+      // While every chain had one entry this was harmless. With a per-Task account list it is not: a
+      // Task placed into a session that was started for the list [max, pro] can be moved onto pro when
+      // that session runs out on max, even though its own list names max alone — an account this Task
+      // was never assigned. The reverse also holds: a Task with two accounts placed into a
+      // single-account session has nowhere to move and waits instead.
+      //
+      // **Not fixed here on purpose.** Retargeting a live chain means rebuilding the rolling
+      // coordinators' cycle and recovery state (which account the session sits on, how far around the
+      // cycle it is, what a restart may resume), which needs its own review. The orchestration guide
+      // says the same thing where it describes --terminal, so a coordinator is told not to mix the two.
+      await this.waitUntilIdle(a.terminal)
+      promptWrite('requested', 'typed')
+      this.deps.writeToSession(a.terminal, prompt)
+      await sleep(ENTER_DELAY_MS)
+      this.deps.writeToSession(a.terminal, '\r')
+      promptWrite('confirmed', 'typed')
+    } else {
+      // bypassPermissions is not passed **from here** — it is decided now, but not by this module:
+      // the value is the app-wide AgentPermissionMode, and this file cannot read app settings (it
+      // takes deps and stays testable). The wiring fills the field in as it spawns, and the reason
+      // the default moved from "stall" to "bypass" is written there (startCoordinator in
+      // src/main/ipc.ts). Leaving the field unset here is what lets that happen.
+      promptWrite('requested', 'argv')
+      const spawned = await this.deps.spawnSession({
+        accountId: a.accountId,
+        cwd,
+        // The tab title is task.title (no UI change, only the title) — without it the worker tab
+        // comes up under the worktree basename and the user cannot tell which task it is
+        title: a.title,
+        // **한도에 걸린 워커가 스스로 이어지게 하는 것이 이 한 줄이다.** 이 값을 넘기면 배선의
+        // spawnSession 이 그 세션을 롤링 코디네이터에 등록하고(ipc.ts), 롤링은 계정이 둘 이상인
+        // 체인에서는 다음 계정으로 갈아타고, 하나뿐인 체인에서는 갈아탈 곳이 없어 리셋까지 기다린
+        // 뒤 이어간다 — 다만 기다린 뒤의 방식은 런타임마다 다르다: claude 는 죽이지 않고 같은
+        // 세션에서 재개하고, codex 는 항상 죽이고 새 세션으로 재기동한다(rollAccountIds 필드의
+        // JSDoc 참고). 넘기지 않던 동안 한도에 걸린 워커는 살아 있지만 멈춘 채 남았고, 사람이
+        // 다시 띄워야 했다.
+        rollAccountIds: a.rollAccountIds,
+        // 재개 문구도 워커의 것을 준다. 넘기지 않으면 롤링은 앱의 UI 언어 문구를 타이핑하는데,
+        // 그것은 워커에게 두 가지로 틀리다: 영어로 지시받은 워커가 다른 언어로 재개되고, 문구가
+        // "계속하라" 여서 끝내고 보고하라는 의무(buildSpecFile 의 Reporting obligation)를 상기시키지
+        // 않는다. 명령의 모양과 식별자는 그 spec 절과 같은 것을 쓴다 — 워커가 이미 읽은 문장이다.
+        // 금지 문자를 넣지 않는다: codex 는 이 문구를 CLI 인자로 넘긴다(LAUNCH_FORBIDDEN).
+        rollPrompt:
+          `Continue the work. When it is finished, report exactly once as the reporting obligation ` +
+          `in your spec file says, with astera send --type worker_done --task-id ${a.taskId} ` +
+          `--dispatch-id ${a.dispatchId}.`,
+        ...(resumeSessionId ? { resumeSessionId } : {}),
+        // codex takes the resume phrase as its own argument after `resume <id>`; claude takes it as
+        // the positional prompt after `--resume <id>` (core/sessions/commands.ts) — so claude gets it
+        // as initialPrompt, same as an ordinary (non-resuming) start.
+        ...(resumeSessionId && a.provider === 'codex' ? { resumePrompt: prompt } : { initialPrompt: prompt })
+      })
+      finalSessionId = spawned.id
+      promptWrite('confirmed', 'argv')
+    }
+
+    return { sessionId: finalSessionId, cwd, specPath }
+  }
+
+  /** Deciding whether that session may be closed (whether it is retained, whether this is the latest
+   *  owner of a reused session) is done up front by the server, which can see the state — the
+   *  coordinator only receives the verdict and calls killSession (the principle that the coordinator
+   *  does not read state). */
+  async releaseWorker(a: {
+    sessionId: string
+    /** Cleanup held back at the user's request (worker-retain) */
+    retained: boolean
+    /** Is this dispatch the most recent one that owns this sessionId. A reused session is owned by a
+     *  more recent dispatch, so closing it when this is not that dispatch kills someone else's
+     *  worker. */
+    isLatestOwner: boolean
+  }): Promise<void> {
+    if (a.retained) {
+      // Not skipped silently — there used to be neither a log nor anything in the response, so the
+      // state where the session is alive while the orchestrator believes it was cleaned up left no
+      // trace at all. Signalling it in the response is the server's job (skipped:'retained' for
+      // worker-release, 409 for worker-stop).
+      this.deps.log(`orch: release skipped — retained dispatch, session=${a.sessionId} is left alive`)
+      return
+    }
+    if (!a.isLatestOwner) return
+    await this.deps.killSession(a.sessionId)
+  }
+
+  /** Ends a coordinator session a hand-over just started and cannot use, because another coordinator
+   *  already holds the Run's slot (Task 1 fix round 1, I2). The server decided; this only kills. */
+  async stopSession(sessionId: string): Promise<void> {
+    await this.deps.killSession(sessionId)
+  }
+}

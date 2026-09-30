@@ -18,6 +18,17 @@ export class RollCycle {
     return this.idx
   }
 
+  /** The consecutive-block streak — written into a rolling snapshot (S6 R4). */
+  get streakCount(): number {
+    return this.streak
+  }
+
+  /** Puts a snapshot's position back (S6 R4): another process wrote the chain down, this one carries it on. */
+  restore(index: number, streak: number): void {
+    this.idx = index
+    this.streak = streak
+  }
+
   /** Limit detected -> roll to the next account, unless the consecutive-block streak is a multiple of the account count (a whole cycle blocked), in which case instruct a wait */
   onLimit(): CycleAction {
     this.streak++
@@ -29,7 +40,7 @@ export class RollCycle {
    *  this, it waits again at the next multiple).
    *  Note: the coordinator now decides the target and the time itself via planRetry, based on the reset
    *  time, so this method and the retryAt/waitMs arguments of the wait action are not called from
-   *  rolling.ts. They are kept to document and test the unit contract (the streak cycling rule). */
+   *  claudeCoordinator.ts. They are kept to document and test the unit contract (the streak cycling rule). */
   onWaitElapsed(): CycleAction {
     return { type: 'roll', toIndex: (this.idx + 1) % this.count }
   }

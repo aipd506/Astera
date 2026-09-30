@@ -75,7 +75,9 @@ export function PaneGrid({
   onRenameEnd,
   renderEditor,
   renderRecord,
-  renderBrowser
+  renderBrowser,
+  appTabInfo,
+  renderApp
 }: {
   layout: PaneNode | null
   activePaneId: string | null
@@ -139,6 +141,11 @@ export function PaneGrid({
    *  for every browser tab, active or not — the page inside has state to keep, so the slot follows
    *  the session-slot rule (mounted for life, hidden with display:none). */
   renderBrowser: (browserTabId: string) => React.ReactNode
+  /** An app mirror tab's chip data by session, or null when neither a session nor a workspace is known
+   *  for it (the tab is then skipped, as a gone session's is). */
+  appTabInfo: (sessionId: string) => { title: string; running: boolean; open: boolean } | null
+  /** An app mirror tab's body. Drawn only while active, the record slot rule: a JPEG keeps no state. */
+  renderApp: (appTabId: string) => React.ReactNode
 }): React.JSX.Element {
   const { t } = useI18n()
   const hostRef = useRef<HTMLDivElement>(null)
@@ -395,6 +402,27 @@ export function PaneGrid({
           </div>
         )
       })}
+      {/* The app mirror slot: the record slot's rule, drawn only while active. */}
+      {paneLeaves.map((l) => {
+        const rect = rects.get(l.id)
+        if (!rect || parseTab(l.activeTabId)?.kind !== 'app') return null
+        return (
+          <div
+            key={`app-${l.id}`}
+            className="terminal-slot"
+            style={{
+              display: 'flex',
+              left: `${rect.x}%`,
+              width: `${rect.w}%`,
+              top: `calc(${rect.y}% + var(--pane-tabbar-h))`,
+              height: `calc(${rect.h}% - var(--pane-tabbar-h))`
+            }}
+            onMouseDown={() => onFocusPane(l.id)}
+          >
+            {renderApp(l.activeTabId)}
+          </div>
+        )
+      })}
       {/* The pane bodies' drop targets — one per pane, whichever kind of tab that pane is showing. They
           cannot live on the slots: a session slot is display:none unless it is the active tab, so a pane
           showing a file had no target, and putting them on the editor slot as well would give one pane two
@@ -489,6 +517,11 @@ export function PaneGrid({
                 // (UnderstandingIcons' RECORD_GLYPH_COLOR)
                 glyphColor: status ? RECORD_GLYPH_COLOR[status] : null
               }
+            }
+            if (ref?.kind === 'app') {
+              const info = appTabInfo(ref.id)
+              if (!info) return null
+              return { tabId, kind: 'app', sessionId: ref.id, title: info.title, running: info.running, open: info.open }
             }
             if (ref?.kind === 'browser') {
               const b = browserTabOf.get(tabId)

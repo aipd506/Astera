@@ -18,6 +18,7 @@ interface HarnessNotifier {
   onHookEvent: (sessionId: string, payload: unknown) => void
   onRollState: (ev: RollStateEvent) => void
   setActiveSession: (sessionId: string | null) => void
+  announceOffline: (count: number, sessionId?: string) => void
 }
 
 interface Harness {
@@ -50,7 +51,8 @@ function harness(flags: Partial<DesktopNotifySettings> = {}, sessions = ['s1', '
     // the whole method went away with the per-event read it existed for).
     onHookEvent: (sessionId, payload) => attention.onHookEvent(sessionId, payload),
     onRollState: (ev) => real.onRollState(ev),
-    setActiveSession: (sessionId) => real.setActiveSession(sessionId)
+    setActiveSession: (sessionId) => real.setActiveSession(sessionId),
+    announceOffline: (count, sessionId) => real.announceOffline(count, sessionId)
   }
   return { notifier, shown, focused }
 }
@@ -99,6 +101,39 @@ describe('DesktopNotifier — the three events', () => {
     h.notifier.onRollState(roll())
     h.notifier.onRollState(roll({ state: 'switching', accountLabel: 'spare' }))
     expect(h.shown).toHaveLength(0)
+  })
+
+  // The two events the capture records for `astera sessions list` are no desktop event either.
+  it('UserPromptSubmit and StopFailure show nothing', () => {
+    const h = harness({ accountSwitched: true })
+    h.notifier.onHookEvent('s1', { hook_event_name: 'UserPromptSubmit', prompt: 'go' })
+    h.notifier.onHookEvent('s1', { hook_event_name: 'StopFailure', error: 'rate_limit' })
+    h.notifier.onHookEvent('s1', { hook_event_name: 'PreToolUse', tool_use_id: 't1' })
+    h.notifier.onHookEvent('s1', { hook_event_name: 'UserPromptSubmit', prompt: 'again' })
+    expect(h.shown).toHaveLength(0)
+  })
+
+  // A turn an API error ended is a turn end (StopFailure fires instead of Stop). It shows nothing
+  // itself, like Stop, but it has to put the session back to idle: otherwise a `waiting` it left
+  // standing swallows the next prompt, which is then no transition into `waiting` and fires nothing.
+  it('after a turn ended by an API error, the next prompt fires again', () => {
+    const h = harness()
+    h.notifier.onHookEvent('s1', { hook_event_name: 'PreToolUse', tool_use_id: 't1' })
+    h.notifier.onHookEvent('s1', { hook_event_name: 'Notification', notification_type: 'permission_prompt' })
+    expect(h.shown.map((s) => s.event)).toEqual(['inputNeeded'])
+    h.notifier.onHookEvent('s1', {
+      session_id: 'cc-1',
+      transcript_path: 'D:/t.jsonl',
+      cwd: 'D:/work',
+      hook_event_name: 'StopFailure',
+      error: 'authentication_failed',
+      last_assistant_message: 'Invalid API key · Please run /login'
+    })
+    expect(h.shown).toHaveLength(1) // the error itself is no desktop event
+    // An MCP server's question comes with no PreToolUse in front of it, so nothing but the turn end
+    // can have taken the session out of `waiting` before it.
+    h.notifier.onHookEvent('s1', { hook_event_name: 'Notification', notification_type: 'elicitation_dialog' })
+    expect(h.shown.map((s) => s.event)).toEqual(['inputNeeded', 'inputNeeded'])
   })
 
   it('other hook events and other roll states are ignored', () => {
@@ -325,5 +360,36 @@ describe('DesktopNotifier — what the notification carries', () => {
     const h = harness({ accountSwitched: true })
     h.notifier.onRollState(roll({ state: 'switching' }))
     expect(h.shown).toHaveLength(0)
+  })
+})
+
+describe('DesktopNotifier — the restored wait and the offline notice (S6 Task 5)', () => {
+  // D7: a waiting with reattach is the restored wait of a session taken back after a restart.
+  it('does not fire limitWaiting for a waiting that carries reattach', () => {
+    const h = harness()
+    h.notifier.onRollState(roll({ reattach: true }))
+    expect(h.shown).toEqual([])
+  })
+
+  it('shows one aggregated notice, even when focused on that session', () => {
+    const h = harness()
+    h.focused.value = true
+    h.notifier.setActiveSession('s1')
+    h.notifier.announceOffline(3, 's1')
+    expect(h.shown).toEqual([
+      { event: 'limitWaiting', sessionId: 's1', title: 'Astera', body: 'While Astera was away from the Host, 3 session(s) hit a usage limit' }
+    ])
+  })
+
+  it('shows nothing for zero, or with limitWaiting off whatever accountSwitched says (fix round 1, M3)', () => {
+    const h = harness()
+    h.notifier.announceOffline(0)
+    expect(h.shown).toEqual([])
+    const switchOnly = harness({ limitWaiting: false, accountSwitched: true })
+    switchOnly.notifier.announceOffline(2)
+    expect(switchOnly.shown).toEqual([])
+    const waitOnly = harness({ limitWaiting: true, accountSwitched: false })
+    waitOnly.notifier.announceOffline(2)
+    expect(waitOnly.shown.length).toBe(1)
   })
 })

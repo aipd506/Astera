@@ -38,6 +38,21 @@ function LoadingDots(): React.JSX.Element {
   )
 }
 
+type ScanState = { active: boolean; done: number; total: number }
+
+/** "Scanning Codex history… N/M" — shown while the codex rollout index reads the heads it does not
+ *  know yet (a first start, or many new rollouts). The project list and an expansion both wait on it,
+ *  so it sits at the top of the list rather than in one row. Exported for HistoryBrowser.test.ts. */
+export function ScanStatus({ scan }: { scan: ScanState | null }): React.JSX.Element | null {
+  const { t } = useI18n()
+  if (!scan?.active) return null
+  return (
+    <li className="history-sentinel" role="status">
+      {t('history.scan.codex', { done: scan.done, total: scan.total })}
+    </li>
+  )
+}
+
 /** One project row plus, when expanded, that project's session list (infinite scroll). Each row owns its own session paging state.
  *  Exported for HistoryBrowser.test.ts only — the row's first render is the whole of what that test
  *  pins, and it cannot be reached through HistoryBrowser (its own project list is empty until an
@@ -274,6 +289,7 @@ export function HistoryBrowser({
   // 우클릭 메뉴는 한 번에 하나만 열려야 하므로 행이 아니라 여기에 둔다 (FileExplorer와 같은 구조)
   const [menu, setMenu] = useState<{ x: number; y: number; projectPath: string } | null>(null)
   const [hidden, setHidden] = useState<string[]>(() => hiddenProjects.list())
+  const [scan, setScan] = useState<ScanState | null>(null)
   const previewReq = useRef<string | null>(null)
   const sentinelRef = useRef<HTMLLIElement>(null)
   const listRef = useRef<HTMLUListElement>(null)
@@ -362,6 +378,8 @@ export function HistoryBrowser({
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => window.api.on('history:scan', (e) => setScan(e.active ? e : null)), [])
 
   // 숨기기(이 화면)와 해제(설정 모달) 양쪽에서 들어온다. offset을 유지한 부분 갱신이 아니라 첫
   // 페이지부터 다시 받는다 — 목록에서 항목이 빠지면 그 뒤 offset이 전부 밀려 중복이나 누락이 생긴다
@@ -474,6 +492,7 @@ export function HistoryBrowser({
         </div>
       </header>
       <ul className="history-list" ref={listRef}>
+        <ScanStatus scan={scan} />
         {projects.map((p) => (
           <ProjectRow
             key={p.projectPath}

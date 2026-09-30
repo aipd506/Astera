@@ -38,6 +38,23 @@ export function parsePythonVersion(output: string): string | null {
   return output.match(/Python\s+(\d\S*)/)?.[1] ?? null
 }
 
+/** Whether a path is one of the Microsoft Store's app-execution aliases — the `python.exe` stub under
+ *  `%LOCALAPPDATA%\Microsoft\WindowsApps` that `where python` lists on a Windows machine with no
+ *  Python installed. It is not an interpreter: run with `--version` it opens nothing useful and can
+ *  hold the probe until its 5 s deadline. Matched on the folder name as a whole path component,
+ *  case-insensitively, so a lookalike such as `MyWindowsAppsPython` is not caught. */
+export function isStoreAppAlias(p: string): boolean {
+  return p.split(/[\\/]/).some((part) => part.toLowerCase() === 'windowsapps')
+}
+
+/** The interpreter paths in `where`/`which` output, one per line, blank lines and Store aliases dropped. */
+export function pathPythonCandidates(stdout: string): string[] {
+  return stdout
+    .split(/\r\n|\r|\n/)
+    .map((l) => l.trim())
+    .filter((l) => l !== '' && !isStoreAppAlias(l))
+}
+
 /** Whether the project root looks like a Python project. This only decides whether RunTypePicker
  *  promotes 'python'/'pytest' into its "detected" group — unlike npm scripts or Gradle tasks, nothing
  *  in a Python project names a single entry point, so there is no auto-seeded run configuration to key

@@ -1,19 +1,36 @@
 import { useEffect, useRef, useState } from 'react'
-import type { Account, BranchRef, ScheduleConfig, SessionKind, Provider } from '../../../core/types'
+import type {
+  Account,
+  BranchRef,
+  ScheduleConfig,
+  SessionKind,
+  Provider,
+  RepoProbe,
+  WorktreeCreateProgress
+} from '../../../core/types'
+import type { UnattendedPermission } from '../../../core/chat/types'
 import { providerOf } from '../../../core/providers/meta'
 import { rollChainCandidates } from '../../../core/resume'
 import { isSlackReady } from '../../../core/slack/ready'
 import { useChatAvailability } from '../hooks/useChatAvailability'
 import { useAccountStatus } from '../hooks/useAccountStatus'
-import { orderBranchesForPicker, reconcileBaseRef } from '../../../core/worktrees/base'
-import { isWaitingReason, startBlockedBy, type StartBlocked } from '../../../core/sessions/startBlocked'
+import { branchPickerState, orderBranchesForPicker } from '../../../core/worktrees/base'
+import {
+  isWaitingReason,
+  startBlockedBy,
+  worktreeOption,
+  repoUnknownHint,
+  type StartBlocked
+} from '../../../core/sessions/startBlocked'
 import type { MessageKey } from '../../../core/i18n'
 import { toast } from '../lib/toast'
+import { trackWorktreeCreate } from '../lib/worktreeCreate'
 import { useI18n } from '../i18n/I18nProvider'
 import { AccountSelect } from './AccountSelect'
 import { BranchGlyph } from './BranchGlyph'
 import { Select, type SelectOption } from './Select'
 import { ScheduleFields } from './ScheduleFields'
+import { StartingOverlay } from './WorktreeCreateStatus'
 import { X } from 'lucide-react'
 
 const SOFT_LIMIT = 12
@@ -46,9 +63,14 @@ export function NewSessionDialog({
     rollPrompt?: string
     slackNotify: boolean
     bypassPermissions: boolean
+    /** chat takeover P8: the new chat session's unattended-permission policy. Absent for a terminal
+     *  session, which has no such policy at all. */
+    unattendedPermission?: UnattendedPermission
     useWorktree: boolean
     worktreeName?: string
     worktreeBaseRef?: string
+    /** Set when a worktree is being made: the id its progress and Cancel go by (worktrees.create's opId). */
+    worktreeOpId?: string
     repoRoot: string | null
     schedule?: ScheduleConfig
   }) => void | Promise<void>
@@ -72,6 +94,10 @@ export function NewSessionDialog({
   // 체크박스가 꺼진 채 잠깐 보였다가 켜진다. 사람이 이 모달에서 끄면 그 세션에만 적용되고 전역
   // 설정은 그대로다: 이 체크박스는 언제나 "이번 세션"을 말한다.
   const [bypassPermissions, setBypassPermissions] = useState(true) // start without permission prompts
+  // chat takeover P8: the new chat session's policy for a permission prompt nobody answers while a
+  // Host holds it as the writer. Meaningless once bypassPermissions is on — that session never holds a
+  // prompt at all — so the control offering this is hidden then (see the checkbox below).
+  const [unattended, setUnattended] = useState<UnattendedPermission>('hold')
   const [slackReady, setSlackReady] = useState(false) // whether a webhook URL is configured — the checkbox is disabled when it is not
   // Both CLIs, because either one can be the missing one — the app opens with just one installed.
   // Two different questions live here, asked two different ways (design D3, fix round 2):
@@ -86,13 +112,21 @@ export function NewSessionDialog({
   // has actually failed with something to say (a passing check, one that hasn't run yet for this
   // folder, or one that died silently inside its own timeout all leave nothing to show)
   const [cliError, setCliError] = useState<{ claude?: string; codex?: string }>({})
-  const [repoRoot, setRepoRoot] = useState<string | null>(null) // result of the git repo check
+  // Result of the git repo check (probeRepoRoot). `unknown` is git not answering within its short
+  // deadline — a UNC or \\wsl$ folder — which leaves Start open and holds back only the worktree option.
+  const [repoProbe, setRepoProbe] = useState<RepoProbe | null>(null)
+  const repoRoot = repoProbe?.kind === 'repo' ? repoProbe.root : null
+  // Whether the per-folder CLI check below is still running. It does not gate Start (see that effect),
+  // but on a slow share it can take its full 10 s, and a line saying so beats silence.
+  const [checkingCli, setCheckingCli] = useState(false)
   const [resolvingRepo, setResolvingRepo] = useState(false) // blocks start while the check runs — stops a spawn with the previous repoRoot
   const [useWorktree, setUseWorktree] = useState(false)
   const [wtName, setWtName] = useState('')
   // Base-branch candidates. null = not loaded yet (or the lookup failed) — the select stays hidden then and
   // creation falls back to the automatic detection, exactly as before this picker existed.
   const [branches, setBranches] = useState<BranchRef[] | null>(null)
+  // git did not answer the branch-list question — shown as "could not check", never as an empty list
+  const [branchesUnavailable, setBranchesUnavailable] = useState(false)
   const [wtBaseRef, setWtBaseRef] = useState('')
   // The effect below reads the current pick but must not re-run when it changes, or picking a branch would
   // immediately refetch the list. Same ref-mirror idiom as HistoryBrowser's accountFilterRef.
@@ -105,14 +139,27 @@ export function NewSessionDialog({
   // seconds: fetch, worktree add, copying the includes). This flag also stops a second click from
   // creating two worktrees.
   const [starting, setStarting] = useState(false)
+  // What the worktree creation behind that wait is doing (stage, copy counts), whether it is done (the
+  // session is starting), and whether Cancel was pressed. The tracker is the one creation being watched.
+  const [wtProgress, setWtProgress] = useState<WorktreeCreateProgress | null>(null)
+  const [wtCreated, setWtCreated] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const wtTrack = useRef<ReturnType<typeof trackWorktreeCreate> | null>(null)
   const touched = useRef(false)
   // On success App closes this modal (setShowNew(false)), so finally can run after unmount
+  // Set again on every mount, not only in the initial value: StrictMode's dev-only unmount and remount
+  // runs the cleanup once, and a ref left false then drops every progress report for the dialog's life.
   const mounted = useRef(true)
-  useEffect(() => () => void (mounted.current = false), [])
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
 
   useEffect(() => {
     // isSlackReady (core/slack/ready.ts) shares its criteria with SlackNotifier.applyConfig() in
-    // src/main/slack.ts — under the old condition that only looked at webhookUrl, a user who had set
+    // src/core/slack/notifier.ts — under the old condition that only looked at webhookUrl, a user who had set
     // only botToken + channelId could not tick the checkbox even though the bot path was actually on.
     void window.api.slack.getConfig().then((c) => setSlackReady(isSlackReady(c)))
     void window.api.settings
@@ -126,9 +173,11 @@ export function NewSessionDialog({
   useEffect(() => {
     // Loaded when the checkbox is ticked, not on every modal open — there is no reason to run git until the
     // user actually wants a worktree. A failure leaves branches null, which hides the select and lets
-    // createWorktree detect the base as it always has.
+    // createWorktree detect the base as it always has — and when git did not answer, the dialog says the
+    // list could not be checked instead of quietly showing nothing.
     if (!useWorktree || !repoRoot) return
     let cancelled = false
+    setBranchesUnavailable(false)
     void window.api.worktrees
       .listBranches(repoRoot)
       .then(({ branches: list, detected }) => {
@@ -136,8 +185,15 @@ export function NewSessionDialog({
         // Reconcile rather than overwrite: the pick survives toggling the checkbox, but a pick left over
         // from a previous project folder does not — it is not in this repo's list, and keeping it left the
         // picker on its "nothing selected" placeholder
-        const base = reconcileBaseRef({ branches: list, detected, current: wtBaseRefRef.current })
-        if (base === null) {
+        const picker = branchPickerState({ branches: list, detected, current: wtBaseRefRef.current })
+        if (picker.kind === 'unavailable') {
+          // Not "no branches": git did not answer. The worktree option stays on and creation detects the
+          // base automatically, but the person is told the list could not be checked.
+          setBranches(null)
+          setBranchesUnavailable(true)
+          return
+        }
+        if (picker.kind === 'noBase') {
           // Nothing to fork from (a repo with no commits yet). Refusing here beats letting the start
           // button run: the loading overlay is opaque and covers the Cancel button, and outside-click
           // close is disabled while starting, so a failure mid-flight leaves no way out of the modal.
@@ -146,11 +202,13 @@ export function NewSessionDialog({
           setBranches(null)
           return
         }
-        setBranches(list)
-        setWtBaseRef(base)
+        setBranches(picker.branches)
+        setWtBaseRef(picker.base)
       })
       .catch(() => {
-        if (!cancelled) setBranches(null)
+        if (cancelled) return
+        setBranches(null)
+        setBranchesUnavailable(true)
       })
     return () => {
       cancelled = true
@@ -168,6 +226,7 @@ export function NewSessionDialog({
   useEffect(() => {
     if (!cwd) return
     let cancelled = false
+    setCheckingCli(true)
     void window.api.system
       .checkCli(cwd)
       .then((c) => {
@@ -175,8 +234,15 @@ export function NewSessionDialog({
         setCliOk({ claude: c.claude.ok, codex: c.codex.ok })
         setCliError({ claude: c.claude.error, codex: c.codex.error })
       })
+      .catch(() => {
+        /* An IPC failure says nothing about the CLI — keep the previous answer, just stop "checking" */
+      })
+      .finally(() => {
+        if (!cancelled) setCheckingCli(false)
+      })
     return () => {
       cancelled = true
+      setCheckingCli(false)
     }
   }, [cwd])
 
@@ -188,18 +254,21 @@ export function NewSessionDialog({
     // Drop the branch list the moment the folder changes. It belongs to the previous repository, and until
     // the new fetch lands the picker would be offering branches that are not in this repo at all.
     setBranches(null)
+    setBranchesUnavailable(false)
     void (async () => {
-      let root: string | null
+      let probe: RepoProbe
       try {
-        root = await window.api.worktrees.isGitRepo(cwd)
+        probe = await window.api.worktrees.isGitRepo(cwd)
       } catch {
-        // An IPC failure is treated as "not a git repo" as well — it only hides the worktree option, it does not block starting a normal session
-        root = null
+        // An IPC failure is "could not check", not "not a repo" — Start stays open, the worktree option waits
+        probe = { kind: 'unknown', reason: 'error' }
       } finally {
         if (!cancelled) setResolvingRepo(false)
       }
       if (cancelled) return
-      setRepoRoot(root)
+      setRepoProbe(probe)
+      if (probe.kind !== 'repo') setUseWorktree(false)
+      const root = probe.kind === 'repo' ? probe.root : null
       const id = await window.api.projects.getDefaultAccount(root ?? cwd)
       if (cancelled || !id || touched.current || !accounts.some((a) => a.id === id)) return
       setAccountIds((prev) => (prev.includes(id) ? prev : [id, ...prev.slice(1)]))
@@ -236,7 +305,7 @@ export function NewSessionDialog({
   // per-folder probe failed, Start stayed dead, nothing ever spawned, so the fix never ran. Kept out
   // of this flag on purpose now: primaryRunsHere still drives the cliFailsHere warning below (the
   // true, more specific statement) and F5 gets its chance. Still checked broadly, not just for a
-  // plain single-account session — rolling supports codex too (codexRolling.ts) and so do Slack
+  // plain single-account session — rolling supports codex too (codexCoordinator.ts) and so do Slack
   // notifications (turn completion is detected from rollout's task_complete), so this flag must not
   // hide either of those.
   const primaryCliMissing = !primaryInstalled
@@ -296,11 +365,30 @@ export function NewSessionDialog({
 
   const rollChecked = multi ? true : rollMode
 
+  const wtOption = worktreeOption(repoProbe)
   const withWorktree = !!repoRoot && useWorktree
 
   const start = async (): Promise<void> => {
     if (!cwd || starting) return
     setStarting(true)
+    setWtProgress(null)
+    setWtCreated(false)
+    setCancelling(false)
+    const track = withWorktree
+      ? trackWorktreeCreate(
+          {
+            on: (channel, cb) => window.api.on(channel, cb),
+            cancelCreate: (opId) => window.api.worktrees.cancelCreate(opId)
+          },
+          crypto.randomUUID(),
+          (p) => {
+            if (!mounted.current) return
+            if (p === null) setWtCreated(true)
+            else setWtProgress(p)
+          }
+        )
+      : null
+    wtTrack.current = track
     try {
       // onSpawn (App.spawn) handles failures internally with a toast and does not reject — both
       // success and failure come back here, and on success App has already closed the modal so the
@@ -316,15 +404,32 @@ export function NewSessionDialog({
         rollPrompt: rollChecked ? rollPrompt.trim() || undefined : undefined,
         slackNotify: slackReady && slackNotify,
         bypassPermissions,
+        ...(kind === 'chat' ? { unattendedPermission: unattended } : {}),
         useWorktree: withWorktree,
         worktreeName: wtName.trim() || undefined,
         worktreeBaseRef: wtBaseRef || undefined,
+        ...(track ? { worktreeOpId: track.opId } : {}),
         repoRoot,
         schedule: schedOn ? (schedule ?? undefined) : undefined
       })
     } finally {
-      if (mounted.current) setStarting(false)
+      track?.stop()
+      wtTrack.current = null
+      if (mounted.current) {
+        setStarting(false)
+        setCancelling(false)
+        setWtProgress(null)
+        setWtCreated(false)
+      }
     }
+  }
+
+  // Cancel on the busy overlay: main aborts the creation and rolls back what it made; the create call
+  // then rejects with WORKTREE_CANCELLED, App says so, and this dialog stays open to try again.
+  const cancelWorktree = (): void => {
+    if (!wtTrack.current || cancelling) return
+    setCancelling(true)
+    wtTrack.current.cancel()
   }
 
   const blocked = startBlockedBy({
@@ -346,14 +451,18 @@ export function NewSessionDialog({
 
   return (
     // While starting, an outside click does not close this — the worktree creation and spawn already
-    // under way are not cancelled, so if only the modal disappears the user mistakes it for a cancel
+    // under way are not cancelled, so if only the modal disappears the user mistakes it for a cancel.
+    // Cancelling a worktree creation is the overlay's own Cancel button.
     <div className="modal-backdrop" onClick={() => !starting && onCancel()}>
       <div className="modal new-session" onClick={(e) => e.stopPropagation()}>
         {starting && (
-          <div className="loading-overlay">
-            <span className="loading-spinner" aria-hidden="true" />
-            {t(withWorktree ? 'session.new.startingWorktree' : 'session.new.starting')}
-          </div>
+          <StartingOverlay
+            withWorktree={withWorktree}
+            progress={wtProgress}
+            created={wtCreated}
+            cancelling={cancelling}
+            onCancel={cancelWorktree}
+          />
         )}
         <h2>{t('session.new.title')}</h2>
         {runningCount >= SOFT_LIMIT && (
@@ -418,7 +527,18 @@ export function NewSessionDialog({
             <button onClick={() => void pick()}>{t('session.new.pickFolder')}</button>
           </div>
         </div>
-        {repoRoot && (
+        {wtOption === 'unknown' && (
+          <>
+            <label className="row check-small">
+              <input type="checkbox" checked={false} disabled />
+              {t('session.new.useWorktree')}
+            </label>
+            <span className="modal-hint">
+              {t(repoUnknownHint(repoProbe?.kind === 'unknown' ? repoProbe.reason : 'error'))}
+            </span>
+          </>
+        )}
+        {wtOption === 'available' && (
           <>
             <label className="row check-small">
               <input
@@ -451,6 +571,9 @@ export function NewSessionDialog({
                       ariaLabel={t('session.new.worktreeBaseRef')}
                     />
                   </div>
+                )}
+                {branchesUnavailable && (
+                  <span className="modal-hint">{t('session.new.worktreeBranchesUnavailable')}</span>
                 )}
               </div>
             )}
@@ -523,7 +646,7 @@ export function NewSessionDialog({
         </label>
         {rollChecked && (
           <div className="field roll-prompt-field">
-            {/* Keep the placeholder in sync with the actual default rolling.ts and codexRolling.ts send
+            {/* Keep the placeholder in sync with the actual default claudeCoordinator.ts and codexCoordinator.ts send
                 (the rolling.continuePrompt key) — that key follows the app language too, so in both ko
                 and en, session.new.rollPromptPlaceholder and rolling.continuePrompt must hold the same value. */}
             <input
@@ -573,6 +696,29 @@ export function NewSessionDialog({
           />
           {t('session.new.bypassPermissions')}
         </label>
+        {/* chat takeover P8: only meaningful for a chat session that is not already bypassing every
+            prompt — a bypassed one never holds a prompt for this policy to apply to. */}
+        {kind === 'chat' && !bypassPermissions && (
+          <div className="field">
+            <label>{t('chat.unattended.heading')}</label>
+            <div className="kind-segmented">
+              <button
+                type="button"
+                className={`segmented${unattended === 'hold' ? ' active' : ''}`}
+                onClick={() => setUnattended('hold')}
+              >
+                {t('chat.unattended.hold')}
+              </button>
+              <button
+                type="button"
+                className={`segmented${unattended === 'deny-after-60s' ? ' active' : ''}`}
+                onClick={() => setUnattended('deny-after-60s')}
+              >
+                {t('chat.unattended.deny60')}
+              </button>
+            </div>
+          </div>
+        )}
         {/* checkCli now runs in the chosen folder, not the app's own cwd, so a toolchain manager that
             refuses this folder's manifest gets caught here instead of killing the session after Start
             (design D3). Gated on primaryInstalled — the dedicated existence probe above — rather than
@@ -607,6 +753,14 @@ export function NewSessionDialog({
           <p className="modal-hint start-blocked">
             {isWaitingReason(blocked) && <span className="loading-spinner small" aria-hidden="true" />}
             {t(BLOCKED_KEY[blocked])}
+          </p>
+        )}
+        {/* The per-folder CLI check does not hold Start, but on a slow share it can run for its full
+            10 s — say it is running rather than leave the warning above to appear out of nowhere. */}
+        {checkingCli && !starting && (
+          <p className="modal-hint start-blocked">
+            <span className="loading-spinner small" aria-hidden="true" />
+            {t('session.new.checkingCli')}
           </p>
         )}
       </div>

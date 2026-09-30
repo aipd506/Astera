@@ -12,14 +12,20 @@
 //
 // **Why the app writes the file instead of answering the menu.** Answering means recognising a
 // screen and typing into it, which is what the rolling coordinator does for its own respawn window
-// (rolling.ts's trustSeen) and it is the fragile half of that code — a menu whose wording changes
+// (claudeCoordinator.ts's trustSeen) and it is the fragile half of that code — a menu whose wording changes
 // leaves no trace of why nothing happened. The file is the same artifact codex writes itself once a
 // person accepts, so pre-writing it is indistinguishable from having accepted.
 //
-// There is no claude counterpart here on purpose: `--dangerously-skip-permissions` covers claude's
-// trust prompt as well, which is why Orca's preset module has no claude entry either.
+// **There is a claude counterpart now (claudeTrust.ts), and this note used to say there could not
+// be.** The claim was that `--dangerously-skip-permissions` covers claude's trust prompt as well,
+// with Orca's preset module having no claude entry as the corroboration. Measured 2026-09-22: a Job
+// worker went into a fresh worktree with that flag on its own command line and stopped at
+// `Yes, I trust this folder`. The flag sets the permission policy; trust is a different question,
+// which is exactly what the paragraph above says about codex's bypass flag. The same reasoning
+// applied to claude the whole time and was not followed through.
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { foldPathCase } from '../files/paths'
 
 export type CodexTrustLevel = 'trusted' | 'untrusted'
 
@@ -30,12 +36,14 @@ function escapeTomlBasicString(v: string): string {
   return v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-/** The comparison key for "is this the same project". Case- and separator-insensitive because the
- *  same folder reaches us spelled differently all the time on win32 (`D:\P\A` from a picker,
- *  `d:/p/a` from a git command), and two blocks for one folder is a file whose meaning depends on
- *  which one codex reads last. */
-function trustKey(p: string): string {
-  return p.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+/** The comparison key for "is this the same project". Separator-insensitive, and case-insensitive
+ *  where the filesystem is (foldPathCase — win32 and darwin), because the same folder reaches us
+ *  spelled differently all the time on win32 (`D:\P\A` from a picker, `d:/p/a` from a git command),
+ *  and two blocks for one folder is a file whose meaning depends on which one codex reads last. On
+ *  linux a differently cased path is another folder: matching it would trust the wrong one, and let a
+ *  forged backlink that differs only in case pass codexTrustRoot's check. */
+function trustKey(p: string, platform: string = process.platform): string {
+  return foldPathCase(p.replace(/[\\/]+/g, '/').replace(/\/+$/, ''), platform)
 }
 
 /** The path inside `[projects."…"]`, or null when the line is not such a header. */
@@ -77,12 +85,13 @@ function togglesMultiline(line: string, open: '"""' | "'''" | null): '"""' | "''
 export function upsertProjectTrust(
   existing: string,
   projectPath: string,
-  level: CodexTrustLevel = 'trusted'
+  level: CodexTrustLevel = 'trusted',
+  platform: string = process.platform
 ): string {
   const content = existing.charCodeAt(0) === 0xfeff ? existing.slice(1) : existing
   const eol = content.includes('\r\n') ? '\r\n' : '\n'
   const trustLine = `trust_level = "${level}"`
-  const want = trustKey(projectPath)
+  const want = trustKey(projectPath, platform)
 
   const lines = content.split(/\r?\n/)
   let multiline: '"""' | "'''" | null = null
@@ -91,7 +100,7 @@ export function upsertProjectTrust(
     const line = lines[i]
     if (multiline === null) {
       const found = projectHeaderPath(line)
-      if (found !== null && trustKey(found) === want) {
+      if (found !== null && trustKey(found, platform) === want) {
         headerIdx = i
         break
       }

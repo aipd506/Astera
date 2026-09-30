@@ -1,6 +1,16 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import type { PtyFactory, PtyLike, PtySpawnOptions } from '../core/sessions/pty'
-import { TerminalManager } from './terminalManager'
+import { win32 } from 'node:path'
+import {
+  PROBE_CACHE_TTL_MS,
+  PROBE_DEGRADED_TTL_MS,
+  PROBE_TIMEOUT_MS,
+  PathKeyedCache,
+  createProbePool,
+  createProber,
+  type ProbeResult
+} from '../core/sessions/pathProbe'
+import { TerminalManager, createOnPath } from './terminalManager'
 
 class FakePty implements PtyLike {
   pid = 999
@@ -28,52 +38,127 @@ function setup(platform: NodeJS.Platform = 'win32') {
     spawned.push({ file, args, opts, pty })
     return pty
   }
-  const mgr = new TerminalManager(factory, platform, (f) => f === 'pwsh.exe', undefined)
+  const mgr = new TerminalManager(factory, platform, async (f) => (f === 'pwsh.exe' ? 'C:\\PS7\\pwsh.exe' : null), undefined, {
+    cwdProbe: async () => 'present'
+  })
   return { mgr, spawned }
 }
 
+afterEach(() => {
+  vi.useRealTimers()
+})
+
 describe('TerminalManager', () => {
-  it('해석된 셸을 프로젝트 경로 cwd로 spawn한다', () => {
+  it('looks for every candidate shell at once, and still takes the first one in order', async () => {
+    const spawned: string[] = []
+    const factory: PtyFactory = (file) => {
+      spawned.push(file)
+      return new FakePty()
+    }
+    const asked: string[] = []
+    const gates: (() => void)[] = []
+    const locate = (f: string) => {
+      asked.push(f)
+      return new Promise<string | null>((res) => gates.push(() => res(f !== 'pwsh.exe' ? `C:\\Windows\\System32\\${f}` : null)))
+    }
+    const mgr = new TerminalManager(factory, 'win32', locate, undefined, { cwdProbe: async () => 'present' })
+    const opening = mgr.open('D:\\p')
+    await vi.waitFor(() => expect(asked).toEqual(['pwsh.exe', 'powershell.exe', 'cmd.exe']))
+    gates.forEach((g) => g())
+    await opening
+    expect(spawned).toEqual(['C:\\Windows\\System32\\powershell.exe'])
+  })
+
+  // node-pty (conpty.cc) walks PATH itself, synchronously, for a relative file name. So the pty must
+  // be handed the absolute path the async lookup found, or one dead PATH entry freezes the thread.
+  it('hands the pty the absolute path the lookup found, never a bare name', async () => {
     const { mgr, spawned } = setup()
-    const info = mgr.open('D:\\work\\proj')
+    await mgr.open('D:\\p')
+    expect(spawned[0].file).toBe('C:\\PS7\\pwsh.exe')
+  })
+
+  it('falls back to cmd.exe under SystemRoot, by absolute path, when no candidate was found', async () => {
+    const files: string[] = []
+    const factory: PtyFactory = (file) => (files.push(file), new FakePty())
+    const mgr = new TerminalManager(factory, 'win32', async () => null, undefined, {
+      cwdProbe: async () => 'present',
+      systemRoot: 'C:\\WINDOWS'
+    })
+    await mgr.open('D:\\p')
+    expect(files).toEqual(['C:\\WINDOWS\\System32\\cmd.exe'])
+  })
+
+  it('a project folder that is not there fails with CWD_MISSING, and no pty is started', async () => {
+    const files: string[] = []
+    const factory: PtyFactory = (file) => (files.push(file), new FakePty())
+    const mgr = new TerminalManager(factory, 'win32', async () => 'C:\\PS7\\pwsh.exe', undefined, { cwdProbe: async () => 'absent' })
+    await expect(mgr.open('D:\\gone')).rejects.toThrow('CWD_MISSING: D:\\gone')
+    expect(files).toEqual([])
+    expect(mgr.list('D:\\gone')).toEqual([])
+  })
+
+  it('a project folder whose probe never answers fails at 1.5 s with "folder not reachable", and no pty is started', async () => {
+    vi.useFakeTimers()
+    const files: string[] = []
+    const factory: PtyFactory = (file) => (files.push(file), new FakePty())
+    const cwdProbe = createProber({ access: () => new Promise<void>(() => {}), log: () => {}, pool: createProbePool(), skipQueue: true })
+    const cwd = '\\\\offline-server\\share\\proj'
+    const mgr = new TerminalManager(factory, 'win32', async () => 'C:\\PS7\\pwsh.exe', undefined, { cwdProbe })
+    const outcome = mgr.open(cwd).then(
+      () => 'resolved',
+      (e: Error) => e.message
+    )
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS - 1)
+    let settled = false
+    void outcome.then(() => (settled = true))
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await outcome).toBe(`CWD_UNREACHABLE: folder not reachable: ${cwd}`)
+    expect(files).toEqual([])
+  })
+
+  it('해석된 셸을 프로젝트 경로 cwd로 spawn한다', async () => {
+    const { mgr, spawned } = setup()
+    const info = await mgr.open('D:\\work\\proj')
     expect(info.projectPath).toBe('D:\\work\\proj')
     expect(info.id).toBeTruthy()
     expect(spawned).toHaveLength(1)
-    expect(spawned[0].file).toBe('pwsh.exe')
+    expect(spawned[0].file).toBe('C:\\PS7\\pwsh.exe')
     expect(spawned[0].args).toEqual([])
     expect(spawned[0].opts.cwd).toBe('D:\\work\\proj')
   })
 
-  it('cols/rows를 넘기면 그대로 쓰고, 없으면 기본값', () => {
+  it('cols/rows를 넘기면 그대로 쓰고, 없으면 기본값', async () => {
     const { mgr, spawned } = setup()
-    mgr.open('D:\\p', 100, 40)
+    await mgr.open('D:\\p', 100, 40)
     expect({ cols: spawned[0].opts.cols, rows: spawned[0].opts.rows }).toEqual({ cols: 100, rows: 40 })
-    mgr.open('D:\\p')
+    await mgr.open('D:\\p')
     expect({ cols: spawned[1].opts.cols, rows: spawned[1].opts.rows }).toEqual({ cols: 120, rows: 30 })
   })
 
-  it('같은 프로젝트에 여러 개를 열 수 있고 id가 서로 다르다', () => {
+  it('같은 프로젝트에 여러 개를 열 수 있고 id가 서로 다르다', async () => {
     const { mgr } = setup()
-    const a = mgr.open('D:\\p')
-    const b = mgr.open('D:\\p')
+    const a = await mgr.open('D:\\p')
+    const b = await mgr.open('D:\\p')
     expect(a.id).not.toBe(b.id)
     expect(mgr.list('D:\\p').map((t) => t.id).sort()).toEqual([a.id, b.id].sort())
   })
 
-  it('list는 프로젝트별로 격리된다', () => {
+  it('list는 프로젝트별로 격리된다', async () => {
     const { mgr } = setup()
-    const a = mgr.open('D:\\one')
-    mgr.open('D:\\two')
+    const a = await mgr.open('D:\\one')
+    await mgr.open('D:\\two')
     expect(mgr.list('D:\\one').map((t) => t.id)).toEqual([a.id])
     expect(mgr.list('D:\\one')).toHaveLength(1)
     expect(mgr.list('D:\\nope')).toEqual([])
   })
 
-  it('출력을 버퍼에 누적하고 onData로 알린다', () => {
+  it('출력을 버퍼에 누적하고 onData로 알린다', async () => {
     const { mgr, spawned } = setup()
     const seen: { id: string; data: string }[] = []
     mgr.onData = (e) => seen.push(e)
-    const info = mgr.open('D:\\p')
+    const info = await mgr.open('D:\\p')
     spawned[0].pty.dataCb('hello ')
     spawned[0].pty.dataCb('world')
     expect(seen).toEqual([
@@ -83,9 +168,9 @@ describe('TerminalManager', () => {
     expect(mgr.list('D:\\p')[0].buffer).toBe('hello world')
   })
 
-  it('버퍼는 200,000자에서 잘린다 (뒤쪽을 남긴다)', () => {
+  it('버퍼는 200,000자에서 잘린다 (뒤쪽을 남긴다)', async () => {
     const { mgr, spawned } = setup()
-    mgr.open('D:\\p')
+    await mgr.open('D:\\p')
     spawned[0].pty.dataCb('x'.repeat(199_998))
     spawned[0].pty.dataCb('abcd')
     const buf = mgr.list('D:\\p')[0].buffer
@@ -93,10 +178,10 @@ describe('TerminalManager', () => {
     expect(buf.endsWith('abcd')).toBe(true)
   })
 
-  it('write/resize를 해당 pty에만 전달한다', () => {
+  it('write/resize를 해당 pty에만 전달한다', async () => {
     const { mgr, spawned } = setup()
-    const a = mgr.open('D:\\p')
-    mgr.open('D:\\p')
+    const a = await mgr.open('D:\\p')
+    await mgr.open('D:\\p')
     mgr.write(a.id, 'ls\r')
     mgr.resize(a.id, 90, 20)
     expect(spawned[0].pty.written).toEqual(['ls\r'])
@@ -105,7 +190,7 @@ describe('TerminalManager', () => {
     expect(spawned[1].pty.resized).toEqual([])
   })
 
-  it('없는 id로 write/resize/close해도 던지지 않는다', () => {
+  it('없는 id로 write/resize/close해도 던지지 않는다', async () => {
     const { mgr } = setup()
     expect(() => {
       mgr.write('nope', 'x')
@@ -114,28 +199,28 @@ describe('TerminalManager', () => {
     }).not.toThrow()
   })
 
-  it('close는 pty를 kill하고 목록에서 즉시 제거한다', () => {
+  it('close는 pty를 kill하고 목록에서 즉시 제거한다', async () => {
     const { mgr, spawned } = setup()
-    const info = mgr.open('D:\\p')
+    const info = await mgr.open('D:\\p')
     mgr.close(info.id)
     expect(spawned[0].pty.killed).toBe(true)
     expect(mgr.list('D:\\p')).toEqual([])
   })
 
-  it('셸이 스스로 죽으면 목록에서 사라지고 onExit이 발생한다', () => {
+  it('셸이 스스로 죽으면 목록에서 사라지고 onExit이 발생한다', async () => {
     const { mgr, spawned } = setup()
     const exited: { id: string; exitCode: number }[] = []
     mgr.onExit = (e) => exited.push(e)
-    const info = mgr.open('D:\\p')
+    const info = await mgr.open('D:\\p')
     spawned[0].pty.exitCb({ exitCode: 3 })
     expect(exited).toEqual([{ id: info.id, exitCode: 3 }])
     expect(mgr.list('D:\\p')).toEqual([])
   })
 
-  it('closeAppOwned는 모든 프로젝트의 터미널을 kill한다', () => {
+  it('closeAppOwned는 모든 프로젝트의 터미널을 kill한다', async () => {
     const { mgr, spawned } = setup()
-    mgr.open('D:\\one')
-    mgr.open('D:\\two')
+    await mgr.open('D:\\one')
+    await mgr.open('D:\\two')
     mgr.closeAppOwned()
     expect(spawned.every((s) => s.pty.killed)).toBe(true)
     expect(mgr.list('D:\\one')).toEqual([])
@@ -145,10 +230,10 @@ describe('TerminalManager', () => {
   // A terminal opened before the Host answered is this process's own child and dies with the app; one
   // opened after belongs to the Host and is exactly what a restart takes back. It stays in the map too —
   // closing it here would drop the app's record of a pty that is still running.
-  it('closeAppOwned leaves a terminal whose pty outlives the app open', () => {
+  it('closeAppOwned leaves a terminal whose pty outlives the app open', async () => {
     const { mgr, spawned } = setup()
-    mgr.open('D:\\one')
-    const kept = mgr.open('D:\\two')
+    await mgr.open('D:\\one')
+    const kept = await mgr.open('D:\\two')
     spawned[1].pty.outlivesApp = true
     mgr.closeAppOwned()
     expect(spawned.map((s) => s.pty.killed)).toEqual([true, false])
@@ -156,28 +241,39 @@ describe('TerminalManager', () => {
     expect(mgr.list('D:\\two').map((t) => t.id)).toEqual([kept.id])
   })
 
-  it('non-win32에서는 envShell을 쓴다', () => {
+  // Fix round 1, I4: HOST_ACT_PATH_IN_USE needs a terminal counted only while its pty is this app's
+  // own — a Host-backed one is already visible to the Host that asked. Mutation-proof: removing the
+  // `!t.pty.outlivesApp` filter in runningAppOwned would make this see both terminals.
+  it('runningAppOwned answers the local terminal only', async () => {
+    const { mgr, spawned } = setup()
+    const local = await mgr.open('D:\\one')
+    await mgr.open('D:\\two')
+    spawned[1].pty.outlivesApp = true
+    expect(mgr.runningAppOwned()).toEqual([{ id: local.id, projectPath: 'D:\\one' }])
+  })
+
+  it('non-win32에서는 envShell을 쓴다', async () => {
     const spawned: { file: string }[] = []
     const factory: PtyFactory = (file) => {
       spawned.push({ file })
       return new FakePty()
     }
-    const mgr = new TerminalManager(factory, 'linux', () => false, '/bin/zsh')
-    mgr.open('/home/u/p')
+    const mgr = new TerminalManager(factory, 'linux', async () => null, '/bin/zsh', { cwdProbe: async () => 'present' })
+    await mgr.open('/home/u/p')
     expect(spawned[0].file).toBe('/bin/zsh')
   })
 
   // The Host stores this and hands it back after a restart; it is the only thing that lets the app
   // rebuild this terminal's record without having persisted anything itself.
-  it('tells the pty factory what this terminal is, so it can be rebuilt later', () => {
+  it('tells the pty factory what this terminal is, so it can be rebuilt later', async () => {
     const { mgr, spawned } = setup()
-    const info = mgr.open('D:/p')
+    const info = await mgr.open('D:/p')
     expect(spawned[0].opts.meta).toEqual({ kind: 'terminal', id: info.id, restore: { projectPath: 'D:/p' } })
   })
 
   describe('adopt', () => {
     // After a restart the shell is already running; adopt rebuilds only the app's own record of it.
-    it('adopts a running pty and puts the terminal back', () => {
+    it('adopts a running pty and puts the terminal back', async () => {
       const { mgr } = setup()
       const pty = new FakePty()
       const info = mgr.adopt({ kind: 'terminal', id: 'term-from-host', pty, restore: { projectPath: 'D:/p' } })
@@ -187,7 +283,7 @@ describe('TerminalManager', () => {
       expect(mgr.list('D:/p')[0].buffer).toContain('replayed output')
     })
 
-    it('an adopted terminal takes input and leaves the list when its shell dies', () => {
+    it('an adopted terminal takes input and leaves the list when its shell dies', async () => {
       const { mgr } = setup()
       const exited: { id: string; exitCode: number }[] = []
       mgr.onExit = (e) => exited.push(e)
@@ -201,7 +297,7 @@ describe('TerminalManager', () => {
     })
 
     // The terminal keeps the id it had before the restart, so the renderer's tab still addresses it.
-    it('keeps the id it is handed rather than minting one', () => {
+    it('keeps the id it is handed rather than minting one', async () => {
       const { mgr } = setup()
       const pty = new FakePty()
       const info = mgr.adopt({ kind: 'terminal', id: 'term-from-host', pty, restore: { projectPath: 'D:/p' } })!
@@ -211,9 +307,32 @@ describe('TerminalManager', () => {
       expect(pty.written).toEqual(['echo hi\r'])
     })
 
+    // **이것이 프로젝트 터미널에는 rendererGate 가 필요 없는 이유다.** 재부착이 끝나면 Host 는
+    // 보관하던 스크롤백을 평범한 출력으로 단 한 번 돌려주는데, 그것이 도착할 때 이 매니저의
+    // onData 는 이미 걸려 있어 live.buffer 로 들어간다. 그래서 그 사이 렌더러가 아직 없어
+    // terminal:data 이벤트를 놓치더라도, 패널이 열릴 때 list() 가 같은 내용을 통째로 돌려준다 —
+    // 되물을 곳이 있는 것이다. 세션에는 이 보관이 없어서(core/sessions/manager.ts 는 backpressure
+    // 만 한다) 놓치면 그것으로 끝이고, 게이트는 그쪽에만 선다.
+    it('입양한 뒤 도착한 Host 의 재생을 버퍼에 담아 list 로 돌려준다', async () => {
+      const { mgr } = setup()
+      const pty = new FakePty()
+      mgr.adopt({ kind: 'terminal', id: 'term-from-host', pty, restore: { projectPath: 'D:/p' } })
+
+      // 입양 직후의 버퍼는 비어 있다 — 앱이 재시작 동안 본 것이 없다.
+      expect(mgr.list('D:/p')).toEqual([{ id: 'term-from-host', buffer: '' }])
+
+      // sendAttach 에 Host 가 답한 ring buffer 가 평범한 출력으로 들어온다.
+      pty.dataCb('$ npm run dev\r\n')
+      pty.dataCb('ready in 300ms\r\n')
+
+      expect(mgr.list('D:/p')).toEqual([
+        { id: 'term-from-host', buffer: '$ npm run dev\r\nready in 300ms\r\n' }
+      ])
+    })
+
     // A run's note is readable as a terminal's — projectPath is a strict subset of it — so without the
     // kind, try-each-manager routing would quietly rebuild a run as a terminal.
-    it("refuses a run's note, readable though it is", () => {
+    it("refuses a run's note, readable though it is", async () => {
       const { mgr } = setup()
       const runNote = {
         projectPath: 'D:/p',
@@ -229,10 +348,40 @@ describe('TerminalManager', () => {
       expect(mgr.list('D:/p')).toEqual([])
     })
 
-    it('refuses a restore it cannot read', () => {
+    it('refuses a restore it cannot read', async () => {
       const { mgr } = setup()
       expect(mgr.adopt({ kind: 'terminal', id: 'term-from-host', pty: new FakePty(), restore: {} })).toBeNull()
       expect(mgr.list('D:/p')).toEqual([])
     })
+  })
+})
+
+describe('createOnPath — the default shell lookup', () => {
+  it('keeps a clean answer for the full cache time, and one a timeout went into for 10 s only', async () => {
+    let t = 0
+    let probes = 0
+    let offline = true
+    const probe = async (p: string): Promise<ProbeResult> => {
+      probes++
+      if (p.startsWith('Z:')) return offline ? 'timeout' : 'absent'
+      return p === 'C:\\Windows\\System32\\cmd.exe' ? 'present' : 'absent'
+    }
+    const onPath = createOnPath(probe, () => 'Z:\\tools;C:\\Windows\\System32', new PathKeyedCache(PROBE_CACHE_TTL_MS, () => t), ';', win32.join)
+    expect(await onPath('pwsh.exe')).toBeNull()
+    const first = probes
+    t += PROBE_DEGRADED_TTL_MS - 1
+    expect(await onPath('pwsh.exe')).toBeNull()
+    expect(probes).toBe(first)
+    t += 1
+    offline = false
+    expect(await onPath('pwsh.exe')).toBeNull()
+    expect(probes).toBeGreaterThan(first)
+    // Clean now: kept for the full time.
+    const second = probes
+    t += PROBE_CACHE_TTL_MS - 1
+    expect(await onPath('pwsh.exe')).toBeNull()
+    expect(probes).toBe(second)
+    // The answer is where the file is, so the pty never walks PATH itself.
+    expect(await onPath('cmd.exe')).toBe('C:\\Windows\\System32\\cmd.exe')
   })
 })

@@ -1,21 +1,26 @@
 import { ipcMain, dialog, app, shell, session, webContents, type BrowserWindow, type WebContents } from 'electron'
-import { promises as fs, cpSync, existsSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync } from 'node:fs'
-import { configuredModelOf } from '../core/models/parse'
+import { promises as fs, existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import net from 'node:net'
 import { execFile, spawn } from 'node:child_process'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import type { Core } from './core'
-import type { RollingCoordinator } from './rolling'
-import type { CodexRollingCoordinator } from './codexRolling'
+import type { RollingCoordinator } from '../core/rolling/claudeCoordinator'
+import type { CodexRollingCoordinator } from '../core/rolling/codexCoordinator'
 import type { SchedulerCoordinator } from './scheduler'
-import type { SlackNotifier, SlackConfigStore, SlackConfig } from './slack'
-import { readFileTail } from './slack'
-import type { CodexRolloutWatcher } from './codexRolloutWatcher'
+import type { SlackNotifier } from '../core/slack/notifier'
+import { readFileTail } from '../core/slack/notifier'
+import { notedThreadOf } from '../core/slack/threadNote'
+import { isForwardedChatEvent } from '../core/slack/forwarded'
+import type { SlackOwnership } from './slackOwnership'
+import type { SlackConfigStore } from './slackConfigStore'
+import type { SlackConfig } from '../core/slack/config'
+import { codexRolloutFromNote, type CodexRolloutWatcher } from '../core/sessions/codexRolloutWatcher'
 import type { DesktopNotifier } from './desktopNotifier'
 import type { DesktopNotifySettings } from '../core/notify/settings'
 import type { AttentionState, Attention } from './attention'
+import { createRendererGate } from './rendererGate'
 import type { PendingPromptState } from './pendingPrompt'
 import {
   createConversationSessions,
@@ -24,26 +29,38 @@ import {
   type ConversationSessions
 } from './conversation'
 import { HostClient, READY_TIMEOUT_MS } from './host/client'
-import { hostSpawnPlan, resolveHostEntry } from './host/spawn'
-import {
-  hostRuntimeBase,
-  hostRuntimePaths,
-  prepareHostRuntime,
-  sweepHostRuntime,
-  type HostRuntimePaths,
-  type RuntimeFs
-} from './host/runtime'
+import { hostSpawnPlan, resolveHostEntry } from '../core/host/spawn'
+import { hostRuntimeBase } from '../core/host/runtime'
+import { createRuntimeInstaller, installHostRuntime, spawnWhenInstalled, type InstalledRuntime } from './host/runtimeInstall'
+import { executableProbe, parseExecutablePath, hostKillPlan, killHostCommand } from './host/hostProcess'
+import { hostPidFilePath, parseHostPidFile } from '../core/host/pidFile'
+import { readHostKey } from '../core/host/hostKey'
 import { hostAddress, retireOlderHosts } from '../host/address'
 import { createHostPtyFactory } from './host/ptyFactory'
 import { createHostProcFactory } from './host/procFactory'
-import { hostSpeaksProcs } from './host/outdated'
+import { APP_CALLER } from '../core/host/driver'
+import { hostSpeaksProcs, hostSpeaksPing, hostSpeaksSpawn, hostSpeaksDispatch, hostSpeaksRolling, hostSpeaksChatTakeover } from './host/outdated'
+import { askHostCoordinatorIdle } from './host/coordinatorIdle'
+import { createBlockSync } from './host/blockSync'
+import { createHostDriverView, type HostDriverView } from './host/hostDriver'
+import { createHostWorkspaceView, type HostWorkspaceView } from './host/hostWorkspace'
+import { createOfflineRolls } from './host/offlineRolls'
+import type { BlockRegistry } from '../core/rolling/blockRegistry'
+import { createHostRollView, installHostRollExit, orchHoldsSession, hostForced, announcesAdopted } from './host/hostRollView'
+import { findHostHeld, hostHeldLive, nativeOfForwardedRekey } from './host/hostNativeGuard'
+import { applyAdoptRolling } from './host/adoptRolling'
+import { chatAdoptPlan, hostCarryOnIsOurs, hostStartingDefers } from './chatAdopt'
 import { reattachSessions, type ReattachResult } from './host/reattach'
-import { HOST_PROTOCOL, type ClientMessage, type HostMessage, type PtyEntry } from '../core/host/protocol'
+import { createWorktreeRoute, NO_HOST_CONNECTION } from './host/worktreeRoute'
+import { createHostGitOps } from './host/hostGitOps'
+import { appPathInUse } from './host/localPathInUse'
+import { HOST_PROTOCOL, HOST_ACT_PATH_IN_USE, HOST_ACT_SLACK_ANSWER, type ClientMessage, type HostMessage, type PtyEntry } from '../core/host/protocol'
+import { hostRollConfigPath, readRollConfigKey } from '../core/rolling/config'
 import { DataBatcher } from '../core/sessions/batcher'
 import { BusyScanner } from '../core/terminal/busy'
-import type { Account, CoreEvents, HistoryPageRequest, HistoryProjectsPageRequest, HostHoldings, HostStatus, OrchSnapshot, Provider, RateLimitWindow, ResumeStrategy, RollStateEvent, RunConfig, RunStatus, ScheduleConfig, SessionInfo } from '../core/types'
+import type { Account, CoreEvents, HistoryPageRequest, HistoryProjectsPageRequest, HostHoldings, HostStatus, OrchHostGate, OrchSnapshot, Provider, RateLimitWindow, ResumeStrategy, RollStateEvent, RunConfig, RunStatus, ScheduleConfig, SessionInfo } from '../core/types'
 import { providerOf } from '../core/providers/meta'
-import { markCodexProjectTrusted } from '../core/accounts/codexTrust'
+import { orchAccountOf } from '../core/accounts/accountsFile'
 import { descriptorOf } from '../core/providers/descriptor'
 import { readGeneratorSettings } from '../core/understanding/generatorSettings'
 import type { ModelListResult } from '../core/models/types'
@@ -55,13 +72,25 @@ import { listClaudeModels, listCodexModels } from './models/discover'
 import { UnderstandingPipeline } from './understanding/pipeline'
 import { copyTranscript, samePath } from '../core/rolling/transcript'
 import { sanitizeResumePrompt } from '../core/sessions/commands'
-import { OrchestrationStore } from './orchestration/store'
+import type { OrchLoadResult } from '../core/orchestration/store'
+import { createMirrorStore, OrchStateConflict } from './orchestration/mirrorStore'
+import { createResumeSweep, type ResumeSweep } from '../core/orchestration/exec/resumeSweep'
+import { createOrchCommitHook } from './orchestration/commitHook'
+import { createReviewStarter } from '../core/orchestration/exec/review'
+import {
+  createDispatchLoop,
+  ORCH_FIRE_TICK_MS,
+  type DispatchLoop
+} from '../core/orchestration/exec/dispatchLoop'
+import { answerOrchAct } from './orchestration/answerAct'
+import { appDiscardRunWorktree, appTimerTick, stopRunFromPanel } from './orchestration/yieldDispatch'
+import { HOST_UNRESPONSIVE_MS } from '../core/host/unresponsive'
 import { UnderstandingStore } from './understanding/store'
 import { WorkUnitStore } from './workUnit/store'
 import { HandoffStore } from './handoff/store'
-import { ContinuityJournal } from './continuity/journal'
-import { ContinuityRecorder } from './continuity/recorder'
-import { readGitSummary } from './gitSummary'
+import { createAppJournal } from './continuity/appJournal'
+import { promptWriteEventOf } from '../core/continuity/promptWrite'
+import { readGitSummary } from '../core/orchestration/exec/gitSummary'
 import { RecoveryReconciler } from './recovery/reconciler'
 import { executeRecovery } from './recovery/execute'
 import { readGitFacts } from './recovery/git'
@@ -71,109 +100,125 @@ import { readGitRef, isAncestorOf, readChangedFiles, readRange } from './workUni
 import {
   OrchCoordinator,
   LAUNCH_FORBIDDEN,
-  buildReviewSpecFile,
-  knowledgeIn,
-  specFileName
-} from './orchestration/coordinator'
+  knowledgeIn
+} from '../core/orchestration/exec/coordinator'
+import { sweepStaleSpecFiles } from '../core/orchestration/exec/specFiles'
+import { killWorkerSession } from './orchestration/stopWorker'
 import {
   handleCommand as orchHandleCommand,
-  startOrchServer,
-  type OrchServer,
   type OrchServerDeps
-} from './orchestration/server'
-import { applyPendingReports, readPendingReports } from './orchestration/pendingDrain'
+} from '../core/orchestration/command'
+import { applyPendingReports, readPendingReports } from '../core/orchestration/pendingDrain'
+import { pauseWorkParkedByTheToggle } from '../core/orchestration/alwaysOn'
 import {
-  PENDING_REPORTS_DIR,
+  pendingReportsDirIn,
   dispatchesHeldOnlyByReport,
   reportedDispatchIdsOf
 } from '../core/orchestration/pendingReports'
-import { OrchRollTap } from './orchestration/rollTap'
-import { TaskValidator } from './orchestration/validator'
+import { ExitsBeforeTap, OrchRollTap } from '../core/orchestration/exec/rollTap'
+import { coordinatorReleaseOf, PendingCoordinatorReleases } from '../core/orchestration/exec/releaseDefer'
+import type { TaskValidator } from '../core/orchestration/exec/validator'
+import { createTaskValidation } from '../core/orchestration/exec/validation'
 import {
-  applyValidationResult,
   bindNativeSession,
-  blockForValidation,
-  blockForReview,
-  openReviewDispatch,
   writeOffDispatch
 } from '../core/orchestration/state'
-import { pickReviewer } from '../core/orchestration/reviewer'
-import { slotsToFill, tasksMissingAccounts } from '../core/orchestration/schedule'
-import {
-  NO_COORDINATOR_ANSWER,
-  unattendedQuestions,
-  unreadUpwardMail
-} from '../core/orchestration/inbox'
-import { coordinatorLaunchPrompt } from '../core/orchestration/handover'
-import { detachCoordinator, stampPolicySnapshot } from '../core/orchestration/state'
 import { PTY_LOST_SIGHT_EXIT_CODE } from '../core/sessions/pty'
+import { chatAnswerFailureOf, chatPendingOf, chatPromptsOf } from '../core/sessions/chatRead'
+import { answerSlackCard } from './slackAnswer'
 import type { ChatAnswer, ChatContextUsage, RateLimitInfo } from '../core/chat/types'
 import { chatSessionUsage } from '../core/usage/chatSession'
-import { isPermissionMode } from '../core/chat/types'
-import { firesDue } from '../core/orchestration/fire'
-import { reapableChildRuns } from '../core/orchestration/reap'
-import {
-  buildIntegrationSpec,
-  integrationTaskFor,
-  isIntegrationTask,
-  pendingMerges,
-  runRootOf,
-  workingInRunRoot,
-  worktreeDepsOf
-} from '../core/orchestration/integrate'
-import { DEFAULT_CONCURRENCY, type Dispatch } from '../core/orchestration/types'
-import {
-  checkConfigIdsOf,
-  completionPolicyHash,
-  policyOf,
-  suspiciousCheckFiles
-} from '../core/orchestration/convergence'
-import { performRepair, repairOnce, repairTargetFor, type RepairDeps } from './orchestration/repair'
-import { accountToDispatchOn, rollChainFor } from '../core/accounts/dispatchAccount'
-import { sameSnapshot, snapshotFor, runsForProject, outcomeOf } from '../core/orchestration/view'
-import { justFinished } from '../core/orchestration/runRecord'
+import { isPermissionMode, isUnattendedPermission } from '../core/chat/types'
+import { performRepair, repairOnce, repairTargetFor, type RepairDeps } from '../core/orchestration/exec/repair'
+import { sameSnapshot, snapshotFor, jobsForProject, outcomeOf } from '../core/orchestration/view'
+import { ensureProject } from '../core/orchestration/projects'
+import { jobOf, resolveRunId } from '../core/orchestration/state'
+import type { CliInstallStatus, WorktreeInfo } from '../core/types'
+
+/** 이 프로젝트의 것인 id 전부 — Job 과 그 회차. **한 집합으로 묻는 이유**는 명령이 둘 중 무엇이든
+ *  지목할 수 있기 때문이다: 사이드바의 Job 줄은 Job 의 id 를, 펼친 회차 줄은 회차의 id 를 보낸다. */
+function idsOfProject(
+  state: OrchState,
+  project: string,
+  worktrees: WorktreeInfo[]
+): ReadonlySet<string> {
+  const ids = new Set(jobsForProject(state, project, worktrees).map((j) => j.id))
+  for (const r of state.runs) if (ids.has(r.jobId)) ids.add(r.id)
+  return ids
+}
 import { timelineFor } from '../core/orchestration/timeline'
 import { layersOf } from '../core/orchestration/graph'
 import { completionForTaskOf } from '../core/orchestration/completion'
 import { repoPathOf } from '../core/worktrees/repo'
 import type { OrchState } from '../core/orchestration/state'
-import { makeLimitProbe } from './orchestration/limitProbe'
-import { writeInfo, writeShuttle } from './orchestration/shuttle'
-import { WorkerTails } from './orchestration/tail'
-import { releaseArgsFor } from './orchestration/release'
-import { installStub } from './orchestration/stub'
+import { makeLimitProbe } from '../core/orchestration/exec/limitProbe'
+import {
+  installShuttle,
+  removeShuttle,
+  sessionCmdLink,
+  shuttleNames,
+  syncShuttle,
+  writeShuttle,
+  type AppImageLaunch
+} from '../core/orchestration/exec/shuttle'
+import { appImageLaunchFor, binDirFor, isOnPath, pathHintFor } from '../core/orchestration/cliInstall'
+import { addToUserPath, removeFromUserPath, userPathHas } from './userPath'
+import { WorkerTails } from '../core/orchestration/exec/tail'
+import { releaseArgsFor } from '../core/orchestration/exec/release'
+import {
+  preTrustWorkspace as preTrustWorkspaceFor,
+  startCoordinatorSession,
+  startWorkerWithChain
+} from '../core/orchestration/exec/workerStart'
+import {
+  forkWorktree,
+  integrateWorktrees,
+  reapWorktree as reapWorktreeIn,
+  worktreeDeps,
+  type IntegrateContext,
+  type ReapContext
+} from '../core/orchestration/exec/integrateGit'
+import { installStub, skillStubs } from './orchestration/stub'
 import { AgentGuestRegistry, type GuestLike } from './agentBrowser/registry'
 import { AgentBufferStore, attachBuffers, installNetworkCapture } from './agentBrowser/buffers'
 import type { GuestDriver } from './agentBrowser/helpers'
 import { AgentBrowserRuns, devServersFor } from './agentBrowser/runs'
 import { previewShotsDir } from './preview/shots'
 import { PREVIEW_PARTITION } from '../core/preview/guards'
-import { buildResumeNote, buildResumePacket, buildTabResumeText } from './orchestration/resumePacket'
+import { buildResumeNote, buildResumePacket, buildTabResumeText } from '../core/orchestration/exec/resumePacket'
 import { extractStatusLineModel, extractStatusLineSession } from '../core/usage/statusline'
 import { listSlashCommands, listCodexMentions } from './slashCommands'
 import { createFileIndex } from './fileIndex'
 import { filterFilePaths } from '../core/files/fileMatch'
-import { sortEntries, isPathWithin, isSamePath, projectRootOf } from '../core/files/tree'
+import { sortEntries, isPathWithin, isSamePath, renamePlan, resolveProjectRootFrom } from '../core/files/tree'
+import { OUTSIDE_ROOT, writeWithinRoot } from '../core/files/atomicWrite'
+import { resolveWindowsExecutable, windowsSpawn } from '../core/sessions/windowsExecutable'
 import { writeFilesToClipboard } from './clipboardFiles'
 import { validateName, uniqueName, canMove, canCopy } from '../core/files/ops'
+import { copyTree, removeTree, removeWithSnapshot } from '../core/files/fsTree'
+import { countFileOp, type FileOpCounter } from '../core/files/fileOpProgress'
 import { imageMime } from '../core/files/imageMime'
 import { parsePorcelainZ, type GitState } from '../core/git/status'
+import { readHostMerges, hostMergesPathIn } from '../core/git/hostMerges'
 import { FileWatcher } from './fileWatcher'
 import { GitWatcher } from './gitWatcher'
 import { createWorktree } from '../core/worktrees/create'
-import { nameForRun, nameForTask } from '../core/worktrees/naming'
+import { createWorktreeOps } from '../core/worktrees/createOps'
 import { listBranches, detectBaseRef } from '../core/worktrees/git'
-import { workerBaseFailure } from '../core/worktrees/base'
 import { goneWorktreeProjects } from '../core/worktrees/hiddenHistory'
 import { deleteProjectHistory } from './historyDeletion'
 import { removeWorktree } from '../core/worktrees/remove'
 import { listWithStatus } from '../core/worktrees/list'
+import { PresenceCache, PRESENCE_SWEEP_MS } from '../core/worktrees/presence'
+import { probeLog } from '../core/sessions/pathProbe'
+import { gateFolders, unreachableInLang, withUnreachableInLang } from './fileOpGate'
+import { readConfiguredModel } from './models/configuredModel'
+import { createPresenceRepush } from './worktreePresenceRepush'
 import {
   git,
   repoRoot,
+  probeRepoRoot,
   gitDir,
-  gitVersionAtLeast,
-  listGitWorktrees,
   isCleanWorktree
 } from '../core/worktrees/git'
 import { readPushState } from '../core/worktrees/push'
@@ -185,8 +230,8 @@ import { listJdks } from './jdkScanner'
 import { listPythonInterpreters } from './pythonScanner'
 import { listComposeServices } from './composeScanner'
 import { listDotnetProjects } from './dotnetScanner'
-import { loadRunConfigs, prepareRun, prepareLaunch } from './run/prepare'
-import { seedKeyOf } from '../core/run/config'
+import { loadRunConfigs, prepareLaunch } from '../core/run/prepare'
+import { allowingJobCwds, orchRunConfigOf } from '../core/run/runConfigsFile'
 import { executeLaunch } from './run/launch'
 import { resolveConsolePath } from './run/resolveLink'
 import { saveConfigsBatch } from './run/saveConfigs'
@@ -201,27 +246,27 @@ import { fillFromCommits } from '../core/github/fill'
  *  **stop 은 동기다** — will-quit 에서 불리므로 비동기 정리는 프로세스가 끝나기 전에 완료될 보장이
  *  없다. onRolled 도 같은 이유로 void 를 돌려준다: 롤링의 send 탭은 동기이고, 그 자리에서 기다릴 수
  *  없다. orchEnv 는 두 롤링 코디네이터가 읽는 세 번째 값이다 — 롤로 띄우는 워커 세션에 astera CLI
- *  환경을 실어야 롤 뒤의 워커가 완료를 보고할 수 있다(rolling.ts/codexRolling.ts 의 orchEnv dep).
+ *  환경을 실어야 롤 뒤의 워커가 완료를 보고할 수 있다(claudeCoordinator.ts/codexCoordinator.ts 의 orchEnv dep).
  *
  *  **onRollState 도 롤링의 send 탭에서 부른다 — 그래서 역시 void 다.** `RollStateEvent` 를 통째로
  *  넘기고, 그 중 어떤 게시가 정지 에피소드의 시작인지 가르는 일과 정지 스냅샷을 남기는 일은
- *  `OrchRollTap` 이 한다(main/orchestration/rollTap.ts 의 onRollState). 통째로 넘기는 이유는 둘이다:
+ *  `OrchRollTap` 이 한다(core/orchestration/exec/rollTap.ts 의 onRollState). 통째로 넘기는 이유는 둘이다:
  *  같은 정지가 'switching' 을 두 번 게시하므로 `reattach` 를 봐야 하고, 리셋 시각(`nextRetryAt`)은
  *  이 이벤트에만 있어 여기서 버리면 브리핑이 그것을 되찾을 방법이 없다.
  *
  *  **resumeText 는 두 롤링 코디네이터가 읽는 네 번째 값이다** — RollingDeps/CodexRollingDeps 의
  *  resumeText dep 구현이고, sessionId 로 열린 Job Dispatch 를 찾아 재개 packet 을 spec 파일에 적어
- *  넣은 뒤 그 자리에 쓸 한 줄을 돌려준다(main/orchestration/resumePacket.ts). Job 워커가 아니면(그리고
+ *  넣은 뒤 그 자리에 쓸 한 줄을 돌려준다(core/orchestration/exec/resumePacket.ts). Job 워커가 아니면(그리고
  *  `tabFallback` 이 참이면) 탭 브리핑으로 저하한다 — 그 저하는 `tabResumeTextFor` 를 그대로 감쌀
- *  뿐이라 오케스트레이션이 켜져 있을 때만 쓸 수 있는 자원(OrchState)에 기대지 않는다. **이 handle
- *  자체가 오케스트레이션이 켜져 있을 때만 존재한다는 점은 그대로다** — `orchRef` 가 null 인 경우의
- *  탭 폴백은 index.ts 가 별도로 받는 `tabResumeTextFor` 참조로 처리한다(fix wave 최종, F1 —
+ *  뿐이라 서버가 서 있을 때만 쓸 수 있는 자원(OrchState)에 기대지 않는다. **이 handle 자체가 서버가
+ *  선 뒤에만 존재한다는 점은 그대로다** — `orchRef` 가 null 인 경우의 탭 폴백은 index.ts 가 별도로
+ *  받는 `tabResumeTextFor` 참조로 처리한다(fix wave 최종, F1 —
  *  `OrchWiring.onTabResumeReady`). */
 export interface OrchHandle {
   stop: () => void
   onRolled: (oldSessionId: string, newInfo: { id: string; accountId: string }) => void
   onRollState: (e: RollStateEvent) => void
-  orchEnv: () => { cliPath: string; infoPath: string; skillsPath: string } | undefined
+  orchEnv: () => { cliPath: string; skillsPath: string; profileDir: string } | undefined
   resumeText: (sessionId: string, form: 'handover' | 'update', tabFallback: boolean) => Promise<string | null>
   /** Job Continuity: binds the provider's session id to the open Dispatch of that app session. */
   onNativeSession: (sessionId: string, nativeSessionId: string) => void
@@ -234,20 +279,28 @@ export interface OrchHandle {
  *  (onRolled), since index.ts is where rolling's own send tap lives. */
 export interface OrchWiring {
   log: (message: string) => void
+  /** Where `log` writes — userData/orchestration.log. **Handed over rather than rebuilt here** so the
+   *  two never drift: the Jobs view names this file when it cannot reach the Host, and a path that
+   *  points at nothing is worse than no path. */
+  logPath: string
   /** Hands over the shutdown cleanup handle once the server is up. Called from will-quit — and it is
    *  synchronous: asynchronous cleanup may not finish before the process ends, and deleting the token
    *  file has to happen (OS permissions on the token file are the access control). */
   onStarted: (h: OrchHandle) => void
   /** fix wave 최종, F1: hands over the tab-briefing function (`tabResumeTextFor` below) once,
    *  unconditionally — called synchronously from inside `registerIpc`, not from `bootOrch`. That is the
-   *  whole point of a separate callback: `onStarted`/`OrchHandle` exist only once orchestration has
-   *  actually booted (the toggle is on), but a plain tab session's briefing has nothing to do with that
-   *  toggle — it reads a transcript and git, not `OrchState`. Before this, index.ts's two rolling
-   *  coordinators reached the tab fallback only through `orchRef?.resumeText`, so on a default install
-   *  (orchestration off) `orchRef` was always null and Smart Resume was inert regardless of its own
-   *  setting. index.ts stores the function this hands over separately from `orchRef` and calls it
+   *  whole point of a separate callback: `onStarted`/`OrchHandle` exist only once the orchestration
+   *  server has actually come up, but a plain tab session's briefing has nothing to do with that — it
+   *  reads a transcript and git, not `OrchState`. Before this, index.ts's two rolling coordinators
+   *  reached the tab fallback only through `orchRef?.resumeText`, so whenever the server was not up
+   *  `orchRef` was null and Smart Resume was inert regardless of its own setting. index.ts stores the function this hands over separately from `orchRef` and calls it
    *  directly when `orchRef` is null. */
   onTabResumeReady: (fn: (sessionId: string, form: 'handover' | 'update') => Promise<string | null>) => void
+  /** One turn into a chat session through index.ts's session driver — the scheduler's and Slack's
+   *  (`sessionDriver.deliver`), so `astera sessions send` moves the adapter's turn state the way they
+   *  do. Handed over rather than rebuilt here: a second driver is a second place for the seam's
+   *  "a rejection means not sent" contract to drift. */
+  deliverChat: (sessionId: string, text: string) => Promise<void>
 }
 
 /** The index.ts side of the Astera Host (design §4). Its own wiring rather than a member of
@@ -260,6 +313,19 @@ export interface HostWiring {
    *  slack.log and orchestration.log. The Host keeps host/host.log from its own end; this is the
    *  app's end of the same conversation. */
   log: (message: string) => void
+  /** index.ts's roll fan-out, for a roll the Host made and pushed (S6 §3.4): what it costs this app —
+   *  the renderer, the Work Unit fork, the scheduler, Slack and the desktop sink. hostRollView always
+   *  passes `orchestration: false` (the Host rekeyed); `codex` adds the codex rollout watcher's
+   *  re-register; `renderer: false` keeps a rekey whose new session the app did not adopt from the
+   *  renderer (S6-17). Optional so a test wiring can omit it. */
+  fanOutRollEvent?: (
+    channel: 'session:rolled' | 'session:rollState',
+    payload: unknown,
+    opts: { orchestration: boolean; codex: boolean; renderer?: boolean }
+  ) => void
+  /** The app's one block registry, shared by both coordinators (index.ts). Exchanged with a Host that
+   *  announces `blocks` (S6 D4, blockSync.ts). Optional so a test wiring can omit it. */
+  blocks?: BlockRegistry
   /** Hands over the shutdown handle once the client is built. Called from inside `registerIpc`, not
    *  from a boot path — the same shape as `OrchWiring.onTabResumeReady` — and read from will-quit.
    *  Not called at all when there is no Host bundle to talk to: there is then nothing to stop. */
@@ -282,7 +348,8 @@ export interface HostWiring {
  *  document, not a disk image, and the cap is what keeps a stray drop from filling a disk. */
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
-const UI_CALLER = 'astera:app'
+// The same string core's handleCommand lets send the driving loop's own calls (APP_CALLER).
+const UI_CALLER = APP_CALLER
 
 /** http:/https:/mailto: 만 허용하는 스킴 화이트리스트. 통과하면 파싱된 URL 을 돌려준다 —
  *  new URL 은 탭·개행을 스스로 걷어내므로, 호출자는 원래 문자열이 아니라 이 반환값의
@@ -407,9 +474,12 @@ export function retryRegistrationsFor(
  *  worktree — see `OrchestrationStore.load`'s own argument for the whole reasoning. */
 export type SessionsTakenBack = ReattachResult | 'unknown' | null
 
-/** The shape `OrchestrationStore.load` wants, from the shape `startHostClient` produces. Trivial, and
- *  a named function with tests anyway: this is the exact place the three answers could quietly become
- *  two, and that collapse is the duplicate-agent bug. */
+/** The shape the app's own boot cleanup wants — `staleSpecFiles` and `dispatchesHeldOnlyByReport` —
+ *  from the shape `startHostClient` produces. **No longer what the restart cleanup inside
+ *  `OrchestrationStore.load` is judged against**: that runs in the Host now, against its own
+ *  registry, where the middle answer cannot arise (design §6). Trivial, and a named function with
+ *  tests anyway: this is the exact place the three answers could quietly become two, and that
+ *  collapse is the duplicate-agent bug. */
 export function liveWorkersFor(taken: SessionsTakenBack): ReadonlySet<string> | 'unknown' | undefined {
   if (taken === null) return undefined
   if (taken === 'unknown') return 'unknown'
@@ -494,10 +564,13 @@ export function hostHoldings(entries: PtyEntry[], procEntries: PtyEntry[]): Host
   return { sessions, terminals, runs, chats }
 }
 
-/** Whether the outdated Host should be replaced *now* (docs/superpowers/specs/2026-09-14-host-replacement-design.md
- *  §4). Four gates, and every one has to open:
+/** Whether the Host should be replaced *now*. Four gates, and every one has to open:
  *
- *  - `outdated` — there is a newer build to run at all (`HostStatus.outdated`).
+ *  - a reason: `outdated`, there is a newer build to run (`HostStatus.outdated`), or
+ *    `runtimeIncomplete`, the runtime it runs from is missing files and could not be repaired while
+ *    it holds them (docs/2026-09-22-host-unresponsive-recovery-design.md F6). The second is the more
+ *    urgent of the two — that Host is one spawn away from stalling for good — but it earns the same
+ *    treatment, because replacing it early still costs somebody their sessions.
  *  - `holdings` all zero — replacing costs nobody anything. **`null` is not zero**: it is the Host not
  *    answering the list in time, and a Host too slow to enumerate twelve terminals is not one to
  *    retire on the assumption it had none. The same distinction `host.holdings` and the restart
@@ -511,13 +584,35 @@ export function hostHoldings(entries: PtyEntry[], procEntries: PtyEntry[]): Host
  *  closure no test can reach, and this is the rule that ends a process. */
 export function hostReplaceDue(a: {
   outdated: boolean
+  runtimeIncomplete: boolean
   holdings: HostHoldings | null
   inFlight: boolean
   quitting: boolean
 }): boolean {
-  if (!a.outdated || a.inFlight || a.quitting) return false
+  if ((!a.outdated && !a.runtimeIncomplete) || a.inFlight || a.quitting) return false
   if (a.holdings === null) return false
   return a.holdings.sessions === 0 && a.holdings.terminals === 0 && a.holdings.runs === 0 && a.holdings.chats === 0
+}
+
+/**
+ * The line `replaceHost` logs once its ready wait is over (Host S2 fix round 2, N2).
+ *
+ * **A Host that is still leaving is not a replacement that failed.** A retired Host first waits up to
+ * SPAWN_DEADLINE_MS for spawns it already took, and keeps its address the whole time (`leave()` in
+ * host/index.ts); on win32 no new Host can bind the pipe name until it has closed. So the app's
+ * ready wait can run out while the old Host (`oldPid`) is still alive, and the client's own cycle
+ * reaches the new Host at a later attempt. Saying "did not come up" then sends a person looking for
+ * a failure that is not there. `oldAlive` is the caller's check on that pid.
+ */
+export function replacementLogLine(a: {
+  now: { connected: boolean; hostVersion: string | null; pid: number | null; problem: string | null }
+  oldPid: number | null
+  oldAlive: boolean
+}): string {
+  if (a.now.connected) return `host: replaced — now Host ${a.now.hostVersion} (pid ${a.now.pid})`
+  if (a.oldPid !== null && a.oldAlive)
+    return `host: the old Host (pid ${a.oldPid}) is still leaving and holds the address — the replacement is retried once it has gone`
+  return `host: the replacement did not come up: ${a.now.problem ?? 'no answer'}`
 }
 
 /**
@@ -559,29 +654,8 @@ export function scheduleForAdoptedSession(
   return stored(key)
 }
 
-/**
- * What the Host's note says about an adopted session's codex rollout, or null when it says nothing.
- *
- * The path is what `CodexRolloutWatcher.register` needs to attach without scanning, and null is a
- * refusal to register at all — for an adopted session the scan is not merely useless but harmful, and
- * the adopter's own note at the call site gives that argument in full. The codex session id rides
- * along because the same mapping produced it and the scheduler's store is keyed by it.
- *
- * The two fields are narrowed separately: they come from a note that crossed a process boundary, and
- * a build that wrote only the path should still get its session watched.
- *
- * A pure function for the same reason `scheduleForAdoptedSession` above is one — the adopter that
- * calls it is an electron-only closure, and "register only when the path is really there" is the
- * whole of the protection that closure is carrying.
- */
-export function codexRolloutFromNote(
-  restore: Record<string, unknown>
-): { rolloutPath: string; codexSessionId: string | null } | null {
-  const rolloutPath = restore.rolloutPath
-  if (typeof rolloutPath !== 'string' || rolloutPath === '') return null
-  const codexSessionId = restore.codexSessionId
-  return { rolloutPath, codexSessionId: typeof codexSessionId === 'string' ? codexSessionId : null }
-}
+// Moved to core with the watcher (Slack in the Host P13): the Host registers from the same note.
+export { codexRolloutFromNote }
 
 /**
  * The running chat session already on a protocol thread, if there is one. One `codex app-server` per
@@ -597,65 +671,11 @@ export function liveChatOnThread(threadId: string, sessions: SessionInfo[]): Ses
   return sessions.find((s) => s.status === 'running' && s.threadId === threadId) ?? null
 }
 
-/** The coordinator's brief, named for the Run it manages. It lives in the same directory as the
- *  workers' spec files, so the boot sweep has to be able to recognise one; `startCoordinator` writes
- *  it. The name is here, in one place, so those two cannot drift. */
-export const coordinatorBriefName = (runId: string): string => `coordinator-${runId}.md`
-
-/**
- * Which of the spec directory's files a boot clears out. `files` is the directory listing, the rest
- * is the state the restart cleanup left behind, and the answer is the names to delete.
- *
- * The rule is short because the invariant behind it is: **a file in here is live exactly as long as
- * the thing that was told to read it is.** Two kinds live here.
- *
- * - A worker's spec, kept while its Dispatch is open. The worker was launched with "read this path
- *   and follow it", and `buildResumePacket` (orchestration/resumePacket.ts) writes the resume
- *   briefing back into that same file, acting only on an open Dispatch.
- *   **Open, not alive.** A Dispatch left open because its worker really is gone is one recovery may
- *   resume, and resuming reads the original spec — so keeping it is right there too, not lenient.
- * - A coordinator's brief, kept while the session managing that Run is one the Host handed back.
- *   `Run.coordinatorSessionId` is that session, and an adopted session keeps its id, so the match is
- *   direct. With no Host nothing was handed back and every brief goes, exactly as before the Host
- *   existed; with `'unknown'` every Run that has a coordinator keeps its brief, for the same reason
- *   the cleanup leaves Dispatches open on that answer.
- *
- * Matching is on the file name alone. `Dispatch.specPath` is an absolute path written by whichever
- * platform produced it, and orchestration.json is hand-edited, so both separators turn up; the names
- * themselves are unique. Taking a worker's name from the stored path rather than rebuilding it from
- * ids keeps that naming rule in the one place that owns it, `OrchCoordinator.startWorker`; a Run
- * stores no path for its brief, so that one name comes from `coordinatorBriefName`, which both this
- * and `startCoordinator` call.
- *
- * A pure function for the same reason `rollCoordinatorForSession` is one: the boot that calls it is
- * an electron-only closure inside `registerIpc`, and this decision deletes files.
- */
-export function staleSpecFiles(a: {
-  /** The spec directory's listing, as plain names. */
-  files: readonly string[]
-  /** Every Dispatch in the state the restart cleanup produced — open ones keep their spec. */
-  dispatches: readonly { endedAt?: string; specPath: string }[]
-  /** Every Run in that same state. */
-  runs: readonly { id: string; coordinatorSessionId?: string }[]
-  /** What the Host said about the sessions it still runs, in `load`'s own three answers. */
-  live: ReadonlySet<string> | 'unknown' | undefined
-}): string[] {
-  const fileName = (p: string): string => p.split(/[\\/]/).pop() ?? ''
-  const keep = a.dispatches.filter((d) => !d.endedAt).map((d) => fileName(d.specPath))
-  for (const r of a.runs) {
-    if (r.coordinatorSessionId === undefined) continue
-    if (a.live === 'unknown' || a.live?.has(r.coordinatorSessionId)) keep.push(coordinatorBriefName(r.id))
-  }
-  // The empty ones are dropped, not kept: `openDispatch` writes `specPath: ''` and the coordinator
-  // fills it in once the worker is actually up, so a Dispatch caught in that window would otherwise
-  // hold an empty name that must not be allowed to match anything.
-  const live = new Set(keep.filter((n) => n !== ''))
-  return a.files.filter((f) => !live.has(f))
-}
+export { coordinatorBriefName, staleSpecFiles } from '../core/orchestration/exec/specFiles'
 
 /**
  * 사이드바 히스토리 재개가 백지 재개로 갈지 정한다. `SPEC §11.5` 가 `--resume` 발원지로 꼽은 셋
- * 중 세 번째 자리이고, 앞의 둘(`rolling.ts`·`codexRolling.ts` 의 `roll()`)이 쓰는 규칙과 같다.
+ * 중 세 번째 자리이고, 앞의 둘(`claudeCoordinator.ts`·`codexCoordinator.ts` 의 `roll()`)이 쓰는 규칙과 같다.
  *
  * **판정을 `spawnSession` 안에 두지 않는 이유는 위 세 헬퍼와 같다** — 그 함수는 `registerIpc` 안의
  * 클로저라 electron 하네스 없이는 테스트가 닿을 수 없다.
@@ -664,7 +684,7 @@ export function staleSpecFiles(a: {
  *   대화까지 버리면 새 세션에 남는 것이 없다.
  * - codex 는 이 줄을 argv 로 싣고 `sanitizeResumePrompt` 가 `["&|<>^%]` 와 연속 공백을 지운다.
  *   그 변환에 걸리는 경로면 포인터가 없는 파일을 가리키게 되는데 **백지 세션에는 돌아갈 대화도
- *   없다** — 그래서 백지를 포기한다(`codexRolling.ts` 의 fix wave 7, finding 2 와 같은 판단).
+ *   없다** — 그래서 백지를 포기한다(`codexCoordinator.ts` 의 fix wave 7, finding 2 와 같은 판단).
  *   `mangled` 를 따로 돌리는 것은 그 거부가 로그 없이 영구화되지 않게 하기 위해서다(같은 파일의 F6).
  * - claude 는 그 sanitizer 를 지나지 않으므로 같은 경로에서도 백지로 간다.
  */
@@ -755,10 +775,10 @@ export function registerIpc(
   slack?: {
     notifier: SlackNotifier
     store: SlackConfigStore
-    // A config change reconfigures the inbound socket too — without this, turning bot mode off (or
-    // even just changing the channel or token) leaves the old socket attached to the old channel,
-    // still injecting into live sessions.
-    reconfigureInbox?: (cfg: SlackConfig) => void
+    /** Who owns Slack (Slack in the Host, P4, P5): this app's notifier hears its inputs only while
+     *  `local()`, a settings save is applied by the owner (`configChanged`), and while a Host owns Slack
+     *  the events only this app sees are forwarded to it. */
+    ownership: SlackOwnership
   }, // Slack notifications
   codexRolling?: CodexRollingCoordinator, // Codex rolling
   scheduler?: SchedulerCoordinator, // session scheduler
@@ -797,9 +817,38 @@ export function registerIpc(
   hostWiring?: HostWiring
 ): void {
   const agentGuests = agentGuestsIn ?? new AgentGuestRegistry<WebContents>((id) => webContents.fromId(id))
-  const send = (channel: string, payload: unknown): void => {
+  // 재생 데이터는 렌더러가 귀를 열 때까지 게이트가 붙잡는다. `webContents.send` 는 들을 사람이
+  // 없으면 그냥 버리고, 하필 그 순간이 부팅 직후다 — Host 에서 세션을 되찾아 ring buffer 를
+  // 돌려받는 일이 앱이 켜진 지 130ms 만에 끝난다(rendererGate.ts 가 그 측정과 증상을 적어 둔다).
+  const gate = createRendererGate((channel, payload) => {
     if (!win.isDestroyed()) win.webContents.send(channel, payload)
+  })
+  const send = (channel: string, payload: unknown): void => gate.send(channel, payload)
+  // 렌더러가 `sessionBus.init()` 으로 채널에 리스너를 건 직후 보내 온다. 페이지 로드 이벤트가
+  // 아니라 렌더러 자신의 신고인 것은, 붙잡은 것을 푸는 조건이 "문서가 다 떴다" 가 아니라
+  // "이 출력을 받을 리스너가 실제로 걸렸다" 이기 때문이다. 리로드하면 다시 온다.
+  //
+  // **신고가 끝내 오지 않아도 게이트는 열린다.** 이것이 없으면 이 수정은 고치려던 것보다 나쁜
+  // 것을 만든다: 렌더러가 번들을 못 읽거나 죽어서 신고를 못 하면 세션 출력이 통째로, 영구히
+  // 막힌다. 시간이 지나면 스스로 열어 최악의 경우에도 고치기 전의 동작 — 그 구간만큼의 유실 —
+  // 으로 돌아가게 한다. 15초는 TerminalView 의 로딩 오버레이가 쓰는 것과 같은 값이고, 이유도
+  // 같다: 그 안에 렌더러가 뜨지 못했다면 기다려서 나아질 상황이 아니다.
+  //
+  // 푼 양은 붙잡은 것이 있을 때만 남긴다. 평소 실행에서는 0 이라 로그가 늘 비어 있고, 줄이
+  // 하나 찍혔다는 것 자체가 "이번 부팅은 Host 에서 세션을 되찾아 왔고 그 재생을 건져 냈다" 는
+  // 뜻이 된다 — 이 경로가 실제로 일했는지 확인할 곳이 그 줄 말고는 없다.
+  const openGate = (why: string): void => {
+    const { count, chars } = gate.open()
+    if (count > 0) hostWiring?.log(`renderer gate: released ${count} held chunk(s), ${chars} chars (${why})`)
   }
+  const readyFailsafe = setTimeout(() => {
+    hostWiring?.log('renderer never reported ready — releasing the held session output')
+    openGate('failsafe')
+  }, 15_000)
+  ipcMain.on('system.rendererReady', () => {
+    clearTimeout(readyFailsafe)
+    openGate('renderer ready')
+  })
   /** Every session this app holds, pty and chat alike. A chat session lives in its own manager
    *  (core.chat) but is a SessionInfo with a real accountId and cwd like any other, so every lookup
    *  that resolves a session id to its account, provider or folder has to look in both — otherwise a
@@ -810,7 +859,7 @@ export function registerIpc(
   const allSessions = (): SessionInfo[] => [...core.sessions.list(), ...core.chat.list()]
 
   // The conversation view: one follow per open session, polling only while at least one is open (see
-  // conversation.ts's own doc). transcriptPathFor reads the same statusLine payload rolling.ts,
+  // conversation.ts's own doc). transcriptPathFor reads the same statusLine payload claudeCoordinator.ts,
   // scheduler.ts and slack.ts already read for a claude session's transcript path, and answers null for
   // a codex one exactly the way it answers null for a claude session with no status line yet — codex
   // never writes one, so this needs no provider branch of its own. A claude *chat* session writes no
@@ -921,8 +970,12 @@ export function registerIpc(
   // ── Agent orchestration ────────────────────────────────────────────
   // The pure layers, the store, the server, the coordinator, and the CLI are first connected here.
   const orchLog = orchWiring?.log ?? ((): void => {})
+  /** The file `orchLog` writes to, for the one surface that names it — the Jobs view's "cannot reach
+   *  the Host" state. Empty when there is no orchestration wiring, which is also when that state can
+   *  never be reached (`bootOrch` does not run). */
+  const orchLogFile = orchWiring?.logPath ?? ''
   /** Task 7 — the directory a tab session's 'handover' briefing is written into (see
-   *  buildTabResumeText's JSDoc, main/orchestration/resumePacket.ts). Same convention as
+   *  buildTabResumeText's JSDoc, core/orchestration/exec/resumePacket.ts). Same convention as
    *  `specsDir` below (userData, never the project folder — the briefing's own "inspect git status"
    *  instruction would otherwise pick up this app-owned file as evidence). Declared at this outer
    *  scope, not inside bootOrch the way specsDir is, because `tabResumeTextFor` (below) closes over
@@ -939,7 +992,7 @@ export function registerIpc(
    *  (`core.sessions.onExit`), keyed to the id that was actually exiting — that was the bug this
    *  startup sweep replaces. A smart-resume roll writes the briefing under the *old*,
    *  about-to-die session's id and hands the *new* session a pointer to that exact path before the
-   *  kill (roll() in rolling.ts/codexRolling.ts). The producer's id and the consumer's id are never
+   *  kill (roll() in claudeCoordinator.ts/codexCoordinator.ts). The producer's id and the consumer's id are never
    *  the same id, so deleting the file the moment the producer exits removed it out from under a
    *  consumer that had not even booted yet — not as a rare race, but as the expected outcome of every
    *  smart resume. A startup sweep has no such mismatch: it runs before any session of this app run
@@ -954,8 +1007,8 @@ export function registerIpc(
   })().catch((err) => orchLog(`tab resume dir create failed: ${String(err)}`))
   // fix wave 최종, F6: specsDir 아래의 같은 검사(이 파일 뒤쪽, bootOrch)와 같은 이유다. 탭
   // handover 의 포인터 한 줄은 이 디렉터리 아래 파일을 가리키므로, 이 경로에 금지 문자가 있으면
-  // codex 의 인자 sanitizer(sanitizeResumePrompt, codexRolling.ts 의 roll())가 그 포인터를
-  // 영구히 망가뜨린다 — 매 롤마다 codexRolling.ts 가 로그를 남기긴 하지만(F6 의 나머지 절반),
+  // codex 의 인자 sanitizer(sanitizeResumePrompt, codexCoordinator.ts 의 roll())가 그 포인터를
+  // 영구히 망가뜨린다 — 매 롤마다 codexCoordinator.ts 가 로그를 남기긴 하지만(F6 의 나머지 절반),
   // 그 로그는 실제로 롤이 일어나야만 나온다. 시작하자마자 원인을 알 수 있도록 여기서도 한 번
   // 경고한다. 시작은 막지 않는다 — specsDir 과 같은 태도.
   if (LAUNCH_FORBIDDEN.test(tabResumeDir))
@@ -976,19 +1029,193 @@ export function registerIpc(
     })
     .catch((e) => orchLog(`handoff.json load failed: ${String(e)}`))
   let orch: {
-    server: OrchServer
     deps: OrchServerDeps
     cliPath: string
-    infoPath: string
     skillsPath: string
+    /** This app's own userData folder — what a spawned session is told so its `astera` finds this
+     *  app's Host and this app's report queue rather than recomputing a profile it cannot know
+     *  (see the ASTERA_PROFILE_DIR note in core/sessions/manager.ts). */
+    profileDir: string
   } | null = null
   /** 롤링↔Dispatch 이음매. startOrchestration 이 만들고 stop 이 버린다. orch 와 생명주기가 같지만
    *  따로 두는 이유는 onExit 이 orch 대입보다 훨씬 먼저 배선되기 때문이다 — 그 콜백은 호출 시점에
    *  이 변수를 읽는다. */
   let orchRollTap: OrchRollTap | null = null
+  /** The exits that arrive before `bootOrch` builds the tap, replayed into it once it does. The
+   *  startup sweep's `pty-attach` hands those exits to this app before the tap exists; see the class. */
+  const exitsBeforeTap = new ExitsBeforeTap()
   /** Astera Host slice 1: the channel exists, and nothing depends on it yet. Built at startup so
    *  slices 2 and 3 inherit an open line rather than one they have to reach for (design §7). */
   let hostClient: HostClient | null = null
+  /** Who drives Jobs, as the Host last said it (limits L3). Null until `startHostClient` builds it. */
+  let hostDriverView: HostDriverView | null = null
+  let hostWorkspaceView: HostWorkspaceView | null = null
+  /** Takes back the one pty a Host roll respawned into (`takeSessionsBack` with its id). Null until
+   *  `startHostClient` has built the sweep queue, and then for good: nothing is pushed before then. */
+  let takeBackRolledPty: ((ptyId: string) => Promise<unknown>) | null = null
+  /** Chat takeover: the same for the one line process a Host chat roll respawned into
+   *  (`session-rolled.procId`). Null until `startHostClient` has built the sweep queue. */
+  let takeBackRolledProc: ((procId: string) => Promise<unknown>) | null = null
+  /** The native session id (claude's session, codex's thread) each adopted session's note carried
+   *  (S6 Task 13), by session id — the history guard's view of a session the Host rolls, which no
+   *  coordinator here holds. Filled by the pty adopter, cleared on exit. */
+  const adoptedNative = new Map<string, string>()
+  /** The live session an adopted note named this native id for, if any (the history guard). */
+  const liveByAdoptedNative = (native: string): SessionInfo | null => {
+    for (const [id, n] of adoptedNative) {
+      if (n !== native) continue
+      const live = core.sessions.list().find((s) => s.id === id && s.status === 'running')
+      if (live) return live
+    }
+    return null
+  }
+  /** Fix round 1, I1a: the same question put to the Host's own pty notes when the local indexes miss —
+   *  a session a Host roll created while this app was attached was adopted before its native id was
+   *  known. Only in front of a Host that rolls, bounded by the pty list's own deadline, and null on any
+   *  failure: the guard then behaves as before rather than blocking the resume. */
+  const liveByHostNative = async (native: string): Promise<SessionInfo | null> => {
+    const found = await findHostHeld(
+      {
+        hostRolls: hostSpeaksRolling(hostClient?.status() ?? { connected: false, features: [] }),
+        list: hostPtyList,
+        // Chat takeover (Task 9 carry): a chat the Host rolls has no chain here (R8), so its native id is
+        // looked for in the proc notes too, whose `threadId` the writer's adapter keeps current.
+        listProcs: hostSpeaksChatTakeover(hostClient?.status() ?? { connected: false, features: [] }) ? hostProcList : null,
+        isCodexAccount: (accountId) => {
+          try {
+            return providerOf(core.accounts.get(accountId)) === 'codex'
+          } catch {
+            return false
+          }
+        }
+      },
+      native
+    )
+    // CT-11: a Host chat this app has not adopted yet has no live session to hand back; the resume is
+    // refused rather than started beside it on the same thread.
+    return hostHeldLive(
+      found,
+      (id) =>
+        core.sessions.list().find((x) => x.id === id && x.status === 'running') ??
+        core.chat.list().find((x) => x.id === id && x.status === 'running') ??
+        null,
+      t(core.lang, 'session.resume.hostChatNotAdopted')
+    )
+  }
+  /** The app's view of the Host's rolls (S6 §3.4) — the two pushes, turned into the app's own roll
+   *  fan-out without its orchestration tap. Built here rather than in `startHostClient` because the
+   *  exit path, `rolling.state` and the adopter all read it, and they are wired long before the Host
+   *  answers. `isCodexPayload` (preflight C9): the codex rollout re-register is for a codex session,
+   *  and a roll-state payload has no `info` — the session id is read off whichever the payload has. A
+   *  rekey is judged by the `info` it carries, so an adoption that failed does not make it claude. */
+  const isCodexPayload = (channel: 'session:rolled' | 'session:rollState', payload: unknown): boolean => {
+    const p = payload as { info?: SessionInfo; sessionId?: unknown }
+    const id = channel === 'session:rolled' ? p.info?.id : p.sessionId
+    if (typeof id !== 'string') return false
+    const sessions = channel === 'session:rolled' && p.info ? [p.info] : core.sessions.list()
+    return providerOfSession(id, sessions, (x) => core.accounts.get(x)) === 'codex'
+  }
+  const hostRollView = createHostRollView({
+    adopt: async (ptyId, procId) => {
+      if (ptyId && takeBackRolledPty) await takeBackRolledPty(ptyId)
+      // A chat roll's new half is a line process (chat takeover): the push comes only after its
+      // handshake, so its note no longer says hostStarting and the sweep adopts it.
+      else if (procId && takeBackRolledProc) await takeBackRolledProc(procId)
+    },
+    forward: (channel, payload, opts) => {
+      const codex = isCodexPayload(channel, payload)
+      hostWiring?.fanOutRollEvent?.(channel, payload, { ...opts, codex })
+      // Fix round 1, I1b: a codex roll resumes the same thread, so the history guard knows the new
+      // session by it at once — its note gains a nativeSessionId only after this adoption.
+      const n = nativeOfForwardedRekey(channel, payload, codex)
+      if (n) adoptedNative.set(n.sessionId, n.native)
+    },
+    log: (m) => hostWiring?.log(`host: ${m}`),
+    // Fix round 1, I2: the old session's exit waits until the mirror no longer names it.
+    orchHolds: (id) => orchHoldsSession(orchMirror.loaded() ? orchMirror.getState() : null, id),
+    // Fix round 1, 3: a rekey whose new session was not adopted leaves its forkSeen for the adopter.
+    // A chat roll's new half is a chat session (chat takeover): held too, so no fork is left pending.
+    isAdopted: (id) => core.sessions.list().some((x) => x.id === id) || core.chat.has(id)
+  })
+  /** Sessions whose note says the Host rolls them (fix round 1, 4), beside the ones hostRollView has
+   *  heard about: the only sessions `rolling.state` asks the Host for. Cleared on exit. */
+  const hostOwned = new Set<string>()
+  /** One reply to one `orch-call` — today's HTTP status and body, unchanged (design §5). */
+  type OrchReply = { status: number; body: unknown }
+  let orchCallSeq = 0
+  /** The `orch-call`s this app has sent and not had answered, by the correlation id it chose. One
+   *  socket can have several outstanding, which is why the reply names which one it answers. */
+  const pendingOrchCalls = new Map<
+    string,
+    { resolve(r: OrchReply): void; reject(e: Error): void; timer: ReturnType<typeof setTimeout> }
+  >()
+  /** Fails everything still waiting. Called when the connection drops: the Host may well have done
+   *  the work, but nothing is coming back on a socket that is gone, and a caller left waiting on one
+   *  is a Job that stops moving. What repairs a `state-put` that landed and whose answer did not is
+   *  the re-mirror on the next handshake, not this. */
+  const failPendingOrchCalls = (why: string): void => {
+    for (const [call, waiting] of [...pendingOrchCalls]) {
+      pendingOrchCalls.delete(call)
+      clearTimeout(waiting.timer)
+      waiting.reject(new Error(why))
+    }
+  }
+  /**
+   * The app's side of `orch-call` (design §5) — one RPC channel to the Host's command layer.
+   *
+   * **A deadline is safe here although `orch-call` also carries the long polls.** Those are the CLI's
+   * (`check --wait`, `ask`, `runs wait`); the only two commands this app ever sends are `state-get`
+   * and `state-put`, and both are one file write at the far end. The constant is the one the Host
+   * judges a silent app by in the other direction, so the two cannot drift.
+   */
+  const orchCall = (m: { cmd: string; args: Record<string, unknown>; sessionId: string }): Promise<OrchReply> =>
+    new Promise((resolve, reject) => {
+      const call = `app_${++orchCallSeq}`
+      const timer = setTimeout(() => {
+        pendingOrchCalls.delete(call)
+        reject(new Error(`the Host did not answer ${m.cmd} within ${HOST_UNRESPONSIVE_MS}ms`))
+      }, HOST_UNRESPONSIVE_MS)
+      timer.unref?.()
+      pendingOrchCalls.set(call, { resolve, reject, timer })
+      // A send that does not go out is the connection having dropped. Answered now rather than after
+      // the deadline's wait for a reply to a question nobody heard. The sentence is the worktree route's
+      // signal that nothing was sent (leftovers Task 1): a write there waits for the next Host and retries.
+      if (!hostClient?.send({ t: 'orch-call', call, cmd: m.cmd, args: m.args, session: m.sessionId })) {
+        pendingOrchCalls.delete(call)
+        clearTimeout(timer)
+        reject(new Error(NO_HOST_CONNECTION))
+      }
+    })
+  /** The app's copy of the orchestration state — the Host owns the file, this holds the last thing it
+   *  said was in it (design §5, §6). One per app: `bootOrch` reads and writes it through the
+   *  store-shaped facade it builds over this, and `startHostClient` fills it from every `orch-state`
+   *  push. Constructed unconditionally, because the pushes arrive whether or not the Jobs feature is
+   *  switched on in this app, and an empty mirror costs nothing. */
+  const orchMirror = createMirrorStore({ call: orchCall })
+  /** Refills the mirror from the Host after a handshake, so a commit pushed while the socket was down
+   *  is not simply missed. Null until `bootOrch` has run — the first handshake needs no refill,
+   *  because `bootOrch` fills the mirror itself and waits for that handshake to do it. */
+  let remirrorOrchState: (() => void) | null = null
+  /** What this app owes a commit once it has landed — see `afterOrchCommit`, which this points at
+   *  once `bootOrch` has built the things it needs (the journal, the scheduler, `prevOrchState`).
+   *
+   *  **Held out here because the commits are no longer all this app's** (ruling F54): the `orch-state`
+   *  handler lives in `startHostClient`, outside `bootOrch`, and a commit the Host made owes the same
+   *  six things as one this app made. Null before orchestration has started, which is also when there
+   *  is nothing to owe: no journal, no scheduler, no sidebar subscription. */
+  let onOrchCommit: ((a: { prev: OrchState; next: OrchState; catchingUp?: boolean }) => void) | null = null
+  /** Re-drives the validations and reviews a restart interrupted, off the mirror (see
+   *  `createResumeSweep`). **Run on every Host attachment, not once per Host lifetime** — the Host's
+   *  `boot` findings go to one app only, and an app restarting against a surviving Host is handed
+   *  `boot: null`, so this is the only thing that finds a Task the kill left `validating`. Null until
+   *  `bootOrch` has built the dependencies it needs (`deps`, and `orch` for the spawn path).
+   *
+   *  **"Every attachment" has one exception, and it is `remirrorOrchState`'s** (ruling F39). A boot
+   *  that could not read the state leaves that refill function null and returns, so a Host that comes
+   *  back an hour later is never picked up — there is no handshake handler to sweep from. Nothing
+   *  retries on its own: the next attempt is a toggle change or an app restart, which is what the
+   *  Jobs view's `cannot reach the Host` state says in as many words. */
+  let resumeSweep: ResumeSweep | null = null
   /** Whether the Host this app is connected to keeps its sessions through an update being installed.
    *  True off win32, where a running binary can simply be replaced; on win32 it is true only once the
    *  Host is running from its own runtime rather than the app's executable inside the install
@@ -996,8 +1223,9 @@ export function registerIpc(
    *  what the fallback path cannot deliver. */
   let hostSurvivesUpdate = process.platform !== 'win32'
   /** One `pty-list` round trip, or null before the Host wiring has built one. `startHostClient`
-   *  assigns it; the `host.holdings` handler is the only caller, and it is registered outside that
-   *  function, which is why this is here rather than a local.
+   *  assigns it; the `host.holdings` handler and worker-stop's `killSession` (for a session the Host
+   *  runs and the app does not hold) are the callers, and both are outside that function, which is
+   *  why this is here rather than a local.
    *
    *  **Not routed through the sweep queue.** A sweep can be waiting out its own five seconds, and a
    *  Settings row must not queue behind that; this asks its own question and reads its own reply.
@@ -1057,94 +1285,86 @@ export function registerIpc(
   void hostSessionsTakenBack.then(() =>
     core.pruneStatusLinePayloads(new Set(core.sessions.list().map((session) => session.id)))
   )
-  /** Job Continuity's recorder. Non-null only while the toggle is on: off means no file is opened and
-   *  nothing is written (spec §0.4). Created before store.load in bootOrch so the restart's losses are
-   *  journaled, and by the toggle handler when turned on at runtime. */
-  let continuity: ContinuityRecorder | null = null
-  /** The journal `continuity` wraps. Needed on its own beside the recorder: Job Continuity P1's
-   *  reconciler and `sweepOrphans` both act on the journal directly, not through the recorder's
-   *  read-only projections. Set in openContinuity, nulled in closeContinuity — same lifecycle as
-   *  `continuity` (closeContinuity's `continuity?.close()` already closes this journal, so this
-   *  variable is only ever nulled here, never closed a second time). */
-  let continuityJournal: ContinuityJournal | null = null
+  // Slack in the Host (P5): who owns Slack is decided once the startup chain settles, and not before, so
+  // this app opens no socket in front of a Slack-owning Host it has not heard from yet.
+  void hostSessionsTakenBack.then(() => slack?.ownership.settled())
   const continuityFile = path.join(app.getPath('userData'), 'orch', 'continuity.sqlite')
+  /** Job Continuity's journal, as this app sees it (Host journal J1, J2, J3). Off means no file is
+   *  opened and nothing is written (spec §0.4). In front of a Host that announces `journal` the Host
+   *  is the one writer and this app only reads, sending its reconciler's rows as `journal-append` and
+   *  a changed setting as `journal-reload`; in front of an older Host it writes the file itself. The
+   *  writer decision is kept from the last greeting (P8), so a dropped socket never makes this app a
+   *  second writer. `orchCall` and `hostClient` are read inside the closures, at call time. */
+  const appJournal = createAppJournal({
+    file: continuityFile,
+    status: () => hostClient?.status() ?? { connected: false, features: [] },
+    call: (cmd, args) => orchCall({ cmd, args, sessionId: '' }),
+    log: orchLog,
+    // Read per row, not captured: these rows are rendered long after they were written, and the
+    // settings handler reassigns core.lang under them.
+    lang: () => core.lang,
+    smartResume: () => core.appSettings.getResumeStrategy() === 'smart',
+    handoffLookup: (sessionId) => handoffs.lookup(sessionId)
+  })
   /** Job Continuity P1's reconciler, and the closure that builds it. **The builder is assigned inside
    *  bootOrch** — it needs the store and the server deps, which live there — while the callers are
    *  outside it (openContinuity, and the settings toggle). Same convention as releaseCoordinator. */
   let recovery: RecoveryReconciler | null = null
   let buildRecovery: (() => void) | null = null
-  /** Opens the journal, or leaves `continuity` null if it can't. ContinuityJournal's constructor
-   *  already moves a corrupt file aside and reopens once, but rethrows if that second open also fails
-   *  (a locked file, a read-only or full disk, an antivirus hold) — caught here because a journal that
-   *  cannot open must not stop orchestration or fail an already-persisted settings toggle. */
+  /** Turns journaling on. Nothing is opened here: appJournal opens its reader, or its own writer, at
+   *  the first use that needs one, and a writer that cannot open is logged there and never stops
+   *  orchestration. Not yet assigned on the very first call (bootOrch turns it on before it builds the
+   *  server deps the reconciler needs), so buildRecovery is a no-op then, built explicitly in bootOrch. */
   const openContinuity = (): void => {
-    if (continuity) return
-    try {
-      const journal = new ContinuityJournal(continuityFile, { log: orchLog })
-      if (journal.recovered) orchLog('continuity journal was unreadable — moved aside, started a new one')
-      continuity = new ContinuityRecorder({
-        journal,
-        log: orchLog,
-        // Read per row, not captured: these rows are rendered long after they were written, and the
-        // settings handler reassigns core.lang under them.
-        lang: () => core.lang,
-        smartResume: () => core.appSettings.getResumeStrategy() === 'smart',
-        handoffLookup: (sessionId) => handoffs.lookup(sessionId)
-      })
-      continuityJournal = journal
-    } catch (err) {
-      orchLog(`continuity: journal could not be opened — journaling stays off until the next start: ${String(err)}`)
-      continuity = null
-    }
-    // Outside the try: a throw from buildRecovery is not a journal failure, and logging it as "the
-    // journal could not be opened" would be false. Guarded on `continuity` rather than on the catch
-    // having been skipped — the same condition, read from the state it left behind — so a failed open
-    // (continuity left null) does not call it at all.
-    if (continuity)
-      // Not yet assigned on the very first call (bootOrch opens the journal before it builds the
-      // server deps the reconciler needs) — a no-op then, built explicitly further down in bootOrch.
-      buildRecovery?.()
+    appJournal.open()
+    buildRecovery?.()
   }
   const closeContinuity = (): void => {
-    continuity?.close()
-    continuity = null
-    continuityJournal = null
+    appJournal.close()
     recovery = null
   }
-  /** 검증기. startOrchestration 이 만들 때까지, 그리고 오케스트레이션이 꺼져 있으면 null 이다 */
+  /** 검증기. bootOrch 가 만들 때까지 null 이다 — 서버가 서지 못한 실행에서는 끝까지 null 로 남는다 */
   let orchValidator: TaskValidator | null = null
   /** 사라진 코디네이터의 자리를 비우는 함수. **bootOrch 안에서 대입한다** — 정의가 그 안에
    *  있어야 orch·deps 를 닫아 쓸 수 있고, 부르는 자리(core.sessions.onExit)는 그 밖이다.
    *  orch·orchValidator 와 같은 관례다. */
   let releaseCoordinator: ((sessionId: string, exitCode: number) => Promise<void>) | null = null
-  /** 예약 템플릿의 다음 발화 시각. **상태에 저장하지 않는다** — 재시작하면 비어 있고, 그때
-   *  firesDue 가 nextFireAt(rule, now) 으로 다시 무장한다. 그것이 곧 "앱이 꺼져 있던 동안의
-   *  발화는 버린다"는 규칙의 구현이다(main/scheduler.ts 가 같은 이유로 같은 선택을 했다). */
-  let orchArmed = new Map<string, number>()
+  /** The releases still inside their roll window (S6 R14). The server's `stop()` drops them, as it
+   *  drops the roll tap's deferred exits: `orch` is never reset, so nothing else stops one of them
+   *  from committing to a server that has gone. */
+  const coordinatorReleases = new PendingCoordinatorReleases()
+  /** 배치 루프(core/orchestration/exec/dispatchLoop.ts). bootOrch 가 짓기 전에는 null 이다 — orchSnapshotOf
+   *  가 예약 템플릿의 다음 발화 시각을 여기서 읽는다(nextFireOf). 무장은 상태에 저장하지 않고 루프가
+   *  메모리에 들고 있다: 재시작하면 비어 있고, 그것이 "앱이 꺼져 있던 동안의 발화는 버린다" 는
+   *  규칙의 구현이다(그 이유는 루프의 `armed` 에 있다). */
+  let orchLoop: DispatchLoop | null = null
+  /** bootOrch's `hostDrives` (N8), for the two places outside it that must ask the same thing: the
+   *  run panel's stop button and the `orch-act` answer. Assigned, never re-derived: one predicate. */
+  let orchHostDrives: () => boolean = () => false
   let orchFireTimer: ReturnType<typeof setInterval> | null = null
   /** A bounded per-dispatch tail of worker output — what worker-read reads. The append, cap, eviction,
    *  and limit rules, along with "when does it get cleared", live in orchestration/tail.ts (its tests
    *  pin them down). Eviction is the only path that clears it — not a dead session, not a
    *  worker-release call: "preserve the output first, then close the session" is the contract. */
   const orchTails = new WorkerTails()
-  /** The CLI-access environment variables planted into a session. Nothing is injected when the server
-   *  is not up (toggle off, or startup failed) or the user turned it off at runtime — "off" has to
-   *  mean "newly created sessions do not know about the CLI". Looking only at whether the server is
-   *  alive (orch !== null) would let a session created after turning it off discover the CLI and then
-   *  get a 409 on every call. **Work-unit tracking counts too**: /astera-task needs the same CLI and
-   *  the same ASTERA_SESSION, and the command gate in the server decides what may be called. **So
-   *  does the agent browser**: `astera browser help` and `astera browser js` are that same CLI, and
-   *  skillsPath is where `browser help` reads the guide from — without this the astera-browser skill
-   *  is planted into a session that cannot reach the program it tells the agent to run. **And Smart
-   *  Resume**: `astera handoff` is that same CLI, and the memo it stores is what the Smart Resume
-   *  briefing reads back. */
-  const orchEnvOf = (): { cliPath: string; infoPath: string; skillsPath: string } | undefined =>
-    orch &&
-    (core.appSettings.getOrchestrationEnabled() ||
-      core.appSettings.getWorkUnitTrackingEnabled() ||
-      core.appSettings.getAgentBrowserEnabled() ||
-      core.appSettings.getResumeStrategy() === 'smart')
-      ? { cliPath: orch.cliPath, infoPath: orch.infoPath, skillsPath: orch.skillsPath }
+  /** The CLI-access environment variables planted into a session. **Every session gets them once the
+   *  server is up**, because orchestration is not a toggle any more — it is something Astera has, like
+   *  sessions, so there is no state in which a session created now must be kept from discovering the
+   *  CLI. The one condition left is the server itself: nothing is injected before it stands, or after
+   *  a startup that failed, since `cliPath`, `skillsPath` and `profileDir` are its values to give.
+   *
+   *  The other features ride on the same three: /astera-task needs this CLI and the same
+   *  ASTERA_SESSION, `astera browser help`/`browser js` are that same CLI with skillsPath as where
+   *  the guide is read from, and `astera handoff` stores the memo the Smart Resume briefing reads
+   *  back. Which of those a session may actually call is the command gate's question, not this
+   *  one's. */
+  const orchEnvOf = (): { cliPath: string; skillsPath: string; profileDir: string } | undefined =>
+    orch
+      ? {
+          cliPath: orch.cliPath,
+          skillsPath: orch.skillsPath,
+          profileDir: orch.profileDir
+        }
       : undefined
   /** The project the Jobs sidebar is folded for. main is not otherwise told what the renderer has
    *  open, and the snapshot is per project, so orch.list doubles as the subscription: the last path
@@ -1170,6 +1390,24 @@ export function registerIpc(
    *  renderer has turned off (and nothing turns it off again), and two overlapping list calls can
    *  settle in the wrong order, leaving main pushing project A to a renderer showing B. */
   let orchRequest = 0
+  /** The last state pushOrchState folded, so a presence answer that lands later can fold it again. */
+  let orchLastPushed: OrchState | null = null
+  /** 워크트리 폴더가 아직 있는가 — 비동기로 묻고, 시간 제한이 있고, 캐시된다(core/worktrees/presence.ts).
+   *  **푸시 경로는 캐시만 읽는다.** 동기 existsSync 였을 때는 네트워크 공유·OneDrive·`\\wsl$` 위의
+   *  워크트리 하나가 모든 setState 마다 메인 스레드를 20~60초씩 세웠다. 답이 아직 없으면 unknown 이고
+   *  (사라졌다고 하지 않는다) 확인이 예약된다. 답이 새로 오거나 바뀌면 마지막 상태를 한 번 더 접어
+   *  보낸다 — sameSnapshot 이 달라진 것이 없으면 버린다. 여러 답이 한꺼번에 와도 다시 접는 것은 한 번이다. */
+  const worktreePresence = new PresenceCache({
+    onChange: createPresenceRepush<OrchState>({
+      // orch.list 가 접은 상태는 pushOrchState 를 지나지 않으므로 지금 상태를 먼저 읽는다
+      current: () => (orch ? orch.deps.getState() : orchLastPushed),
+      push: (state) => pushOrchState(state),
+      log: orchLog
+    }),
+    log: probeLog
+  })
+  // 주기적으로 알려진 경로 전부와 레지스트리의 워크트리를 다시 묻는다. 타이머는 프로세스를 붙잡지 않는다.
+  worktreePresence.start(PRESENCE_SWEEP_MS, () => core.worktrees.list().map((w) => w.path))
   const orchSnapshotOf = (state: OrchState, projectPath: string): OrchSnapshot => {
     // The set is built once per fold rather than per Task — sessions.list() copies every SessionInfo.
     const known = new Set(core.sessions.list().map((s) => s.id))
@@ -1181,13 +1419,16 @@ export function registerIpc(
       projectPath,
       (id) => known.has(id),
       core.worktrees.list(),
-      (runId) => orchArmed.get(runId) ?? null,
-      // 폴더가 아직 있는가. 동기 확인인 이유는 이 폴드가 모든 setState 뒤에 돌기 때문이다 — Run 하나에
-      // 워크트리 몇 개이므로 호출 수는 작고, 비동기로 만들면 이 함수와 그 호출자 셋이 전부 async 가 된다.
-      (p) => existsSync(p)
+      // 예약 템플릿의 다음 발화 — 무장은 배치 루프가 들고 있다(N3). bootOrch 전에는 null 이다.
+      (runId) => orchLoop?.nextFireOf(runId) ?? null,
+      // 폴더가 아직 있는가 — 캐시만 읽는다(worktreePresence). 이 폴드는 모든 setState 뒤에 메인
+      // 스레드에서 돌므로 fs 를 동기로 만지지 않는다. 확인된 missing 만 뺀다: unknown(아직 묻는 중)과
+      // unreachable(닿지 못했다)은 사라졌다는 증거가 아니다.
+      (p) => worktreePresence.peek(p) !== 'missing'
     )
   }
   const pushOrchState = (state: OrchState): void => {
+    orchLastPushed = state
     if (orchProject === null) return // the renderer has not asked for a project, or it unwatched
     // The push is a notification and runs inside the awaited setState (below), so a throw here would
     // reject a write that has **already been persisted** — every CLI command would start answering
@@ -1201,6 +1442,34 @@ export function registerIpc(
       send('orch:state', next)
     } catch (err) {
       orchLog(`orch:state push failed project=${orchProject}: ${String(err)}`)
+    }
+  }
+  /** Why the Jobs view has nothing to draw, when the reason is the Host (see `OrchHostGate`). Null
+   *  whenever the snapshot's own emptiness is the honest answer: before `bootOrch` runs at all (every
+   *  toggle off — nobody is waiting on anything), and again once it has succeeded. */
+  let orchHostGate: OrchHostGate | null = null
+  /**
+   * Says it on screen, **on a channel of its own and with no project in it** (ruling F41).
+   *
+   * It used to ride `orch:state` as a field on `OrchSnapshot`, and that is what made it invisible in
+   * the one state that needs it most. A snapshot is per project: main only pushes one while
+   * `orchProject` is set, which `orch.list` sets and the renderer only calls with a project open —
+   * and with none open the renderer substitutes a synthetic empty snapshot of its own that no push
+   * ever replaces. So a fresh install, or any window that has not opened a session, met four dead
+   * features and a sidebar saying "no project is open". Measured on screen.
+   *
+   * This gate is not per project — it is one fact about this app's Host — so it is answered by
+   * `orch.hostGate` and pushed on `orch:host`, neither of which knows what a project is. The renderer
+   * reads once at mount and listens after that, which is also what closes the window between the two:
+   * a gate set before the window existed is still there to be read.
+   */
+  const setOrchHostGate = (next: OrchHostGate | null): void => {
+    if (JSON.stringify(orchHostGate) === JSON.stringify(next)) return
+    orchHostGate = next
+    try {
+      send('orch:host', next)
+    } catch (err) {
+      orchLog(`orch:host push failed: ${String(err)}`)
     }
   }
 
@@ -1244,7 +1513,7 @@ export function registerIpc(
       }
     }
     try {
-      slack?.notifier.handleData(e) // limit detection for non-rolling sessions
+      if (slack?.ownership.local() !== false) slack?.notifier.handleData(e) // limit detection for non-rolling sessions (a Slack-owning Host reads the same output)
     } catch {
       /* A Slack failure does not block the session */
     }
@@ -1262,7 +1531,13 @@ export function registerIpc(
    *  genuinely per-kind are NOT here: the pty's own cleanup (busy scanners, the rolling coordinators)
    *  is harmless for a chat id and is left where it was, and the chat's own (attention, the rollout
    *  watcher) lives in the chat subscriber below, next to the events that set them up. */
-  const onSessionExit = (e: { sessionId: string; exitCode: number }): void => {
+  // The exit of a session a Host roll is replacing waits until the new session is adopted, the rekey
+  // forwarded and the mirror moved (S6 §3.4, withHostRollHold), so the renderer replaces the old tab
+  // rather than closing it, and the app's orchestration tap finds the Dispatch already rekeyed.
+  // installHostRollExit sets this one held handler as both core.sessions.onExit and core.chat.onExit (S6-20).
+  installHostRollExit(hostRollView, [core.sessions, core.chat], (e: { sessionId: string; exitCode: number }): void => {
+    adoptedNative.delete(e.sessionId)
+    hostOwned.delete(e.sessionId)
     batcher.flush()
     // Before the renderer hears about it, because that is what closes the tab. A run outlives its
     // session by up to the whole script deadline, and its next open() would find no guest, ask for a
@@ -1295,7 +1570,11 @@ export function registerIpc(
         .catch((err) => orchLog(`work unit exit failed: ${String(err)}`))
     // The exit code goes with the id: an exit that only means the app lost sight of the session must
     // not empty the slot. See `releaseCoordinator` itself for why refusing is the whole fix.
-    void releaseCoordinator?.(e.sessionId, e.exitCode) // 이 세션이 어느 Run 의 관리자였다면 그 칸을 비운다
+    // 이 세션이 어느 Run 의 관리자였다면 그 칸을 비운다 — 롤 창(EXIT_DEFER_MS)이 지난 뒤에: 롤이 다시
+    // 띄운 코디네이터라면 그 사이 롤 탭이 칸을 새 세션으로 옮겨 두어, 옛 id 로는 칸을 찾지 못한다 (S6 R14).
+    // The server's `stop()` cancels the releases still waiting (`coordinatorReleases.cancelAll`), so none
+    // commits after it; before the first boot `releaseCoordinator` is null and nothing is armed.
+    if (releaseCoordinator) coordinatorReleases.defer(releaseCoordinator, e, orchLog)
     // Task 7's tab-resume briefing file is no longer deleted here — see tabResumeDir's own comment
     // above (fix wave 7, finding 1 (CRITICAL)) for why a per-exit delete keyed to this id was wrong:
     // it fired for the *old* session a smart resume had just written the briefing under, while the
@@ -1305,7 +1584,8 @@ export function registerIpc(
     if (busyState.get(e.sessionId)) send('session:busy', { sessionId: e.sessionId, busy: false })
     busyState.delete(e.sessionId)
     try {
-      slack?.notifier.handleExit(e) // exit notification — delayed 3s, cancelled on a rolling switch
+      // exit notification — delayed 3s, cancelled on a rolling switch. A Slack-owning Host sources every exit (P6).
+      if (slack?.ownership.local() !== false) slack?.notifier.handleExit(e)
     } catch {
       /* A Slack failure does not block the session */
     }
@@ -1317,10 +1597,15 @@ export function registerIpc(
     // 유일한 경우는 stop() 이 탭을 null 로 되돌린 **뒤**, 즉 종료(quit) 중이다. 그때 도착한 exit 는
     // 일부러 버린다 — dispose() 의 정책과 같다: 열린 채 남은 Dispatch 는 다음 실행에서 store.load 의
     // 재시작 정리가 outcome_unknown 으로 처리하며 Task 는 건드리지 않는다.
+    //
+    // **Except before the first tap.** The startup sweep's `pty-attach` makes the Host leave these
+    // exits to this app while `bootOrch` is still on its way to building the tap, so they wait in
+    // `exitsBeforeTap` and are replayed into it (review of Task 12, I2). After that drain, a null tap is
+    // the quit above again.
     if (orchRollTap) orchRollTap.onExit(e)
-  }
-  core.sessions.onExit = onSessionExit
-  core.chat.onExit = onSessionExit
+    else if (exitsBeforeTap.hold(e) === 'full')
+      orchLog(`exit of session=${e.sessionId} dropped: too many exits arrived before orchestration started`)
+  })
   /** Chat sessions' own log line, as this wiring block sees it. They are the Host's line processes, so
    *  their notices belong in the same file the Host's own do. Read from `hostWiring` here rather than
    *  through the reattach sweep's `hostLog`, which is declared inside a closure that runs much later
@@ -1396,10 +1681,27 @@ export function registerIpc(
     // return at the notifier's first line. The transcript path is a getter because Claude's file exists
     // only after the first turn and Codex names its rollout at `ready` — the summary reads it when the
     // turn ends, not when the session starts.
-    slack?.notifier.onChatEvent(sessionId, event, {
-      provider: core.chat.state(sessionId)?.provider ?? 'codex',
-      transcriptPath: () => chatTranscripts.get(sessionId) ?? codexRollout?.rolloutPathFor(sessionId) ?? null
-    })
+    //
+    // While a Host owns Slack, the events the notifier reads (never an exit: the Host sources those, P6)
+    // are forwarded to it with the account and the transcript path known now (P11). The Host drops one for
+    // a session whose adapter it holds itself, so a Host-held chat is announced once.
+    if (slack?.ownership.local() !== false) {
+      slack?.notifier.onChatEvent(sessionId, event, {
+        provider: core.chat.state(sessionId)?.provider ?? 'codex',
+        transcriptPath: () => chatTranscripts.get(sessionId) ?? codexRollout?.rolloutPathFor(sessionId) ?? null
+      })
+    } else if (isForwardedChatEvent(event)) {
+      const accountId = core.chat.info(sessionId)?.accountId
+      if (accountId)
+        slack.ownership.forward({
+          kind: 'chat',
+          sessionId,
+          accountId,
+          event,
+          provider: core.chat.state(sessionId)?.provider ?? 'codex',
+          transcriptPath: chatTranscripts.get(sessionId) ?? codexRollout?.rolloutPathFor(sessionId) ?? null
+        })
+    }
     if (event.type === 'ready') {
       const info = core.chat.info(sessionId)
       if (!info) return
@@ -1501,6 +1803,8 @@ export function registerIpc(
     send('history:updated', { total: 0 })
     workUnitCollector.onTranscriptChanged()
   }
+  // "Scanning Codex history… N/M" while the rollout index reads heads it does not know yet
+  core.history.onScanProgress = (e) => send('history:scan', e)
   // Accounts go out exactly as stored. There is no default-account flag to decorate: the default is decided
   // per provider from the list plus login state, and the renderer already holds both (useAccountStatus), so
   // it derives that itself with core/accounts/defaultAccount.ts.
@@ -1548,6 +1852,12 @@ export function registerIpc(
       const live = codexRolling.findLiveByCodexSession(opts.resumeSessionId)
       if (live) return live
     }
+    // The same guard for a session the Host rolls (S6 Task 14): no coordinator here holds its chain, so
+    // the two indexes above do not know it — the native id its note carried when it was adopted does.
+    if (opts.resumeSessionId) {
+      const live = liveByAdoptedNative(opts.resumeSessionId) ?? (await liveByHostNative(opts.resumeSessionId))
+      if (live) return live
+    }
     // The same guard for the resume path a 대화 has of its own. The two checks above read
     // `opts.resumeSessionId`, which a chat resume never sets — it carries the protocol thread id instead
     // (App.tsx's resumeFromHistory), and only a chat resume sets that — so resuming a thread as 대화
@@ -1561,7 +1871,10 @@ export function registerIpc(
     if (opts.resumeThreadId) {
       const liveChat = liveChatOnThread(opts.resumeThreadId, core.chat.list())
       if (liveChat) return liveChat
-      const liveTerminal = codexRolling?.findLiveByCodexSession(opts.resumeThreadId)
+      const liveTerminal =
+        codexRolling?.findLiveByCodexSession(opts.resumeThreadId) ??
+        liveByAdoptedNative(opts.resumeThreadId) ??
+        (await liveByHostNative(opts.resumeThreadId))
       if (liveTerminal) return liveTerminal
     }
     // Resuming re-stamps updatedAt when it revives a schedule. register() already knows the sessionKey,
@@ -1634,7 +1947,7 @@ export function registerIpc(
     // believed for the account that produced them.
     let resumeSameAccount = false
     // Smart Resume — `SPEC §11.5` 가 `--resume` 발원지로 꼽은 셋 중 **세 번째** 자리다(앞의 둘은
-    // `rolling.ts`·`codexRolling.ts` 의 `roll()`). 설정이 켜져 있고 브리핑이 실제로 만들어지면 대화를
+    // `claudeCoordinator.ts`·`codexCoordinator.ts` 의 `roll()`). 설정이 켜져 있고 브리핑이 실제로 만들어지면 대화를
     // 복사하지도 `--resume` 하지도 않는다: 백지 세션을 띄우고 그 브리핑을 가리키는 한 줄만 싣는다.
     //
     // **복사보다 먼저 묻는다.** 브리핑은 원본 대화 파일을 읽어야 하는데(읽기만 한다), 백지로 갈지
@@ -1643,7 +1956,7 @@ export function registerIpc(
     //
     // **설정이 꺼져 있으면 브리핑을 아예 만들지 않는다.** `buildTabResumeText` 의 'handover' 는
     // 파일을 쓰는 부수 효과가 있다 — 쓰지도 않을 브리핑 파일을 재개할 때마다 남길 이유가 없다
-    // (codexRolling.ts 의 `tabFallback = strategy === 'smart'` 와 같은 판단).
+    // (codexCoordinator.ts 의 `tabFallback = strategy === 'smart'` 와 같은 판단).
     //
     // **A chat resume is deliberately not offered this.** The condition stays on `opts.resumeSessionId`,
     // which only a pty resume sets — a chat resume carries `opts.resumeThreadId` instead. It is out of
@@ -1673,7 +1986,7 @@ export function registerIpc(
       const plan = historyResumePlan({ strategy, provider, briefing })
       // 뭉개짐 거부는 로그가 없으면 조용히 영구화된다 — userData 경로에 `["&|<>^%]` 가 하나 있으면
       // 이 설치본의 codex 사이드바 재개는 매번 여기서 거부되는데, 그 사실이 어디에도 남지 않는다
-      // (codexRolling.ts 의 F6 이 같은 자리에서 고친 것과 같은 사고).
+      // (codexCoordinator.ts 의 F6 이 같은 자리에서 고친 것과 같은 사고).
       if (plan.mangled)
         orchLog(
           `history resume — smart resume refused, the briefing pointer would be mangled by the argv sanitizer, falling back to --resume session=${opts.resumeSessionId}`
@@ -1741,6 +2054,8 @@ export function registerIpc(
         slackNotify: opts.slackNotify === true,
         rollAccountIds: opts.rollAccountIds,
         rollPrompt: opts.rollPrompt,
+        // Chat takeover: what a Host does with a prompt nobody is there to answer. Hold unless asked.
+        unattendedPermission: isUnattendedPermission(opts.unattendedPermission) ? opts.unattendedPermission : 'hold',
         bypassSignal
       })
       // The schedule is the one feature this slice attaches to a chat session (chat-sessions slice 4
@@ -1777,6 +2092,10 @@ export function registerIpc(
     // orchEnv is decided in this one place — the user path (sessions.spawn) and the coordinator path
     // (OrchCoordinator.spawnSession) both go through this function, so passing it per call site would
     // give us two copies.
+    // The folder and, on win32, Git Bash are looked for first, off this thread and within the probe
+    // limit (core/sessions/pathProbe.ts): an offline drive refuses the spawn in about 1.5 s instead of
+    // freezing every window for as long as the SMB redirector takes to give up.
+    await core.sessions.prepare({ account, cwd: opts.cwd })
     const info = core.sessions.spawn({
       ...opts,
       account,
@@ -1972,12 +2291,12 @@ export function registerIpc(
   }
 
   /** resumeText 가 Dispatch 를 못 찾았을 때(탭 세션 — Job 워커가 아니다) 저하하는 자리.
-   *  buildTabResumeText(main/orchestration/resumePacket.ts) 자신은 cwd·provider·transcript 경로를
+   *  buildTabResumeText(core/orchestration/exec/resumePacket.ts) 자신은 cwd·provider·transcript 경로를
    *  인자로만 받는다 — 코디네이터 체인을 들여다보지 않기 위해서다(그 함수의 JSDoc). 그 값을 실제로
    *  찾는 것은 이 배선의 몫이다: cwd 는 core.sessions.list() 에서 얻는다.
    *
    *  **대화 파일 경로는 provider 마다 자리가 다르다.** claude 는 statusLine 페이로드에서 얻는다
-   *  (rolling.ts 의 refreshMeta·scheduler.ts·slack.ts 가 이미 같은 페이로드로 같은 값을 얻는 것과
+   *  (claudeCoordinator.ts 의 refreshMeta·scheduler.ts·slack.ts 가 이미 같은 페이로드로 같은 값을 얻는 것과
    *  같은 자리). codex 는 statusLine 이 없다(usesStatusLine=false) — 그 값을 아는 유일한 쪽은
    *  rollout 파일을 파일시스템 스캔으로 찾아 둔 codexRolling 코디네이터뿐이라, 그쪽의
    *  rolloutPathFor 를 대신 묻는다. 어느 쪽도 찾지 못하면(등록되지 않은 체인, 매핑 전) null 이고,
@@ -2017,54 +2336,43 @@ export function registerIpc(
     })
   }
   // fix wave 최종, F1: handed over here, unconditionally — not inside bootOrch below, which only runs
-  // when orchestration is enabled. index.ts keeps this apart from `orchRef` (set by `onStarted`, further
-  // down) so the two rolling coordinators can reach a tab session's briefing even with the toggle off.
+  // once the server actually starts. index.ts keeps this apart from `orchRef` (set by `onStarted`,
+  // further down) so the two rolling coordinators can reach a tab session's briefing even when the
+  // server never came up.
   orchWiring?.onTabResumeReady(tabResumeTextFor)
 
   /**
-   * Installs whichever discovery stub(s) match the toggles' current state, against every known
-   * account. Pulled out of bootOrch (which used to build and install this list inline, once) into a
-   * standalone function that settings.setOrchestrationEnabled, settings.setWorkUnitTrackingEnabled,
-   * settings.setAgentBrowserEnabled and settings.setResumeStrategy also call directly — **not just
+   * Installs the discovery stubs that belong to the current state, against every known account.
+   * **The orchestration stub is unconditional** — orchestration is something Astera has rather than
+   * something a person switches on, so every agent session is told it can orchestrate. The other
+   * three follow their own toggles.
+   *
+   * Pulled out of bootOrch (which used to build and install this list inline, once) into a standalone
+   * function that settings.setWorkUnitTrackingEnabled, settings.setAgentBrowserEnabled,
+   * settings.setResumeStrategy and settings.setJobContinuityEnabled also call directly — **not just
    * bootOrch**.
    *
    * **Why bootOrch alone is not enough**: bootOrch only runs on the transition that actually starts
-   * the server (see startOrch's `if (orch || orchStarting) return`). Before this task the server could
-   * only be up when orchestration was on, so setOrchestrationEnabled(true) always reached it. Now
-   * any of the toggles can start the server, so the second toggle to turn on reaches a server that is
-   * already up — bootOrch, and this install, never run for it. Concretely: tracking on first plants
-   * the task stub (server boots); orchestration on second calls startOrch(), which no-ops because
-   * `orch` is already set — without this function being called independently, the orchestration stub
-   * would never be planted for that session, on the one transition (enabling the feature) where losing
-   * the only discovery path for it matters most (see the header comment in stub.ts).
+   * the server (see startOrch's `if (orch || orchStarting) return`), and the server is already up
+   * from app start. So a toggle turned on later reaches a running server, and bootOrch — with the
+   * install inside it — never runs for that toggle. Without this function being called independently
+   * its stub would never be planted, on the one transition (enabling the feature) where losing the
+   * only discovery path for it matters most (see the header comment in stub.ts).
    *
    * No-ops when the server has never come up (`orch` is null — nothing has a skillsPath yet to install
-   * from) or when every toggle is off (`stubs` comes out empty). Safe to call redundantly — that is
-   * the point of calling it from five places: installStub already skips a write once content matches
-   * (see stub.ts), so the worst repeated cost is a per-account file read, not a per-account write.
+   * from). Safe to call redundantly — that is the point of calling it from five places (bootOrch and
+   * the four setters above): installStub already skips a write once content matches (see stub.ts),
+   * so the worst repeated cost is a per-account file read, not a per-account write.
    */
   const installStubsForCurrentToggles = (): void => {
     if (!orch) return
-    const stubs = [
-      ...(core.appSettings.getOrchestrationEnabled()
-        ? [
-            {
-              stubPath: path.join(orch.skillsPath, 'orchestration-stub.md'),
-              skillName: 'astera-orchestration'
-            }
-          ]
-        : []),
-      ...(core.appSettings.getWorkUnitTrackingEnabled()
-        ? [{ stubPath: path.join(orch.skillsPath, 'task-stub.md'), skillName: 'astera-task' }]
-        : []),
-      ...(core.appSettings.getAgentBrowserEnabled()
-        ? [{ stubPath: path.join(orch.skillsPath, 'browser-stub.md'), skillName: 'astera-browser' }]
-        : []),
-      ...(core.appSettings.getResumeStrategy() === 'smart'
-        ? [{ stubPath: path.join(orch.skillsPath, 'handoff-stub.md'), skillName: 'astera-handoff' }]
-        : [])
-    ]
-    if (stubs.length === 0) return
+    // The list and its gates are skillStubs' (stub.ts) — `astera skills install` builds from the same one.
+    const stubs = skillStubs(orch.skillsPath, {
+      workUnitTrackingEnabled: core.appSettings.getWorkUnitTrackingEnabled(),
+      agentBrowserEnabled: core.appSettings.getAgentBrowserEnabled(),
+      agentAppEnabled: core.appSettings.getAgentAppEnabled(),
+      resumeStrategy: core.appSettings.getResumeStrategy()
+    }).filter((s) => s.enabled)
     // installStub swallows per-stub and per-account failures itself and does not throw, but the
     // .catch is here so that even an unexpected failure cannot affect the caller.
     void installStub({
@@ -2081,14 +2389,13 @@ export function registerIpc(
   }
 
   let orchStarting = false
-  /** Starts the orchestration server. Called when **any of the four** toggles is on — agent
-   *  orchestration, work-unit tracking, the agent browser, or Smart Resume, since `/astera-task`,
-   *  `astera browser js` and `astera handoff` need the same CLI and the same `ASTERA_SESSION` the
-   *  orchestration server already hands out (see `orchEnvOf`'s doc). With all off, this is never
-   *  called and no port is opened. Turning any one of them on at runtime comes back through here and
-   *  starts immediately (sessions created after that get the CLI — environment variables are fixed
-   *  at spawn time, so sessions already running cannot). If it is already up, this does nothing.
-   *  Turning a toggle off does not close the server — `enabled()`/`trackingEnabled()`/
+  /** Starts the orchestration server. **Called at app start, unconditionally** — orchestration is
+   *  something Astera has rather than something a person switches on, so there is no state in which
+   *  Jobs, the `astera` command or the Host are absent by choice. `/astera-task`, `astera browser js`
+   *  and `astera handoff` ride on the same CLI and the same `ASTERA_SESSION` it hands out (see
+   *  `orchEnvOf`'s doc), so their toggles do not decide this either. If it is already up, this does
+   *  nothing; the toggles call it again only so a start that failed can be retried.
+   *  Turning one of those toggles off does not close the server — `trackingEnabled()`/
    *  `browserEnabled()`/`handoffEnabled()` are read on every request, so CLI calls after that are
    *  rejected with a 409. */
   const startOrch = async (): Promise<void> => {
@@ -2099,11 +2406,43 @@ export function registerIpc(
     orchStarting = true
     try {
       await bootOrch()
+    } catch (err) {
+      // **The Jobs view must not blame the Host for something else** (ruling F38). `bootOrch` says
+      // "waiting for the Host" from the moment it commits to needing one, and it turns a real Host
+      // failure into `unreachable` with the reason before it returns — so anything that reaches here
+      // is a throw from the parts that have nothing to do with the Host: the `fs.mkdir` of the spec
+      // directory and `writeShuttle`. Left as it was, the screen would stay on "connecting"
+      // for the rest of the app's life and tell a person four features are waiting on a connection
+      // that is fine. Cleared rather than given a third state: saying nothing is honest here, and the
+      // failure is in the log with its real reason. The throw carries on to the caller's own catch.
+      setOrchHostGate(null)
+      throw err
     } finally {
       orchStarting = false
     }
   }
+  /** 셔틀이 띄우는 번들. 위 주석의 두 후보를 그대로 본다 — 설치 버튼도 같은 것을
+   *  가리켜야 하므로 계산을 두 군데 두지 않는다. */
+  const cliEntryPath = (): string | undefined =>
+    [path.join(app.getAppPath(), 'out', 'main', 'cli.js'), path.join(__dirname, 'cli.js')].find((p) =>
+      existsSync(p)
+    )
+  /** The skills folder the CLI's help reads (the skillsPath note in bootOrch below). One definition,
+   *  because the Host is started with it too (spawnHost) and the two must name the same folder. */
+  const appSkillsPath = (): string =>
+    app.isPackaged ? path.join(process.resourcesPath, 'skills') : path.join(app.getAppPath(), 'resources', 'skills')
+
   const bootOrch = async (): Promise<void> => {
+    // **The one question every step below that starts work asks** (S4+S5 §4.2, D5, ruling N8): does
+    // the connected Host drive Jobs? A Host that announces `dispatch` does — this app's hello yields
+    // it (`HOST_YIELD_DISPATCH`) — so the app's dispatch loop, its pending-report drain, its resume
+    // sweeps, its schedule fires and its coordinator nudges all stand down, and the Host does each.
+    // In front of an older Host (S3, S2) or none, the app drives exactly as it did.
+    //
+    // **Read live at every call, never cached** (F58): the status flips in the same turn as the
+    // handshake or the drop, so there is no window where both processes start work.
+    const hostDrives = (): boolean => hostSpeaksDispatch(hostClient?.status() ?? { connected: false, features: [] })
+    orchHostDrives = hostDrives
     // Pin down two paths first — the CLI entry point the shuttle (astera) runs, and the skills
     // directory help reads.
     //
@@ -2120,13 +2459,8 @@ export function registerIpc(
     // skillsPath: extraResources in electron-builder.yml copies resources/skills to resources/skills —
     //   under process.resourcesPath when packaged, inside the repo in development. The CLI's help reads
     //   orchestration-guide.md from there (see resolveGuidePath in src/cli/run.ts).
-    const entryPath = [
-      path.join(app.getAppPath(), 'out', 'main', 'cli.js'),
-      path.join(__dirname, 'cli.js')
-    ].find((p) => existsSync(p))
-    const skillsPath = app.isPackaged
-      ? path.join(process.resourcesPath, 'skills')
-      : path.join(app.getAppPath(), 'resources', 'skills')
+    const entryPath = cliEntryPath()
+    const skillsPath = appSkillsPath()
     // Starting with a wrong path makes every CLI call an agent issues fail with no discoverable reason — so it does not start at all
     if (!entryPath || !existsSync(skillsPath)) {
       orchLog(
@@ -2134,6 +2468,10 @@ export function registerIpc(
       )
       return
     }
+    // From here on, everything below waits on the Host — and the Jobs view is the surface that says
+    // so. Not before the guard above: a missing CLI bundle is not the Host's fault and pointing at
+    // the Host log for it would send a person to the wrong file.
+    setOrchHostGate({ state: 'waiting', logPath: orchLogFile })
 
     // spec files are written outside the user's repository: a spec body carries the work instructions
     // the orchestrator wrote, and keeping it inside the repo would show up in git status, get
@@ -2150,66 +2488,195 @@ export function registerIpc(
         `warning — the spec directory path contains characters forbidden in a launch prompt (" & | < > ^ %): ${specsDir} — every worker-start will be rejected in this state`
       )
 
-    const store = new OrchestrationStore(path.join(app.getPath('userData'), 'orchestration.json'))
+    /**
+     * **The app stops owning `orchestration.json`** (design §6). One writer, and it is the Host — the
+     * app reads its own mirror of what the Host last said, and every write goes back across the
+     * socket as `state-put`.
+     *
+     * Shaped like the `OrchestrationStore` this replaces, so the thirty-odd `store.get()` call sites
+     * below do not change: `getState()` stays synchronous, which is what several of them depend on
+     * (they read it twice around an await on purpose — the run-create comment in the command layer
+     * says why). That is the whole point of the mirror.
+     */
+    const orchFile = path.join(app.getPath('userData'), 'orchestration.json')
+    const store = {
+      get: (): OrchState => orchMirror.getState(),
+      save: (next: OrchState): Promise<void> => orchMirror.setState(next),
+      /** Copies the file aside before `reset` and `run-delete` do something destructive.
+       *
+       *  **Only for the commands this app answers itself** — the renderer's `orch.command`, which
+       *  still runs `handleCommand` here. Anything arriving through the Host is backed up by the Host
+       *  (`src/host/orchDeps.ts` classifies `backup` as OWNED since the CLI stopped going through the
+       *  app), so this is no longer asked for across the socket.
+       *
+       *  Same path and the same `.bak` convention the store used, done directly, and best effort for
+       *  the store's own reason: blocking the command because the copy failed leaves a person no way
+       *  to discard a state they cannot use. What is lost with the store is the write queue this used
+       *  to go through, which no longer means anything across two processes; the rename the Host
+       *  writes with is atomic, so what lands here is one whole state either way, just possibly the
+       *  one from a moment ago. */
+      backup: async (): Promise<void> => {
+        await fs.copyFile(orchFile, orchFile + '.bak').catch(() => {})
+      }
+    }
     if (core.appSettings.getJobContinuityEnabled()) openContinuity()
-    // Reports that could not be delivered while the app was away. **Read before the cleanup and
-    // applied further down, after `orch` is assigned** — the two halves cannot be one call, and the
-    // gap between them is the whole point:
+    // Reports that could not be delivered while nothing was there to take them. **Read here and
+    // applied further down, after `orch` is assigned** — applying one reaches `startValidation` and
+    // `startReview`, which spawn, which needs `orch` set (the same constraint the dispatch loop's boot
+    // run and the recovery boot sweep are under).
     //
-    // - The cleanup below closes every open Dispatch it cannot prove alive, and `applyWorkerDone`
-    //   answers `alreadyReported` for a Dispatch that already has `endedAt`. So the report has to be
-    //   in hand *before* the load, or it is thrown away by the very boot that was supposed to take
-    //   it — and the reconciler then reads that Dispatch as a lost worker. `reportedDispatchIds`
-    //   carries that evidence into the cleanup; its own note has the rest.
-    // - Applying one reaches `startValidation` and `startReview`, which spawn, which needs `orch`
-    //   set — the same constraint `runScheduler` and the recovery boot sweep are under.
+    // **The Host reads this same queue for its own reason**, and that half no longer happens here:
+    // the cleanup that has to know which Dispatches an undelivered report speaks for now runs inside
+    // the Host's `store.load` (`src/host/orch.ts`). So two processes read this folder at boot, and
+    // **reading it is not read-only** — `readPendingReports` also sweeps abandoned `.json.tmp` files
+    // and renames unreadable reports aside. That the two sweeps cannot destroy anything between them
+    // is a property worth writing down rather than assuming:
     //
-    // Neither line can throw: `readPendingReports` swallows its own failures (a missing folder is
-    // the ordinary case, not an error) and `reportedDispatchIdsOf` is pure. A queue that cannot be
-    // read costs the reports in it, never the boot.
-    const pendingReportsDir = path.join(app.getPath('userData'), 'orch', PENDING_REPORTS_DIR)
+    // - The swept set and the read set are disjoint by suffix: the sweep only touches
+    //   `<name>.json.tmp`, and only `.json` is ever read or applied.
+    // - A `.json.tmp` is swept only after an hour of not being touched (`WORKING_FILE_TTL_MS`), so a
+    //   write actually in flight in the other process is never the one swept.
+    // - Both the `rm` and the `rename` pass `force`/a catch, so the loser of a race between the two
+    //   sweeps does nothing rather than failing.
+    //
+    // **The one visible effect**, and it is cosmetic: the drain below deletes a `.json` once it has
+    // applied it, and if that lands between the Host's `readdir` and its `readFile` of the same name,
+    // the Host logs `setting aside … — it is not a report this app can read` about a report that
+    // applied perfectly well. Nothing is lost — the file it would set aside is already gone.
+    //
+    // This line cannot throw: `readPendingReports` swallows its own failures, a missing folder being
+    // the ordinary case rather than an error.
+    const pendingReportsDir = pendingReportsDirIn(app.getPath('userData'))
     const pendingReports = await readPendingReports({ dir: pendingReportsDir, log: orchLog })
 
-    // Ask what the Host still had before deciding which workers were lost. Reattaching therefore
-    // runs before the cleanup, not after it: the sessions it took back are the ones whose Dispatch
-    // must stay open, and this is the only moment both facts are in hand.
+    // What the Host was still running when this app attached. **No longer the restart cleanup's
+    // evidence** — the Host judges that against its own registry now, where "we asked and got no
+    // answer" is not a state it can be in about itself (design §6) — but still this app's own, for
+    // the two things below that are the app's: which spec files are still being read, and which
+    // Dispatches a queued report is the *only* reason for. `'unknown'` therefore still means what it
+    // always did here: a Host answered the address and could not be asked, so nothing is written off
+    // on the strength of an empty list.
     //
     // **The ids match with nothing in between.** An adopted session keeps the id it had before the
     // restart (reattach.ts's `ReattachResult.sessions`), so a stored `Dispatch.sessionId` is
-    // literally one of these strings — there is no old-id/new-id map to keep, and a Dispatch that
-    // survives the cleanup is already pointing at the session that answers to it.
+    // literally one of these strings — there is no old-id/new-id map to keep.
     //
     // **The wait is bounded, and it is the wiring's own wait rather than a second one.** Reattaching
     // starts on `ready()`, which ends at the handshake, at the client giving up, or at its own
     // timeout; the list it then asks for gives up after five seconds. A build with no
-    // `out/main/host.js` waits for none of it — `startHostClient` settles this on the way out — so
-    // that app boots exactly as fast, with exactly the same answer, as it did before the Host existed.
-    //
-    // **A Host that never speaks does not give the same answer as no Host.** An earlier version of
-    // this comment said it did, and that was the bug: closing every open Dispatch is only safe when
-    // the emptiness is evidence, and it is evidence only when there was no Host to ask. A peer that
-    // accepted the connection and then went quiet is positive evidence a Host exists and none at all
-    // about its sessions, so the answer is `'unknown'` and the cleanup leaves open Dispatches where
-    // they are. A Job that stalls is a person noticing nothing moved; the alternative was a second
-    // agent dispatched into a worktree whose first one is still running.
+    // `out/main/host.js` waits for none of it — `startHostClient` settles this on the way out.
+    // Awaited before the mirror is filled for one more reason: it is also what guarantees the Host
+    // client exists to send `state-get` over.
     const aliveSessionIds = liveWorkersFor(await hostSessionsTakenBack)
     const reportedDispatchIds = reportedDispatchIdsOf(pendingReports.map((q) => q.report))
-    const loaded = await store.load({ aliveSessionIds, reportedDispatchIds })
-    // The unknown case gets a line of its own, because from the state alone it is indistinguishable
-    // from a boot that had nothing to clean up — and a person looking for why a Job did not move
-    // needs to be able to find it. The reason it could not be asked was logged by the Host wiring.
+
+    /**
+     * Fill the mirror, and take what the Host's load found.
+     *
+     * **This is where the app stops being the process that loads** (design §6). `state-get` makes the
+     * Host read the file, run the restart cleanup against its own registry, and answer with the state
+     * — so the two halves of what `store.load()` used to return arrive separately: the state, in the
+     * mirror, and the findings, in `boot`.
+     *
+     * `boot` is null when this Host had already loaded for somebody else — an app restarting against
+     * a Host that has been up for hours. That is the honest answer: nothing was lost, because the
+     * Host never went away, and re-running a cleanup's consequences hours later would journal a diff
+     * spanning everything since and restart validations for Tasks that have moved on.
+     */
+    let loaded: OrchLoadResult | null = null
+    try {
+      const answer = await orchCall({ cmd: 'state-get', args: { boot: true }, sessionId: '' })
+      if (answer.status !== 200) throw new Error(`the Host answered state-get with ${answer.status}`)
+      const body = answer.body as { state: OrchState; boot: OrchLoadResult | null; version?: number }
+      // The version rides along so this app's first write can quote something the Host really issued
+      // (ruling F56) — without it every write of this session would be unchecked.
+      orchMirror.accept(body.state, body.version)
+      loaded = body.boot
+    } catch (err) {
+      // **Nothing below can run without the state**, and inventing an empty one here is the single
+      // most expensive mistake available in this design: every read would answer "no such Job" and
+      // the first write would commit that over the real file.
+      //
+      // So this start is abandoned. **Returned rather than thrown**, for two reasons: `startOrch`
+      // is awaited from the settings handlers, where a throw becomes an error on a checkbox that
+      // did in fact get saved; and `orch` staying null is a state this app already knows how to be
+      // in — every guard below asks for it before acting — so flipping a toggle later tries again
+      // from the top. The person's half of this is the Jobs view's own two states.
+      //
+      // **The four features are named, here and on that surface** (ruling F35). `startOrch` serves
+      // agent orchestration, work-unit tracking, the agent browser and Smart Resume, and before this
+      // plan not one of them needed a Host — so "orchestration is not starting" reads as one feature
+      // being off to someone whose /astera-task just stopped working. One line that names all four
+      // beats four surfaces that each name one.
+      orchLog(
+        `could not read the orchestration state from the Host: ${String(err)} — agent orchestration (Jobs), work-unit tracking, the agent browser and Smart Resume are all waiting on it and none of them is starting; it will try again the next time a toggle changes or the app restarts`
+      )
+      setOrchHostGate({ state: 'unreachable', reason: String(err), logPath: orchLogFile })
+      return
+    }
+    // Refills the mirror after a later handshake. A commit the Host made while the socket was down
+    // was pushed to nobody, and nothing else would ever correct it. `boot` is deliberately not asked
+    // for: those findings belong to the next app start, not to a reconnect.
+    remirrorOrchState = () => {
+      void orchCall({ cmd: 'state-get', args: {}, sessionId: '' })
+        .then((r) => {
+          if (r.status !== 200) throw new Error(`the Host answered state-get with ${r.status}`)
+          const refill = r.body as { state: OrchState; version?: number }
+          const state = refill.state
+          const before = orchMirror.loaded() ? orchMirror.getState() : state
+          orchMirror.accept(state, refill.version)
+          // **The same hook a push pays, and for the same reason** (ruling F54, reached again through
+          // this path). A refill carries every commit the Host made while the socket was down, and a
+          // worker report among them leaves the next Task at `ready` unless the scheduler runs — the
+          // F54 symptom exactly, met after a Host restart or a dropped connection rather than in
+          // steady state. `pushOrchState` is inside the hook, so the sidebar is still told.
+          //
+          // `catchingUp` is the one thing that differs, and it is an argument rather than a second
+          // copy of the list: the git checkpoints describe a moment that has already passed by the
+          // time a refill sees it (the reason is written where the hook skips them).
+          if (onOrchCommit) onOrchCommit({ prev: before, next: state, catchingUp: true })
+          else pushOrchState(state)
+          // **And here, on the refilled mirror, not on the one this handshake replaced.** A Host that
+          // just came back may be a different Host holding the same file, and the Tasks a restart
+          // left mid-validation are found in the state, not in `boot` — which this deliberately does
+          // not ask for. Doing nothing until the refill has landed is the whole reason this is inside
+          // the `then`.
+          //
+          // After the hook, not before: the sweep drives the Tasks nothing else will, and the hook's
+          // scheduler drives the ones the state already makes ready. Running the sweep first would
+          // have it decide against a mirror the hook is about to act on.
+          if (!hostDrives()) resumeSweep?.run('the Host attached')
+          else orchLog('resume sweep — the Host drives dispatch and runs its own after it attaches')
+        })
+        .catch((e) => orchLog(`could not refill the orchestration mirror after reconnecting: ${String(e)}`))
+    }
+    // **Which of two silences this boot is, said out loud.** "The Host loaded and found nothing to
+    // clean up" and "the Host's findings went to an earlier app" leave exactly the same trace in the
+    // state, and every line below is conditional on `loaded` — so without this, a person looking for
+    // why an interrupted validation was not restarted has nothing at all to read.
+    if (!loaded)
+      orchLog(
+        'restart cleanup — the Host was already up and had already loaded, so there was no restart for this app to clean up after'
+      )
     if (aliveSessionIds === 'unknown')
       orchLog(
-        `restart cleanup — the Host could not be asked what it is still running, so ${store.get().dispatches.filter((d) => !d.endedAt).length} open dispatch(es) were left open rather than written off`
+        `restart cleanup — the Host could not be asked what it is still running, so no spec file was cleared on the strength of an empty list, and ${store.get().dispatches.filter((d) => !d.endedAt).length} open dispatch(es) were left where they are`
       )
     else if (aliveSessionIds && aliveSessionIds.size > 0)
       orchLog(
         `restart cleanup — the Host still runs ${aliveSessionIds.size} session(s); any open Dispatch of theirs was left open`
       )
+    // What the Host's own load did, when this app is the one it happened for. Counted off the state
+    // it handed back rather than off the findings, so the number is Dispatches that are really open
+    // now — the same thing the line above counts, for the other reason.
+    else if (loaded)
+      orchLog(
+        `restart cleanup — the Host runs no session of ours; ${store.get().dispatches.filter((d) => !d.endedAt).length} open dispatch(es) survived it`
+      )
     // Said out loud because emptying the slot is what turns the Run's safety net and its restart
     // button back on, and both are invisible until someone looks at the Jobs list. A person whose
     // Job stopped answering needs a line that says when it lost its coordinator.
-    if (loaded.coordinatorsLost > 0)
+    if (loaded && loaded.coordinatorsLost > 0)
       orchLog(
         `restart cleanup — ${loaded.coordinatorsLost} Run(s) lost their coordinator to the restart; the app answers their workers now and the Jobs list offers to start a new one`
       )
@@ -2232,7 +2699,7 @@ export function registerIpc(
       orchLog(
         `restart cleanup — ${heldOnlyByReport.size} open dispatch(es) were left open because an undelivered report speaks for them; the drain below says what became of each`
       )
-    if (loaded.stuckInterruptions > 0)
+    if (loaded && loaded.stuckInterruptions > 0)
       orchLog(
         `restart cleanup — ${loaded.stuckInterruptions} interrupted Task(s) were left as they were: their Dispatch is still open, so there is nothing to gate`
       )
@@ -2244,104 +2711,38 @@ export function registerIpc(
     // cleanup rather than before it because only the cleanup knows which Dispatches are still open,
     // now that a worker the Host kept running survives a restart with its Dispatch intact.
     //
-    // A failed cleanup must never block startup, so every step here swallows its own failure: an
-    // unreadable directory yields nothing to delete, and one file that will not go does not cost the
-    // rest their turn. The worst outcome is a stale file nobody reads, which the next boot retries.
-    const swept = store.get()
-    for (const name of staleSpecFiles({
-      files: await fs.readdir(specsDir).catch(() => []),
-      dispatches: swept.dispatches,
-      runs: swept.runs,
-      live: aliveSessionIds
-    }))
-      await fs.rm(path.join(specsDir, name), { recursive: true, force: true }).catch(() => {})
+    // **Two owners, never both** (Host S2 design §2.7). A Host that announces `spawn` writes specs
+    // itself, so a sweep here could delete one it has just written for a worker this app has not
+    // heard of yet; that Host sweeps at its own load instead (`createHostOrch`'s `specsDir`), where
+    // it is the only writer. So this app sweeps only when no such Host is connected: no Host at all,
+    // or an older one that spawns nothing. An older app in front of a spawning Host still sweeps
+    // here, which is the accepted risk of mixing versions.
+    //
+    // `sweepStaleSpecFiles` never throws: a failed cleanup must never block startup, and the worst
+    // outcome is a stale file nobody reads, which the next boot retries.
+    if (!hostSpeaksSpawn(hostClient?.status() ?? { connected: false, features: [] }))
+      await sweepStaleSpecFiles({ dir: specsDir, state: store.get(), live: aliveSessionIds })
+    else orchLog('spec files — the Host sweeps them at its own load (it announces spawn)')
 
     // The restart cleanup is a state transition like any other: every worker it closed as
     // outcome_unknown lands as ATTEMPT_LOST, and Runs the TTL pruned lose their journal rows.
-    if (continuity && loaded.before) {
-      continuity.record(loaded.before, store.get())
-      continuity.reportSkew(store.get())
-    }
-    // Job Continuity P1: rows the journal kept for a Run that no longer exists (deleted, or pruned by
-    // the TTL above) are dead weight — nothing will ever read them again. A failure here must not
-    // stop the boot, the same discipline as the recorder's own journal writes.
-    if (continuityJournal) {
-      try {
-        const swept = continuityJournal.sweepOrphans(new Set(store.get().runs.map((r) => r.id)))
-        if (swept > 0) orchLog(`continuity: swept ${swept} orphaned run(s) from the journal`)
-      } catch (e) {
-        orchLog(`continuity: sweepOrphans failed: ${String(e)}`)
-      }
-    }
-    if (loaded.recovered) orchLog('failed to read or parse orchestration.json — kept the .bak and started from an empty state')
+    // Job Continuity P1: and rows the journal kept for a Run that no longer exists (deleted, or pruned
+    // by the TTL above) are swept. Only when this app is the writer: a Host that writes the journal
+    // does both at its own load (Host journal J2).
+    appJournal.bootCleanup(loaded?.before ?? null, store.get())
+    if (loaded?.recovered) orchLog('failed to read or parse orchestration.json — kept the .bak and started from an empty state')
     if (
-      loaded.unknownOutcomes > 0 ||
-      loaded.pruned > 0 ||
-      loaded.staleValidations > 0 ||
-      loaded.staleReviews > 0
+      loaded &&
+      (loaded.unknownOutcomes > 0 ||
+        loaded.pruned > 0 ||
+        loaded.staleValidations > 0 ||
+        loaded.staleReviews > 0)
     )
       orchLog(
         `restart cleanup — ${loaded.unknownOutcomes} dispatch(es) left as outcome_unknown, ` +
           `${loaded.pruned} expired Run(s), ${loaded.staleValidations} interrupted validation(s), ` +
           `${loaded.staleReviews} interrupted review(s)`
       )
-
-    /** 프로젝트 폴더가 **서 있는 브랜치**에서 워크트리를 하나 만들고 그 경로를 낸다.
-     *
-     *  워커의 워크트리도 Run 의 워크트리도 프로젝트가 서 있는 브랜치에서 갈라져야 한다.
-     *  createWorktree 의 자동 판정(origin/HEAD → main → master, core/worktrees/git.ts 의
-     *  detectBaseRef)에 맡기면 프로젝트의 기본 브랜치에서 갈라지고 — Run 이 서 있는 브랜치와 다른
-     *  조상이다 — 병합 단계가 무의미해진다: 의존의 워크트리를 이 뿌리로 접어 넣은 뒤 Task 를
-     *  시작하는데, origin/HEAD 에서 갈라진 워커에게는 그 히스토리가 애초에 조상이 아니어서 병합
-     *  때문에 보이는 것이 하나도 바뀌지 않는다.
-     *
-     *  문자열 'HEAD' 를 그대로 넘길 수 없다: baseRef 는 toFullRef 를 지나는데 슬래시 없는 이름을
-     *  refs/heads/<name> 으로만 푼다 — 'HEAD' 는 refs/heads/HEAD 를 찾아 없으므로 NO_BASE 로
-     *  던진다. 그래서 브랜치의 짧은 이름을 먼저 읽는다.
-     *
-     *  `rev-parse --abbrev-ref HEAD` 가 아니라 `symbolic-ref --quiet --short HEAD` 를 쓴다:
-     *  전자는 분리된 HEAD 에서 실패하지 않고 리터럴 'HEAD' 를 돌려주므로, 그 값을 믿는 호출자는
-     *  존재하지 않는 'HEAD' 라는 브랜치에서 갈라지려 한다. symbolic-ref 는 분리된 HEAD 에서
-     *  그냥 실패하고, 그 실패가 정확히 여기 필요한 신호다. 이 저장소의 다른 두 곳도 같은 질문을
-     *  같은 방식으로 묻는다(integrateWorktrees 의 병합 전 확인, git.ts 의 listBranches).
-     *
-     *  **저장소에 닿는지를 먼저 묻는다.** symbolic-ref 는 유효한 저장소에서만 "분리됐는가" 를
-     *  답한다 — 그 경로에서 git 을 돌릴 수 없을 때도 똑같이 실패하므로, 그 실패를 곧 분리로 읽던
-     *  동안 앱은 폴더가 사라진 Run 에도 "HEAD 가 분리됐다"고 말했다. 어느 쪽인지 가르는 것은
-     *  core 의 workerBaseFailure 이고 문장도 그쪽에 있다.
-     *
-     *  **자동 판정으로 조용히 물러나지 않고 던진다.** 물러나면 이 확인이 막으려던 버그가 그대로
-     *  되살아나고, 워커는 나중에 아무 데도 합칠 수 없는 일을 하게 된다 — 워커 세션 하나를 통째로
-     *  태운 뒤에야 문제가 보인다. 여기서 던지면 시작 시점에 보고된다.
-     *
-     *  toFullRef 의 해석 순서에 남은 위험(브랜치 이름의 첫 조각이 원격 이름과 같을 때 원격 추적
-     *  사본에서 갈라진다)은 그대로다 — 이 저장소의 원격은 origin 하나이고 어느 지역 브랜치의 첫
-     *  조각도 그것과 다르다. 그 판단의 전문은 이 헬퍼를 뽑아 온 자리(git.ts 의 fetchBaseRef 주석)에
-     *  있다. */
-    const forkWorktree = async (a: { repoPath: string; name?: string }): Promise<string> => {
-      const gitDirProbe = await git(['rev-parse', '--git-dir'], { cwd: a.repoPath })
-      const head = gitDirProbe.ok
-        ? await git(['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: a.repoPath })
-        : { ok: false, stdout: '', stderr: '' }
-      const baseFailure = workerBaseFailure({
-        repoPath: a.repoPath,
-        repoReachable: gitDirProbe.ok,
-        onBranch: head.ok,
-        stderr: gitDirProbe.stderr || gitDirProbe.stdout
-      })
-      if (baseFailure !== null) throw new Error(baseFailure)
-      const r = await createWorktree({
-        repoPath: a.repoPath,
-        name: a.name,
-        baseRef: head.stdout,
-        registry: core.worktrees
-      })
-      // 경고를 버리지 않는다 — worktree.create.fetchFailed 는 "base 를 가져올 수 없어 낡은 참조에서
-      // 만들었다" 는 뜻이고 워커는 그 위에서 일한다. 이 경로에는 사용자 화면이 없어 로그가 유일한
-      // 흔적이다. 키만 남긴다: 번역은 렌더러의 일이고 여기에는 언어가 없다.
-      for (const w of r.warnings) orchLog(`worktree warning ${w.key} ${JSON.stringify(w.params ?? {})}`)
-      return r.info.path
-    }
 
     // The coordinator never reads or writes OrchState (the server owns state).
     // 워커 세션은 이제 롤링에 등록된다 — 아래 spawnSession 클로저가 o.rollAccountIds 를 그대로
@@ -2362,34 +2763,18 @@ export function registerIpc(
     // 그쪽 지연은 그대로다.
     //
     // 그래도 지금 이 조합을 그대로 두는 이유: 롤링의 idle nudge 는 Notification 훅을 정지 신호로
-    // 쓴다(rolling.ts 의 onHookEvent) — 훅을 떼면 그 갈래가 워커에게만 사라진다.
+    // 쓴다(claudeCoordinator.ts 의 onHookEvent) — 훅을 떼면 그 갈래가 워커에게만 사라진다.
     // **wantHooks 에 체인과 별개인 자기 입력을 주는 일은 나중으로 남긴다.**
-    /** Marks the repository behind `cwd` trusted for this codex account before a session is spawned
-     *  into it, so an agent nobody is sitting in front of does not stop at codex's "Do you trust this
-     *  folder?" menu.
-     *
-     *  **Only the orchestration path calls this**, not the shared `spawnSession` every tab goes
-     *  through. The justification is exactly that nobody is there: a worker starts in a worktree made
-     *  seconds earlier, which no person has ever approved, and the menu is a wall it cannot get past
-     *  on its own — measured, three workers in a row. A person opening a tab is present to answer, and
-     *  pre-approving a folder on their behalf would take away a decision they still have.
-     *
-     *  **claude needs no counterpart**: `--dangerously-skip-permissions` covers its trust prompt too,
-     *  which is why Orca's own preset module (src/main/agent-trust-presets.ts) has cursor, copilot and
-     *  codex in it and no claude. codex is the exception there for the reason its note gives — the
-     *  bypass flag sets approval and sandbox policy, and trust is a different question.
-     *
-     *  Best-effort: a config.toml this cannot write is a menu the agent will meet, not a reason to
-     *  refuse to start it. The same convention as the other incidental failures around here. */
-    const preTrustCodexWorkspace = async (accountId: string, cwd: string): Promise<void> => {
-      const account = core.accounts.get(accountId)
-      if (!account || providerOf(account) !== 'codex') return
-      try {
-        await markCodexProjectTrusted(account.configDir, cwd)
-      } catch (e) {
-        orchLog(`codex trust preset failed account=${accountId} cwd=${cwd}: ${String(e)}`)
-      }
-    }
+    // Folder trust before an orchestration spawn — the reasoning lives on preTrustWorkspace in
+    // core/orchestration/exec/workerStart.ts, which the Host will call (Task 9).
+    const preTrustWorkspace = (accountId: string, cwd: string): Promise<void> =>
+      preTrustWorkspaceFor({
+        account: core.accounts.get(accountId),
+        cwd,
+        homeDir: app.getPath('home'),
+        descriptors: core.descriptors,
+        log: orchLog
+      })
 
     const coordinator = new OrchCoordinator({
       // session:created is emitted at three sites: here (this spawnSession closure), in
@@ -2407,7 +2792,7 @@ export function registerIpc(
       // twice.
       spawnSession: async (o) => {
         // 워커는 방금 만들어진 워크트리에서 뜬다 — 사람이 승인한 적 없는 폴더다(위 주석).
-        await preTrustCodexWorkspace(o.accountId, o.cwd)
+        await preTrustWorkspace(o.accountId, o.cwd)
         // satisfies pins this to the coordinator's opts shape: spawnSession above takes opts: any, so a
         // misspelled field (titel and friends) would fail compilation nowhere but at this hop — the
         // defence of making title required on the coordinator side would end here. Narrowing all of
@@ -2419,13 +2804,13 @@ export function registerIpc(
           // **워커의 권한 태도는 전역 설정이 정한다**(AgentPermissionMode). `??` 인 이유는 이
           // 클로저가 값을 **만드는 자리가 아니라 메꾸는 자리**이기 때문이다 — 지금은 coordinator.ts
           // 가 이 칸을 채우지 않지만(그쪽은 앱 설정을 볼 수 없다), 언젠가 Task 하나만 다르게
-          // 띄우기로 하면 그 값이 여기서 이겨야 한다. 근거는 startCoordinator 의 주석에 있다.
+          // 띄우기로 하면 그 값이 여기서 이겨야 한다. 근거는 startCoordinatorSession 의 주석에 있다.
           bypassPermissions:
             o.bypassPermissions ?? core.appSettings.getAgentPermissionMode() === 'yolo',
           initialPrompt: o.initialPrompt,
           title: o.title, // the worker tab title is task.title
           // 이 워커의 롤링 체인 — 첫 원소가 이 Dispatch 의 계정이고 나머지는 갈아탈 순서다
-          // (Task.accountIds 에서 온다; 아래 startWorker 래퍼가 rollChainFor 로 만든다). 지정이 없는
+          // (Task.accountIds 에서 온다; startWorkerWithChain 이 rollChainFor 로 만든다). 지정이 없는
           // Task 에서는 그대로 한 원소다. **넘기는 것 자체가 이 세션을 롤링에 등록시킨다.**
           rollAccountIds: o.rollAccountIds,
           rollPrompt: o.rollPrompt, // 워커용 재개 문구 — 없으면 롤링이 UI 언어 기본값을 쓴다
@@ -2450,12 +2835,34 @@ export function registerIpc(
       writeToSession: (id, data) => core.sessions.write(id, data),
       isBusy: orchIsBusy,
       isAlive: (id) => core.sessions.list().some((s) => s.id === id && s.status === 'running'),
-      killSession: (id) => core.sessions.kill(id),
+      // A worker the Host started is not the app's until `pty-opened` has been answered, and
+      // `core.sessions.kill` of a session the app does not hold does nothing — so worker-stop would
+      // mark it stopped while it keeps running. `killWorkerSession` ends it in the Host instead, and
+      // counts it stopped only on the Host's pty-exit or a list that no longer shows it; otherwise it
+      // refuses (Task 11 review I3(c), fix round I2).
+      killSession: (id) =>
+        killWorkerSession(id, {
+          app: { info: (sid) => core.sessions.list().find((s) => s.id === sid), kill: (sid) => core.sessions.kill(sid) },
+          host:
+            hostClient && hostPtyList
+              ? {
+                  list: hostPtyList,
+                  kill: (ptyId) => hostClient?.send({ t: 'pty-kill', id: ptyId }) ?? false,
+                  onExit: (ptyId, cb) =>
+                    hostClient?.onMessage((m) => {
+                      if (m.t === 'pty-exit' && m.id === ptyId) cb()
+                    }) ?? ((): void => {})
+                }
+              : null,
+          log: orchLog
+        }),
       // Reuses the worktree creation utility the app already has (core/worktrees/create) — that also
       // registers it, so the worktree list and delete paths in settings handle a worker's worktree
-      // exactly like any other. 갈라질 자리를 고르는 판단은 forkWorktree 에 있다(위) — Run 워크트리를
-      // 만드는 스케줄러도 같은 것을 쓴다.
-      createWorktree: async (a) => ({ path: await forkWorktree(a) }),
+      // exactly like any other. 갈라질 자리를 고르는 판단은 forkWorktree(integrateGit.ts)에 있다 —
+      // Run 워크트리를 만드는 스케줄러도 같은 것을 쓴다.
+      createWorktree: async (a) => ({
+        path: await forkWorktree(a, { registry: core.worktrees, log: orchLog })
+      }),
       accountProvider: (id) => {
         try {
           return providerOf(core.accounts.get(id))
@@ -2471,22 +2878,7 @@ export function registerIpc(
       // Job Continuity's two prompt rows. Not a state transition, so it cannot come out of the
       // setState diff: only the coordinator knows when the prompt left the app. The Run comes from
       // the Task because the event carries no runId.
-      onPromptWrite: (e) => {
-        if (!continuity) return
-        const st = store.get()
-        const task = st.tasks.find((t) => t.id === e.taskId)
-        if (!task) return
-        const type = e.phase === 'requested' ? 'PROMPT_WRITE_REQUESTED' : 'PROMPT_WRITE_CONFIRMED'
-        continuity.note({
-          runId: task.runId,
-          taskId: task.id,
-          dispatchId: e.dispatchId,
-          type,
-          at: new Date().toISOString(),
-          idempotencyKey: `${type}:${e.dispatchId}`,
-          payload: { via: e.via, promptLength: e.promptLength, specPath: e.specPath }
-        })
-      }
+      onPromptWrite: (e) => appJournal.note(promptWriteEventOf(store.get(), e, new Date().toISOString()))
     })
 
     // performRepair/repairOnce(repair.ts)가 받는 의존 묶음. 판정이 검증에서 왔든(onSettled, 아래)
@@ -2496,1155 +2888,113 @@ export function registerIpc(
     // deps 는 이 validator 뒤에 정의되기 때문이다. onSettled 는 이것을 클로저로만 참조하고 지금
     // 당장 읽지 않으므로, deps 정의가 끝난 뒤 대입해도 안전하다(그 자리의 주석 참고).
     let repairDeps: RepairDeps
-    // 검증 실행. runner 는 prepareRun + RunManager 이고, 결과는 서버의 setState 로 되돌아간다.
-    // dispatchOf 로 cwd 에서 Task 를 되찾지 않는 이유: TaskValidator 가 taskId 를 들고 있다.
-    const validator = new TaskValidator({
-      runner: {
-        start: async ({ cwd, taskId, configId }) => {
-          const st = store.get()
-          const task = st.tasks.find((t) => t.id === taskId)
-          if (!task) throw new Error(`unknown task ${taskId}`)
-          // 큐에서 기다리는 동안 Task 가 validating 을 떠났을 수 있다(task-update). 그대로 두면
-          // 빌드 전체가 돌고 실행 패널을 차지한 뒤에야 applyValidationResult 가
-          // 결과를 거절한다. 던지지 않고 'skip' 을 돌려주는 이유는 ValidatorRunner.start 의 주석에
-          // 있다 — 이것은 실패가 아니라 없어진 할 일이다.
-          if (task.status !== 'validating') return 'skip'
-          const run = st.runs.find((r) => r.id === task.runId)
-          if (!run) throw new Error(`unknown run for task ${taskId}`)
-          // PTY 를 띄울 경로는 가드를 통과해야 한다. Dispatch.cwd 는 오케스트레이션 소켓에서 온
-          // 값이고 resolveProjectRoot 는 ADR-003 이 명시하듯 "최선 노력이지 검증이 아니다".
-          // 실패하면 그것이 그대로 Gate 가 되므로(onCannotRun) 여기가 올바른 자리다.
-          await assertAllowedPath(cwd)
-          // 구성은 Run 의 프로젝트에서, 실행은 Dispatch 의 cwd 에서. ignoreConfigCwd 는 구성에 박힌
-          // 경로가 워커의 트리가 아닌 곳을 가리키기 때문이다(spec 2절). configId 는 TaskValidator 가
-          // enqueue 의 configIds 목록에서 지금 도는 자리를 골라 넘긴 것이다.
-          const { config, command, projectName } = await prepareRun({
-            projectPath: run.cwd,
-            configId,
-            stored: core.runConfig.get(run.cwd),
-            ignoreConfigCwd: true,
-            assertAllowedPath,
-            t: (key, params) => t(core.lang, key as MessageKey, params)
-          })
-          // validation: marks this run as not the user's. The run list and the global badge label it,
-          // and run.stop routes markStopped by it (RunStatus.validation). Nothing waits for the user's
-          // own runs any more — a validation starts beside them; same-tree validations are serialised
-          // by TaskValidator's own queue.
-          const started = core.run.start({ projectPath: cwd, projectName, config, command, validation: true })
-          return { runId: started.runId, name: config.name }
-        },
-        output: (runId) => core.run.recentOutput(runId).slice(-4000),
-        // 타임아웃이 이 PTY 를 두 번째로 멈춘다(validator.ts 의 startCheck 타이머). **core.run.stop 을
-        // 직접 부른다 — `ipcMain.handle('run.stop', ...)` 을 거치지 않는다.** 그 핸들러는 사용자가
-        // 화면에서 직접 멈춘 검증 실행에 `orchValidator.markStopped` 까지 얹어 "실패가 아니라 증명
-        // 못 함"으로 읽는다(그 핸들러의 주석). 이 stop 은 이미 validator.ts 자신이 head.timedOut 으로
-        // 표시해 두었으므로, 여기서 markStopped 까지 걸면 한 exit 에 stopped 와 timedOut 이 겹치고
-        // onRunExit 은 stopped 를 먼저 보므로(그 순서의 주석) 이 exit 가 "사용자가 정지했다"로 읽혀
-        // timeout 의 재시도·기록이 사라진다. core.run.stop 을 바로 부르면 PTY 만 죽고 그 겹침이 없다.
-        //
-        // **던지지 않는다 — 이 자리는 바로 setTimeout 콜백이다(validator.ts).** 여기서 던지면 잡을
-        // 것이 없는 uncaught exception 으로 main 프로세스가 죽는다(리뷰 fix 1차, Minor). status 확인
-        // (RunManager.stop 은 status !== 'running' 이면 no-op)이 있어도, POSIX 에서는 그 확인과 실제
-        // pty.kill() 사이에 그 프로세스가 스스로 막 끝나는 창이 있을 수 있다 — node-pty 는 죽은 pid 에
-        // kill 을 던질 수 있고, write/resize 를 감싸는 withExitedPtyGuard 는 stop 을 감싸지 않는다.
-        // 잡아서 로그만 남긴다: 그 경우 프로세스는 이미 스스로 끝났으므로 pty 의 자연스러운 exit 가
-        // 뒤따라 오고, head.timedOut 은 그대로 남아 있어 그 exit 를 여전히 timeout 으로 정산한다.
-        stop: (runId) => {
-          try {
-            core.run.stop(runId)
-          } catch (e) {
-            orchLog(`validator: run.stop failed for run=${runId}: ${String(e)}`)
-          }
-        }
+    // 검증 배선(러너·판정 콜백·startValidation 본문)은 core/orchestration/exec/validation.ts 한 모듈이다 —
+    // Host 도 같은 것을 짓는다(설계 §5.1, R12). 여기서는 앱의 값을 한 줄짜리 어댑터로 넘기기만 한다.
+    // startReview·repairDeps·deps 는 이 아래에서 정의되지만 여기의 화살표 함수는 부를 때 읽으므로
+    // 순서 문제는 없다(orchTails·repairDeps 와 같은 모양).
+    const validation = createTaskValidation({
+      getState: () => store.get(),
+      setState: (next) => deps.setState(next),
+      now: () => new Date().toISOString(),
+      lang: () => core.lang,
+      log: orchLog,
+      assertAllowedPath: (p) => assertAllowedPath(p),
+      storedConfigs: (p) => core.runConfig.get(p),
+      runs: {
+        start: (o) => core.run.start(o),
+        recentOutput: (runId) => core.run.recentOutput(runId),
+        stop: (runId) => core.run.stop(runId)
       },
-      onSettled: async ({ taskId, results }) => {
-        const before = store.get()
-        // 판정 직전에 repair 대상을 정한다(설계 §6.2) — 순수 층(state.ts)은 세션이 살아 있는지 모른다.
-        // 서버가 검토 판정에서 하는 것과 같은 판정이다(아래 deps.repairTargetFor).
-        const repair = repairTargetFor(before, taskId, (id) =>
-          core.sessions.list().some((s) => s.id === id && s.status === 'running')
-        )
-        const r = applyValidationResult(
-          before,
-          // 서버가 applyWorkerDone 에 넘기는 것과 같은 값들이다 — 이 배선에는 startReview 가 있다.
-          // repair 는 convergence Run 에서 필수다(없으면 순수 층이 거절한다); lang 은 Gate 문구의
-          // 언어다.
-          { taskId, results, canReview: true, ...(repair ? { repair } : {}), lang: core.lang },
-          new Date().toISOString()
-        )
-        if (!r.ok) {
-          orchLog(`validation result rejected task=${taskId}: ${r.error}`)
-          return
-        }
-        await deps.setState(r.state)
-        // 검증이 통과했고 검토가 걸려 있으면 여기서 이어진다. 서버의 worker_done 분기가 검증이 걸리지
-        // 않은 Task 에 대해 같은 일을 한다. cwd 는 넘기지 않는다 — startReview 가 구현 Dispatch 에서
-        // 얻는다(그 Dispatch 를 provider 때문에 어차피 찾는다).
-        // 종단 .catch 를 붙인다 — 이유는 deps.startReview 쪽 주석에 있다(validator 가 자기
-        // onSettled/onCannotRun 에 붙이는 것과 같은 것이다).
-        if (r.value.status === 'reviewing')
-          void startReview({ taskId }).catch((e) =>
-            orchLog(`startReview failed task=${taskId}: ${String(e)}`)
-          )
-        // 판정이 repair Dispatch 를 새로 열었으면(routeFailure) 그 부수 효과(spec 파일을 쓰고 살아
-        // 있는 세션에 넣거나 새 워커를 띄운다)를 시작한다 — **커밋(위 setState) 뒤에만** 부른다.
-        // **여기서도 getState() 를 다시 읽는다** — r.state 를 그대로 뒤지지 않는다. 서버의 검토
-        // 판정 분기(server.ts)가 자신의 setState 뒤에 afterReview = deps.getState() 로 다시 읽는
-        // 것과 같은 모양이다 — 지금은 둘이 갈라질 수 없지만(그 사이에 await 가 없다), 한쪽이 나중에
-        // await 를 얻어도 이 자리가 조용히 낡은 채로 남지 않는다. openRepairDispatch 가 채우는
-        // specPath 는 '' 이므로 !d.specPath 는 그것도 "아직 시작되지 않았다"로 읽는다(performRepair
-        // 의 liveRepairDispatch 와 같은 조건).
-        const afterValidation = deps.getState()
-        const opened = afterValidation.dispatches.find(
-          (d) => d.taskId === taskId && d.repair !== undefined && !d.endedAt && !d.specPath
-        )
-        if (opened)
-          void performRepair(repairDeps, { dispatchId: opened.id }).catch((e) =>
-            orchLog(`repair failed task=${taskId}: ${String(e)}`)
-          )
-      },
-      onCannotRun: async ({ taskId, reason }) => {
-        const r = blockForValidation(store.get(), { taskId, reason }, new Date().toISOString())
-        if (!r.ok) {
-          orchLog(`could not block task=${taskId}: ${r.error}`)
-          return
-        }
-        await deps.setState(r.state)
-      },
-      log: orchLog
+      isAlive: (id) => core.sessions.list().some((s) => s.id === id && s.status === 'running'),
+      startReview: (a) => startReview(a),
+      startRepair: (a) => performRepair(repairDeps, a),
+      firstCheckpointHead: (dispatchId) => appJournal.firstCheckpointHead(dispatchId),
+      diffNames: async (cwd, fromHead) => {
+        const r = await git(['diff', '--name-only', fromHead, 'HEAD'], { cwd })
+        return r.ok ? r.stdout.split('\n').map((line) => line.trim()).filter(Boolean) : null
+      }
     })
-    orchValidator = validator
+    orchValidator = validation.validator
 
-    /** 검토 세션 하나를 띄운다. 실패하는 모든 경로가 Gate 로 간다 — 조용히 통과시키면 "검토됨"과
-     *  "검토 못 함"이 화면에서 같아진다. */
-    const startReview = async ({ taskId }: { taskId: string }): Promise<void> => {
-      /** Gate 로 넘긴다. **먼저 이 Task 의 열린 검토 Dispatch 를 지운다.** createGate 는 열린
-       *  Dispatch 가 있는 Task 를 거절하므로(state.ts), 이미 커밋한 검토 Dispatch 를 그대로 두고
-       *  Gate 를 열려 하면 그것도 실패하고 Task 는 reviewing 에 열린 Dispatch 와 함께 갇힌다 —
-       *  꺼내 줄 것이 아무것도 없다. worker-start 의 실패 롤백이 같은 일을 한다(server.ts): Dispatch
-       *  를 배열에서 아예 지운다. 다만 Task 의 상태는 되돌리지 않는다 — openReviewDispatch 는 상태를
-       *  옮기지 않았으므로 reviewing 그대로가 맞고, 그 자리에서 Gate 가 blocked 로 데려간다.
-       *
-       *  정리가 세션 시작 실패 자리가 아니라 여기 있는 이유: 커밋 뒤에 던지는 경로는 그 하나가
-       *  아니다(뒤의 setState, 그리고 밖의 catch 로 오는 모든 것). 두 자리에 같은 코드를 두면 한쪽만
-       *  고쳐지고, "실패하는 모든 경로가 Gate 로 간다"는 위의 문장이 거짓이 된다.
-       *
-       *  조건을 id 가 아니라 "이 Task 의 열려 있는 검토 Dispatch"로 쓴 것도 그래서다 — 아직 아무것도
-       *  열지 않은 경로는 지울 것이 없어 그대로 지나가고(그래서 두 번 불러도 같다), 구현 Dispatch 는
-       *  정당하게 남아 있는 닫힌 Dispatch 이므로 건드리지 않고, 이미 보고를 마친 검토 Dispatch 도
-       *  대상이 아니다. */
-      const gate = async (reason: string): Promise<void> => {
-        const before = store.get()
-        const kept = before.dispatches.filter(
-          (d) => !(d.taskId === taskId && d.review && !d.outcome && !d.endedAt)
-        )
-        if (kept.length !== before.dispatches.length)
-          await deps.setState({ ...before, dispatches: kept })
-        // 방금 쓴 것을 다시 읽는다 — 위 커밋이 메모리의 상태를 바꿨으므로 before 로 Gate 를 열면
-        // 지운 Dispatch 가 되살아난다.
-        const r = blockForReview(store.get(), { taskId, reason }, new Date().toISOString())
-        if (!r.ok) {
-          orchLog(`could not block task=${taskId} for review: ${r.error}`)
-          return
-        }
-        await deps.setState(r.state)
-      }
-      try {
-        const st = store.get()
-        const task = st.tasks.find((t) => t.id === taskId)
-        // 큐를 거치지 않고 곧바로 오지만, setState 뒤에 불리므로 그 사이 task-update 가 상태를
-        // 옮겼을 수 있다. validator.start 가 같은 이유로 'skip' 을 돌려준다.
-        if (task?.status !== 'reviewing') return
-        // 구현 Dispatch — 그 provider 를 피해야 하고, cwd 도 여기서 얻는다(그래서 이 함수는 taskId
-        // 하나만 받는다: 호출자가 cwd 를 따로 구하면 두 경로가 갈라진다)
-        const impl = st.dispatches
-          .filter((d) => d.taskId === taskId && !d.review)
-          .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-          .at(-1)
-        if (!impl) return void (await gate(`no implementation dispatch for task ${taskId}`))
-        const cwd = impl.cwd
-        const accounts = core.accounts.list()
-        // core.ts 의 defaultAccountIdFor 와 같은 모양 — 로그인 조회는 계정마다 파일(또는 macOS 에서는
-        // Keychain)을 읽으므로 순차로 돌리면 계정 수만큼 늘어난다. 같은 일을 하는 자리가 이미 있으니
-        // 그 모양을 따른다.
-        const loggedInIds = await Promise.all(
-          accounts.map(async (a) => ((await core.accounts.loginStatus(a.id)) ? a.id : null))
-        )
-        const loggedIn = new Set(loggedInIds.filter((id): id is string => id !== null))
-        const picked = pickReviewer({ implProvider: impl.provider, accounts, loggedInIds: loggedIn })
-        if (!picked)
-          return void (await gate(`no logged-in account on a provider other than ${impl.provider}`))
-        // PTY 를 띄울 경로는 가드를 통과해야 한다 — validator.start 와 같은 이유(Dispatch.cwd 는
-        // 오케스트레이션 소켓에서 온 값이고 정규화는 검증이 아니다, ADR-003).
-        await assertAllowedPath(cwd)
-        // Dispatch 를 먼저 커밋한다 — 세션을 띄우기 전에 id 가 있어야 spec 파일의 보고 문장에
-        // 그것을 실을 수 있다. worker-start 가 같은 순서다(server.ts: openDispatch 커밋 → startWorker).
-        //
-        // **입구의 st 가 아니라 여기서 다시 읽은 상태를 넘긴다.** 위의 loginStatus 와
-        // assertAllowedPath 는 진짜 await(계정마다 파일·Keychain 읽기, knownProjectPaths)이고, 그
-        // 사이에 다른 흐름이 커밋할 수 있다. st 를 넘기면 setState 가 그 낡은 상태를 통째로 되쓰므로
-        // 그 창에 들어온 커밋이 디스크에서만이 아니라 메모리에서도 사라진다 — 남의 Task 의
-        // worker_done 이 되돌려져 그 Dispatch 가 다시 열리고, 이미 "ok" 를 듣고 떠난 워커는 두 번
-        // 보고하지 않는다. server.ts 가 probeLimit 뒤에 getState 를 다시 읽는 것과 같은 규칙이고,
-        // store.ts 가 같은 것을 못박아 두었다. worker-start 는 openDispatch 앞의 검사가 전부 동기라서
-        // 입구 스냅숏을 그대로 넘길 수 있다 — 이쪽은 그렇지 않다.
-        //
-        // 그 창에서 옮겨졌을 상태도 여기서 다시 본다. 입구의 검사는 이제 너무 이르다 — 그것은
-        // 로그인 조회를 아끼는 값싼 선검사로 남는다.
-        const fresh = store.get()
-        const freshTask = fresh.tasks.find((t) => t.id === taskId)
-        if (freshTask?.status !== 'reviewing') return
-        const opened = openReviewDispatch(
-          fresh,
-          {
-            taskId,
-            provider: picked.provider,
-            accountId: picked.accountId,
-            // 세션 id 는 아직 없다. worker-start 가 같은 자리에서 쓰는 자리표시자와 같은 모양이다
-            // (server.ts 의 handleCommand, worker-start 분기의 pendingSessionId: `pending:${randomBytes(4).toString('hex')}`) — 그 값은 어떤 세션도
-            // 가리키지 않으며 jobTaskOf 의 isKnownSession 이 걸러 낸다.
-            sessionId: `pending:${randomBytes(4).toString('hex')}`,
-            cwd,
-            specPath: ''
-          },
-          new Date().toISOString()
-        )
-        if (!opened.ok) return void (await gate(opened.error))
-        await deps.setState(opened.state)
-        const spec = buildReviewSpecFile({
-          title: task.title,
-          spec: task.spec,
-          taskId,
-          dispatchId: opened.value.id,
-          implReport: task.result,
-          filesModified: task.filesModified,
-          // checkConfigIdsOf 는 옛 validateConfigId 와 새 validateConfigIds 를 함께 읽는다 — 이 칸만
-          // 보면 새 필드만 쓰는 Task 는 "검증 없음"으로 잘못 읽힌다.
-          validated: checkConfigIdsOf(task).length > 0,
-          // 구현자와 **같은 목록**을 받는다 — 검토자의 일이 "닫힌 결정이 다시 열렸는지"를 잡는 것인데
-          // 그 목록을 안 주면 그 자리가 빈다. 훑는 뿌리도 같다: 검토자는 구현자가 일한 트리에서
-          // 돈다(바로 아래 worktree 'current' + runCwd = 그 cwd).
-          knowledge: await knowledgeIn(cwd, orchLog),
-          // 이 Task 가 이미 들고 있는 값을 그대로 옮긴다(설계 §8.1·§8.3) — checks 는 마지막 검증
-          // 라운드의 check 별 결과, previousIssues 는 직전 검토 라운드의 이슈(buildReviewSpecFile
-          // 이 그중 blocking 만 추린다), suspiciousFiles 는 startValidation 이 검증을 큐에 넣을 때
-          // best-effort 로 채워 둔 것이다.
-          //
-          // **suspiciousFiles 만 freshTask 에서 읽는다, task 가 아니다(리뷰 fix 1차, Minor).**
-          // startValidation 의 그 계산은 이 흐름과 동시에 도는 별개의 비동기 흐름이라, 맨 위의 st
-          // 를 읽은 뒤 이 자리에 오기까지의 그 어떤 await(로그인 조회 등) 사이에도 끝나 커밋될 수
-          // 있다 — checks·previousIssues 는 이 판정이 reviewing 으로 넘어오기 전에 이미 끝난
-          // 값이라 그런 창이 없다.
-          checks: task.checks,
-          previousIssues: task.reviewIssues,
-          suspiciousFiles: freshTask.suspiciousFiles,
-          policyChanged: freshTask.policyChanged === true,
-          // review.ts·state.ts 가 이미 기대하는 이름과 같은 규칙이다 — 이 Dispatch 의 spec 파일
-          // 이름(coordinator.ts 의 specFileName, startWorker 가 실제로 쓰는 그 이름)에
-          // `.review.json` 을 붙인 것. **리터럴을 다시 적지 않는다** — 여기서 조립하는 시점에는
-          // 코디네이터가 아직 돌지 않아 진짜 specPath 를 모르므로 같은 함수로 미리 계산해야 하고,
-          // 독립된 리터럴은 오늘은 우연히 같아도 한쪽만 바뀌는 날 조용히 갈라진다(검토자는 아무도
-          // 읽지 않는 파일에 쓰고, server.ts 는 그 파일을 찾지 못한다 — malformed 도 "이슈 없음"도
-          // 아니다).
-          //
-          // **convergence Run 에서만 넘긴다(전체 브랜치 리뷰, Important 1).** server.ts 는
-          // policyOf(...) !== null 일 때만 이 파일을 읽는다(applyReviewResult) — 없는 Run 에도 항상
-          // 넘기면 그 Run 의 검토자가 아무도 읽지 않는 파일에 쓰고, "구조화된 판정" 절이 "파싱 실패는
-          // 사람에게 간다"는 거짓을 말하게 된다. **raw 필드가 아니라 policyOf 다** — 나머지 모든
-          // 관문과 같은 판별식(reconciler.ts 의 주석, ipc.ts 의 startValidation 가드와 같은 이유).
-          ...(policyOf(fresh, task) !== null
-            ? { resultPath: path.join(specsDir, `${specFileName(taskId, opened.value.id)}.review.json`) }
-            : {})
-        })
-        let started: { sessionId: string; cwd: string; specPath: string }
-        try {
-          // 검토자는 구현자가 일한 트리에서 돈다 — worktree 'current' + runCwd = 그 cwd.
-          //
-          // **coordinator.startWorker 가 아니라 deps.startWorker 다.** 그쪽은 통과 함수가 아니다 —
-          // 코디네이터를 부른 뒤 orchTails.start 로 그 세션의 출력을 이 Dispatch 에 묶는다. 직접
-          // 부르면 검토 Dispatch 에는 tail 이 없고 worker-read 가 untracked 를 돌려준다: 검토자가
-          // 멈췄거나 판정이 이해되지 않을 때 코디네이터가 볼 것이 사라진다. 그리고 그 차이는 검토
-          // Dispatch 만 다르게 행동하는 자리가 되어 다음 사람을 속인다.
-          started = await deps.startWorker({
-            dispatchId: opened.value.id,
-            taskId,
-            title: `Review: ${task.title}`,
-            // spec 은 본문이고 coordinator 가 그것을 **구현자의** 템플릿으로 감싼다 — 검토 파일을
-            // 그 자리에 넣으면 H1 과 보고 의무가 두 벌이 되고, 마지막 줄이 "바꾼 파일의 경로를
-            // --files-modified 로 넘겨라"가 되어 맨 위의 "코드를 바꾸지 말라"와 정면으로 부딪힌다.
-            // 그래서 조립이 끝난 파일은 specFileContent 로 넘긴다(coordinator.ts 에 이유가 있다).
-            // spec 은 이 경로에서 쓰이지 않지만 인터페이스의 필수 필드이므로 Task 의 본문을 준다 —
-            // 빈 문자열을 주면 이 값이 무엇인지 다음 사람이 읽을 수 없다.
-            spec: task.spec,
-            specFileContent: spec,
-            provider: picked.provider,
-            accountId: picked.accountId,
-            runCwd: cwd,
-            worktree: 'current'
-          })
-        } catch (e) {
-          // 검토 Dispatch 의 롤백은 gate() 안에 있다 — 커밋 뒤에 던지는 경로가 이 자리 하나가 아니기
-          // 때문이다(그 이유는 gate 의 주석에 있다).
-          return void (await gate(
-            `failed to start the reviewer: ${e instanceof Error ? e.message : String(e)}`
-          ))
-        }
-        // 실제 세션 id 와 spec 경로로 Dispatch 를 메운다. **여기서도 최신 상태를 다시 읽는다** —
-        // 코디네이터를 기다리는 동안 그 Dispatch 에 다른 변경이 내려앉았을 수 있고, 넘겨줄 것은
-        // 이 세 필드뿐이다(worker-start 의 같은 주석 참고).
-        const latest = store.get()
-        await deps.setState({
-          ...latest,
-          dispatches: latest.dispatches.map((d) =>
-            d.id === opened.value.id
-              ? { ...d, sessionId: started.sessionId, cwd: started.cwd, specPath: started.specPath }
-              : d
-          )
-        })
-        orchLog(
-          `review started task=${taskId} provider=${picked.provider} dispatch=${opened.value.id}`
-        )
-      } catch (err) {
-        await gate(String(err))
-      }
+    /** 검토 세션 하나를 띄운다 — 본문과 그것이 실패를 넘기는 reviewGate 는 core/orchestration/exec/review.ts
+     *  한 모듈이다. Host 도 같은 것을 짓는다(설계 §5.1). 여기서는 앱의 값을 한 줄짜리 어댑터로 넘기기만
+     *  한다. `deps` 는 이 아래에서 정의되지만 여기의 화살표 함수는 부를 때 읽으므로 순서 문제는 없다
+     *  (orchTails·repairDeps 와 같은 모양). startWorker 는 **deps.startWorker** 다 — 코디네이터를 직접
+     *  부르면 체인과 tail 이 붙지 않는다(그 이유는 review.ts 의 그 호출 자리에 있다). */
+    const startReview = createReviewStarter({
+      getState: () => store.get(),
+      setState: (next) => deps.setState(next),
+      now: () => new Date().toISOString(),
+      log: orchLog,
+      accounts: () => core.accounts.list(),
+      loginStatus: (accountId) => core.accounts.loginStatus(accountId),
+      assertAllowedPath: (p) => assertAllowedPath(p),
+      // `(w)` 는 일부러다 — ipcConvergenceWiring.test.ts 의 남은 가드가 첫 `startWorker: (a) =>` 에 닻을 내린다.
+      startWorker: (w) => deps.startWorker(w),
+      specsDir
+    })
+
+    /** What reapWorktree (core/orchestration/exec/integrateGit.ts) may close and ask in the app.
+     *  `isPathInUse` is called through a wrapper: it is declared further down registerIpc, and is
+     *  initialised by the time any reap runs. */
+    const reapCtx: ReapContext = {
+      registry: core.worktrees,
+      sessions: {
+        inTree: (p) =>
+          core.sessions.list().filter((x) => x.status === 'running' && isPathWithin(p, x.cwd)),
+        anyRunningIn: (p) =>
+          allSessions().some((x) => x.status === 'running' && isPathWithin(p, x.cwd)),
+        kill: (id) => core.sessions.kill(id)
+      },
+      dispatches: () => orch?.deps.getState().dispatches ?? [],
+      isPathInUse: (p) => isPathInUse(p),
+      log: orchLog
+    }
+    const reapWorktree = (p: string): Promise<boolean> => reapWorktreeIn(p, reapCtx)
+    /** The three things integrateWorktrees needs from the app (core/orchestration/exec/integrateGit.ts). */
+    const gitCtx: IntegrateContext = {
+      log: orchLog,
+      gitOp: {
+        begin: (k, cwd) => workUnitCollector.beginGitOperation(k, cwd),
+        end: (id) => workUnitCollector.endGitOperation(id)
+      },
+      reap: reapWorktree
     }
 
-    /** 이 자리를 지금 띄울 수 없다고 **사람에게** 알린다. 로그가 아니라 Gate 인 이유: 이 층의 실패는
-     *  "일이 실패했다"가 아니라 **"앱이 일을 시작하지 못했다"** 이고, 그 판단은 사람의 것이다.
-     *  Reviewer 슬라이스가 정한 규칙("Gate 는 돌릴 수 없을 때만 쓴다")이 정확히 이 경우다 — 계정이
-     *  없을 때가 이미 그렇게 처리되고 있으므로 같은 부류인 worker-start 실패를 다르게 다루지 않는다.
-     *
-     *  **되풀이를 멈추는 장치이기도 하다.** Gate 가 열리면 Task 가 blocked 로 가고 slotsToFill 은
-     *  ready 만 고르므로 그 자리는 더 이상 후보가 아니다. 그것이 없으면 진짜로 매번 실패하는 자리
-     *  (userData 경로에 & 가 들어가 launch 프롬프트가 깨지는 경우가 그렇다 — 위의 LAUNCH_FORBIDDEN
-     *  경고는 경고일 뿐 startup 을 막지 않는다)가 **바깥의 상태 변경마다 한 번씩 영원히** 다시 시도된다.
-     *  실패 롤백은 consecutiveFailures 를 올리지 않으므로 회로 차단이 대신 걸리는 일도 없다.
-     *
-     *  이 함수는 실패를 **알리는** 자리이지 실패를 만드는 자리가 아니므로 던지지 않는다. gate-create
-     *  도 setState 를 지나므로 같은 이유로 거부될 수 있고, 그것을 그대로 흘려보내면 이 함수를 부르게
-     *  만든 원래의 실패까지 함께 지워진다. */
-    const gateSlot = async (d: OrchServerDeps, taskId: string, reason: string): Promise<void> => {
-      // Gate 와 별개로 로그를 남긴다 — Gate 는 사용자가 읽는 것이고, 이 줄은 왜 그 Gate 가 열렸는지
-      // 나중에 되짚을 때 읽는 것이다.
-      orchLog(`scheduler: cannot start task=${taskId} — ${reason}`)
-      try {
-        const gated = await orchHandleCommand(d, { sessionId: UI_CALLER }, 'gate-create', {
-          task: taskId,
-          question: reason
-        })
-        // Gate 마저 거절되는 경우가 있다: gate-create 는 열린 Dispatch 가 있는 Task 를 거절하고
-        // (state.ts), dispatched 에서 blocked 로 가는 전이도 없다(types.ts 의 ALLOWED). 그 상태로
-        // 남는 자리는 ready 가 아니라서 slotsToFill 이 더는 고르지 않으므로 되풀이로는 이어지지
-        // 않지만, 사용자에게 남는 신호가 사라지므로 그 자리를 로그로 메운다.
-        if (gated.status >= 400)
-          orchLog(`scheduler: gate-create rejected task=${taskId} — ${JSON.stringify(gated.body)}`)
-      } catch (e) {
-        orchLog(`scheduler: gate-create failed task=${taskId} — ${String(e)}`)
-      }
-    }
-
-    /** 통합의 결과. 셋뿐이다 — 합쳤다, 사람에게 가야 한다, 에이전트에게 넘겨야 한다. */
-    type Integration =
-      /** uncommitted: 합친 워크트리들에 **커밋되지 않은 채 남은** 변경의 수. git 은 커밋만 옮기므로
-       *  그 변경은 병합되지 않았고 그 폴더에만 있다 — 폴더를 지우면 사라진다. 워커에게 커밋 의무를
-       *  주기는 하지만(coordinator 의 commitObligation) 지켰는지 확인하는 곳은 없어서, 이 수가
-       *  사람에게 그 사실이 닿는 유일한 자리다. */
-      | { kind: 'merged'; uncommitted: number }
-      | { kind: 'human'; reason: string }
-      | { kind: 'agent'; reason: string; worktrees: { path: string; branch: string | null }[] }
-
-    /** 워크트리에서 끝난 일을 **합칠 폴더에 실제로 합친다.** 그 폴더는 부르는 쪽이 정한다 —
-     *  스케줄러는 Run 뿌리를 주고 `run-delete --merge` 는 프로젝트 폴더를 준다. 무엇을 합쳐야
-     *  하는가의 판정은 integrate.ts 가 하고(순수하므로 테스트가 있다), 이 함수는 그 답을 git 으로
-     *  실행한다.
-     *
-     *  **이것이 사용자의 저장소에 스스로 쓰는 유일한 자동 경로다.** 사용자가 그렇게 결정했으므로
-     *  허용되지만, 지켜야 하는 것이 하나 있다: **어떤 실패 경로에서도 합칠 폴더를 병합 중간
-     *  상태로 남기지 않는다.** 아래의 순서(미리 검사 → 진짜 병합 → 실패하면 되돌리고 되돌아갔는지
-     *  확인)가 전부 그것을 위한 것이다. */
-    /** 워크트리의 세션이 닫히기를 기다리는 상한. pty.kill 은 비동기이고 상태는 exit 이벤트가 와야
-     *  바뀐다 — 고정 대기가 아니라 조건을 폴링하고(coordinator 의 waitUntilIdle 과 같은 관례) 이
-     *  시간을 넘기면 정리를 건너뛴다. 살아 있는 프로세스 밑의 폴더는 지우지 않는다. */
-    const WORKTREE_CLOSE_TIMEOUT_MS = 5_000
-    /**
-     * 워크트리 하나를 폴더째 지운다 — 그 안에서 도는 세션을 먼저 닫고. true = 지워졌다.
-     *
-     * **두 곳이 이것을 쓴다**: 병합 직후의 자동 정리와 `run-delete --remove-worktrees`. 복제하면
-     * "무엇을 닫아도 되는가" 의 답이 두 벌이 되고, 한쪽만 고쳐지는 날 다른 쪽이 살아 있는 세션 밑의
-     * 폴더를 지운다.
-     *
-     * **세션을 먼저 닫는 이유**: 끝난 워커의 세션은 스스로 죽지 않는다 — worker-release 는 코디네이터가
-     * 부르는 명령이고 앱이 자동으로 부르는 자리가 없다. 닫지 않으면 removeWorktree 의 isPathInUse 가
-     * 늘 IN_USE 를 내고 이 정리는 사실상 한 번도 돌지 않는다.
-     *
-     * **닫지 않는 두 경우**: 붙잡아 둔 세션(worker-retain — 사람이 살려 두라고 말한 것)과 아직 열려
-     * 있는 Dispatch 의 세션(지금 일하는 중이다). 그때는 아무것도 닫지 않고 그 워크트리를 그대로 둔다 —
-     * removeWorktree 가 IN_USE 로 거절하는 것이 그 결과다. run-delete 가 retained 에 같은 예외를 둔다.
-     */
-    const reapWorktree = async (worktreePath: string): Promise<boolean> => {
-      const inTree = core.sessions
-        .list()
-        .filter((x) => x.status === 'running' && isPathWithin(worktreePath, x.cwd))
-      const held = (orch?.deps.getState().dispatches ?? []).some(
-        (d) =>
-          (d.retained || (!d.outcome && !d.endedAt)) && inTree.some((x) => x.id === d.sessionId)
-      )
-      if (held) {
-        orchLog(`worktree ${worktreePath} has a held or working session — left alone`)
-        return false
-      }
-      for (const x of inTree) core.sessions.kill(x.id)
-      // 조건 폴링. 상태가 바뀌는 것을 기다리는 것이지 정해진 시간을 자는 것이 아니다
-      const deadline = Date.now() + WORKTREE_CLOSE_TIMEOUT_MS
-      while (
-        Date.now() < deadline &&
-        allSessions().some((x) => x.status === 'running' && isPathWithin(worktreePath, x.cwd))
-      )
-        await new Promise((r) => setTimeout(r, 50))
-      const entry = core.worktrees.list().find((w) => isSamePath(w.path, worktreePath))
-      if (!entry) {
-        orchLog(`${worktreePath} is not an app worktree — left alone`)
-        return false
-      }
-      try {
-        const removed = await removeWorktree({
-          id: entry.id,
-          force: true,
-          registry: core.worktrees,
-          isPathInUse
-        })
-        orchLog(`removed worktree ${worktreePath} (branch deleted=${removed.branchDeleted})`)
-        return true
-      } catch (e) {
-        orchLog(`worktree cleanup skipped for ${worktreePath}: ${String(e)}`)
-        return false
-      }
-    }
-    /**
-     * 워크트리 브랜치들을 `mergeInto` 에 합친다.
-     *
-     * **`reap` 이 두 호출자를 가른다.** 기본값이 참인 것은 스케줄러의 통합 병합이다 — 그 워크트리는
-     * 끝난 의존의 것이고 방금 접어 넣었으므로 다시 쓸 사람이 없다. 회차마다 워커 수만큼 폴더가
-     * 쌓이는 것을 막는 것이 그 자동 정리의 이유다(스물일곱 개까지 갔다).
-     *
-     * `reap: false` 로 부르는 것은 사람이 누르는 병합(`run-merge`)과 `run-delete --merge` 다. 폴더를
-     * 지우는 것은 그 사람의 몫이다 — 삭제 모달에는 그 체크박스가 따로 있고, 사람은 결과를 보고 다시
-     * 합칠 수도 있다. 여기서 걷으면 `run.worktree` 가 사라진 폴더를 가리킨 채 남고(setRunWorktree 는
-     * 두 번째 쓰기를 거절한다) 배치가 그 경로를 fs.stat 하므로, **그 Run 은 다시는 Task 를 띄울 수
-     * 없다.**
-     */
-    const integrateWorktrees = async (
-      mergeInto: string,
-      paths: string[],
-      opts: { reap?: boolean } = {}
-    ): Promise<Integration> => {
-      const reap = opts.reap ?? true
-      // 1. **저장소가 무언가의 중간이면 아무것도 하지 않는다.** 아래 2의 porcelain 검사는 경로 항목만
-      //    내므로 브랜치·상태를 전혀 말하지 않는다 — 작업 트리가 깨끗한 채로 rebase·bisect 중인
-      //    저장소와 분리된 HEAD 는 **빈 출력을 낸다.** 그것을 안전으로 읽으면 앱이 그 위에 병합을 건다.
-      //
-      //    **git 이 막아 주지 않는다.** 임시 저장소에서 실측한 것이다(이 자리에는 테스트가 없다):
-      //    bisect 중에도, `rebase -i` 가 break 에서 멈춘 상태에서도 `git merge` 는 **성공한다**
-      //    (exit 0, "Merge made by the 'ort' strategy"). 그 병합 커밋은 분리된 HEAD 위에 생기고 앱은
-      //    "합쳤다"고 보고한다. 사용자가 브랜치를 체크아웃하거나 `rebase --continue|--abort` 를 하는
-      //    순간 그 커밋은 도달 불가가 되고, bisect·rebase 세션은 깨진다. 일 자체는 워크트리 브랜치에
-      //    남으므로 영구 손실은 아니지만, **사용자의 저장소를 이상한 상태로 두지 않는다**는 이 함수의
-      //    규칙에 정면으로 걸린다.
-      //
-      //    두 가지를 함께 묻는다. 하나로는 못 덮기 때문이다.
-      //    - **분리된 HEAD 는 `symbolic-ref --quiet HEAD` 의 실패**로 본다(listBranches 가 이미 그렇게
-      //      묻는다). 이것 하나가 bisect·rebase(대화형이든 아니든 HEAD 를 분리한다)·순수 분리 HEAD 를
-      //      함께 덮는다. `status --porcelain=v2 --branch` 의 헤더로도 분리는 알 수 있지만 그 헤더는
-      //      rebase·bisect·cherry-pick 을 전혀 알려주지 않아 어차피 두 번째 질문이 필요하다.
-      //    - **HEAD 를 분리하지 않는 진행 중 작업은 git 디렉터리의 표시 파일**로 본다. cherry-pick·
-      //      revert·am·병합은 브랜치 위에 머무르므로 위의 질문에 걸리지 않고, 그 대부분은 충돌이나
-      //      staged 변경을 남겨 2가 잡지만 전부는 아니다 — 빈 커밋에서 멈춘 cherry-pick 은 작업
-      //      트리가 깨끗한 채 CHERRY_PICK_HEAD 만 남는다. git 자신도 wt_status_get_state 에서 같은
-      //      파일들을 본다.
-      //
-      //    표시 파일의 자리를 `<mergeInto>/.git` 으로 짐작하지 않는다 — 워크트리에서 `.git` 은 파일이고
-      //    실제 디렉터리는 <주 저장소>/.git/worktrees/<이름> 이다. 그리고 이 상태들은 워크트리마다
-      //    따로다. gitDir()(worktrees/git.ts)이 `--absolute-git-dir` 로 그 자리를 답한다.
-      // **git 디렉터리를 먼저 묻는다.** 아래 symbolic-ref 의 실패는 유효한 저장소에서만 "분리됐다"를
-      // 뜻하고, 폴더가 사라졌거나 저장소가 아닐 때도 똑같이 실패한다 — 순서가 반대였을 때 이 함수는
-      // 그 경우에도 "분리된 HEAD" 라고 말했다. 그 오진이 createWorktree 어댑터 쪽에서 실제로 사람을
-      // 헤매게 했고(그쪽 주석), 같은 질문을 같은 방식으로 묻는 이 자리도 같은 순서여야 한다.
-      const dir = await gitDir(mergeInto)
-      if (!dir)
-        return {
-          kind: 'human',
-          reason:
-            `합칠 폴더(${mergeInto})에서 git 을 돌릴 수 없어 워크트리를 합치지 못했습니다 — 그 폴더가 ` +
-            `사라졌거나 git 저장소가 아닙니다.`
-        }
-      const head = await git(['symbolic-ref', '--quiet', 'HEAD'], { cwd: mergeInto })
-      if (!head.ok)
-        return {
-          kind: 'human',
-          reason:
-            `합칠 폴더(${mergeInto})의 HEAD 가 브랜치를 가리키지 않아 워크트리를 합치지 않았습니다` +
-            `(분리된 HEAD — bisect 나 rebase 중일 수도 있습니다). 그 위에 병합하면 만든 커밋이 어느 ` +
-            `브랜치에도 남지 않고, 진행 중인 작업이 있다면 그것이 깨집니다. 브랜치를 체크아웃한 뒤 ` +
-            `이 Gate 를 해결해 주세요.`
-        }
-      // 표시 파일과 사람에게 보일 이름. rebase-apply 는 `git am` 도 쓴다.
-      const busy = (
-        [
-          ['rebase-merge', 'rebase'],
-          ['rebase-apply', 'rebase 또는 am'],
-          ['BISECT_LOG', 'bisect'],
-          ['CHERRY_PICK_HEAD', 'cherry-pick'],
-          ['REVERT_HEAD', 'revert'],
-          ['MERGE_HEAD', '병합']
-        ] as const
-      ).find(([marker]) => existsSync(path.join(dir, marker)))
-      if (busy)
-        return {
-          kind: 'human',
-          reason:
-            `합칠 폴더에서 ${busy[1]} 작업이 진행 중(${busy[0]})이어서 워크트리를 합치지 ` +
-            `않았습니다. 그 중간에 병합하면 진행 중인 작업이 깨집니다 — 끝내거나 중단한 뒤 이 Gate 를 ` +
-            `해결해 주세요.`
-        }
-
-      // 2. **추적되는 변경이 남아 있으면 아무것도 하지 않는다.** 병합은 작업 트리에 쓰므로, 그 위에
-      //    사용자가 저장하지 않은 일이 있으면 그것을 위험에 놓는다. 그 일을 어떻게 할지는 사람의
-      //    판단이고 에이전트가 대신 정할 것이 아니므로 Gate 다("돌릴 수 없을 때만 Gate" 규칙 그대로다).
-      //
-      //    **isCleanWorktree(worktrees/git.ts)를 쓰지 않는다.** 그쪽은 `--untracked-files=all` 이라
-      //    추적되지 않는 파일 하나만 있어도 dirty 라고 답한다 — 그 함수가 답하는 질문은 "이 워크트리를
-      //    지워도 되는가"이고 거기서는 그것이 맞다. 여기서 그것을 쓰면 스크린샷 하나 남은 저장소(그것이
-      //    보통의 저장소다)에서 자동 Run 이 늘 서 버린다. 추적되지 않는 파일을 통과시켜도 안전한
-      //    이유는 git 이 그것을 스스로 지키기 때문이다: 병합이 그 파일을 덮어써야 하면 작업 트리를
-      //    **건드리기 전에** 거절한다("untracked working tree files would be overwritten").
-      //
-      //    `git diff --quiet HEAD` 가 아니라 porcelain 을 읽는 이유는 실패를 구별할 수 있어서다 —
-      //    diff 는 "차이가 있다"와 "명령이 실패했다"를 둘 다 0 이 아닌 종료 코드로 내고 git() 은 ok
-      //    하나만 준다. 그러면 Gate 의 문장이 사실을 말할 수 없다.
-      const status = await git(['status', '--porcelain', '--untracked-files=no'], { cwd: mergeInto })
-      if (!status.ok)
-        return {
-          kind: 'human',
-          reason: `합칠 폴더(${mergeInto})의 git 상태를 읽을 수 없어 워크트리를 합치지 못했습니다: ${status.stderr}`
-        }
-      if (status.stdout !== '')
-        return {
-          kind: 'human',
-          reason:
-            `합칠 폴더에 커밋되지 않은 변경이 ${status.stdout.split('\n').length}개 있어 워크트리를 ` +
-            `합칠 수 없습니다. 커밋하거나 되돌린 뒤 이 Gate 를 해결해 주세요(추적되지 않는 새 파일은 ` +
-            `여기에 세지 않습니다).`
-        }
-
-      // 3. 각 워크트리의 브랜치를 알아낸다. `git worktree list` 한 번으로 경로 → 브랜치가 전부 나온다.
-      //    listGitWorktrees 는 git() 과 달리 **실패하면 던진다** — 그래서 감싼다.
-      let rows: { path: string; branch: string | null }[]
-      try {
-        rows = await listGitWorktrees(mergeInto)
-      } catch (e) {
-        return { kind: 'human', reason: `워크트리 목록을 읽을 수 없습니다: ${String(e)}` }
-      }
-      // 경로 비교는 isSamePath 다 — 한쪽은 createWorktree 가 만들어 Dispatch 에 저장된 값이고 다른
-      // 쪽은 git 이 방금 낸 값이라 대소문자나 구분자가 다를 수 있다(둘 다 절대경로이므로 결정적이다).
-      const targets = paths.map((p) => ({
-        path: p,
-        branch: rows.find((r) => isSamePath(r.path, p))?.branch ?? null
-      }))
-      const unknown = targets.filter((x) => !x.branch)
-      if (unknown.length > 0)
-        return {
-          kind: 'agent',
-          // 워크트리가 지워졌거나 HEAD 가 분리된 경우다. 합칠 ref 의 이름을 모르므로 앱은 여기서
-          // 할 수 있는 것이 없다 — 그렇다고 없는 것으로 치면 그 의존의 일이 없는 채로 다음 Task 가
-          // 뜨고, 그것은 조용히 틀린 결과다.
-          reason: `the app could not work out which branch belongs to ${unknown
-            .map((x) => x.path)
-            .join(', ')} — the worktree may have been removed, or its HEAD may be detached`,
-          worktrees: targets
-        }
-
-      // 4. merge-tree 가 없으면 **미리 검사할 수 없다.** 검사하지 못하는 것을 낙관하지 않는다 —
-      //    낙관해서 진짜 병합을 걸면 충돌할 때 `git merge --abort` 로 되돌려야 하고, 그 되돌리기까지
-      //    실패하면 사용자의 저장소가 충돌 상태로 남는다. 그래서 곧바로 에이전트에게 넘긴다.
-      if (!(await gitVersionAtLeast(2, 38)))
-        return {
-          kind: 'agent',
-          reason:
-            'this git is older than 2.38, so the app has no way to test a merge without writing to the working tree',
-          worktrees: targets
-        }
-
-      // 5. 하나씩 **미리 검사한 바로 뒤에 합친다.** 전부 검사하고 전부 합치는 순서가 아닌 이유는
-      //    merge-tree 의 기준이 그때의 HEAD 라는 것이다 — 첫 병합이 커밋을 만들면 HEAD 가 움직이고,
-      //    그 앞에서 통과했던 두 번째 검사는 낡은 사실이 된다(첫 병합이 가져온 변경 때문에 충돌할 수
-      //    있다). 그러면 진짜 병합이 실패하고, 되돌리기에 기대는 바로 그 경로로 들어간다.
-      //
-      //    검사는 `merge-tree --write-tree` 의 **종료 코드**로 읽는다. remove.ts 의 isBranchMerged 는
-      //    같은 명령의 결과 트리를 대상의 트리와 견주지만 그것은 다른 질문("이미 합쳐졌는가", squash
-      //    병합 판정)에 답하는 것이다. 여기서 필요한 것은 "충돌하는가"이고 그것이 곧 종료 코드다.
-      //
-      //    병합 대상은 `HEAD` 다. mergeTarget()(remove.ts)을 쓰지 않는 이유는 그 함수가
-      //    branch.<b>.base → origin/HEAD 를 고를 수 있어서다 — 원격 ref 에 합치는 것은 다른 일이다.
-      //    이름(`rev-parse --abbrev-ref HEAD`)을 따로 얻지 않는 이유는 **1에서 HEAD 가 브랜치를
-      //    가리킴을 이미 보장했으므로** 여기서 `HEAD` 가 곧 "사용자가 지금 서 있는 로컬 브랜치"이고,
-      //    그 이름을 다시 문자열로 받아 오면 같은 이름의 태그와 헷갈릴 여지만 생기기 때문이다
-      //    (`rev-parse --abbrev-ref HEAD` 는 분리된 HEAD 에서 브랜치 이름이 아니라 `HEAD` 를
-      //    돌려주므로, 1의 검사가 없다면 그 문자열을 대상으로 삼는 것 자체가 결함이 된다).
-      // 커밋되지 않고 남은 변경의 수. **합치기 전에 센다** — 병합은 대상 폴더를 바꾸지만 원본
-      // 워크트리는 건드리지 않으므로 값은 같지만, 세는 시점이 앞이면 병합이 중간에 실패해도 이미
-      // 얻은 사실이 남는다.
-      //
-      // `--porcelain` 의 기본값을 쓴다: 추적되지 않는 파일도 센다. 워커가 새 파일을 만들고 add 하지
-      // 않은 것이 정확히 이 경고가 잡아야 하는 경우이고, 커밋 의무의 `git add -A` 도 그것을 담는다.
-      // 무시되는 파일(빌드 산출물, node_modules)은 기본적으로 빠진다.
-      let uncommitted = 0
-      for (const target of targets) {
-        const dirty = await git(['status', '--porcelain'], { cwd: target.path })
-        const n = dirty.ok && dirty.stdout !== '' ? dirty.stdout.split('\n').length : 0
-        if (n > 0) orchLog(`merge: ${target.path} has ${n} uncommitted change(s) — not merged`)
-        uncommitted += n
-        // 같은 이름의 태그가 브랜치보다 먼저 잡히는 것을 막으려고 전체 ref 를 쓴다(remove.ts 와 같다)
-        const ref = `refs/heads/${target.branch}`
-        const probe = await git(['merge-tree', '--write-tree', 'HEAD', ref], { cwd: mergeInto })
-        if (!probe.ok)
-          return {
-            kind: 'agent',
-            // **0 이 아닌 것에는 두 가지가 섞여 있다** — 충돌과 "명령이 아예 못 돌았다"(없는 ref,
-            // 커밋이 없는 HEAD …). git() 은 ok 하나만 주므로 종료 코드로는 가를 수 없고, 임시
-            // 저장소에서 실측한 결과 둘 다 exit 1 이었다(오류가 128 이라는 보장도 없다). 대신
-            // **stderr 가 갈라 준다**: 충돌일 때 merge-tree 는 결과를 stdout 에 쓰고 stderr 를
-            // 비우며(273바이트/0바이트), 없는 ref 에서는 stdout 이 비고 stderr 에
-            // "merge-tree: refs/heads/nope - not something we can merge" 가 온다.
-            //
-            // 가는 곳은 어느 쪽이든 에이전트다. 가르는 것은 **문장**이다: 실제로는 ref 가 잘못된
-            // 것인데 spec 의 첫 문장이 "충돌한다"이면 에이전트는 없는 충돌을 찾아 헤매다 결국
-            // `git merge` 를 돌려 진짜 오류를 다시 발견해야 한다. 앱이 아는 것을 그대로 넘긴다.
-            reason: probe.stderr
-              ? `the app could not test whether ${target.branch} merges into the branch this folder is on — git merge-tree failed: ${probe.stderr}`
-              : `git merge-tree says ${target.branch} does not merge cleanly into the branch this folder is on`,
-            worktrees: targets
-          }
-        // `--no-edit` 는 편집기를 막는 것이다. 이 자리에는 사람이 없고, 편집기가 뜨면 그 git 프로세스는
-        // git() 의 30초 timeout 까지 서 있다가 죽는다 — 그때 남는 저장소가 곧 병합 중간 상태다.
-        //
-        // **저장소를 실제로 움직이는 자리다** — mergeInto 의 HEAD 와 index 를 옮긴다. gitWatcher 가
-        // 바로 그 둘을 보고 있으므로, 이 병합을 EG §26 에 등록해 두지 않으면 Astera 자신이 방금 만든
-        // 변경이 "외부에서 저장소가 바뀌었다"로 기록된다(EG §41-9). `finally` 로 닫는 이유는 아래
-        // 실패 분기가 그 안에서 그대로 `return` 하기 때문이다 — try 없이 두면 그 경로로 나갈 때
-        // 등록이 영원히 "진행 중"으로 남고, 그날부터 이 프로젝트의 모든 외부 변경이 조용히 삼켜진다.
-        const mergeOpId = workUnitCollector.beginGitOperation('job-merge', mergeInto)
-        try {
-          const merged = await git(['merge', '--no-edit', ref], { cwd: mergeInto })
-          if (!merged.ok) {
-            // 미리 검사가 통과했는데도 실패했다면 충돌이 아닌 이유다(추적되지 않는 파일과의 겹침,
-            // index.lock, 훅, 서명). 되돌린 뒤 사람에게 간다 — 에이전트에게 넘기지 않는 이유는 이것이
-            // "합치면 충돌한다"가 아니라 "앱이 병합을 돌릴 수 없다"이기 때문이다.
-            await git(['merge', '--abort'], { cwd: mergeInto }) // 병합이 시작되지도 않았으면 실패한다 — 무시한다
-            // **되돌아갔는지 확인해서 그 사실을 문장에 넣는다.** 앱이 저장소를 어떤 상태로 두었는지를
-            // 사용자가 짐작하게 두지 않는다 — 이 경로가 있는 이유가 그것이다.
-            const after = await git(['status', '--porcelain', '--untracked-files=no'], { cwd: mergeInto })
-            const left =
-              after.ok && after.stdout === ''
-                ? '합칠 폴더는 병합 전 상태로 되돌렸습니다.'
-                : '**합칠 폴더가 병합 중간 상태로 남아 있을 수 있습니다 — git status 로 직접 확인해 주세요.**'
-            return {
-              kind: 'human',
-              reason: `${target.branch} 브랜치를 합칠 폴더에 합치지 못했습니다: ${merged.stderr || merged.stdout}. ${left}`
-            }
-          }
-        } finally {
-          workUnitCollector.endGitOperation(mergeOpId)
-        }
-        orchLog(`scheduler: merged ${ref} into ${mergeInto}`)
-        // 합친 워크트리는 여기서 지운다 — **폴더까지. 단 `reap` 일 때만이다**(위 주석: 사람이 누른
-        // 병합은 폴더를 남긴다). 예약이 이 자동 정리를 필수로 만들었다: 회차마다
-        // 워커 수만큼 워크트리가 생기므로 사람이 손으로 지우는 것은 현실적이지 않다.
-        //
-        // 지우는 방법은 removeWorktree(core/worktrees/remove.ts)가 안다 — 탐색기의 워크트리 패널이
-        // 쓰는 **같은 함수**다. 두 번째 제거 경로를 만들면 위험 경로 검사·사용 중 검사·브랜치 처리가
-        // 두 벌이 되고, 한쪽만 고쳐지는 날 이쪽이 폴더를 잘못 지운다. 그 함수가 폴더 자체를
-        // (`git worktree remove --force`) 지우고, 비게 된 저장소별 상위 폴더도 rmdir 하고,
-        // 레지스트리 항목까지 걷는다.
-        //
-        // force: true — 합친 뒤 워크트리에 남는 것은 커밋되지 않은 변경과 추적되지 않는 파일뿐이고,
-        // 커밋된 일은 방금 합칠 폴더로 들어갔다. 그 대가를 알고 고른 동작이다.
-        //
-        // **정리 실패가 병합을 망치지 않는다.** 병합은 이미 성공했고 결과물은 합칠 폴더에 있다 —
-        // 정리가 안 됐다고 Gate 를 열면 사람이 손쓸 것도 없는 자리에서 파이프라인이 선다. 도는
-        // 세션이 그 폴더를 쓰고 있으면 removeWorktree 가 IN_USE 로 던지고 **그것이 맞다**: 살아 있는
-        // 프로세스 밑의 폴더는 지우지 않는다. 그때 그 워크트리는 남고 이유는 로그에 남는다.
-        if (reap) await reapWorktree(target.path)
-      }
-      return { kind: 'merged', uncommitted }
-    }
-
-    // 자동 진행. **setState 뒤에 매단다** — 새 Task 가 ready 가 되거나 자리가 비는 경로가 일곱이고
-    // (task-create, worker_done, 검증 결과, 검토 결과, gate-resolve, worker-stop, task-update),
-    // 명령마다 훅을 달면 하나를 빠뜨린다. 빠뜨렸을 때의 증상은 "Task 가 이유 없이 안 돈다"이고,
-    // 그것은 이 기능 계열이 없애려는 바로 그 증상이다. setState 는 상태가 저장되는 유일한 문이다.
-    //
-    // 띄우는 길은 orchHandleCommand 하나뿐이다 — openDispatch 나 deps.startWorker 를 직접 부르면
-    // CLI 가 지나는 검사(회로 차단, 열린 Dispatch, 실패 롤백)를 앱만 건너뛰는 두 번째 문이 생긴다.
-    let scheduling = false
-    let scheduleAgain = false
-    const runScheduler = async (): Promise<void> => {
-      // 재진입 가드 — 띄우기가 openDispatch 를 커밋하면 그것이 다시 setState 를 부른다. 도는 중이면
-      // 표시만 남기고 빠지고, 끝난 뒤 한 번 더 돈다. 8cce9c2 의 startHead 재진입 방어와 같은 모양이다.
-      if (scheduling) {
-        scheduleAgain = true
-        return
-      }
-      scheduling = true
-      try {
-        // 이 활성화에서 이미 한 번 손댄 Task. **없으면 아래 do-while 이 영원히 돈다.** worker-start 가
-        // 세션을 띄우다 실패하면 server.ts 의 롤백이 Dispatch 를 배열에서 지우고 Task 를 ready 로
-        // 되돌리는데, 그 롤백 자체가 setState 라서 scheduleAgain 이 서고, 다음 바퀴의 slotsToFill 은
-        // 같은 자리를 그대로 다시 준다 — 롤백 경로는 consecutiveFailures 를 올리지 않으므로 회로
-        // 차단도 걸리지 않는다(그것을 올리는 것은 closeDispatch 이고, 그 경로는 세션이 실제로 떴을
-        // 때만 지난다). 그래서 실패 → 롤백 → 같은 실패가 CLI 를 무한히 다시 띄운다. 한 활성화 안에서
-        // 한 Task 는 한 번만 건드린다: 다음 기회는 다음 상태 변경이 주고, 그때는 정말로 달라진 것이
-        // 있다.
-        //
-        // **아래 gateSlot 이 생겼다고 이것이 남아돌지는 않는다.** Gate 가 열리면 Task 가 blocked 로
-        // 가서 그 자리가 후보에서 빠지지만, gate-create 자체가 거절되거나 던지는 경우(그 이유는
-        // gateSlot 에 적었다)에는 Task 가 ready 그대로 남는다. 그 경우에 회전을 막는 것은 이것뿐이다.
-        const attempted = new Set<string>()
-        do {
-          scheduleAgain = false
-          if (!orch) return
-          // 꺼져 있으면 곧바로 나간다. **판정의 두 번째 사본이 아니다** — 권위는 그대로
-          // handleCommand 에 있고(그쪽이 409 conflict 로 거절한다), 여기 있는 이유는 값을 아끼는
-          // 것뿐이다: 꺼진 채로 저장이 일어날 때마다 슬롯 수만큼 로그가 쌓이는데 orchLog 는 메인
-          // 스레드의 동기 appendFileSync 다. 아래 slots.length === 0 조기 탈출과 같은 성격이다.
-          if (!orch.deps.enabled()) return
-          // **계정이 없어 띄울 수 없는 Task 에 Gate 를 연다.** slotsToFill 이 그것들을 건너뛰므로
-          // 아래 루프는 보지 못하고, 그냥 두면 Run 이 이유 없이 서 있는다 — 이 하위 시스템이
-          // 없애려는 증상 그대로다(gateSlot 의 주석). Gate 는 Task 를 blocked 로 보내므로 판정이
-          // 다음 바퀴에 같은 Task 를 다시 내지 않는다(tasksMissingAccounts 의 주석).
-          for (const m of tasksMissingAccounts(orch.deps.getState())) {
-            if (attempted.has(m.taskId)) continue
-            attempted.add(m.taskId)
-            await gateSlot(orch.deps, m.taskId, t(core.lang, 'jobs.gate.noAccountAssigned'))
-          }
-          // **답할 사람이 없는 질문을 풀어 준다.** `ask` 는 부드리기라 워커가 답이 올 때까지 멈춰
-          // 서 있는데, 그 답을 줄 코디네이터가 앱이 만든 Run 에는 없다(inbox.ts 의 머리말 —
-          // 실측으로 잡힌 정지다). 사람에게 올리지 않는 이유도 거기 있다.
-          //
-          // **Gate 로 올릴 수 없다는 것도 이유의 하나다.** createGate 는 열린 Dispatch 를 가진
-          // Task 를 거절하고(state.ts), `dispatched -> blocked` 전이 자체가 없다(types.ts 의
-          // ALLOWED). 즉 기다리는 워커가 있는 동안 Gate 는 존재할 수 없다.
-          //
-          // `UI_CALLER` 는 열린 Dispatch 를 갖지 않으므로 COORDINATOR_ONLY 가드를 지난다
-          // (server.ts 의 isWorker 판정). 실패는 로그로만 남긴다 — 이 자리에서 할 수 있는 것이
-          // 없고, 다음 바퀴에 같은 질문이 다시 후보로 올라온다.
-          for (const id of unattendedQuestions(orch.deps.getState())) {
-            const answered = await orchHandleCommand(
-              orch.deps,
-              { sessionId: UI_CALLER },
-              'reply',
-              { id, body: NO_COORDINATOR_ANSWER }
-            )
-            orchLog(
-              answered.status >= 400
-                ? `inbox: reply rejected message=${id} — ${JSON.stringify(answered.body)}`
-                : `inbox: answered an unattended question message=${id} — no coordinator on this run`
-            )
-          }
-          const slots = slotsToFill(orch.deps.getState()).filter((s) => !attempted.has(s.taskId))
-          // 띄울 자리가 없으면 계정 조회까지 가지 않는다. 이 함수는 **모든 저장마다** 불리고 그
-          // 대부분은 띄울 것이 없는 저장이다 — 아래 조회에 계정마다 파일(macOS 에서는 Keychain)
-          // 읽기가 하나씩 붙으므로, 빈 바퀴에 그것을 치르면 상태를 쓰는 모든 명령이 그만큼 느려진다.
-          if (slots.length === 0) continue
-          // 계정 조회는 **바퀴마다 한 번**이다. 슬롯마다 부르면 같은 파일 읽기가 슬롯 수만큼 되풀이되고,
-          // 활성화 전체에 한 번만 부르면 do-while 이 여러 바퀴 도는 동안(그 사이 워커가 실제로 뜬다)
-          // 로그인 상태가 낡는다. "한 바퀴 = 한 스냅숏"이 그 둘의 가운데다.
-          //
-          // 얻는 방식은 startReview 와 같다(core.ts 의 defaultAccountIdFor 도 같은 모양이다) — 로그인
-          // 조회를 순차로 돌리면 계정 수만큼 늘어나므로 병렬로 편다.
-          const accounts = core.accounts.list()
-          const loggedInIds = await Promise.all(
-            accounts.map(async (a) => ((await core.accounts.loginStatus(a.id)) ? a.id : null))
-          )
-          const loggedIn = new Set(loggedInIds.filter((id): id is string => id !== null))
-          for (const slot of slots) {
-            attempted.add(slot.taskId)
-            // 슬롯 하나의 실패는 **그 슬롯에서 멈춘다.** 거절(status >= 400)과 예외는 여기서 같은
-            // 뜻이다 — "이 자리는 지금 못 뜬다" — 이므로 같은 곳으로 보낸다. handleCommand 는 실제로
-            // 던진다: 그 안의 setState 가 store.save 의 tmp+rename 을 지나고, 디스크가 찼거나
-            // Windows 에서 rename 이 잠기면 거부된다. 잡지 않으면 그 예외가 이 for 를 뚫고 나가
-            // **남은 슬롯이 통째로 버려진다** — 상관없는 다른 프로젝트의 Run 이 남의 실패 때문에
-            // 서 있게 되고, 하나의 문제가 전부를 세우지 않는다는 이 루프의 전제가 거짓이 된다.
-            try {
-              // 사람이 이 Task 에 계정을 지정했으면 그 목록의 첫 계정, 아니면 그 provider 의 기본
-              // 계정. 판정은 core 에 있다(accountToDispatchOn) — 이 파일에는 테스트가 닿지 않는다.
-              // **갈아탈 순서(체인)는 여기서 넘기지 않는다** — worker-start 를 거쳐 가므로 그 체인은
-              // deps.startWorker 래퍼가 다시 계산한다(그래야 CLI 로 띄운 워커도 같은 체인을 받는다).
-              // **provider 는 이 Task 의 첫 계정이 정한다.** Slot 에는 그 칸이 없다 — 계정 id 를
-              // provider 로 옮기려면 계정 목록을 봐야 하고 그것은 core 가 볼 수 없는 것이라
-              // (schedule.ts 의 Slot 주석), 그 한 걸음이 여기 있다. 첫 id 가 목록에 없으면 판정에
-              // 넘길 provider 자체가 없으므로 곧바로 Gate 다 — accountToDispatchOn 이 같은 id 를
-              // 'assigned-unusable' 로 답할 자리이고, 사람이 할 일도 같다(지정을 고친다).
-              const firstAccount = accounts.find((x) => x.id === slot.accountIds[0])
-              if (!firstAccount) {
-                await gateSlot(
-                  orch.deps,
-                  slot.taskId,
-                  t(core.lang, 'jobs.gate.assignedAccountUnusable')
-                )
-                continue
-              }
-              const slotProvider = providerOf(firstAccount)
-              const picked = accountToDispatchOn({
-                assigned: slot.accountIds,
-                provider: slotProvider,
-                accounts,
-                loggedInIds: loggedIn
-              })
-              if (!picked.ok) {
-                // 조용히 넘기면 Run 이 이유 없이 서 있다 — 이 슬라이스가 없애려는 증상 그대로다.
-                // Reviewer 슬라이스가 "쓸 수 있는 다른 provider 계정이 없다"에 내린 것과 같은 판단이다.
-                // **지정한 계정을 못 쓰는 경우도 여기로 온다** — 목록의 첫 칸을 못 쓰는 것과 목록에
-                // 쓸 것이 아예 없는 것, 둘 다다. 기본 계정으로도 뒤 칸으로도 갈아타지 않는 이유는
-                // accountToDispatchOn 의 주석에 있다: 그가 아끼려던 계정에 일이 간다. 그러니 이
-                // Gate 가 사람이 그 사실을 아는 유일한 자리다.
-                await gateSlot(
-                  orch.deps,
-                  slot.taskId,
-                  picked.reason === 'assigned-unusable'
-                    ? t(core.lang, 'jobs.gate.assignedAccountUnusable')
-                    : t(core.lang, 'jobs.gate.noAccount', { provider: slotProvider })
-                )
-                continue
-              }
-              const accountId = picked.accountId
-              // **한 Run 은 두 방식 중 하나로만 돈다.** 섞지 않는 이유는 병합 대상이다 — 병합은
-              // 깨끗한 작업 트리에만 적용되고, 워커 하나를 합칠 자리에 띄우면 그 폴더에 커밋 안 된
-              // 변경이 남아 나머지 워크트리를 합칠 자리가 없어진다. 그래서 동시 실행 손잡이 하나가
-              // 두 가지를 정한다: 1 이면 **Run 워크트리**에서 차례대로, 2 이상이면 전부 자기
-              // 워크트리에서. 병렬인데 한 폴더는 고를 수 있어서는 안 되는 조합이다 — 서로를 덮어쓴다.
-              //
-              // **프로젝트 폴더에서 도는 워커는 없다.** 한때 1 이하가 그 뜻이었다(그리고 사용자가
-              // 보고 있는 체크아웃에 에이전트가 썼다). 이제 Run 이 자기 워크트리를 갖고, 프로젝트
-              // 폴더로 합치는 것은 사람이 상세 창에서 누른다.
-              //
-              // run 은 slotsToFill 이 만든 스냅숏이 **아니라** 여기서 새로 읽은 상태에서 찾는다 —
-              // 그 사이(위) 계정 로그인 조회가 await 를 하나 두었고, 이 for 문의 앞선 슬롯이 이미
-              // gateSlot 이나(아래) orchHandleCommand(worker-start) 로 실제 쓰기를 했을 수 있어,
-              // 이 시점의 상태를 slotsToFill 이 봤던 것과 같다고 가정할 수 없다. run 과 task 가
-              // 그래도 반드시 있는 것은 스냅숏이 같아서가 아니라, 이 활성화 동안 Run 이나 Task 를
-              // 지우는 명령이 없기 때문이다(slotsToFill 이 이미 run.id === task.runId 인 run 이
-              // 있는 Task 만 후보로 냈으므로 — schedule.ts). **이 루프의 동시성 논증은 모두 이
-              // 전제(스냅숏이 아니라 슬롯마다 새로 읽는다) 위에 서 있다** — 여기를 "같은 스냅숏"
-              // 이라고 잘못 적으면 다음에 이 루프의 레이스를 따지는 사람이 틀린 전제에서 시작한다.
-              let state = orch.deps.getState()
-
-              // **Run 워크트리를 여기서 만든다 — 게으르게.** Run 을 만들 때가 아닌 이유가 둘이다:
-              // 예약 템플릿은 한 번도 돌지 않으므로 워크트리가 필요 없고, pendingStart Run 은
-              // 사람이 '실행' 을 누르기 전까지 디스크에 아무것도 남기지 않아야 한다. 이 자리는
-              // 둘 다 이미 지난 곳이다(slotsToFill 이 그 둘을 슬롯으로 내지 않는다).
-              //
-              // 병합 블록보다 앞에 두는 이유: 통합 병합의 대상이 Run 뿌리이므로(아래
-              // integrateWorktrees) 그때 이미 있어야 한다. 동시 실행 2 이상인 Run 은 첫 Task 들이
-              // 자기 워크트리로 가므로 Run 워크트리를 아무도 만들지 않는데, 그 Run 의 통합 Task 는
-              // Run 워크트리에서 돌아야 한다.
-              let run = state.runs.find((r) => r.id === slot.runId)!
-              if (run.worktree === undefined) {
-                try {
-                  // forkWorktree(위)가 프로젝트가 **서 있는 브랜치**에서 갈라 준다. raw
-                  // createWorktree 를 부르면 origin/HEAD 에서 갈라져 최종 병합이 엉뚱한 조상을 끌고
-                  // 온다 — 그 판단은 한 곳에만 있어야 한다.
-                  const created = await forkWorktree({
-                    repoPath: run.cwd,
-                    name: nameForRun(run)
-                  })
-                  const set = await orchHandleCommand(
-                    orch.deps,
-                    { sessionId: UI_CALLER },
-                    'run-worktree-set',
-                    { run: run.id, worktree: created }
-                  )
-                  if (set.status >= 400) {
-                    await gateSlot(
-                      orch.deps,
-                      slot.taskId,
-                      `Run 워크트리를 기록하지 못했습니다: ${JSON.stringify(set.body)}`
-                    )
-                    continue
-                  }
-                  orchLog(`scheduler: run=${run.id} works in ${created}`)
-                  // **상태를 다시 읽는다 — run 만이 아니라 state 도.** run 은 아래 runRoot 와 limit
-                  // 이 그것에서 나오기 때문이다: 방금 기록한 워크트리가 없는 run 을 들고 가면 배치와
-                  // 통합 병합의 대상이 프로젝트 폴더가 되어, 이 블록이 막으려던 바로 그 결과가 된다.
-                  //
-                  // state 는 병합 판정(pendingMerges·workingInRunRoot) 때문이다. 이 자리에서 낡은
-                  // 스냅숏은 병합을 **덜** 센다 — 그 스냅숏의 뿌리는 프로젝트 폴더이므로 프로젝트
-                  // 폴더에서 돈 Dispatch 를 "뿌리에서 돌았다"고 보아 건너뛴다. 중간에 워크트리를
-                  // 갖게 된 Run 은 그런 Dispatch 를 그대로 들고 있고(이 배선 전에 뜬 워커들이다),
-                  // 그것들은 이제 합쳐야 하는 재료다. 낡은 스냅숏으로 물으면 그 일이 조용히 빠진다.
-                  state = orch.deps.getState()
-                  run = state.runs.find((r) => r.id === slot.runId)!
-                } catch (e) {
-                  // 저장소에 닿을 수 없으면 `NO_REPO:`, HEAD 가 분리됐으면 `NO_BASE:` 다 —
-                  // workerBaseFailure 가 그 문장을 만들고 forkWorktree 가 던진다. **저장소가 아닌
-                  // 폴더도 `NO_REPO:` 다** — forkWorktree 의 `rev-parse --git-dir` 탐침이 먼저
-                  // 실패하므로 createWorktree 까지 가지 않는다. 그쪽의 `NOT_GIT_REPO:`
-                  // (create.ts 의 createWorktree, repoRoot 가 null)는 git 은 돌지만 작업 트리가 없는
-                  // 저장소 — bare 저장소 — 만 남는다. 셋 다
-                  // 읽을 수 있는 접두사가 붙어 오므로 그대로 Gate 에 싣는다. 다음 상태 변경에 다시
-                  // 시도한다(사람이 저장소를 고치는 것 자체가 상태 변경은 아니지만, 그 Gate 를 푸는
-                  // 것이 상태 변경이다).
-                  await gateSlot(
-                    orch.deps,
-                    slot.taskId,
-                    `Run 워크트리를 만들지 못했습니다: ${String(e)}`
-                  )
-                  continue
-                }
-              }
-              // Task 는 **워크트리 확보 블록 뒤에** 읽는다. 반드시 있는 것은 run 과 같은 이유이고
-              // (slotsToFill 이 상태에서 골라낸 id 다), 여기까지 내려온 것은 이 루프의 "슬롯마다
-              // 새로 읽는다" 전제를 그대로 지키기 위해서다 — 위 블록이 run-worktree-set 으로 쓰기를
-              // 하므로, 그보다 앞에서 읽은 값은 그 쓰기를 못 본 스냅숏이 된다. 지금 읽는 필드가
-              // 바뀌지 않는 것들(title·deps)이라 오늘은 무해하지만, 그 논증이 필요 없는 자리로
-              // 옮기는 것이 전제를 지키는 값싼 방법이다.
-              const task = state.tasks.find((t) => t.id === slot.taskId)!
-              const runRoot = runRootOf(run)
-
-              // **통합 단계 — worker-start 앞이다.** 의존이 자기 워크트리에서 돌았다면 그 브랜치의
-              // 커밋을 Run 뿌리로 먼저 합친다. 앱이 직접 합치고 **충돌할 때만 에이전트에게**
-              // 넘기는 것이 이 기능의 결정이다: 사람을 부르는 것은 모든 작업이 끝났을 때로 미룬다.
-              //
-              // 통합 Task 자신은 이 단계를 지나지 않는다. 지나면 그 Task 의 deps(= 그 워크트리 Task
-              // 들)를 보고 통합 Task 를 위한 통합 Task 를 만들고, 그것이 끝없이 이어진다 — 새 Task 는
-              // 매번 새 id 라서 아래의 attempted 가 막지 못한다(integrate.ts 에 자세히 적었다).
-              const merges = isIntegrationTask(task) ? [] : pendingMerges(state, slot.taskId)
-              if (merges.length > 0) {
-                // **이미 통합 Task 가 있으면 새로 만들지 않는다.** 아직 끝나지 않았으면 그것을
-                // 기다린다. 실패했어도 만들지 않는다 — 즉시 실패하는 통합은 상태 변경마다 Task 를
-                // 하나씩 늘리게 되고 그것은 경계가 없다. 보이는 정지가 조용한 쌓임보다 낫다(실패한
-                // Task 는 그래프에 그대로 남고, 거기서 다시 띄우는 것이 사람의 길이다).
-                const existing = integrationTaskFor(state, slot.taskId)
-                if (existing && existing.status !== 'completed') {
-                  orchLog(
-                    `scheduler: task=${slot.taskId} waits for integration task=${existing.id} (${existing.status})`
-                  )
-                  continue
-                }
-                // Run 뿌리에서 도는 워커가 있으면 합치지 않는다 — 그 워커가 읽은 트리를 그
-                // 아래에서 갈아치우는 일이고, 그 실패는 조용하다(integrate.ts 에 이유가 있다).
-                // 다음 상태 변경에 다시 본다. 그 워커가 끝나는 것 자체가 상태 변경이다.
-                if (workingInRunRoot(state, slot.runId)) {
-                  orchLog(
-                    `scheduler: task=${slot.taskId} waits — a worker is still working in ${runRoot}`
-                  )
-                  continue
-                }
-                // **여기서부터 git 이 돈다.** 위까지는 상태만 본다 — runScheduler 는 모든 저장마다
-                // 불리고 그 대부분은 합칠 것이 없는 저장이므로, 그 바퀴에 git 프로세스를 띄우지 않는다
-                // (슬롯이 없을 때 계정 조회 앞에서 빠지는 것과 같은 성격이다).
-                const integration = await integrateWorktrees(runRoot, merges)
-                if (integration.kind === 'human') {
-                  await gateSlot(orch.deps, slot.taskId, integration.reason)
-                  continue
-                }
-                if (integration.kind === 'agent') {
-                  // 통합 Task 가 이미 completed 인데 아직 깨끗하지 않다면 넘길 곳이 없다 — 두 번째
-                  // 통합 Task 를 만들지 않기로 했으므로 사람에게 간다. 조용히 넘기면 사용자에게
-                  // 남는 것은 '완료된 통합 Task 와 이유 없이 서 있는 Task' 뿐이어서 문제가 보이지
-                  // 않는다(실패한 통합 Task 는 그래프에서 스스로 보이므로 그쪽은 Gate 가 아니다).
-                  if (existing) {
-                    await gateSlot(
-                      orch.deps,
-                      slot.taskId,
-                      `통합 Task 가 끝났는데도 워크트리를 합칠 수 없습니다: ${integration.reason}`
-                    )
-                    continue
-                  }
-                  // 통합 Task 도 **task-create 로** 만든다 — 앱이 createTask 를 직접 부르지 않는다.
-                  // 문은 하나다. `runId` 도 명시한다: 그 인자가 없으면 task-create 는 '가장 마지막에
-                  // 만들어진 Run' 을 쓰고(server.ts), 그것은 이 슬롯의 Run 이 아닐 수 있다.
-                  const created = await orchHandleCommand(
-                    orch.deps,
-                    { sessionId: UI_CALLER },
-                    'task-create',
-                    {
-                      runId: slot.runId,
-                      // parentId 가 "이 Task 의 통합 Task" 라는 표식이다 — 다음 바퀴에 그것을 보고
-                      // 두 번 만들지 않는다(integrate.ts 의 integrationTaskFor).
-                      parent: slot.taskId,
-                      deps: worktreeDepsOf(state, slot.taskId),
-                      // 제목은 그래프에 뜨므로 사람의 말(한국어)이고 — 같은 파일의 Gate 질문이
-                      // 그렇다 — spec 본문은 에이전트가 읽으므로 영어다(buildSpecFile 의 의무 절과
-                      // 같은 이유). 둘 다 i18n 카탈로그에 넣지 않는다: 그 카탈로그는 렌더러의 문구를
-                      // 위한 것이고 이 문구는 main 에서 조립된다. 80자로 자르는 것은 title 을 주지
-                      // 않았을 때 task-create 가 하는 것과 같은 길이다.
-                      title: `워크트리 병합: ${task.title}`.slice(0, 80),
-                      spec: buildIntegrationSpec({
-                        mergeInto: runRoot,
-                        reason: integration.reason,
-                        worktrees: integration.worktrees
-                      })
-                    }
-                  )
-                  if (created.status >= 400) {
-                    await gateSlot(
-                      orch.deps,
-                      slot.taskId,
-                      `워크트리를 합칠 통합 Task 를 만들지 못했습니다: ${JSON.stringify(created.body)}`
-                    )
-                    continue
-                  }
-                  orchLog(
-                    `scheduler: integration task created for task=${slot.taskId} — ${integration.reason}`
-                  )
-                  // 이번 회차에서 이 Task 는 띄우지 않는다. 통합 Task 는 방금의 setState 로 스케줄러가
-                  // 한 바퀴 더 돌 때 스스로 슬롯이 된다(deps 가 이미 전부 completed 이므로 ready 다).
-                  continue
-                }
-              }
-
-              // 통합 Task 는 동시 실행 손잡이와 상관없이 Run 뿌리에 놓이므로(아래 배치 예외), 그
-              // 자리에 이미 도는 워커와 **겹치지 않게 한다.** 접합점이 둘이면 통합 Task 도 둘이
-              // 만들어질 수 있고, 그 둘을 같은 폴더에 함께 띄우면 서로의 index.lock 과 서로가 만든
-              // 병합을 밟는다 — 한 폴더에 병렬 워커를 두지 않는다는 Task 배치 규칙의 이유가 그대로
-              // 여기에도 있다. 뒤의 것은 다음 상태 변경에 다시 본다(앞의 것이 끝나는 것 자체가 상태
-              // 변경이다).
-              if (isIntegrationTask(task) && workingInRunRoot(state, slot.runId)) {
-                orchLog(
-                  `scheduler: integration task=${slot.taskId} waits — a worker is still working in ${runRoot}`
-                )
-                continue
-              }
-
-              const limit = run.concurrency ?? DEFAULT_CONCURRENCY
-              // **통합 Task 는 Run 워크트리에서 돈다 — Task 별 워크트리 규칙의 예외다.** 예외인
-              // 이유는 그 Task 의 일 자체가 "이 뿌리로 합치는 것" 이라서다: 자기 워크트리에서 돌면
-              // origin 기준으로 갈라진 다른 브랜치에 합치게 되어 아무 값이 없고, buildSpecFile 이
-              // 붙이는 커밋 의무("이 워크트리에 커밋하라")가 spec 본문("이 폴더에 합치고 커밋하라")과
-              // 정면으로 부딪힌다(코디네이터가 검토 spec 을 구현자 템플릿으로 감싸지 않는 것과 같은
-              // 부류의 충돌이다). 섞지 않는 원래 이유(합칠 폴더에 커밋 안 된 변경이 남으면 합칠
-              // 자리가 없어진다)는 여기서도 지켜진다: 그 spec 이 끝에 작업 트리를 깨끗하게 두라고
-              // 요구하고, 그 Dispatch 가 열려 있는 동안은 workingInRunRoot 가 앱의 병합을 막는다.
-              //
-              // **스케줄러의 배치는 'current' 를 더 이상 보내지 않는다.** 명시 경로 분기
-              // (coordinator.ts)로 보내는 이유는 그쪽이 fs.stat 으로 존재를 확인해 주기 때문이다.
-              // 'current' 를 보내는 곳은 **둘뿐이다**: 검토 Dispatch 는 구현자의 트리를 runCwd 로 넘겨
-              // 검토자를 정확히 그 트리에, 커밋 의무 없이 세우고(startReview), CLI 에서는 사람이
-              // `--worktree current` 를 직접 쓸 수 있다. 상세 창의 수동 띄우기 버튼은 셋째였는데
-              // 이제 아무 배치도 보내지 않는다 — 그 결정은 worker-start 의 기본값이 Run 에게 묻는다
-              // (server.ts).
-              const placement =
-                isIntegrationTask(task) || limit <= 1
-                  ? { worktree: runRoot }
-                  : {
-                      // nameForTask 는 이미 slugify 를 거친 값(또는 그것이 던질 때의 Task id)을 낸다 —
-                      // 여기서 이미 유일성을 보장하지는 않지만, createWorktree 가 받는 이름에 slugify 를
-                      // 한 번 더 걸어도(naming.ts, 멱등이다) 값이 바뀌지 않고, 충돌(같은 이름의
-                      // 브랜치·경로)도 candidateName 접미사 루프로 스스로 피한다(create.ts) — 그래서
-                      // 여기서 접미사를 더 붙이지 않는다.
-                      worktree: 'new',
-                      name: nameForTask(task)
-                    }
-              const reply = await orchHandleCommand(
-                orch.deps,
-                { sessionId: UI_CALLER },
-                'worker-start',
-                { task: slot.taskId, agent: slotProvider, account: accountId, ...placement }
-              )
-              if (reply.status >= 400)
-                await gateSlot(
-                  orch.deps,
-                  slot.taskId,
-                  `이 Task 를 시작하지 못했습니다: ${JSON.stringify(reply.body)}`
-                )
-            } catch (e) {
-              await gateSlot(orch.deps, slot.taskId, `이 Task 를 시작하지 못했습니다: ${String(e)}`)
-            }
-          }
-        } while (scheduleAgain)
-
-        // **끝난 예약 회차의 워크트리를 걷는다.** 발화마다 폴더가 하나씩 쌓이던 것을 막는다.
-        // 판정은 순수 함수가 하고(reapableChildRuns) 여기서는 그 목록을 지운다 — 합치지 않고
-        // 지우지만 회차의 커밋은 브랜치에 남는다(removeWorktree 의 `branch -d` 가 합쳐지지 않은
-        // 브랜치를 거부한다). 그 브랜치가 남았다는 사실은 reapWorktree 가 `branch deleted=false` 로
-        // 로그에 남긴다.
-        //
-        // 슬롯 루프 뒤인 이유: 회차가 끝나는 순간은 마지막 Task 가 completed 되는 저장이고 그 저장
-        // 에는 띄울 슬롯이 없다.
-        //
-        // **순차로 지운다.** reapWorktree 는 세션을 닫고 그 세션이 실제로 사라질 때까지 조건 폴링을
-        // 하므로, 병렬로 부르면 같은 저장소의 git 을 여럿이 동시에 밟는다(run-delete 의
-        // removeWorktrees 가 같은 이유로 순차다).
-        //
-        // **try/catch 를 두지 않는다.** reapWorktree 는 던지지 않는다 — boolean 을 돌려주고 실패는
-        // 스스로 로그에 남긴다(reapWorktree 안의 catch 가 orchLog 를 부른다). 감싸면 절대 실행되지
-        // 않는 catch 가 하나 생기고, 다음에 읽는 사람은 그것을 "여기서 던질 수 있다"는 신호로 읽는다.
-        const isAppWorktree = (p: string): boolean =>
-          core.worktrees.list().some((w) => isSamePath(w.path, p))
-        for (const r of reapableChildRuns(orch.deps.getState(), isAppWorktree))
-          for (const w of r.worktrees) await reapWorktree(w)
-      } finally {
-        // finally 여야 한다 — 위의 `if (!orch) return` 도, handleCommand 안에서 올라오는 예외(디스크가
-        // 찬 store.save 가 그것이다)도 이 자리를 지나간다. 한 번이라도 놓치면 scheduling 이 true 로
-        // 남아 스케줄러가 앱이 사는 내내 다시는 돌지 않는다.
-        scheduling = false
-      }
-    }
-
-    /** 15초 — 세션 스케줄러의 TICK_MS 와 같은 값이다 */
-    const ORCH_FIRE_TICK_MS = 15_000
-    /** 코디네이터를 깨우기 전에 기다리는 시간.
-     *
-     *  **짧으면** `check --wait` 안에서 정상적으로 기다리는 코디네이터를 찌른다 — 그 호출은 서버에서
-     *  막혀 있고 도는 동안 토큰을 안 쓰므로, 헛된 찌르기는 그 공짜 기다림을 유료 턴으로 바꾼다.
-     *  **길면** 잠든 코디네이터 밑에서 Run 이 그만큼 서 있다.
-     *
-     *  90초로 둔 근거: `check` 의 기본 대기가 그보다 짧고(DEFAULT_CHECK_TIMEOUT_MS), 정상 코디네이터는
-     *  타임아웃마다 다시 `check` 를 불러 그 배치를 ack 하므로 이 시각까지 미확인으로 남지 않는다.
-     *  즉 이 문턱을 넘는 것은 "루프를 놓았다" 의 신호에 가깝다. 틱이 15초이므로 실제 깨우기는
-     *  90~105초 사이에 일어난다. */
-    const COORDINATOR_NUDGE_MS = 90_000
-    /** 예약 템플릿의 발화. 판정은 core 의 firesDue 가 하고(그쪽에 테스트가 있다) 여기는 그 답대로
-     *  명령을 부른다. */
-    const orchFireTick = async (): Promise<void> => {
-      // 꺼져 있으면 아무 일도 하지 않는다. **끄는 것이 서버를 닫지는 않는다** —
-      // settings.setOrchestrationEnabled 는 enabled() 로 거절하게만 하므로, 이 확인이 없으면 꺼진
-      // 채로 회차가 계속 생긴다. runScheduler 의 같은 가드와 같은 이유다.
-      //
-      // **무장을 들고 있지 않고 버린다.** 들고 있으면 꺼져 있던 동안 지나간 시각이 그대로 남아,
-      // 다시 켜는 순간 그 시각들이 한꺼번에 발화한다 — 09:00 예약이 15:00 에 도는 것이고, 아무도
-      // 그 시각을 잡지 않았다. 놓친 발화는 버리는 것이 이 기능의 결정이므로(설계 2·5절) 끄고
-      // 켜는 것이 재시작과 같아야 한다: 재시작하면 이 Map 은 비어 있고, firesDue 의 첫 바퀴가
-      // nextFireAt(rule, now) 으로 다시 무장하기만 한다.
-      const o = orch
-      if (!o || !o.deps.enabled()) {
-        orchArmed = new Map()
-        return
-      }
-      const { fire, arm } = firesDue(o.deps.getState(), orchArmed, Date.now())
-      // **아래 await 들보다 먼저 갈아 끼운다.** 회차를 만드는 데 15초가 넘게 걸리면 다음 tick 이
-      // 겹쳐 도는데, 그때 무장이 아직 옛 값이면 같은 템플릿이 한 번 더 발화한다.
-      orchArmed = arm
-      // **순차로 부른다.** 병렬로 띄우면 각 run-spawn 이 자기 진입 시점의 상태에 커밋해서 나중
-      // 것이 앞선 것의 자식 Run 을 덮는다 — run-create 가 await 뒤에 getState() 를 다시 읽는 것과
-      // 같은 위험이고, 그쪽은 한 명령 안의 await 를 다루지만 이쪽은 명령 사이의 await 다.
-      for (const runId of fire) {
-        // 템플릿 하나의 실패가 나머지를 막아서는 안 된다 — 무장은 이미 다음 시각으로 넘어갔으므로,
-        // 여기서 멈추면 뒤의 템플릿들은 이번 tick 에서 조용히 건너뛰어진다(재시도가 아니라 누락이다).
-        try {
-          const reply = await orchHandleCommand(o.deps, { sessionId: UI_CALLER }, 'run-spawn', {
-            run: runId
-          })
-          // 실패한 발화는 잃는다 — 무장은 이미 다음 시각으로 옮겨졌으므로 다음 시각에 다시 시도한다.
-          // 디스크가 찼거나 win32 에서 rename 이 잠긴 경우가 이 갈래다.
-          if (reply.status >= 400)
-            orchLog(`scheduled spawn failed run=${runId} status=${reply.status}`)
-          else orchLog(`scheduled spawn run=${runId} child=${JSON.stringify(reply.body)}`)
-        } catch (e) {
-          orchLog(`scheduled spawn failed run=${runId}: ${String(e)}`)
-        }
-      }
-    }
+    // 자동 진행 — 배치 루프, 예약 발화, 잠든 코디네이터 깨우기. 본문과 그 이유는 전부
+    // core/orchestration/exec/dispatchLoop.ts 에 있고(Host 가 같은 것을 짓는다), 여기 남는 것은 앱의
+    // 어댑터다. **setState 뒤에 매단다**: 커밋 훅의 schedule 이 loop.run() 을 부른다(아래
+    // afterOrchCommit). 띄우는 길은 orchHandleCommand 하나뿐이다 — openDispatch 나 deps.startWorker 를
+    // 직접 부르면 CLI 가 지나는 검사(회로 차단, 열린 Dispatch, 실패 롤백)를 앱만 건너뛰는 두 번째 문이
+    // 생긴다. `deps` 는 아래에서 정의되지만 이 화살표들은 부를 때 읽으므로 순서 문제는 없다
+    // (startReview 의 `(w) => deps.startWorker(w)` 와 같은 모양).
+    const loop = createDispatchLoop({
+      handle: (cmd, args) => orchHandleCommand(deps, { sessionId: UI_CALLER }, cmd, args),
+      getState: () => deps.getState(),
+      accounts: () => core.accounts.list(),
+      loginStatus: (accountId) => core.accounts.loginStatus(accountId),
+      lang: () => core.lang,
+      forkRunWorktree: (a) =>
+        forkWorktree({ repoPath: a.repoPath, name: a.name }, { registry: core.worktrees, log: orchLog }),
+      integrate: (runRoot, merges) => integrateWorktrees(runRoot, merges, {}, gitCtx),
+      reap: (p) => reapWorktree(p),
+      isRegisteredWorktree: (p) => core.worktrees.list().some((w) => isSamePath(w.path, p)),
+      sessionAlive: (id) => core.sessions.list().some((x) => x.id === id && x.status !== 'exited'),
+      // L1: exited with a real code. A lost-sight exit is a Host-held session still running, and a
+      // session not in the list is one this app cannot tell about: neither confirms a stop.
+      sessionGone: (id) =>
+        core.sessions
+          .list()
+          .some((x) => x.id === id && x.status === 'exited' && x.exitCode !== undefined && x.exitCode !== PTY_LOST_SIGHT_EXIT_CODE),
+      sessionBusy: (id) => busyState.get(id) ?? null,
+      typeInto: (id, text) => core.sessions.write(id, text),
+      // 앱에서 "운전해도 되는가" 는 서버가 서 있고, dispatch 를 알리는 Host 가 몰지 않는가다(§4.2, N8).
+      // 슬롯마다 다시 묻으므로, 한 바퀴 도중에 그런 Host 가 붙으면 그 자리에서 멈춘다.
+      mayStart: () => orch !== null && !hostDrives(),
+      log: orchLog,
+      nowMs: () => Date.now()
+    })
+    orchLoop = loop
 
     // The state before this write, so a Run's finish can be caught as an edge (runRecord.ts) rather
     // than read as a state — outcomeOf is derived, so "finished" stays true on every round after the
@@ -3652,40 +3002,46 @@ export function registerIpc(
     // fresh app start needs (see the null fallback in setState below).
     let prevOrchState: OrchState | null = null
 
-    /** 이 Task 의 **첫** 구현 Dispatch(검토가 아닌 것 중 가장 먼저 시작한 것) — convergence.ts 의
-     *  latestImplDispatch 의 반대쪽 끝이다. changedFilesSince(아래)의 기준점은 이 Dispatch 여야
-     *  한다: 이 Task 가 일을 시작한 지점부터의 diff 가 목적이고, 마지막(수리를 포함한) 시도만의
-     *  diff 가 아니다(리뷰 fix 1차, Important 2b). */
-    const firstImplDispatch = (s: OrchState, taskId: string): Dispatch | undefined =>
-      s.dispatches
-        .filter((d) => d.taskId === taskId && !d.review)
-        .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
-        .at(0)
-
-    /** startValidation(아래)이 검증을 큐에 넣기 전에 부르는 최선노력 계산(설계 §8.3) — 이 시도가
-     *  check 의 동작을 바꾸는 파일을 건드렸는지. **기준점은 continuity journal 의, 이 Task 의 첫
-     *  구현 Dispatch 에 대한 첫 체크포인트 head 뿐이다.**
-     *
-     *  **`Dispatch.stopSnapshot.headCommit` 을 쓰지 않는다(리뷰 fix 1차, Important 2a).** 그것은
-     *  그 Dispatch 의 **마지막** 사용량 한도 정지 시점의 HEAD 이고 정지마다 덮어써서, 이미 일부
-     *  작업이 반영된 뒤의(기준점보다 나중인) 값이다 — 그것을 기준으로 잡으면 diff 가 실제보다
-     *  좁아져, 계정을 갈아타며 일한 바로 그 경우에 의심 파일을 놓친다. `firstCheckpointFor` 가
-     *  주는 'attempt-started' 체크포인트(core/continuity/checkpointPolicy.ts 의 KIND_OF — Dispatch
-     *  가 열릴 때 기록된다)가 그 Dispatch 가 일을 시작하기 **전**의 HEAD 다.
-     *
-     *  기준점이 없으면(continuity 가 꺼져 있거나 체크포인트가 없다) git 을 부르지 않고 Task 가 이미
-     *  보고한 filesModified 로 물러난다 — 이 계산의 실패가 검증 자체를 막아서는 안 되므로(호출부의
-     *  주석), git 이 실패해도 같은 자리로 물러난다.
-     *
-     *  **Task 의 filesModified 를 쓴다, Dispatch 의 것이 아니다** — Dispatch 에는 그런 칸이 없다. */
-    const changedFilesSince = async (first: Dispatch, cwd: string): Promise<string[]> => {
-      const head = continuityJournal?.firstCheckpointFor(first.id)?.gitHead ?? null
-      if (head) {
-        const r = await git(['diff', '--name-only', head, 'HEAD'], { cwd })
-        if (r.ok) return r.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
-      }
-      return store.get().tasks.find((t) => t.id === first.taskId)?.filesModified ?? []
-    }
+    /**
+     * Everything this app owes a commit once it has landed — **whichever process made it** (ruling
+     * F54). The list, and why it is one function rather than two, is in `createOrchCommitHook`; what
+     * stays here is the wiring, because every one of these depends on something local to this boot.
+     */
+    const afterOrchCommit = createOrchCommitHook({
+      // Asked at every commit, not decided once at boot: whether this app writes follows the Host it
+      // last greeted (P8), and a refill or a push from a Host that writes the journal records nothing.
+      record: (prev, next) => appJournal.record(prev, next),
+      checkpoint: (events, next) => appJournal.checkpoint(events, next),
+      push: pushOrchState,
+      // Assembling the record needs the project key and the understanding pipeline, so it stays on
+      // this side; which Runs finished is the hook's judgement (justFinished).
+      onRunFinished: ({ runId, outcome, state }) => {
+        const run = state.runs.find((r) => r.id === runId)
+        if (!run) return
+        const tasks = state.tasks.filter((t) => t.runId === runId)
+        const finishedJob = jobOf(state, run)
+        if (!finishedJob) return
+        void understandingPipeline.onRunFinished(understandingKeyOf(finishedJob.cwd), {
+          runId,
+          jobName: finishedJob.objective.slice(0, 60),
+          objective: finishedJob.objective,
+          at: new Date().toISOString(),
+          taskIds: tasks.map((t) => t.id),
+          tasks: tasks.map((t) => ({ title: t.title, outcome: t.status })),
+          changedFiles: [...new Set(tasks.flatMap((t) => t.filesModified ?? []))],
+          validation: { status: outcome === 'completed' ? 'passed' : 'failed' }
+        })
+      },
+      previous: () => prevOrchState,
+      remember: (next) => {
+        prevOrchState = next
+      },
+      // 떠나 보내는 promise 에 **종단 .catch 가 있어야 한다**(startReview 와 같은 이유: 붙이지
+      // 않으면 unhandled rejection 이 main 프로세스를 죽인다).
+      schedule: () => void loop.run().catch((e) => orchLog(`scheduler failed: ${String(e)}`)),
+      log: orchLog
+    })
+    onOrchCommit = afterOrchCommit
 
     const deps: OrchServerDeps = {
       getState: () => store.get(),
@@ -3701,259 +3057,91 @@ export function registerIpc(
       // re-read is needed. A command that writes twice (worker-start) pushes twice — the payload is
       // one project's Runs and the renderer replaces its copy wholesale, so a duplicate is a no-op.
       setState: async (next) => {
-        // Job Continuity: the journal row lands before the projection does (spec §8 — intent first);
-        // the spawn that follows a worker-start happens after both. A journal failure is logged
-        // inside record() and never reaches here.
+        // **The journal is written by the hook, after the write is accepted** — not here, ahead of it
+        // (ruling F56/d). The reason the ordering changed is in `createOrchCommitHook`: a write can be
+        // refused now, and a row for a transition that never happened is read by the reconciler as a
+        // fact rather than as an absence.
         const prev = store.get()
-        const events = continuity?.record(prev, next) ?? []
         await store.save(next)
-        if (continuity && events.length > 0)
-          void continuity.checkpoint(events, next).catch((e) => orchLog(`continuity: checkpoint failed: ${String(e)}`))
-        pushOrchState(next)
-        // A finished Run becomes a record. `prevOrchState ?? next` on the first write after boot
-        // treats "before" as "after" — justFinished(next, next) is always empty — so a Run that was
-        // already finished when the app started is not recorded (same rule as D2: the screen holds
-        // only what the app watched happen, not what it finds already done).
-        //
-        // Caught per Run, not around the loop. Several Runs can finish in one write (runRecord's
-        // own test pins that), and a throw while handling the first would silently drop the rest —
-        // the same per-item isolation orchFireTick uses below. The catch is needed at all for the
-        // reason pushOrchState's own comment gives: store.save has already committed by this
-        // point, so a throw here must not turn a successful write into a command that errors.
-        for (const { runId, outcome } of justFinished(prevOrchState ?? next, next)) {
-          try {
-            const run = next.runs.find((r) => r.id === runId)
-            if (!run) continue
-            const tasks = next.tasks.filter((t) => t.runId === runId)
-            void understandingPipeline.onRunFinished(understandingKeyOf(run.cwd), {
-              runId,
-              jobName: run.objective.slice(0, 60),
-              objective: run.objective,
-              at: new Date().toISOString(),
-              taskIds: tasks.map((t) => t.id),
-              tasks: tasks.map((t) => ({ title: t.title, outcome: t.status })),
-              changedFiles: [...new Set(tasks.flatMap((t) => t.filesModified ?? []))],
-              validation: { status: outcome === 'completed' ? 'passed' : 'failed' }
-            })
-          } catch (e) {
-            orchLog(`run-finished record failed for ${runId}: ${String(e)}`)
-          }
-        }
-        prevOrchState = next
-        // 저장이 끝난 뒤에 돈다 — 스케줄러가 읽는 것은 getState() 이고, 저장 전에 부르면 방금의
-        // 변경을 못 본다. 떠나 보내는 promise 에 **종단 .catch 가 있어야 한다**(startReview 와 같은
-        // 이유: 붙이지 않으면 unhandled rejection 이 main 프로세스를 죽인다).
-        void runScheduler().catch((e) => orchLog(`scheduler failed: ${String(e)}`))
+        // Everything this commit owes is the hook's, and the Host's own commits owe exactly the same
+        // list (ruling F54).
+        afterOrchCommit({ prev, next })
       },
       // The .bak for reset — the one documented safety net for a destructive operation
       backup: () => store.backup(),
-      // `run-merge`(사람이 상세 창에서 누른다)와 `run-delete --merge` 가 부른다.
-      // integrateWorktrees 의 'agent'(충돌 → 에이전트에게 넘김)도 여기서는 실패다 — 사람이 결과를
-      // 기다리고 있고, 지우는 경로에서는 넘길 Run 자체가 사라지는 중이라 통합 Task 를 붙일 자리가
-      // 없다. 두 경우 모두 이유를 그대로 올려 보내 사람이 무엇을 해야 하는지 읽게 한다.
-      //
-      // **`reap: false`** — 이 두 호출자는 폴더를 남긴다(그 이유는 integrateWorktrees 의 주석).
-      //
-      // **폴더가 있는지로 거른다 — 레지스트리 등록 여부가 아니다.** "합칠 수 있는가"와 "앱이 지워도
-      // 되는가"는 다른 질문이다. 뒤쪽만 레지스트리의 것이다(reapableChildRuns 의 isAppWorktree — 그
-      // 판정은 이 이유로 바뀌지 않는다). integrateWorktrees 는 git 자신의 `worktree list`에서 브랜치를
-      // 찾으므로, 앱이 만들었지만 아직(또는 더 이상) 레지스트리에 없는 워크트리도 git 에게는 멀쩍이
-      // 합칠 수 있는 대상이다 — 오케스트레이터가 스스로 만들어 `worker-start --worktree <path>` 로
-      // 띄워 넣은, 살아서 일하고 있는 워크트리가 레지스트리 필터 때문에 조용히 걸러지던 것이 바로
-      // 그 결함이었다. 재료 `paths`(runWorktrees, `Dispatch.cwd` 를 본다)에 남을 수 있는 건 이제
-      // 하나뿐이다: 폴더 자체가 사라진 경우(통합 병합이 이미 걷어 갔거나 예약 회차가 걷혔다) —
-      // 그것만 거른다. 존재 확인은 동기다: 폴더가 없으면 합칠 것이 없고, 있으면 그 뒤는 git 의 일이다.
-      mergeWorktrees: async (runCwd, paths) => {
-        const alive = paths.filter((p) => existsSync(p))
-        const gone = paths.filter((p) => !existsSync(p))
-        if (gone.length > 0)
-          orchLog(`merge: skipping ${gone.length} removed worktree(s): ${gone.join(', ')}`)
-        // 남은 것이 없으면 성공이다 — 합칠 것이 없는 것은 실패가 아니고, 여기서 실패로 내면 사람이
-        // 손쓸 수 없는 이유로 병합 버튼과 삭제가 막힌다.
-        if (alive.length === 0) return { ok: true, merged: [], uncommitted: 0 }
-        const r = await integrateWorktrees(runCwd, alive, { reap: false })
-        return r.kind === 'merged'
-          ? { ok: true, merged: alive, uncommitted: r.uncommitted }
-          : { ok: false, reason: r.reason }
-      },
-      // `run-delete --remove-worktrees` 가 부른다. 순차로 지운다 — reapWorktree 가 세션을 닫고
-      // 상태가 바뀌기를 기다리므로, 병렬로 돌리면 서로의 폴링이 남의 세션을 기다린다.
-      removeWorktrees: async (paths) => {
-        const failed: string[] = []
-        for (const p of paths) {
-          // **이미 없는 폴더는 실패가 아니다.** Dispatch 의 cwd 는 워크트리를 지운 뒤에도 상태에 남으므로
-          // 그런 경로가 여기까지 온다 — reapWorktree 는 그것을 "앱 워크트리가 아니다" 로 거절하고 false 를
-          // 내는데, 그것을 failed 에 담으면 사용자에게 "이 폴더를 지우지 못했습니다" 로 보고된다.
-          // 요청한 끝 상태는 이미 그것이다. mergeWorktrees 가 같은 이유로 같은 판정을 한다.
-          if (!existsSync(p)) {
-            orchLog(`remove: skipping already removed worktree ${p}`)
-            continue
-          }
-          if (!(await reapWorktree(p))) failed.push(p)
-        }
-        return { failed }
-      },
+      // `run-merge`, `run-delete --merge` and `run-delete --remove-worktrees` — the bodies and their
+      // reasons are worktreeDeps in core/orchestration/exec/integrateGit.ts.
+      ...worktreeDeps({
+        integrate: (into, paths, opts) => integrateWorktrees(into, paths, opts, gitCtx),
+        reap: reapWorktree,
+        log: orchLog
+      }),
+      // run-start's cleanup of a fresh Run worktree whose coordinator failed to start (R25): the same
+      // branch the Host takes, with reapWorktree's in-use check. Its false is "not removed", never
+      // "in use", so the 400 says the folder could not be removed (C7).
+      discardRunWorktree: appDiscardRunWorktree(reapWorktree),
       /** 이 Run 이 일할 워크트리를 하나 만든다 — 인계 시점에 서버가 부른다(run-start).
        *
        *  **forkWorktree 를 그대로 쓴다.** 프로젝트가 **서 있는 브랜치**에서 갈라 주는 판단이 그
        *  안에 있고, raw createWorktree 를 부르면 origin/HEAD 에서 갈라져 최종 병합이 엉뚱한 조상을
        *  끌고 온다 — 스케줄러의 게으른 생성이 같은 함수를 쓰는 이유와 같다. 그 판단은 한 곳에만
        *  있어야 한다. */
-      makeRunWorktree: (a) => forkWorktree({ repoPath: a.repoPath, name: a.name }),
-      /** 이 Run 을 관리할 코디네이터 세션을 띄운다. **워커가 아니다** — Dispatch 도 spec 파일도
-       *  워크트리도 없다. 사람이 여는 세션과 같은 모양이고, 다른 것은 첫 입력이 인수 프롬프트라는
-       *  것뿐이다(core/orchestration/handover.ts).
-       *
-       *  **롤링 체인을 그대로 넘긴다** — 코디네이터도 에이전트라 한도에 걸린다. 워커에게 이 값을
-       *  넘기는 것과 같은 이유이고 같은 기계를 탄다(rollAccountIds 의 JSDuc).
-       *
-       *  **`bypassPermissions` 는 전역 설정이 정한다** — startWorker 와 같은 자리에서 같은 값을
-       *  읽는다(AgentPermissionMode). 한동안 이 자리는 그것을 넘기지 않았고, 그 선택은 "멈추는 쪽이
-       *  허가 없는 실행에 대해 안전하다" 는 것이었다. 뒤집은 근거는 안전이 덜 중요해져서가 아니라
-       *  **멈춤이 실제로는 안전이 아니라 정지였기 때문이다**: 코디네이터는 워크트리가 아니라 프로젝트
-       *  루트에서 뜨지만 그가 띄우는 워커는 매번 새 워크트리에서 뜨고, 사람이 그 프로젝트에 쌓아 둔
-       *  허용 목록은 거기 따라오지 않는다. 그래서 manual 인 Job 은 자율로 돌라고 띄운 세션이 첫
-       *  명령에서 서고, 사람은 탭마다 승인하러 다니게 된다 — 사용자가 보고한 그대로다. */
-      startCoordinator: async (a) => {
-        // **브리핑은 파일로, 세션에는 한 줄만.** 이 프롬프트는 argv 로 가고 win32 에서 세션은
-        // `cmd.exe /c` 로 뜨므로 줄바꿈이 명령을 끊는다 — 워커의 spec 파일과 탭 재개 브리핑이
-        // 같은 제약 때문에 같은 모양으로 갈렸다(coordinatorLaunchPrompt 의 주석).
-        //
-        // **specsDir 에 쓴다.** 그 경로에 argv 금지 문자가 있으면 앱 시작 시 경고가 남는 자리가
-        // 이미 그것이고(아래 LAUNCH_FORBIDDEN 검사), 시작 시 비워지는 것도 무해하다: 앱을 다시
-        // 켜면 코디네이터도 없으므로 사람이 실행을 다시 누른다.
-        //
-        // **The last clause stopped being true when the Host started keeping terminals alive**, and
-        // the boot no longer relies on it: a coordinator session the Host hands back is still running
-        // with this path in its launch prompt, so the boot sweep keeps this file while
-        // `Run.coordinatorSessionId` names a session that survived. That is `staleSpecFiles`, which
-        // recognises this file by `coordinatorBriefName` — the same function that names it here, so
-        // the two cannot drift.
-        const briefPath = path.join(specsDir, coordinatorBriefName(a.runId))
-        await fs.writeFile(briefPath, a.brief, 'utf8')
-        // 코디네이터는 프로젝트 루트에서 뜨므로 대개 이미 신뢰돼 있다 — 그래도 부른다. 그 Run 을
-        // 처음 돌리는 사람에게는 여기가 첫 codex 세션이고, 멈추면 아무도 답할 사람이 없는 것은
-        // 워커와 같다(preTrustCodexWorkspace 의 주석).
-        await preTrustCodexWorkspace(a.accountId, a.cwd)
-        // **워커와 같은 래퍼를 쓴다**(위 spawnSession) — 그 래퍼가 계정 객체를 찾고, 롤링
-        // 코디네이터에 등록하고, orchEnv 를 실어 준다. core.sessions.spawn 을 직접 부르면 그 셋을
-        // 여기서 다시 하게 되고, 그중 하나를 빠뜨리면 코디네이터는 한도에 걸린 채 멈춰 선다.
-        const info = await spawnSession({
-          accountId: a.accountId,
-          cwd: a.cwd,
-          bypassPermissions: core.appSettings.getAgentPermissionMode() === 'yolo',
-          initialPrompt: coordinatorLaunchPrompt(briefPath.replace(/\\/g, '/')),
-          // 탭 제목 — 워커 탭이 Task 제목을 쓰는 것과 같은 이유다. 없으면 워크트리 basename 으로
-          // 떠서 사용자가 이것이 무엇인지 알 수 없다.
-          title: `Coordinator · ${a.runId.slice(0, 12)}`,
-          // **한 원소다.** 그래서 롤링은 계정을 갈아타지 않고 리셋까지 기다린 뒤 같은 세션에서
-          // 이어간다 — 관리 중이던 Run 의 맥락을 잃지 않는 쪽을 골랐다(Run.coordinatorAccountId).
-          rollAccountIds: [a.accountId]
-        })
-        // **탭을 띄우는 것이 이 한 줄이다.** 공용 spawnSession 은 이 이벤트를 내지 않는다 — 사용자
-        // 경로에서는 반환값이 렌더러로 가서 App.tsx 가 탭을 만들기 때문이다(그 함수 위의 주석).
-        // main 안에서 직접 부르는 이 자리는 반환값이 렌더러에 닿지 않으므로, 워커 세션이 그랬던
-        // 것처럼 탭 없는 세션이 된다. 코디네이터 탭은 보여야 한다는 것이 이 기능의 결정이고
-        // (사람이 직접 지시할 자리가 그것이다), 탭이 없으면 그 자리가 사라진다.
-        //
-        // 실패는 삼킨다 — 같은 관례다(startWorker 의 emit): 부수적 실패가 세션 생성을 막지 않고,
-        // 탭은 다음 렌더러 마운트의 sessions.list() 재입양이 만든다.
-        try {
-          send('session:created', info)
-        } catch (err) {
-          orchLog(`session:created emit failed session=${info.id}: ${String(err)}`)
-        }
-        orchLog(`coordinator started run=${a.runId} session=${info.id} account=${a.accountId}`)
-        return { sessionId: info.id }
-      },
-      startWorker: async (a) => {
-        // **이 워커의 롤링 체인을 여기서 정한다 — 워커를 띄우는 길이 전부 이 래퍼로 모이기
-        // 때문이다.** 자동 배치 루프도 orchHandleCommand('worker-start') 를 부르고, CLI 의
-        // worker-start 도 같은 핸들러이며(server.ts 의 deps.startWorker), 검토 Dispatch 도 이 함수를
-        // 지난다. 체인을 그중 한 곳에서 넘기면 나머지 경로는 갈아탈 곳 없는 워커를 띄운다.
-        //
-        // **규칙 자체는 core 에 있다**(rollChainFor) — 이 파일에는 테스트가 닿지 않으므로(위
-        // accountToDispatchOn 호출부의 주석) 규칙을 여기 두면 다음 편집을 막아 줄 것이 없다. 여기
-        // 남는 것은 순수 함수가 가질 수 없는 것뿐이다: Task 를 읽고, 로그인 여부를 조회하고,
-        // 그 조회의 예외를 삼키고, 저하한 이유를 로그에 남긴다.
-        let rollAccountIds = [a.accountId]
-        const stateHere = store.get()
-        const task = stateHere.tasks.find((t) => t.id === a.taskId)
-        // Task 의 provider — **그 Task 의 첫 계정이 정한다**(Task.accountIds). 계정 목록 조회는
-        // 메모리에서 끝나므로(비싼 것은 아래 loginStatus 다) 이 한 걸음에 비용이 없다. 첫 id 가
-        // 목록에 없으면 undefined — 아래 조건이 그 경우를 "어긋났다고 말할 수 없다"로 다룬다.
-        const taskProvider = task?.accountIds?.length
-          ? (() => {
-              const first = core.accounts.list().find((x) => x.id === task.accountIds![0])
-              return first ? providerOf(first) : undefined
-            })()
-          : undefined
-        // **두 경우에 로그인 조회를 하지 않는다.**
-        // (1) 지정이 없을 때 — 답은 요청된 계정 하나로 확정이고(rollChainFor), 그 조회는 계정마다 파일
-        //     읽기(macOS 의 claude 계정은 `security` 프로세스)를 붙인다. 워커를 띄우는 모든 자리가 이
-        //     래퍼를 지나므로 그 값을 헛되이 물릴 이유가 없다(자동 배치 루프가 바퀴마다 한 번만
-        //     조회하는 것과 같은 이유).
-        // (2) **띄우는 provider 가 이 Task 의 provider 와 다를 때** — 검토 Dispatch 가 그 자리다.
-        //     검토자는 구현자와 다른 provider 이므로 Task 의 계정은 rollChainFor 안에서 전부 걸러지고,
-        //     남는 것은 조회 비용과 "쓸 수 있는 계정이 하나도 없다"는 어긋난 로그뿐이다 — 사실은 그
-        //     계정들이 다른 provider 의 것일 뿐이고 사람이 할 일은 없다. 검토 경로는 이 앞에서 이미
-        //     같은 조회를 한 번 했다(startReview). 첫 계정 id 가 목록에 없어 provider 를 알 수
-        //     없으면 어긋났다고 말할 수 없으므로 건너뛰지 않는다.
-        if (task?.accountIds?.length && (taskProvider === undefined || taskProvider === a.provider)) {
-          try {
-            const accountList = core.accounts.list()
-            const loggedInHere = new Set(
-              (
-                await Promise.all(
-                  accountList.map(async (x) =>
-                    (await core.accounts.loginStatus(x.id)) ? x.id : null
-                  )
-                )
-              ).filter((id): id is string => id !== null)
-            )
-            const picked = rollChainFor({
-              requested: a.accountId,
-              taskAccountIds: task.accountIds,
-              provider: a.provider,
-              accounts: accountList,
-              loggedInIds: loggedInHere
-            })
-            rollAccountIds = picked.chain
-            // 저하한 두 갈래를 갈라 적는다 — 사람이 할 일이 다르다: 앞은 이 Task 의 계정을 아무것도
-            // 못 쓴다는 뜻(로그인이 필요하다), 뒤는 하필 이 Dispatch 의 계정만 걸러졌다는 뜻이다.
-            if (picked.degraded === 'nothing-usable')
-              orchLog(
-                `worker-start: no usable account among ${a.accountId},${task.accountIds.join(',')} ` +
-                  `for ${a.provider} — rolling chain falls back to ${a.accountId} alone`
-              )
-            else if (picked.degraded === 'requested-unusable')
-              orchLog(
-                `worker-start: the dispatch account ${a.accountId} is not usable, so the chain ` +
-                  `${task.accountIds.join(',')} is dropped — falls back to ${a.accountId} alone`
-              )
-          } catch (e) {
-            // 로그인 조회는 계정 파일과 Keychain 을 읽으므로 던질 수 있다. 그것이 워커를 못 띄우는
-            // 이유가 되어서는 안 된다 — 체인 없이 띄우는 것은 이 목록이 생기기 전의 동작이다.
-            orchLog(
-              `worker-start: could not read login status — rolling chain falls back to ` +
-                `${a.accountId} alone: ${String(e)}`
-            )
-          }
-        }
-        const started = await coordinator.startWorker({ ...a, rollAccountIds })
-        // From this point on, that session's output belongs to this dispatch. On reuse (--terminal) the
-        // previous dispatch's tail freezes where it is. Only a dispatch that has reached a terminal
-        // state is eligible for eviction — a live worker's tail is not dropped even past the cap (see
-        // tail.ts).
-        orchTails.start(
-          { dispatchId: a.dispatchId, sessionId: started.sessionId },
-          (id) => {
-            const d = store.get().dispatches.find((x) => x.id === id)
-            return d === undefined || d.endedAt !== undefined || d.outcome !== undefined
-          }
-        )
-        return started
-      },
+      makeRunWorktree: (a) =>
+        forkWorktree({ repoPath: a.repoPath, name: a.name }, { registry: core.worktrees, log: orchLog }),
+      /** 이 Run 을 관리할 코디네이터 세션을 띄운다 — the body, and the reasoning for its brief file,
+       *  its one-account chain and its permission mode, is startCoordinatorSession in
+       *  core/orchestration/exec/workerStart.ts. What stays here is the app's spawn adapter. */
+      startCoordinator: (a) =>
+        startCoordinatorSession(
+          {
+            specsDir,
+            preTrust: preTrustWorkspace,
+            bypassPermissions: async () => core.appSettings.getAgentPermissionMode() === 'yolo',
+            spawn: async (o) => {
+              const info = await spawnSession(o)
+              // **탭을 띄우는 것이 이 한 줄이다.** 공용 spawnSession 은 이 이벤트를 내지 않는다 — 사용자
+              // 경로에서는 반환값이 렌더러로 가서 App.tsx 가 탭을 만들기 때문이다(그 함수 위의 주석).
+              // main 안에서 직접 부르는 이 자리는 반환값이 렌더러에 닿지 않으므로, 워커 세션이 그랬던
+              // 것처럼 탭 없는 세션이 된다. 코디네이터 탭은 보여야 한다는 것이 이 기능의 결정이고
+              // (사람이 직접 지시할 자리가 그것이다), 탭이 없으면 그 자리가 사라진다.
+              //
+              // 실패는 삼킨다 — 같은 관례다(startWorker 의 emit): 부수적 실패가 세션 생성을 막지 않고,
+              // 탭은 다음 렌더러 마운트의 sessions.list() 재입양이 만든다.
+              try {
+                send('session:created', info)
+              } catch (err) {
+                orchLog(`session:created emit failed session=${info.id}: ${String(err)}`)
+              }
+              return info
+            },
+            log: orchLog
+          },
+          a
+        ),
+      // A coordinator a hand-over started and cannot use: another one already holds the Run's slot
+      // (Task 1 fix round 1, I2). Killed the way worker-stop kills a worker, the app's or the Host's pty.
+      stopCoordinator: (sessionId) => coordinator.stopSession(sessionId),
+      // Whether a coordinator is parked in `check --wait` (final round 3, I-A). Those waits are served by the
+      // Host, which every CLI call reaches, so when this app drives it asks the Host; an older, absent or
+      // silent Host answers unknown, and the fire then skips (coordinatorIdle.ts).
+      coordinatorIdle: (runId, sessionId) =>
+        askHostCoordinatorIdle({ status: () => hostClient?.status() ?? null, call: orchCall, log: orchLog }, runId, sessionId),
+      // Every worker start goes through this one wrapper — the auto-dispatch loop, the CLI's
+      // worker-start and review Dispatches alike. The chain rule and the tail are
+      // startWorkerWithChain's (core/orchestration/exec/workerStart.ts), which the Host will call
+      // (Task 9).
+      startWorker: (a) =>
+        startWorkerWithChain(
+          {
+            getState: () => store.get(),
+            accounts: async () => core.accounts.list(),
+            loginStatus: (id) => core.accounts.loginStatus(id),
+            coordinator,
+            tails: orchTails,
+            log: orchLog
+          },
+          a
+        ),
       releaseWorker: async ({ dispatchId }) => {
         // The coordinator does not know about state, so the wiring pulls the material for the "is it
         // safe to close" verdict out of state and passes it in (the computation is in release.ts, and
@@ -3978,7 +3166,8 @@ export function registerIpc(
         core.accounts
           .list()
           .filter((a) => provider === undefined || providerOf(a) === provider)
-          .map((a) => ({ id: a.id, label: a.label, provider: providerOf(a) })),
+          // 같은 투영을 Host 가 accounts.json 을 읽을 때도 쓴다(accountsFile.ts) — 두 답이 갈라지지 않게.
+          .map(orchAccountOf),
       // limit is a line count (200 by default). The tail is returned as-is even after the session has
       // died — worker-release does not clear output. Why untracked, empty, and non-empty tails get three
       // different messages is explained in tail.ts (an empty string reads as "the worker did nothing").
@@ -3987,11 +3176,10 @@ export function registerIpc(
           return `(unknown dispatch: ${dispatchId})`
         return orchTails.read(dispatchId, limit)
       },
-      // Read on every request — turning it off at runtime has to reject CLI calls from then on
-      enabled: () => core.appSettings.getOrchestrationEnabled(),
-      // Same reasoning as `enabled` above, but for the session-task-* commands. workUnitCollector is
-      // declared further down (around the `WorkUnitCollector` construction) — referencing it here is
-      // fine because these arrows only run once a call comes in, well after that declaration has run.
+      // Read on every request — turning it off at runtime has to reject the session-task-* commands
+      // from then on. workUnitCollector is declared further down (around the `WorkUnitCollector`
+      // construction) — referencing it here is fine because these arrows only run once a call comes
+      // in, well after that declaration has run.
       trackingEnabled: () => core.appSettings.getWorkUnitTrackingEnabled(),
       // Same reasoning again, for browser-js — and `agentRuns` is built above this function so the
       // deps can name it here.
@@ -4045,97 +3233,93 @@ export function registerIpc(
         },
         log: orchLog
       }),
-      // run-create 가 --cwd 를 저장하기 전에 통과시키는 해석기. 후보는 두 곳에서 온다.
-      //
-      // **세션 cwd 는 후보가 아니다.** assertAllowedPath 는 그것을 첫 번째로 보지만, 워커 세션의
-      // cwd 는 워크트리라서 후보에 넣으면 Run.cwd 가 워크트리 **안으로** 내려간다 — 정규화가
-      // 하려는 것과 정반대 방향이다.
-      //
-      // 워크트리는 path 가 아니라 repoPath 를 넣는다. path 를 넣으면 Run.cwd 가 워크트리가 되고,
-      // 그 값은 worker-start 가 runCwd 로도 쓰므로 워커가 도는 자리까지 바뀐다. 다만 이 후보가
-      // **워크트리 안에서 만든 Run 을 저장소로 올려 주지는 않는다** — 워크트리는 레지스트리
-      // 루트(기본 ~/astera-worktrees) 아래, 저장소 밖에 있어서 projectRootOf 의 포함 판정에 걸리지
-      // 않기 때문이다. 그 경우의 소유 판정은 읽는 쪽에서 한다(core/orchestration/view.ts 의
-      // runsForProject 가 r.cwd 를 repoPathOf 로 되돌린다). 여기서 repoPath 가 하는 일은, 저장소
-      // 루트가 knownProjectPaths 에 아직 없을 때 그 자리를 채워 주는 것이다.
-      resolveProjectRoot: async (cwd) => {
-        const candidates = [
-          ...core.worktrees.list().map((w) => w.repoPath),
-          ...(await core.history.knownProjectPaths())
-        ]
-        // 걷기를 git 저장소 경계에서 멈춘다. Run.cwd 는 표시용 값이 아니다 — worker-start 가
-        // runCwd 로 넘겨 `--worktree current` 는 그 자리에서 워커를 돌리고 `--worktree new` 는
-        // 그 경로의 저장소로 워크트리를 만든다. 세션을 연 적 없는 중첩 저장소(서브모듈, 벤더링된
-        // 클론)에서 run-create 를 부르면 그 저장소는 후보가 아니고 부모만 후보라서, 경계가 없으면
-        // 정규화가 저장소 밖으로 올라가고 워커가 엉뚱한 저장소에서 돈다.
-        const root = await repoRoot(cwd)
-        // 후보 하나하나에 git 을 부르지 않는다. projectRootOf 는 target 을 담는 후보만 고르므로,
-        // 남은 판정은 "그 후보가 target 의 저장소 루트 아래인가"뿐이다 — 저장소 루트와 target
-        // 사이의 디렉터리에는 .git 이 있을 수 없고(있었다면 그것이 target 의 저장소 루트다),
-        // 따라서 그 구간의 후보는 전부 같은 저장소다. git 호출은 target 에 대해 한 번뿐이다.
-        //
-        // cwd 가 저장소가 아니면(root === null) 경계 자체가 없다. 이때 후보를 전부 버리면 정규화가
-        // 통째로 사라져 하위 디렉터리 Run 이 다시 보이지 않게 되는데, 막으려는 피해(워커가 다른
-        // 저장소에서 도는 것)는 저장소 안에서만 생긴다. 그래서 이 경우에는 경계를 걸지 않는다.
-        const bounded = root === null ? candidates : candidates.filter((c) => isPathWithin(root, c))
-        return projectRootOf(bounded, cwd)
-      },
+      // run-create 가 --cwd 를 저장하기 전에 통과시키는 해석기. 규칙(후보의 순서, 저장소 경계,
+      // 받은 cwd 로의 폴백)은 Host 와 같이 쓰는 resolveProjectRootFrom(core/files/tree.ts)에 있고,
+      // 여기서는 앱의 두 후보 목록을 모아 넘긴다. 앱이 없을 때는 Host 가 제 워크트리 레지스트리와
+      // 감시자 없는 기록 목록으로 같은 함수를 부른다(host/projectRoots.ts).
+      resolveProjectRoot: async (cwd) =>
+        resolveProjectRootFrom({
+          cwd,
+          repoPaths: core.worktrees.list().map((w) => w.repoPath),
+          projectPaths: await core.history.knownProjectPaths(),
+          repoRoot
+        }),
       // 코디네이터가 --validate 에 넣을 목록. 조립은 하지 않으므로
       // loadRunConfigs 만 부른다.
+      // `astera status` 가 세는 값 둘. 세션은 SessionManager 의 것이고 버전은 Electron 의
+      // 것이라, 둘 다 OrchState 만 보는 층에는 없다.
+      runningSessions: () => core.sessions.runningAppOwned().length,
+      appVersion: () => app.getVersion(),
       listRunConfigs: async (projectPath) => {
         const { configs } = await loadRunConfigs({
           projectPath,
           stored: core.runConfig.get(projectPath),
-          assertAllowedPath
+          // 이 층의 모든 호출(run-configs, run-configs-list, tasks-add)은 상태의 Job cwd 를 넘긴다.
+          // 셸에서 만든 Job 의 새 폴더도 받는다 — 앱이 닫혀 있을 때 Host 가 읽는 것과 같은 경계다.
+          assertAllowedPath: allowingJobCwds(() => store.get().jobs, assertAllowedPath)
         })
-        return configs.map((c) => ({ id: c.id, name: c.name, type: c.type }))
+        return configs.map(orchRunConfigOf)
       },
-      // checkConfigIdsOf 는 옛 validateConfigId 와 새 validateConfigIds 를 함께 읽으므로, 지금
-      // 존재할 수 있는 모든 Task 에 대해 이것으로 충분하다.
-      startValidation: ({ taskId, cwd }) => {
-        const task = store.get().tasks.find((t) => t.id === taskId)
-        validator.enqueue({ taskId, cwd, configIds: task ? checkConfigIdsOf(task) : [] })
-        // 의심 파일(설계 §8.3) — **convergence Run 에서만** 계산한다(리뷰 fix 1차, Important 1).
-        // 이 계산은 Task 에 suspiciousFiles 를 써서 리뷰어 spec 에 새 절을 만드는데, 다른 모든
-        // convergence 전용 자리(state.ts 의 checks 기록, server.ts 의 readReviewFile 가드)가
-        // "convergence 가 없으면 오늘과 바이트 단위로 같다"를 지키므로 여기도 그래야 한다.
-        // policyOf 로 판정한다 — run.convergence !== undefined 가 아니라: 손으로 고친
-        // "convergence": null 을 정책 있음으로 잘못 읽지 않는다(Task 11 의 같은 판단).
-        // 검증을 늦추지 않도록 큐에 넣은 뒤 옆에서 계산한다. 구현 Dispatch 가 없거나 의심 파일이
-        // 없으면 아무것도 쓰지 않는다(빈 배열을 Task 에 남기지 않는다). 실패해도 검증 자체는 이미
-        // 큐에 들어가 그대로 돈다 — 그래서 종단 .catch 는 로그만 남긴다.
-        const pol = task ? policyOf(store.get(), task) : null
-        if (!task || pol === null) return
-        // 설계 G3(명세 §37·§36): 이 라운드가 쓰는 완료 정책의 지문을 찍는다. 처음이면 스냅숏이 되고,
-        // 이미 있는데 달라졌으면 `policyChanged` 가 선다 — 막지 않고 표시한다.
-        //
-        // 구성 조회가 비동기라(loadRunConfigs) 의심 파일과 같은 자리에서, 검증을 늦추지 않도록 큐에
-        // 넣은 뒤 옆에서 한다. 실패해도 검증은 그대로 돈다 — 지문이 없으면 다음 라운드에 다시 찍는다.
-        void (async () => {
-          const { configs } = await loadRunConfigs({
-            projectPath: cwd,
-            stored: core.runConfig.get(cwd),
-            assertAllowedPath
-          })
-          const byId = new Map(configs.map((c) => [c.id, c]))
-          const key = completionPolicyHash(task, pol, (id) => {
-            const c = byId.get(id)
-            return c ? seedKeyOf(c) : null
-          })
-          await deps.setState(stampPolicySnapshot(store.get(), { taskId, key }, new Date().toISOString()))
-        })().catch((e) => orchLog(`policy snapshot task=${taskId}: ${String(e)}`))
-        void (async () => {
-          const first = firstImplDispatch(store.get(), taskId)
-          if (!first) return
-          const suspicious = suspiciousCheckFiles(await changedFilesSince(first, cwd))
-          if (suspicious.length === 0) return
-          const st = store.get()
-          await deps.setState({
-            ...st,
-            tasks: st.tasks.map((t) => (t.id === taskId ? { ...t, suspiciousFiles: suspicious } : t))
-          })
-        })().catch((e) => orchLog(`suspicious files task=${taskId}: ${String(e)}`))
+      // `astera sessions read` 의 pending — 대화 세션이 열어 둔 카드는 어댑터의 프로토콜 상태에만
+      // 있다(CLI phase D4). 모르는 id 에는 null 이다. Host 가 묻고, 앱이 없으면 칸을 싣지 않는다.
+      // 쥐지 않은 세션(재접속 중)은 카드를 모른다 — null(없음)이 아니라 undefined(모름)다.
+      chatPending: async (sessionId) =>
+        core.chat.has(sessionId) ? chatPendingOf(core.chat.state(sessionId)?.request ?? null) : undefined,
+      // `astera sessions send --wait` (CLI spec §15): where a chat session this app holds is in its turn, as
+      // its adapter decodes it. undefined for a session it does not hold (yet), which the Host reads as
+      // "cannot say" rather than as a turn that ended.
+      chatTurn: async (sessionId) => {
+        if (!core.chat.has(sessionId)) return undefined
+        const st = core.chat.state(sessionId)
+        if (!st) return undefined
+        return {
+          alive: core.chat.info(sessionId)?.status === 'running',
+          status: st.status,
+          error: st.error,
+          prompt: chatPromptsOf(sessionId, core.chat.pendingOf(sessionId))[0] ?? null
+        }
       },
+      // `astera sessions send` 가 대화 세션에 치는 턴. 스케줄러와 Slack 이 쓰는 그 세션 드라이버로
+      // 넘겨 앱의 턴 상태가 제 것으로 남는다. 카드가 열려 있으면 치지 않고 그 카드를 돌려준다 —
+      // 답은 앱에서 사람이 한다(R4.3). Slack 은 여기서 카드에 답하지만, 셸에서 온 글자를 승인이나
+      // 질문의 답으로 읽는 것은 이 명령의 약속이 아니다.
+      // Chat takeover C3: the open permission prompts of the chat sessions this app holds (it is their
+      // writer), and an answer to one of them. The Host forwards these only to an app that yields
+      // chat-takeover (Task 8). A question is answered in Astera only (P6).
+      chatPrompts: async (sid) => ({
+        prompts: core.chat
+          .list()
+          .filter((i) => !sid || i.id === sid)
+          .flatMap((i) => chatPromptsOf(i.id, core.chat.pendingOf(i.id))),
+        complete: true
+      }),
+      chatAnswer: async (sid, rid, decision) => {
+        if (!core.chat.has(sid)) return { answered: false, reason: 'not-held' }
+        const r = core.chat.pendingOf(sid).find((x) => x.id === rid)
+        if (!r) return { answered: false, reason: 'not-open' }
+        if (r.kind === 'question') return { answered: false, reason: 'question' }
+        try {
+          await core.chat.answer(sid, rid, { kind: 'approval', decision: decision === 'allow' ? 'accept' : 'decline' })
+          return { answered: true }
+        } catch (err) {
+          // Final review M3: only "no open request" is not-open; an EPIPE or a refused write is not-held.
+          const failed = chatAnswerFailureOf(err)
+          if (failed.answered === false && failed.reason === 'not-held')
+            orchLog(`chat ${sid}: answering ${rid} failed: ${String(err)}`)
+          return failed
+        }
+      },
+      chatSend: async (sessionId, text) => {
+        // 아직 되찾지 않은 세션 — 지금 상태 때문이다. 오류(1)가 아니라 거절(6)로 돌려준다.
+        if (!core.chat.has(sessionId)) return { sent: false, reason: 'not-held' }
+        const pending = chatPendingOf(core.chat.state(sessionId)?.request ?? null)
+        if (pending !== null) return { sent: false, pending }
+        if (!orchWiring) throw new Error('orchestration is not wired in this app')
+        await orchWiring.deliverChat(sessionId, text)
+        return { sent: true }
+      },
+      // 큐에 넣고, 그 옆에서 완료 정책 지문과 의심 파일을 계산한다 — 본문은 validation.ts 에 있다.
+      startValidation: (a) => validation.startValidation(a),
       // 검토를 시작한다. 검증과 달리 **세션을 띄운다** — 그래서 provider·계정을 고르고, 검토
       // Dispatch 를 커밋하고, deps.startWorker 를 부르는 세 걸음이다. 동기 서명이므로
       // 비동기 작업은 안에서 흘려보낸다(startValidation 이 큐에 넣기만 하는 것과 같은 이유:
@@ -4192,13 +3376,10 @@ export function registerIpc(
       // Job Continuity P1: a worker Dispatch just closed without an outcome, so its Task is
       // stranded. Always injected — the wiring always sets this property — but a no-op whenever
       // `recovery` is null (the toggle is off, or the reconciler has not been built yet on this very
-      // first call) or orchestration itself is off (same guard, same reason as the boot sweep below:
-      // a worker that recovery spawns while orchestration is off can never report — every call it
-      // makes gets a 409).
+      // first call).
       onDispatchLost: (a) =>
         void (
           recovery &&
-          deps.enabled() &&
           recovery.reconcileOne(a.dispatchId).catch((e) => orchLog(`recovery: reconcileOne failed: ${String(e)}`))
         )
     }
@@ -4217,13 +3398,26 @@ export function registerIpc(
       now: () => new Date().toISOString()
     }
 
+    // The re-drive for the validations and reviews a restart interrupted. **Built here, well before
+    // it is first run** (that is at the end of this function, once `orch` stands): the two deps above
+    // tell it about every resume the ordinary path starts, and the first of those happens in the
+    // pending-report drain, which is between here and there.
+    resumeSweep = createResumeSweep({
+      // 거울이 비어 있으면 null — 빈 상태로 판정하면 "끊긴 것이 없다" 는 거짓말이 된다. 여기까지
+      // 왔다는 것은 state-get 이 성공했다는 뜻이라 실제로는 늘 차 있다.
+      getState: () => (orchMirror.loaded() ? orchMirror.getState() : null),
+      startValidation: (r) => deps.startValidation?.(r),
+      startReview: (r) => deps.startReview?.(r),
+      now: () => new Date().toISOString(),
+      log: orchLog
+    })
+
     // Job Continuity P1's reconciler needs the store and the deps above, both local to this closure —
     // openContinuity (outside bootOrch) cannot build it, so it only calls this builder. Assigned here,
     // after `deps` is complete, and invoked once below if continuity is already on; a later runtime
     // toggle-on calls it through openContinuity's own `buildRecovery?.()`.
     buildRecovery = () => {
-      if (!continuityJournal) return
-      const journal = continuityJournal
+      if (!appJournal.enabled()) return
       // Nulling `recovery` (closeContinuity, on toggle-off or will-quit) cannot cancel a sweep that
       // is already running — reconcileAll/reconcileOne hold this reconciler through their own
       // closure, so a running one would otherwise go on to call deps.startWorker seconds after the
@@ -4233,17 +3427,16 @@ export function registerIpc(
       mine = new RecoveryReconciler({
         getState: deps.getState,
         setState: deps.setState,
-        journal,
+        journal: appJournal.reconcilerJournal,
         readGitFacts: (cwd) => readGitFacts(cwd),
         smartResume: () => core.appSettings.getResumeStrategy() === 'smart',
         // The last gate before a worker is spawned. Turning the toggle off, or quitting, must not
-        // put a worker on the disk a moment later — so this checks both `recovery === mine` (still
-        // the live reconciler, not one closeContinuity already retired) and orchestration itself
-        // (same reason the boot sweep and onDispatchLost guard on deps.enabled() above). The
-        // reconciler journals this as RECOVERY_FAILED through its own swallow-and-log helper, which
-        // is the honest record of what happened.
+        // put a worker on the disk a moment later — so this checks that `recovery === mine` (still
+        // the live reconciler, not one closeContinuity already retired). The reconciler journals
+        // this as RECOVERY_FAILED through its own swallow-and-log helper, which is the honest record
+        // of what happened.
         execute: async (a) => {
-          if (recovery !== mine || !deps.enabled())
+          if (recovery !== mine)
             return { ok: false, error: 'recovery was turned off while this attempt was being decided' }
           return executeRecovery(a, {
             getState: deps.getState,
@@ -4266,31 +3459,87 @@ export function registerIpc(
       })
       recovery = mine
     }
-    if (continuity) buildRecovery()
+    if (appJournal.enabled()) buildRecovery()
 
-    const server = await startOrchServer(deps)
-    // A failure after listen must close the server and only then throw. Throwing here would leave orch
-    // null while the server is still listening and the handle is gone — will-quit could not close it,
-    // and toggling back on would start a second server (because orch === null). A writeShuttle ENOSPC
-    // on a full disk reaches this.
-    let cliPath: string
-    let infoPath: string
-    const dir = path.join(app.getPath('userData'), 'orch')
-    try {
-      cliPath = await writeShuttle({ dir, execPath: process.execPath, entryPath })
-      infoPath = await writeInfo({ dir, port: server.port, token: server.token })
-    } catch (err) {
-      await server.close().catch(() => {}) // a failed close must not mask the original error
-      throw err
+    /**
+     * **The one-time pause for work the old orchestration toggle had parked** (ruling F62).
+     *
+     * Turning that toggle off never tore anything down — it left five guards standing still, and
+     * this task removed all five and made the server start unconditionally. So a person who
+     * switched orchestration off mid-flight would, on their next launch, have the scheduler
+     * dispatch, the templates fire and the reconciler spawn replacements: their accounts spent and
+     * commits landed on the strength of a decision they made in the other direction. `paused` is
+     * what all four of those read, and one click in the Jobs list undoes it.
+     *
+     * **Above `orch = {…}` on purpose.** A throw here reaches `startOrch`'s catch with `orch` still
+     * null, so the drain, the scheduler, the recovery sweep and the resume sweep — everything below
+     * that could act on this state — do not run at all. Failing into "nothing happened" is the only
+     * acceptable direction for a guard whose job is to stop unasked-for spending.
+     *
+     * **The marker is written last**, after the state write has landed, so a failed pause is retried
+     * on the next launch rather than recorded as done.
+     *
+     * **And it is written even when nothing is paused** (ruling F64). The profiles that had the
+     * toggle *on* have nothing to stop, but they are the ones that most need the record: the old key
+     * has left `persist`, so their next ordinary settings write drops it, and a launch after that
+     * would read the absence as "it was off" and pause the very Runs this exists to protect. The
+     * `{ pause }` object rather than a boolean is what makes that hard to get wrong here — there is
+     * one branch to be inside, and the record is the last thing in it.
+     */
+    const migration = core.appSettings.orchAlwaysOnMigration()
+    const parkedByTheOldToggle = migration?.pause === true
+    if (migration) {
+      if (migration.pause) {
+        const paused = pauseWorkParkedByTheToggle(store.get())
+        if (paused.runs.length > 0 || paused.jobs.length > 0) {
+          await deps.setState(paused.state)
+          orchLog(
+            `always-on migration — orchestration used to be off on this profile, so ${paused.runs.length} run(s) ` +
+              `[${paused.runs.join(', ')}] and ${paused.jobs.length} schedule(s) [${paused.jobs.join(', ')}] were ` +
+              `paused rather than restarted. Resume them from the Jobs list when you want them to go on.`
+          )
+        } else orchLog('always-on migration — nothing was parked on this profile, so nothing was paused')
+      } else
+        orchLog(
+          'always-on migration — orchestration was already on for this profile, so nothing was paused; recorded so a later settings write cannot make this look like an off profile'
+        )
+      await core.appSettings.markOrchAlwaysOnMigrated()
     }
-    orch = { server, deps, cliPath, infoPath, skillsPath }
+
+    // The same string `startHost` hashes into the Host's address (`hostAddress`), so a session told
+    // this folder derives exactly this app's Host and no other.
+    const profileDir = app.getPath('userData')
+    const dir = path.join(profileDir, 'orch')
+    // A `writeShuttle` ENOSPC on a full disk reaches the caller's catch with `orch` still null, which
+    // is the truth: nothing was assigned and nothing needs unwinding. There is no listening socket to
+    // close first any more — the command layer is the Host's (host control plane design §7).
+    // win32: from a non-ASCII install folder outside the user folders, the session `.cmd` goes through
+    // the same %LOCALAPPDATA%\astera\app junction as the public one (sessionCmdLink), made here before
+    // any session starts. It is never removed from this path. When it cannot be made, the path is raw.
+    const sessionLink = await sessionCmdLink(
+      {
+        // binDirFor directly, not cliBinDir: that const is declared further down registerIpc.
+        publicDir: binDirFor({ platform: process.platform, env: process.env, home: app.getPath('home') }),
+        execPath: process.execPath,
+        entryPath
+      },
+      (w) => orchLog(`session astera shuttle: ${w.code}: ${w.detail}`)
+    )
+    const cliPath = await writeShuttle({ dir, execPath: process.execPath, entryPath, link: sessionLink })
+    orch = { deps, cliPath, skillsPath, profileDir }
+    // Nobody is waiting on the Host any more, so the Jobs view goes back to meaning what it says.
+    // Before `pushOrchState` below, which is what redraws it.
+    setOrchHostGate(null)
     orchRollTap = new OrchRollTap(deps)
-    orchLog(`started — port=${server.port} cli=${cliPath} skills=${skillsPath}`)
+    // The exits of adopted sessions that ended while this boot was on its way here.
+    const replayed = exitsBeforeTap.drainInto(orchRollTap)
+    if (replayed > 0) orchLog(`replayed ${replayed} session exit(s) that arrived before orchestration started`)
+    orchLog(`started — cli=${cliPath} skills=${skillsPath}`)
     // The other half of the queue read at the top of this function: the reports workers wrote down
     // while there was no server to take them.
     //
-    // **Awaited, and before everything below it.** `runScheduler` and the recovery boot sweep are
-    // both fired and forgotten, so the ordering only holds if this one is not: a Task these reports
+    // **Awaited, and before everything below it.** The dispatch loop's boot run and the recovery boot
+    // sweep are both fired and forgotten, so the ordering only holds if this one is not: a Task these reports
     // complete must be complete before the reconciler decides whether its worker was lost, and its
     // dependents must be ready before the scheduler looks for something to dispatch. In the ordinary
     // case there is nothing in the queue and this costs one `readdir` that already happened.
@@ -4300,57 +3549,87 @@ export function registerIpc(
     // same validation and review after it. Nothing here needs a separate copy of any of that, and a
     // copy would be the thing that drifts.
     //
-    // **`deps.enabled()` guards it, for a reason the other two do not have.** `bootOrch` runs for
-    // any of the four toggles, so it can run with orchestration itself off — and then
-    // `handleCommand` answers every one of these with a 409, which the drain would read as the app
-    // refusing them and clear their files. That would delete finished workers' reports because
-    // somebody had the browser toggle on and orchestration off. They stay where they are instead,
-    // and the next start with orchestration on takes them.
-    if (pendingReports.length > 0 && !deps.enabled())
+    // **The standing guard is gone, and a one-time one takes its place.** It used to be guarded on
+    // orchestration being on, because `bootOrch` runs for any of the toggles and `handleCommand`
+    // answered every queued report with a 409 while orchestration was off — which this drain reads
+    // as "the app refused it" and clears the file for, deleting a finished worker's report because
+    // somebody happened to have the browser toggle on. With orchestration always on that refusal
+    // cannot be produced, so the condition is no longer "is it off" but "is this the launch that
+    // just paused this profile's parked work" (ruling F62, the block above).
+    //
+    // **Why the migrating launch skips it.** Applying a queued `worker_done` is recording work that
+    // already happened, which is harmless in itself — but on a convergence Run it hands the Task to
+    // the reviewer, and `startReview` spawns a session. That is spending, on a Run this launch has
+    // just decided the person did not ask to continue. Skipping loses nothing: an untouched queue
+    // file is read again at the next start, which is a start where they have seen the paused Runs.
+    //
+    // **What made the old guard necessary is still here, and it is the `ok:` line below.** Any
+    // non-2xx reads as a refusal, and `applyPendingReports` deletes a refused report's file — its
+    // contract is that a refusal is permanent ("that answer will be the same at every future
+    // start"). A 409 that means "not now" rather than "no" would therefore destroy a finished
+    // worker's only record. No such 409 is reachable for a queued report today, and this is the
+    // third pass at saying so, so here it is exactly: a queued report is `send` and nothing else
+    // (`isQueueableReport`), and every exit of the `send` case is `okBody`, `bad` (400), `denied`
+    // (403) or `refused` — which is 404 when the report names a Dispatch, or behind it a Task, that
+    // is not there (`unknown dispatch` / `unknown task` from applyWorkerDone or applyReviewResult),
+    // and 400 for every other refusal. It never reaches `conflict`, and it never goes through
+    // `commit`. **400, 403 and 404 are the whole set**, and all three are permanent: the same report
+    // will be refused the same way at every future start, which is exactly what `applyPendingReports` deletes the file on the strength of. A new
+    // `conflict(…)` reachable from `send` would have to be weighed against that before it is added.
+    if (pendingReports.length > 0 && parkedByTheOldToggle)
       orchLog(
-        `pending reports — ${pendingReports.length} left untouched: orchestration is off, so there is nothing that can apply them yet`
+        `pending reports — ${pendingReports.length} left untouched: this launch paused work the old ` +
+          `orchestration setting had parked, and applying a report can open a review on it. The next ` +
+          `start takes them, or, in front of a Host that drives dispatch, that Host's next load or handover.`
       )
     else if (pendingReports.length > 0) {
-      const drained = await applyPendingReports({
-        queued: pendingReports,
-        apply: async (r) => {
-          const reply = await orchHandleCommand(deps, { sessionId: r.sessionId }, r.cmd, r.args)
-          return {
-            ok: reply.status >= 200 && reply.status < 300,
-            detail: `${reply.status} ${JSON.stringify(reply.body)}`
-          }
-        },
-        // The other half of `heldOnlyByReport` above: a Dispatch the restart cleanup left open only
-        // because this report spoke for it, and the report has just turned out to be undeliverable.
-        // Closing it here is putting the boot where it would have been had the report never been
-        // queued — and it has to be *here*, because the recovery sweep that can then take the Task
-        // runs a few lines below and `candidates` skips a Task with any open Dispatch.
-        //
-        // **The set is the boot's, not a fresh read.** It was computed against the state the
-        // cleanup produced, so it holds the cleanup's own three reasons; asking again now would
-        // catch Dispatches that earlier reports in this very drain opened.
-        writeOff: async (r) => {
-          const dispatchId = String(r.args.dispatchId)
-          if (!heldOnlyByReport.has(dispatchId)) return
-          const res = writeOffDispatch(
-            deps.getState(),
-            { dispatchId },
-            new Date().toISOString()
-          )
-          if (!res.closed) return
-          await deps.setState(res.state)
-          orchLog(
-            `pending reports — dispatch=${dispatchId} is written off: it was left open only for a report that could not be applied, and recovery can take its Task at this start` +
-              (res.interrupted === 'validation' ? '. Its Task was validating and is now gated' : '') +
-              (res.interrupted === 'review' ? '. Its Task was reviewing and is now gated' : '') +
-              (res.stuck ? '. Its Task could not be interrupted and was left as it was' : '')
-          )
-        },
-        log: orchLog
-      })
-      orchLog(
-        `pending reports — ${drained.applied} applied, ${drained.rejected} refused, ${drained.kept} left for the next start, ${drained.gaveUp} given up on`
-      )
+      // **Not in front of a Host that drives** (§4.2): its handover drains the same queue (Task 11's
+      // drainOnce), and two drains would apply one report twice. The files are left for it.
+      if (!hostDrives()) {
+        const drained = await applyPendingReports({
+          queued: pendingReports,
+          apply: async (r) => {
+            const reply = await orchHandleCommand(deps, { sessionId: r.sessionId }, r.cmd, r.args)
+            return {
+              ok: reply.status >= 200 && reply.status < 300,
+              detail: `${reply.status} ${JSON.stringify(reply.body)}`
+            }
+          },
+          // The other half of `heldOnlyByReport` above: a Dispatch the restart cleanup left open only
+          // because this report spoke for it, and the report has just turned out to be undeliverable.
+          // Closing it here is putting the boot where it would have been had the report never been
+          // queued — and it has to be *here*, because the recovery sweep that can then take the Task
+          // runs a few lines below and `candidates` skips a Task with any open Dispatch.
+          //
+          // **The set is the boot's, not a fresh read.** It was computed against the state the
+          // cleanup produced, so it holds the cleanup's own three reasons; asking again now would
+          // catch Dispatches that earlier reports in this very drain opened.
+          writeOff: async (r) => {
+            const dispatchId = String(r.args.dispatchId)
+            if (!heldOnlyByReport.has(dispatchId)) return
+            const res = writeOffDispatch(
+              deps.getState(),
+              { dispatchId },
+              new Date().toISOString()
+            )
+            if (!res.closed) return
+            await deps.setState(res.state)
+            orchLog(
+              `pending reports — dispatch=${dispatchId} is written off: it was left open only for a report that could not be applied, and recovery can take its Task at this start` +
+                (res.interrupted === 'validation' ? '. Its Task was validating and is now gated' : '') +
+                (res.interrupted === 'review' ? '. Its Task was reviewing and is now gated' : '') +
+                (res.stuck ? '. Its Task could not be interrupted and was left as it was' : '')
+            )
+          },
+          log: orchLog
+        })
+        orchLog(
+          `pending reports — ${drained.applied} applied, ${drained.rejected} refused, ${drained.kept} left for the next start, ${drained.gaveUp} given up on`
+        )
+      } else
+        orchLog(
+          `pending reports — ${pendingReports.length} left for the Host: it drives dispatch and drains them itself`
+        )
     }
     // One push for the state that was just loaded off disk. Startup races the renderer's first
     // orch.list (both happen at app start) and the settings toggle boots this long after it, and in
@@ -4360,53 +3639,41 @@ export function registerIpc(
     // 재시작 뒤 ready 인 Task 가 남아 있을 수 있다. 아무도 돌지 않으면 사용자가 앱을 켠 채로
     // 아무 일도 일어나지 않고, 그 이유는 화면 어디에도 없다.
     // **orch 대입 뒤에 있어야 한다** — 앞에 두면 orch 가 아직 null 이라 아무 일도 하지 않는다.
-    void runScheduler().catch((e) => orchLog(`scheduler failed at startup: ${String(e)}`))
+    // 앞에 dispatch 를 알리는 Host 가 있으면 돌리지 않는다 — 그 Host 가 제 load 와 넘겨받기에서 돈다.
+    if (!hostDrives()) void loop.run().catch((e) => orchLog(`scheduler failed at startup: ${String(e)}`))
+    else orchLog('scheduler — the Host drives dispatch, so this app does not run its loop at startup')
     // Job Continuity P1: decide what to do about every worker the restart lost. It reads the state,
     // the journal and the worktrees, and acts; a failure inside is logged per attempt and never
     // stops the boot.
     //
-    // **Must be after `orch = {...}` above, for the same reason runScheduler is** — deps.startWorker
+    // **Must be after `orch = {...}` above, for the same reason the loop's boot run is** — deps.startWorker
     // reaches spawnSession, which reads orchEnvOf(), which answers undefined while `orch` is still
     // null. A worker recovered in that window would come up with no astera CLI and no
     // ASTERA_SESSION: stranded with a spec file telling it to run commands it does not have — the
     // exact failure this feature exists to prevent.
-    //
-    // **`deps.enabled()` guards it too** — Job Continuity's checkbox does not imply orchestration is
-    // on (it lives in the Smart Resume section and is its own reason to run startOrch), and with
-    // orchestration off the server rejects every call a spawned worker makes with a 409, so it can
-    // never report. Same guard, same reasoning as runScheduler's `if (!orch.deps.enabled()) return`.
-    if (recovery && deps.enabled())
+    if (recovery)
       void recovery.reconcileAll().catch((e) => orchLog(`recovery: boot sweep failed: ${String(e)}`))
-    // 완료 수렴 Run 이 재시작으로 멈춘 validating·reviewing Task(store.load 가 위에서 채운
-    // loaded.revalidate·loaded.rereview) — store.load 는 아무것도 시작하지 않고 목록만 돌려주는
-    // 계약이므로(store.ts), 시작은 deps 가 다 갖춰지고 orch 가 선 뒤인 여기다. 이미 Run
-    // 게이트(일시 중지·예약 템플릿·pendingStart)와 열린 Dispatch 로 store.load 에서 걸러져
-    // 왔으므로 여기서 다시 거르지 않는다. runScheduler·recovery.reconcileAll 과 같은 이유로
-    // deps.enabled() 로 가드한다 — 꺼져 있으면 서버가 모든 보고를 409 로 거절해 시작해도 끝을 볼
-    // 수 없다.
+    // 완료 수렴 Run 이 재시작으로 멈춘 validating·reviewing Task. 시작은 deps 가 다 갖춰지고 orch 가
+    // 선 뒤인 여기다 — startValidation 은 큐에, startReview 는 세션 spawn 에 닿는다.
     //
-    // **가드가 막았을 때 조용히 있지 않는다(리뷰 fix 1차, Minor→promoted).** `bootOrch` 는
-    // orchestration 자체가 꺼진 채로도(continuity·tracking 만 켜져 있어도) 돈다 — 그때 이 두
-    // 목록을 그냥 버리면, 나중에 orchestration 을 다시 켜도(재시작 없이 설정만 바꿔서는)
-    // `store.load()` 가 다시 불리지 않으므로 이 목록은 영영 되살아나지 않는다. 이 branch 가
-    // 열 번의 fix round 를 들여 없앤 것과 같은 부류의 결함 — "조용히 버려지는 복구 대상" —
-    // 이므로 로그로 그 사실을 남긴다. 다음 정상 재시작(orchestration 이 켜진 채)의
-    // store.load() 는 이 Task 들이 여전히 validating·reviewing 이고 열린 Dispatch 가 없으므로
-    // 같은 목록을 다시 채운다 — "재시작하면 잡힌다"는 문장은 그래서 참이다.
-    if (deps.enabled()) {
-      for (const r of loaded.revalidate) deps.startValidation?.({ taskId: r.taskId, cwd: r.cwd })
-      for (const taskId of loaded.rereview) deps.startReview?.({ taskId })
-    } else if (loaded.revalidate.length > 0 || loaded.rereview.length > 0)
-      orchLog(
-        `restart cleanup — orchestration is off, so ${loaded.revalidate.length} interrupted validation(s) and ${loaded.rereview.length} interrupted review(s) were not restarted; turning it on without restarting does not retry them — a restart with it already on will`
-      )
+    // **목록은 Host 의 `boot` 가 아니라 거울에서 온다(Task 7b).** `boot` 는 Host 수명마다 한 번만
+    // 나가고(설계대로다: `before` 와 카운터는 그 한 번의 load 를 말한다), Host 는 앱보다 오래 산다 —
+    // 그래서 살아남은 Host 에 다시 붙는 앱은 언제나 `boot: null` 을 받는다. 그 목록에만 기대면, 앱이
+    // 죽어 validating 으로 남은 Task 는 다시 검증되는 일이 영원히 없다: 검증은 앱 안의 큐이고,
+    // recovery 의 화해기는 잃어버린 Dispatch 만 본다. 이 계획 전에는 앱이 뜰 때마다 store.load 가
+    // 그 Task 들을 다시 찾아 주었다. 이제는 sweep 이 그 자리를 대신하고, 붙을 때마다 돈다.
+    //
+    // 판정식은 load 와 같은 함수 하나다(core/orchestration/store.ts 의 interruptedResumes) — Run
+    // 게이트(일시 중지·예약 템플릿·pendingStart)와 열린 Dispatch 를 그쪽이 거른다.
+    if (!hostDrives()) resumeSweep.run('this app started')
+    else orchLog('resume sweep — the Host drives dispatch and runs its own at its load and handover')
     // 예약 템플릿의 발화. **첫 바퀴는 무장만 한다**(firesDue) — 앱을 켤 때마다 한 회차가 도는
     // 것을 막는 장치가 그것이고, 그래서 여기서 즉시 한 번 부르지 않는다.
     /** 코디네이터 세션이 사라졌을 때 그 Run 의 관리자 칸을 비운다. **다시 띄우지는 않는다.**
      *
      *  사람이 탭을 닫은 것인지 크래시인지 구별할 방법이 없고(`SessionManager.kill` 은 표시를 남기지
      *  않는다), 닫은 쪽이라면 곧바로 다시 여는 것은 그 결정을 무시하는 일이다. 대신 사이드바의
-     *  Run 줄에 다시 띄우는 버튼이 나온다(JobRun.coordinatorMissing) — 언제 되돌릴지는 사람이
+     *  Run 줄에 다시 띄우는 버튼이 나온다(JobRow.coordinatorMissing) — 언제 되돌릴지는 사람이
      *  정한다. 그동안 워커의 질문은 앱의 그물이 풀어 준다(inbox.ts).
      *
      *  **앱 재시작은 이 경로가 아니다.** 그때는 세션이 프로세스와 함께 사라지고 exit 이 오지 않는다.
@@ -4428,52 +3695,21 @@ export function registerIpc(
       // The cost, if the coordinator really did die with its Host: the slot stays attached to a session
       // that is gone and the restart button never appears. That is already what a plain app restart
       // leaves behind, since the slot is persisted and nothing at boot clears it.
-      if (exitCode === PTY_LOST_SIGHT_EXIT_CODE) return
-      if (!orch || !orch.deps.enabled()) return
-      const st = orch.deps.getState()
-      const run = st.runs.find((r) => r.coordinatorSessionId === sessionId)
-      if (!run) return
-      const detached = detachCoordinator(st, { runId: run.id })
-      if (!detached.ok) return
-      await orch.deps.setState(detached.state)
-      orchLog(`coordinator gone run=${run.id} session=${sessionId} — restart it from the Jobs list`)
-    }
-
-    /** 잠든 코디네이터를 깨운다. **판정은 core 에 있다**(unreadUpwardMail) — 이 파일에는 테스트가
-     *  닿지 않으므로 규칙을 여기 두면 다음 편집을 막아 줄 것이 없다. 여기 남는 것은 순수 함수가
-     *  가질 수 없는 것뿐이다: 세션에 타이핑하고, 바쁜지 보고, 로그를 남긴다.
-     *
-     *  **바쁜 세션은 건드리지 않는다.** 두 가지를 함께 막는다: (1) 턴 중인 코디네이터는 이미 일하고
-     *  있어 깨울 것이 없고, (2) 권한 요청 대화상자는 턴 중에 뜨므로 그때 타이핑하면 Enter 가 화면의
-     *  선택지를 승인해 버린다 — 롤링이 같은 위험을 훅 알림으로 막는다(rolling.ts 의 onHookEvent).
-     *  훅이 아니라 바쁨으로 막는 것은 더 거친 근사다: 대화상자가 떴는데 바쁨이 풀리는 런타임이
-     *  있으면 이 가드는 새어 나간다. 그 경우를 실측한 적은 없다. */
-    const nudgeSleepingCoordinators = async (): Promise<void> => {
-      if (!orch || !orch.deps.enabled()) return
-      for (const m of unreadUpwardMail(orch.deps.getState(), {
-        nowMs: Date.now(),
-        staleMs: COORDINATOR_NUDGE_MS
-      })) {
-        if (busyState.get(m.sessionId) === true) continue
-        // 세션이 없으면(사용자가 닫았다) 깨울 것이 없다 — 그 자리는 되띄우기가 맡는다.
-        if (!core.sessions.list().some((x) => x.id === m.sessionId && x.status !== 'exited')) continue
-        // **영어다.** 코디네이터는 영어로 인계받았다(handover.ts) — 롤링이 워커의 재개 문구를
-        // 앱의 UI 언어로 타이핑하다 같은 어긋남을 겪었고, 그 주석이 이유를 적어 두었다.
-        core.sessions.write(
-          m.sessionId,
-          `Your Run has ${m.messageIds.length} unread message(s). Run \`astera check --json\`, ` +
-            'handle them, ack the batch, then go back to `astera check --wait`.'
-        )
-        core.sessions.write(m.sessionId, '\r')
-        orchLog(
-          `coordinator nudged run=${m.runId} session=${m.sessionId} unread=${m.messageIds.length}`
-        )
-      }
+      //
+      // The rule — this lost-sight refusal, then the Run whose slot names the session — is
+      // `coordinatorReleaseOf` (releaseDefer.ts), so its tests read the rule this runs.
+      if (!orch) return
+      const released = coordinatorReleaseOf(orch.deps.getState(), sessionId, exitCode)
+      if (!released) return
+      await orch.deps.setState(released.state)
+      orchLog(`coordinator gone run=${released.run.id} session=${sessionId} — restart it from the Jobs list`)
     }
 
     orchFireTimer = setInterval(() => {
-      void orchFireTick().catch((e) => orchLog(`fire tick failed: ${String(e)}`))
-      void nudgeSleepingCoordinators().catch((e) => orchLog(`nudge failed: ${String(e)}`))
+      // 서버가 서 있지 않으면 발화하지 않고 **무장을 버린다** — 그 이유는 forgetArming 에 있다
+      // (core/orchestration/exec/dispatchLoop.ts). 앞에 모는 Host 가 있으면 발화도 깨우기도 그 Host 가
+      // 하고, 앱은 **무장만 한다** — 사이드바의 다음 발화 시각이 그 무장에서 온다(N3, appTimerTick).
+      appTimerTick(loop, { serving: orch !== null, hostDrives: hostDrives(), log: orchLog })
     }, ORCH_FIRE_TICK_MS)
     // Installing the discovery stub(s) — without one there is no path by which an agent finds the
     // matching feature. **Done for every claude and codex account**: the path is the same
@@ -4485,7 +3721,8 @@ export function registerIpc(
     // installStubsForCurrentToggles's own comment for why the settings handlers call it too.
     // **A remaining limit**: an account added while everything relevant is already on does not get
     // the stub until the next app start or a toggle flip — hooking accounts.onChanged would write to
-    // user files on every account edit, and that trade-off is out of scope here.
+    // user files on every account edit, and that trade-off is out of scope here. `astera skills
+    // install` (src/cli/skills.ts) is the way to fill that gap without a restart.
     installStubsForCurrentToggles()
     orchWiring?.onStarted({
       stop: () => {
@@ -4494,19 +3731,15 @@ export function registerIpc(
         // 미뤄 둔 exit 를 버린다. 남겨 두면 서버가 내려간 뒤에 setState 가 돌 수 있다.
         orchRollTap?.dispose()
         orchRollTap = null
+        // 같은 이유로 창 안에 남은 코디네이터 칸 해제도 버린다(S6 R14, releaseDefer.ts).
+        coordinatorReleases.cancelAll()
         if (orchFireTimer) {
           clearInterval(orchFireTimer)
           orchFireTimer = null
         }
-        // Delete the token file. unlinkSync because this is called from will-quit, where an asynchronous
-        // delete has no guarantee of completing before the process ends. Leaving the shuttle behind is
-        // harmless (it holds no token).
-        try {
-          unlinkSync(infoPath)
-        } catch {
-          /* Already gone — ignore */
-        }
-        void server.close()
+        // Nothing to tear down beyond this: there is no socket of this app's own to close and no
+        // token file to remove any more. The shuttle stays where it is — it holds no secret, and it
+        // is rewritten at every boot.
       },
       onRolled: (oldSessionId, newInfo) => {
         // 롤링의 send 탭은 동기다 — 기다릴 자리가 없어 던져 놓고 간다. onRolled 는 스스로 예외를
@@ -4552,7 +3785,7 @@ export function registerIpc(
       // 금지한 전체 인계가 아니라, 그 절이 이미 허용한 한 줄이다. Job 워커의 함수가 다른 이유(spec
       // 쓰기 실패 등)로 null 을 돌린 경우도 `tabFallback` 이 참이면 같은 이유로 이쪽으로 내려간다 —
       // 구조화된 Job 인계를 못 만들었다고 git+대화 기반의 일반 브리핑까지 포기할 이유는 없다.
-      // `tabFallback` 이 거짓이면(rolling.ts/codexRolling.ts 의 ordinary-path 'handover' 호출,
+      // `tabFallback` 이 거짓이면(claudeCoordinator.ts/codexCoordinator.ts 의 ordinary-path 'handover' 호출,
       // F3) 탭 세션에 대해서는 Job 과 마찬가지로 그냥 `null` 이다 — 부르는 쪽이 `chain.prompt` 로
       // 저하한다.
       resumeText: (sessionId, form, tabFallback) =>
@@ -4575,15 +3808,11 @@ export function registerIpc(
       }
     })
   }
-  if (
-    orchWiring &&
-    (core.appSettings.getOrchestrationEnabled() ||
-      core.appSettings.getWorkUnitTrackingEnabled() ||
-      core.appSettings.getAgentBrowserEnabled() ||
-      core.appSettings.getResumeStrategy() === 'smart' ||
-      core.appSettings.getJobContinuityEnabled())
-  )
-    void startOrch().catch((err) => orchLog(`startup failed: ${String(err)}`))
+  // **Unconditional.** Orchestration is not a toggle any more, so there is no combination of
+  // settings under which the server stays down: Jobs is always in the rail, `astera` always has a
+  // Host to reach, and every session it starts is given the CLI. The toggles that used to be the
+  // other four reasons to come here now only decide which commands are answered.
+  if (orchWiring) void startOrch().catch((err) => orchLog(`startup failed: ${String(err)}`))
   ipcMain.on('sessions.write', (_e, id, data) => core.sessions.write(id, data))
   ipcMain.on('sessions.resize', (_e, id, cols, rows) => core.sessions.resize(id, cols, rows))
   ipcMain.on('sessions.ack', (_e, id, bytes) => core.sessions.ack(id, bytes))
@@ -4625,8 +3854,11 @@ export function registerIpc(
   // down as spawn opts.
   // The key is the per-provider CLI session id (claude=claudeSessionId, codex=rollout sessionId) — both
   // coordinators store under that id in the same rolling.json.
-  ipcMain.handle('sessions.resumeDefaults', (_e, sessionId: string) => ({
-    roll: core.rollConfig.get(sessionId),
+  ipcMain.handle('sessions.resumeDefaults', async (_e, sessionId: string) => ({
+    // S6 R9: a chain the Host owns keeps its config in the Host's own file; this app's file first.
+    roll:
+      core.rollConfig.get(sessionId) ??
+      (await readRollConfigKey(hostRollConfigPath(app.getPath('userData')), sessionId)),
     schedule: core.schedulerConfig.get(sessionId)
   }))
 
@@ -4638,9 +3870,23 @@ export function registerIpc(
   ipcMain.handle('scheduler.state', (_e, sessionId: string) => scheduler?.stateOf(sessionId) ?? null)
   // The roll banner's snapshot, read once per session as the renderer adopts it — the mirror of
   // scheduler.state. A session is in at most one coordinator; ask claude first, codex second.
-  ipcMain.handle('rolling.state', (_e, sessionId: string) =>
-    rolling?.stateOf(sessionId) ?? codexRolling?.stateOf(sessionId) ?? null
-  )
+  // A session the Host rolls is in neither (S6 §3.4): the last state it pushed, and failing that — a
+  // renderer that mounted before this app heard any push — the Host is asked, for a session this app
+  // knows is the Host's. Any failure is null.
+  ipcMain.handle('rolling.state', async (_e, sessionId: string): Promise<RollStateEvent | null> => {
+    const known = rolling?.stateOf(sessionId) ?? codexRolling?.stateOf(sessionId) ?? hostRollView.stateOf(sessionId)
+    if (known) return known
+    // Only a session the Host owns by this app's knowledge (fix round 1, 4): a plain app session is
+    // answered here, with no round trip to a Host that may not be answering.
+    if (!hostOwned.has(sessionId) && !hostRollView.knows(sessionId)) return null
+    if (!hostSpeaksRolling(hostClient?.status() ?? { connected: false, features: [] })) return null
+    try {
+      const r = await orchCall({ cmd: 'roll-state', args: { sessionId }, sessionId: '' })
+      return r.status === 200 ? ((r.body as { state?: RollStateEvent | null } | null)?.state ?? null) : null
+    } catch {
+      return null
+    }
+  })
 
   // history
   ipcMain.handle('history.page', (_e, req?: HistoryPageRequest) => core.history.page(req))
@@ -4657,10 +3903,13 @@ export function registerIpc(
   // 판정은 core 의 goneWorktreeProjects 가 한다(루트 밑인가 + 없는가). 후보 목록은
   // knownProjectPaths 가 projectsPage 와 **같은 캐시**에서 주므로 디렉터리를 다시 훑지 않는다.
   ipcMain.handle('history.projectsPage', async (_e, req?: HistoryProjectsPageRequest) => {
-    const gone = goneWorktreeProjects(
+    // 폴더 확인은 비동기다(worktreePresence, core/worktrees/presence.ts). 동기 existsSync 는 끊긴
+    // 네트워크 공유 위의 루트에서 히스토리를 여는 것만으로 메인 스레드를 세웠다. 확인하지 못한
+    // 폴더는 감추지 않는다.
+    const gone = await goneWorktreeProjects(
       await core.history.knownProjectPaths(),
       core.worktrees.getRoot(),
-      existsSync
+      (p) => worktreePresence.refresh(p)
     )
     return core.history.projectsPage(
       gone.length === 0 ? req : { ...req, hiddenPaths: [...(req?.hiddenPaths ?? []), ...gone] }
@@ -4706,17 +3955,33 @@ export function registerIpc(
     if (r) return `RUN:${r.configName}`
     return null
   }
-  ipcMain.handle('worktrees.list', () => listWithStatus(core.worktrees))
-  ipcMain.handle('worktrees.create', (_e, opts: { repoPath: string; name?: string; baseRef?: string }) =>
-    createWorktree({
-      repoPath: opts.repoPath,
-      name: opts.name,
-      baseRef: opts.baseRef,
-      registry: core.worktrees
-    })
+  ipcMain.handle('worktrees.list', () => listWithStatus(core.worktrees, (p) => worktreePresence.refresh(p)))
+  // Creation the new-session dialog watches: with an opId, the stage and copy progress go to the
+  // renderer (throttled to about 4 a second) and worktrees.cancelCreate can stop it. Without one it is
+  // the plain call it always was. createOps.ts holds the bookkeeping so it is testable without electron.
+  const worktreeCreates = createWorktreeOps({
+    create: createWorktree,
+    send: (ev) => send('worktree:createProgress', ev)
+  })
+  ipcMain.handle(
+    'worktrees.create',
+    (_e, opts: { repoPath: string; name?: string; baseRef?: string; opId?: string }) =>
+      worktreeCreates.create(
+        {
+          repoPath: opts.repoPath,
+          name: opts.name,
+          baseRef: opts.baseRef,
+          registry: core.worktrees
+        },
+        opts.opId
+      )
+  )
+  ipcMain.handle('worktrees.cancelCreate', (_e, opId: unknown) =>
+    typeof opId === 'string' ? worktreeCreates.cancel(opId) : false
   )
   // Base-branch candidates for the new-session worktree picker. detected rides along so the select can
   // preselect what the automatic path would have chosen — a separate IPC would mean a second round trip.
+  // branches is null when git did not answer; the dialogs say "could not check" rather than show [].
   ipcMain.handle('worktrees.listBranches', async (_e, repoPath: string) => ({
     branches: await listBranches(repoPath),
     detected: await detectBaseRef(repoPath)
@@ -4724,7 +3989,9 @@ export function registerIpc(
   ipcMain.handle('worktrees.remove', (_e, id: string, opts?: { force?: boolean }) =>
     removeWorktree({ id, force: opts?.force === true, registry: core.worktrees, isPathInUse })
   )
-  ipcMain.handle('worktrees.isGitRepo', (_e, dir: string) => repoRoot(dir))
+  // Short deadline, and `unknown` rather than "not a repo" when git does not answer in time (a UNC or
+  // \\wsl$ folder): the dialog keeps Start open then and only holds back the worktree option.
+  ipcMain.handle('worktrees.isGitRepo', (_e, dir: string) => probeRepoRoot(dir))
   ipcMain.handle('worktrees.getRoot', () => core.worktrees.getRoot())
   ipcMain.handle('worktrees.setRoot', (_e, root: string | null) => core.worktrees.setRoot(root))
   ipcMain.handle('worktrees.pushState', (_e, repoPath: string, bases: string[]) =>
@@ -4954,14 +4221,17 @@ export function registerIpc(
     return { dataUrl: `data:${mime};base64,${buf.toString('base64')}` }
   })
   ipcMain.handle('files.write', async (_e, filePath: string, content: string) => {
-    await assertAllowedPath(filePath)
-    const tmp = filePath + '.cmtmp'
-    await fs.writeFile(tmp, content, 'utf8')
+    const root = await assertAllowedPath(filePath)
+    // The temporary file and the rename are the editor's only writes, and both used to trust the
+    // lexical check above: a link a repository planted at the temporary name, or a linked directory
+    // inside the root, put the write outside it (security review 2026-09-28). core/files/atomicWrite.ts
+    // opens the temporary file exclusively under a name nobody can plant, and resolves the directory
+    // for real against the root, the way readDataUrl does for reads.
     try {
-      await fs.rename(tmp, filePath)
+      await writeWithinRoot(root, filePath, content)
     } catch (e) {
-      // Clean up so a failed rename (antivirus, a lock, the disk) leaves no temporary file behind, then propagate the error
-      await fs.rm(tmp, { force: true }).catch(() => {})
+      if (e instanceof Error && e.message.startsWith(OUTSIDE_ROOT))
+        throw new Error(t(core.lang, 'files.error.pathNotAllowed'))
       throw e
     }
   })
@@ -5010,7 +4280,11 @@ export function registerIpc(
   // The same assertAllowedPath as run.list: the path decides which Runs come back, so an arbitrary
   // one would let the renderer enumerate Runs created outside every registered project.
   // An empty snapshot before orchestration has started (toggle off, or startup still running or
-  // failed) — there is no state to read yet, and bootOrch pushes once as soon as there is.
+  // failed) — there is no state to read yet, and bootOrch pushes once as soon as there is. **Why the
+  // Host is not in it**: that is one fact about this app, not about this project, and a reply the
+  // renderer only asks for with a project open cannot carry it (ruling F41). `orch.hostGate` answers
+  // it instead, and is answered whether or not anything here has ever run.
+  ipcMain.handle('orch.hostGate', () => orchHostGate)
   ipcMain.handle('orch.list', async (_e, projectPath: string) => {
     const request = ++orchRequest
     // The guard runs on the path as sent — it decides what the renderer is allowed to name, and the
@@ -5023,7 +4297,19 @@ export function registerIpc(
     // renderer because the registry is main's (core.worktrees), and applied to orchProject as well
     // so the push path folds for the same project this reply did.
     const project = repoPathOf(core.worktrees.list(), projectPath)
-    const snapshot = orch
+    // **여기가 프로젝트가 등록되는 자리다.** 이 핸들러는 사람이 프로젝트를 열 때마다 불리고, 그
+    // 경로는 방금 저장소로 되돌려졌다 — 앱이 "프로젝트" 라고 부르는 값 그 자체다. 따로 등록 화면을
+    // 두지 않는 이유가 이것이다: 사람에게 이미 한 일을 다시 시키지 않는다.
+    //
+    // **읽기 핸들러가 쓰기를 한다.** 그래도 되는 것은 ensureProject 가 이미 있는 프로젝트에는
+    // 같은 state 를 그대로 돌려주기 때문이다 — 그래서 저장은 저장소마다 딱 한 번이고, 그 뒤로는
+    // 이 줄이 배열 조회 하나로 끝난다.
+    if (orch) {
+      const before = orch.deps.getState()
+      const { state } = ensureProject(before, { path: project, now: new Date().toISOString() })
+      if (state !== before) await orch.deps.setState(state)
+    }
+    const snapshot: OrchSnapshot = orch
       ? orchSnapshotOf(orch.deps.getState(), project)
       : { runs: [], projectFolderBusy: false }
     // Superseded while awaiting — by an unwatch, or by a later list for another project. The caller
@@ -5038,7 +4324,7 @@ export function registerIpc(
   })
   // 스냅샷에 태우지 않고 따로 읽는 이유는 크기다 — Message.body 에는 검증 출력 꼬리가 실리므로
   // 프로젝트의 모든 Run 의 모든 이벤트를 매 쓰기마다 미는 것은 불가능하다. 모달이 열릴 때만 온다.
-  ipcMain.handle('orch.runDetail', async (_e, projectPath: string, runId: string) => {
+  ipcMain.handle('orch.runDetail', async (_e, projectPath: string, runId: string, opts?: { journalPages?: unknown }) => {
     // orch.list 와 같은 가드, 같은 이유 — 경로가 어느 Run 을 볼 수 있는지를 정한다
     await assertAllowedPath(projectPath)
     if (!orch) return { events: [], layers: [], deps: {}, cyclic: [] }
@@ -5046,20 +4332,28 @@ export function registerIpc(
     const state = orch.deps.getState()
     // **소유 판정을 복제하지 않는다.** 이 프로젝트의 Run 목록에 없는 id 는 읽지 않는다 — 규칙을
     // 다시 쓰면 orch.list 가 막는 Run 을 이 핸들러가 통과시키는 우회로가 된다.
-    if (!runsForProject(state, project, core.worktrees.list()).some((r) => r.id === runId)) {
+    if (!idsOfProject(state, project, core.worktrees.list()).has(runId)) {
       orchLog(`orch.runDetail: run ${runId} does not belong to ${project}`)
       return { events: [], layers: [], deps: {}, cyclic: [] }
     }
+    // 사이드바의 Job 줄은 계획의 id 를 보낸다 — 상세는 언제나 한 회차의 것이므로 가장 최근 회차로
+    // 푼다(resolveRunId). 아직 돌지 않은 Job 이면 보여 줄 기록은 없지만 **그림은 있다**: 그 계획의
+    // 정의 Task 다(layersOf 가 계획의 id 를 받는다). 빈 그림을 주면 "새 작업" 으로 짠 계획이 실행을
+    // 누르기 전까지 빈 창으로 보인다.
+    const detailRunId = resolveRunId(state, runId)
+    if (detailRunId === undefined) return { events: [], ...layersOf(state, runId) }
     const known = new Set(core.sessions.list().map((s) => s.id))
-    const { layers, deps, cyclic } = layersOf(state, runId)
+    const { layers, deps, cyclic } = layersOf(state, detailRunId)
     // The journal's losses are merged in rather than derived: an attempt the restart could not find
     // leaves nothing in the projection to read it back from — only the journal remembers it happened.
-    const events = [
-      ...timelineFor(state, runId, (id) => known.has(id)),
-      ...(continuity?.lostEventsFor(runId, state) ?? []),
-      ...(continuity?.recoveryEventsFor(runId, state) ?? [])
-    ].sort((a, b) => a.at.localeCompare(b.at))
-    return { events, layers, deps, cyclic }
+    // Stage 3 T1: the newest `journalPages` pages of those rows only, and a journal the Host holds
+    // locked answers at once with the rows last read (`journal.busy`); appJournal clamps the count.
+    const journalPages = typeof opts?.journalPages === 'number' ? opts.journalPages : 1
+    const journal = appJournal.timeline(detailRunId, state, journalPages)
+    const events = [...timelineFor(state, detailRunId, (id) => known.has(id)), ...journal.events].sort((a, b) =>
+      a.at.localeCompare(b.at)
+    )
+    return { events, layers, deps, cyclic, journal: { busy: journal.busy, older: journal.older, capped: journal.capped } }
   })
   /** 한 Task 가 왜 완료 정책을 못 넘었는가 — 화면이 블록을 펼칠 때 한 번 부른다(설계 §2.2).
    *
@@ -5072,11 +4366,13 @@ export function registerIpc(
     if (!orch) return null
     const project = repoPathOf(core.worktrees.list(), projectPath)
     const state = orch.deps.getState()
-    if (!runsForProject(state, project, core.worktrees.list()).some((r) => r.id === runId)) {
+    if (!idsOfProject(state, project, core.worktrees.list()).has(runId)) {
       orchLog(`orch.completion: run ${runId} does not belong to ${project}`)
       return null
     }
-    return completionForTaskOf(state.tasks, runId, taskId)
+    const completionRunId = resolveRunId(state, runId)
+    if (completionRunId === undefined) return null
+    return completionForTaskOf(state.tasks, completionRunId, taskId)
   })
   // orch.command 의 args 에서 Run id·Task id·Dispatch id 를 읽는 키 — 명령마다 다르고, 짐작이 아니라
   // server.ts 의 switch 를 다시 열어 확인한 값만 적었다: task-create 는 args.runId, run-start·
@@ -5131,8 +4427,8 @@ export function registerIpc(
       const v = args[key]
       return typeof v === 'string' && v.length > 0 ? v : null
     }
-    const runBelongs = (runId: string): boolean =>
-      runsForProject(state, project, core.worktrees.list()).some((r) => r.id === runId)
+    const owned = idsOfProject(state, project, core.worktrees.list())
+    const runBelongs = (id: string): boolean => owned.has(id)
 
     const runKey = RUN_ID_ARG[cmd]
     const runId = runKey ? strArg(runKey) : null
@@ -5146,7 +4442,7 @@ export function registerIpc(
     if (taskId) {
       const task = state.tasks.find((t) => t.id === taskId)
       if (!task) return null
-      return runBelongs(task.runId) ? null : `task ${taskId} does not belong to ${project}`
+      return runBelongs(task.runId ?? task.jobId ?? '') ? null : `task ${taskId} does not belong to ${project}`
     }
 
     const dispatchKey = DISPATCH_ID_ARG[cmd]
@@ -5155,7 +4451,9 @@ export function registerIpc(
       const dispatch = state.dispatches.find((d) => d.id === dispatchId)
       const task = dispatch ? state.tasks.find((t) => t.id === dispatch.taskId) : undefined
       if (!task) return null
-      return runBelongs(task.runId) ? null : `dispatch ${dispatchId} does not belong to ${project}`
+      return runBelongs(task.runId ?? task.jobId ?? '')
+        ? null
+        : `dispatch ${dispatchId} does not belong to ${project}`
     }
 
     return null
@@ -5175,7 +4473,9 @@ export function registerIpc(
     'orch.command',
     async (_e, projectPath: string, cmd: string, args: Record<string, unknown>) => {
       await assertAllowedPath(projectPath)
-      if (!orch) return { status: 409, body: { error: 'orchestration disabled' } }
+      // The server is not up — a boot that failed, or one still in flight. Not 'orchestration is
+      // off': there is no such state any more, and a person told that would go looking for a switch.
+      if (!orch) return { status: 409, body: { error: 'orchestration is not running yet' } }
       // **범위는 렌더러가 지금 보고 있는 것이다.** 소유 판정이 답해야 하는 물음은 "이 렌더러가 남의
       // 프로젝트 Run 을 부르는가" 이고, 렌더러는 자기가 **보여 준** Run 만 이름 부른다. 무엇을
       // 보여 줬는지는 orchProject 가 알고 있다 — orch.list 가 정규화해 둔 저장소 경로다.
@@ -5199,7 +4499,23 @@ export function registerIpc(
         orchLog(`orch.command: rejected ${cmd} — ${mismatch}`)
         return { status: 403, body: { error: mismatch } }
       }
-      return orchHandleCommand(orch.deps, { sessionId: UI_CALLER }, cmd, args ?? {})
+      try {
+        return await orchHandleCommand(orch.deps, { sessionId: UI_CALLER }, cmd, args ?? {})
+      } catch (err) {
+        // **A write the Host refused because the state had moved on** (ruling F56). It must not
+        // vanish: this is a button the person pressed, the thing they pressed it for did not happen,
+        // and the screen they decided from was already stale. Answered as a 409 so every caller's
+        // existing failure branch says so out loud — the renderer's Jobs handlers all toast on
+        // `status >= 400` — and logged with the versions, which is the half a toast cannot carry.
+        //
+        // The mirror has already been put onto the Host's current state by the time this is caught
+        // (see `OrchStateConflict`), so the next thing the person does is decided from the truth.
+        if (err instanceof OrchStateConflict) {
+          orchLog(`orch.command: ${cmd} was refused — ${err.message}`)
+          return { status: 409, body: { error: err.message, conflict: 'state-moved-on' } }
+        }
+        throw err
+      }
     }
   )
   // The way out, the same as files.unwatch and git.unwatch: the Jobs view unmounts on a rail toggle,
@@ -5213,10 +4529,10 @@ export function registerIpc(
   })
 
   // How It Works: understanding.json persistence. Unlike OrchestrationStore above (built inside
-  // bootOrch, which only runs when the orchestration toggle is on), this has nothing to do with agent
-  // orchestration — a project's stored explanation must be readable whether or not that toggle is on,
-  // and the toggle defaults to off. So it is constructed here, unconditionally, at the same scope as
-  // assertAllowedPath (needed by the handler below) rather than beside OrchestrationStore.
+  // bootOrch, which only runs if the server comes up), this has nothing to do with agent
+  // orchestration — a project's stored explanation must be readable even on a start where the server
+  // failed. So it is constructed here, unconditionally, at the same scope as assertAllowedPath
+  // (needed by the handler below) rather than beside OrchestrationStore.
   const understanding = new UnderstandingStore(
     path.join(app.getPath('userData'), 'understanding.json')
   )
@@ -5269,7 +4585,9 @@ export function registerIpc(
     now: () => new Date().toISOString(),
     // Commit subjects in the unit's range — material for the write-up. readRange is the same reader
     // the collector uses for git provenance, so there is no second way to ask this question.
-    readCommits: async (root, from, to) => (from && to ? (await readRange(root, from, to)).subjects : []),
+    // A range git could not read (null) gives no material — the record is still written, just without
+    // commit subjects, which is what the pipeline already does when this reader throws.
+    readCommits: async (root, from, to) => (from && to ? ((await readRange(root, from, to))?.subjects ?? []) : []),
     // 배경 재생성이 끝났다고 화면에 알린다. **접힌 키를 그대로 실어 보낸다** — 렌더러는 그 접기를
     // 모르므로(워크트리 세션이면 원 저장소의 키다) 값을 비교하지 않고 다시 읽기만 한다.
     // 그쪽 주석이 그 이유를 적고 있다.
@@ -5287,8 +4605,8 @@ export function registerIpc(
 
   // Work Unit detection: workUnits.json persistence, and the collector that fills it. Built here for
   // exactly the reason the understanding store above is — this has nothing to do with agent
-  // orchestration, so it must not go inside bootOrch, which only runs when the orchestration toggle is
-  // on and that toggle defaults to off. **Built unconditionally, started conditionally**: the object
+  // orchestration, so it must not go inside bootOrch, which only runs if the server comes up.
+  // **Built unconditionally, started conditionally**: the object
   // always exists, so every trigger site (session data, session exit, history updates, the git
   // watcher) can call it on a default install, and it is start() that the work unit toggle gates.
   // Those trigger sites appear earlier in this function than this declaration and close over it;
@@ -5355,6 +4673,7 @@ export function registerIpc(
     git: { readRef: readGitRef, isAncestor: isAncestorOf, changedFiles: readChangedFiles, readRange },
     now: () => Date.now(),
     pendingGitOps: () => workUnitCollector.getPendingGitOps(),
+    hostMerges: () => readHostMerges(hostMergesPathIn(app.getPath('userData'))),
     // **수집기가 자기 `.git` 감시자를 갖는다.** 아래(git.watch)의 감시자는 탐색기의 것이고,
     // 탐색기 패널이 떠 있을 때만 산다 — 렌더러의 useGitStatus 가 언마운트에서 git.unwatch 를
     // 부르므로, 사이드바를 Jobs 로 바꾸면 수집기는 git 이벤트를 하나도 받지 못했다. 트랜스크립트
@@ -5385,7 +4704,7 @@ export function registerIpc(
     // Spec §5.4 — the same question server.ts asks before accepting session-task-*: is this
     // session's work already going to be recorded by a Run, at some level, when that Run finishes?
     inRun: (sessionId) => {
-      if (!orch || !orch.deps.enabled()) return false
+      if (!orch) return false
       const st = orch.deps.getState()
       if (st.dispatches.some((d) => d.sessionId === sessionId)) return true
       return st.runs.some(
@@ -5490,7 +4809,7 @@ export function registerIpc(
     const tr = (key: string, params?: Record<string, string | number>): string =>
       t(core.lang, key as MessageKey, params)
     // The plan and every step's command, before anything starts: a chain with a broken step must not
-    // leave the steps before it already running (main/run/prepare.ts).
+    // leave the steps before it already running (core/run/prepare.ts).
     const { plan, prepared, projectName } = await prepareLaunch({
       projectPath,
       rootId: configId,
@@ -5575,9 +4894,18 @@ export function registerIpc(
   ipcMain.handle('run.stop', async (_e, runId: string) => {
     // A user stopping a validation run is "could not prove it", not "the work is wrong" — leave the mark
     // so the exit that follows goes to the Gate rather than being settled as a failure
-    // (TaskValidator.markStopped).
-    if (core.run.get(runId)?.validation) orchValidator?.markStopped(runId)
-    return core.run.stop(runId)
+    // (TaskValidator.markStopped). While a Host that drives runs the validation, the mark is its
+    // validator's: the stop goes to it as `validation-stop`, which marks and kills, and the app does
+    // not kill the run as well (the rules, and the degraded path, are stopRunFromPanel's).
+    await stopRunFromPanel({
+      runId,
+      isValidation: core.run.get(runId)?.validation === true,
+      hostDrives: orchHostDrives(),
+      askHost: (id) => orchCall({ cmd: 'validation-stop', args: { runId: id }, sessionId: '' }),
+      markStopped: (id) => orchValidator?.markStopped(id),
+      stop: (id) => core.run.stop(id),
+      log: orchLog
+    })
   })
   // The run list's ✕. Like run.stop this acts on a run that already exists, so there is no path guard —
   // an unknown id does nothing.
@@ -5597,7 +4925,7 @@ export function registerIpc(
   })
   ipcMain.on('run.write', (_e, runId: string, data: string) => core.run.write(runId, data))
   ipcMain.on('run.resize', (_e, runId: string, cols: number, rows: number) => core.run.resize(runId, cols, rows))
-  // 저장 시점의 cwd 검사 — 규칙과 그 근거는 main/run/prepare.ts 의 resolveRunCwd 를 보라. 그 함수는
+  // 저장 시점의 cwd 검사 — 규칙과 그 근거는 core/run/prepare.ts 의 resolveRunCwd 를 보라. 그 함수는
   // prepareRun 이 id 로 구성을 찾는 일까지 하므로 저장 경로에서는 쓸 수 없어, 같은 규칙을 여기 따로 둔다.
   const assertConfigCwd = async (projectPath: string, cwd: unknown): Promise<void> => {
     if (cwd === undefined || cwd === null || cwd === '') return
@@ -5634,8 +4962,9 @@ export function registerIpc(
   ipcMain.handle('terminal.close', (_e, id: string) => core.terminal.close(id))
 
   // The live-update watcher: watches the explorer root and refreshes the tree and viewer through
-  // files:changed. The path guard is reused — watching an arbitrary path is refused.
-  const fileWatcher = new FileWatcher((change) => send('files:changed', change))
+  // files:changedBatch — one message per batching window, not one per event. The path guard is reused —
+  // watching an arbitrary path is refused.
+  const fileWatcher = new FileWatcher((batch) => send('files:changedBatch', batch))
   ipcMain.handle('files.watch', async (_e, root: string) => {
     await assertAllowedPath(root)
     await fileWatcher.watch(root)
@@ -5692,6 +5021,32 @@ export function registerIpc(
   // ---- File operations. Validation runs a second time through the same pure module the renderer uses
   // (ops.ts) — this is a trust boundary.
   // assertAllowedPath is applied to both source and destination, blocking operations outside the project.
+
+  /** A delete or copy that can take long (move, remove, copy, importExternal) may carry an opId; its
+   *  running entry count then goes to the renderer on 'files:opProgress' under that id, about 4 a
+   *  second (fileOpProgress.ts), so the explorer can show it is working rather than look frozen.
+   *  Without one nothing is sent — the calls are exactly what they were. */
+  const fileOpCounter = (opId: unknown): FileOpCounter | null =>
+    typeof opId === 'string' && opId !== ''
+      ? countFileOp((progress) => send('files:opProgress', { opId, progress }))
+      : null
+  /** `touched` are the paths the operation creates or removes: the explorer's watcher is closed while
+   *  it runs and reports them afterwards (fileWatcher.ts quietWhile — on Windows a watched bulk delete
+   *  ran at a dozen files a second). */
+  const withFileOp = async <T>(
+    opId: unknown,
+    touched: string[],
+    run: (c: FileOpCounter | null) => Promise<T>
+  ): Promise<T> => {
+    const counter = fileOpCounter(opId)
+    try {
+      // fsTree's and the Local History store's ROOT_UNREACHABLE (a folder that did not answer, refused
+      // before any call) in the person's language (fileOpGate.ts).
+      return await fileWatcher.quietWhile(touched, () => withUnreachableInLang(core.lang, () => run(counter)))
+    } finally {
+      counter?.end()
+    }
+  }
   ipcMain.handle('files.create', async (_e, parentDirPath: string, name: string, isDir: boolean) => {
     const reason = validateName(name)
     if (reason) throw new Error(t(core.lang, reason.key, reason.params))
@@ -5714,9 +5069,12 @@ export function registerIpc(
     await assertAllowedPath(from)
     const to = path.join(path.dirname(from), newName)
     await assertAllowedPath(to)
-    if (path.resolve(from) === path.resolve(to)) return to // exactly the same — no-op
-    // A rename that only changes case can fail or no-op on win32, so it goes via a temporary name
-    const caseOnly = from.toLowerCase() === to.toLowerCase()
+    // renamePlan (core/files/tree.ts) decides: exactly the same is a no-op; a case-only change where the
+    // filesystem ignores case (win32, darwin) goes via a temporary name; anything else — on linux a
+    // case-only change too, since the two names are two files — hits the exists check first.
+    const plan = renamePlan(from, to)
+    if (plan === 'noop') return to
+    const caseOnly = plan === 'viaTemp'
     if (!caseOnly) {
       try {
         await fs.access(to)
@@ -5745,7 +5103,7 @@ export function registerIpc(
     return to
   })
 
-  ipcMain.handle('files.move', async (_e, from: string, destDir: string) => {
+  ipcMain.handle('files.move', async (_e, from: string, destDir: string, opId?: string) => {
     const reason = canMove(from, destDir)
     if (reason) throw new Error(t(core.lang, reason.key, reason.params))
     await assertAllowedPath(from)
@@ -5754,6 +5112,7 @@ export function registerIpc(
     // path.basename does not normalise, so a `from` of the form '...\sub\..' can return '..' — that
     // would leak `to` out into destDir's parent, so it is checked before the existence check
     await assertAllowedPath(to)
+    await gateFolders(core.lang, [from, destDir])
     try {
       await fs.access(to)
       throw new Error(t(core.lang, 'files.error.alreadyExistsInDest', { name: path.basename(from) }))
@@ -5767,13 +5126,15 @@ export function registerIpc(
       // A different volume — copy, then remove the original. force:false gives the same guarantee as the
       // copy handler, so nothing is silently overwritten in the race window between the existence check
       // above and the actual copy.
-      await fs.cp(from, to, { recursive: true, errorOnExist: true, force: false })
-      await fs.rm(from, { recursive: true })
+      await withFileOp(opId, [from, to], async (c) => {
+        await copyTree(from, to, c ? () => c.entry('copy') : undefined)
+        await removeTree(from, c ? () => c.entry('delete') : undefined)
+      })
     }
     return to
   })
 
-  ipcMain.handle('files.remove', async (_e, targetPath: string, projectRoot: string) => {
+  ipcMain.handle('files.remove', async (_e, targetPath: string, projectRoot: string, opId?: string) => {
     await assertAllowedPath(targetPath)
     // The snapshot's key (projectPath) must be **exactly** the root the restore UI (localHistory.list)
     // queries. The matched root assertAllowedPath returns is the first match in the insertion order of
@@ -5785,44 +5146,23 @@ export function registerIpc(
     // really is under it.
     await assertAllowedPath(projectRoot)
     if (!isPathWithin(projectRoot, targetPath)) throw new Error(t(core.lang, 'files.error.pathNotAllowed'))
-    // The snapshot taken just before deleting. Deletion is still permanent — Local History is not a
-    // recycle bin but the safety net in front of one, so a failed snapshot (size limit exceeded, a
-    // permissions error, …) does not block the delete. The reason is reported through the return value
-    // and the delete proceeds. Size is measured inside core.localHistory.snapshot() on the same
-    // (non-dereferencing) basis as fs.cp, so it is not measured again here — it used to be measured here
-    // with dirSize (which dereferences), and that basis differed from what fs.cp actually copies, so the
-    // too-large verdict for a folder containing symbolic links disagreed with reality.
-    let snapshotSkipped: 'too-large' | 'failed' | null = null
-    let snapshotId: string | null = null
-    let isDir = false
-    try {
-      isDir = (await fs.stat(targetPath)).isDirectory()
-      const entry = await core.localHistory.snapshot(projectRoot, targetPath, isDir)
-      if (entry === null) snapshotSkipped = 'too-large'
-      else snapshotId = entry.id
-    } catch {
-      snapshotSkipped = 'failed'
-    }
-    try {
-      await fs.rm(targetPath, { recursive: true })
-    } catch (err) {
-      // Even when fs.rm fails the snapshot is already committed to the index — leaving it means a file
-      // that was not deleted shows up in Local History as "deleted", and pressing restore creates a
-      // duplicate next to the original.
-      // A file: deleting a single entry is atomic, so on failure the original is intact → discard the
-      // snapshot, nothing is lost. A folder: a recursive rm can fail after deleting some children, so
-      // discarding the snapshot would lose the only copy of children that are already gone → leave the
-      // snapshot in place.
-      // A failed discard is swallowed too — it must not mask the original fs.rm failure.
-      if (snapshotId !== null && !isDir) {
-        await core.localHistory.discard(projectRoot, snapshotId).catch(() => {})
-      }
-      throw err
-    }
-    return { snapshotSkipped, snapshotId }
+    // The snapshot taken just before deleting, then the delete (fsTree.ts removeWithSnapshot): a skipped
+    // snapshot (over the byte or entry cap) or a failed one does not block the delete — the reason comes
+    // back and the renderer tells the user. Size and entry count are measured inside
+    // core.localHistory.snapshot() on the same (non-dereferencing) basis as fs.cp, so they are not
+    // measured again here — measuring here with dirSize (which dereferences) once made the too-large
+    // verdict for a folder containing symbolic links disagree with reality.
+    return withFileOp(opId, [targetPath], (c) =>
+      removeWithSnapshot({
+        projectRoot,
+        targetPath,
+        history: core.localHistory,
+        onEntry: c ? (stage) => c.entry(stage) : undefined
+      })
+    )
   })
 
-  ipcMain.handle('files.copy', async (_e, from: string, destDir: string) => {
+  ipcMain.handle('files.copy', async (_e, from: string, destDir: string, opId?: string) => {
     await assertAllowedPath(from)
     await assertAllowedPath(destDir)
     // The same rule as the renderer's (ops.ts canCopy) is applied here as well — a caller that does not
@@ -5830,13 +5170,14 @@ export function registerIpc(
     // copying into itself.
     const copyReason = canCopy(from, destDir)
     if (copyReason) throw new Error(t(core.lang, copyReason.key, copyReason.params))
+    await gateFolders(core.lang, [from, destDir])
     const existing = await fs.readdir(destDir)
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
     // path.basename does not normalise, so a `from` of the form '...\sub\..' can return '..' as-is —
     // that would leak `to` out into destDir's parent, so `to` is checked separately from destDir
     await assertAllowedPath(to)
-    await fs.cp(from, to, { recursive: true, errorOnExist: true, force: false })
+    await withFileOp(opId, [to], (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
     return to
   })
 
@@ -5849,7 +5190,7 @@ export function registerIpc(
    *  canCopy is kept for the same reason files.copy keeps it — copying a folder into itself or into
    *  its own descendant is reachable from outside too (a parent directory of the project), and it
    *  should say so in the user's language rather than surface fs.cp's EINVAL. */
-  ipcMain.handle('files.importExternal', async (_e, from: string, destDir: string) => {
+  ipcMain.handle('files.importExternal', async (_e, from: string, destDir: string, opId?: string) => {
     // A relative source would be resolved against main's own working directory, which is not a place
     // this IPC has any business reading from. Everything the OS clipboard hands over is absolute, so
     // this only closes the case where the renderer sends something else.
@@ -5857,11 +5198,12 @@ export function registerIpc(
     await assertAllowedPath(destDir)
     const copyReason = canCopy(from, destDir)
     if (copyReason) throw new Error(t(core.lang, copyReason.key, copyReason.params))
+    await gateFolders(core.lang, [from, destDir])
     const existing = await fs.readdir(destDir)
     const name = uniqueName(existing, path.basename(from))
     const to = path.join(destDir, name)
     await assertAllowedPath(to)
-    await fs.cp(from, to, { recursive: true, errorOnExist: true, force: false })
+    await withFileOp(opId, [to], (c) => copyTree(from, to, c ? () => c.entry('copy') : undefined))
     return to
   })
 
@@ -5949,7 +5291,7 @@ export function registerIpc(
       // what keeps both consistent.
       const msg = err instanceof Error ? err.message : String(err)
       if (msg.startsWith('LOCAL_HISTORY_NOT_FOUND')) throw new Error(t(core.lang, 'localHistory.notFound'))
-      throw err
+      throw unreachableInLang(err, core.lang)
     }
   })
 
@@ -5966,11 +5308,12 @@ export function registerIpc(
   ipcMain.handle('slack.setConfig', async (_e, patch: Partial<SlackConfig>) => {
     if (!slack) return
     const normalized = await slack.store.patch(patch)
-    slack.notifier.applyConfig(normalized) // applied immediately on save
-    // The inbound socket is reconfigured immediately too — it disconnects when this turns off (any of
-    // botToken, channelId, or appToken missing), and reopens when the channel or token changes. With no
-    // change it does not reconnect (the dedup in SlackInboxController.apply).
-    slack.reconfigureInbox?.(normalized)
+    // Applied immediately on save by whichever process owns Slack: here (the notifier, and the inbound
+    // socket, which disconnects when this turns off — any of botToken, channelId, or appToken missing —
+    // and reopens when the channel or token changes; with no change it does not reconnect, the dedup in
+    // SlackInboxController.apply), or in the Slack-owning Host, told to read the file again with
+    // slack-reload. Undecided (the startup chain has not settled): nothing, the decision reads the file.
+    await slack.ownership.configChanged(normalized)
   })
 
   // The language setting. getLang returns both halves: `resolved` is what the renderer translates with,
@@ -5990,26 +5333,135 @@ export function registerIpc(
     onLangChanged?.()
   })
 
-  // The agent orchestration toggle. The same trust-boundary check as setLang — the value the renderer
-  // sent is validated before being written to disk.
-  ipcMain.handle('settings.getOrchestrationEnabled', () => core.appSettings.getOrchestrationEnabled())
-  ipcMain.handle('settings.setOrchestrationEnabled', async (_e, enabled: boolean) => {
-    if (typeof enabled !== 'boolean')
-      throw new Error(`INVALID_ORCHESTRATION_ENABLED: ${String(enabled)}`)
-    await core.appSettings.setOrchestrationEnabled(enabled)
-    // Turning it on starts it immediately (a no-op if already up). Why turning it off does not close it is in the startOrch comment.
-    if (enabled && orchWiring) await startOrch()
-    // Not gated on whether startOrch() just booted anything — the case this covers is exactly the one
-    // where it did not: the server was already up (started by another toggle), so bootOrch's own
-    // install never ran for this one. installStubsForCurrentToggles re-reads every toggle itself and
-    // no-ops when the server still is not up.
-    if (enabled) installStubsForCurrentToggles()
+  /**
+   * `astera` 를 보통 셸에서 부를 수 있게 만들기 (공개 CLI 설계 §10).
+   *
+   * **새로 만드는 것은 자리뿐이다.** 셔틀은 앱이 부팅마다 userData/orch 에 이미 쓴다. 이것은
+   * 같은 파일을 사람의 PATH 에서 닿는 자리에 한 벌 더 쓰고, 그 자리가 PATH 에 있는지 말해 준다.
+   *
+   * **셸 프로필을 고치지 않는다**(명세 §29). 한 줄을 건네고 실행하는 것은 사람이 한다 — 사람이
+   * 쓰지 않은 파일은 무언가 망가졌을 때 들여다볼 생각을 하지 않는 파일이다.
+   */
+  const cliBinDir = (): string =>
+    binDirFor({ platform: process.platform, env: process.env, home: app.getPath('home') })
+
+  const cliStatus = async (): Promise<CliInstallStatus> => {
+    const dir = cliBinDir()
+    let onPath = isOnPath({ dir, pathVar: process.env.PATH ?? '', platform: process.platform })
+    // win32: this app's own PATH was read once when it started, so a folder put on the user Path since
+    // (by Install, or by the person) is asked of the registry, which is what the next shell reads.
+    if (!onPath && process.platform === 'win32') {
+      onPath = await userPathHas({ dir, env: process.env }).catch((err: unknown) => {
+        orchLog(`the user Path could not be read: ${String(err)}`)
+        return false
+      })
+    }
+    return {
+      dir,
+      installed: shuttleNames().every((n) => existsSync(path.join(dir, n))),
+      onPath,
+      hint: pathHintFor({ dir, platform: process.platform }),
+      ...(process.platform === 'win32' ? { canEditUserPath: true as const } : {})
+    }
+  }
+
+  /** 공개 셔틀이 부를 대상. AppImage 면 임시 마운트가 아니라 AppImage 파일이다(appImageLaunchFor).
+   *  세션 셔틀(bootOrch)은 앱이 도는 동안만 살아서 마운트를 그대로 쓴다. */
+  const publicShuttleTarget = (
+    entryPath: string
+  ): { execPath: string; entryPath: string; appImage?: AppImageLaunch } => ({
+    execPath: process.execPath,
+    entryPath,
+    appImage:
+      process.platform === 'linux'
+        ? appImageLaunchFor({ env: process.env, execPath: process.execPath, entryPath })
+        : undefined
   })
+
+  ipcMain.handle('cli.status', () => cliStatus())
+  ipcMain.handle('cli.install', async (_e, opts?: { addToPath?: unknown }) => {
+    const entryPath = cliEntryPath()
+    // 번들을 못 찾으면 쓰지 않는다 — 잘못된 경로를 가리키는 셔틀은 없는 셔틀보다 나쁘다.
+    if (!entryPath) throw new Error('CLI_ENTRY_MISSING')
+    // win32: a non-ASCII install folder outside the user folders goes through a junction (installShuttle).
+    // When it cannot, the shuttle is written raw as before and the reply says why.
+    const { warnings } = await installShuttle({ dir: cliBinDir(), ...publicShuttleTarget(entryPath) })
+    for (const w of warnings) orchLog(`public astera shuttle: ${w.code}: ${w.detail}`)
+    // win32, and only when the person left the checkbox on: the folder goes on the user Path, the one
+    // entry this app adds (main/userPath.ts). A failure leaves the command installed and says why; the
+    // panel then shows the line to run by hand, as it always has.
+    let userPath: CliInstallStatus['userPath']
+    let userPathError: string | undefined
+    if (process.platform === 'win32' && opts?.addToPath === true) {
+      try {
+        userPath = await addToUserPath({ dir: cliBinDir(), env: process.env })
+      } catch (err) {
+        userPathError = err instanceof Error ? err.message : String(err)
+        orchLog(`the astera folder could not be put on the user Path: ${userPathError}`)
+      }
+    }
+    return {
+      ...(await cliStatus()),
+      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(userPath ? { userPath } : {}),
+      ...(userPathError ? { userPathError } : {})
+    }
+  })
+  // 되돌리기(명세 §29). 우리가 쓴 셔틀 파일만 지우고 폴더와 이웃 파일은 남긴다(removeShuttle).
+  ipcMain.handle('cli.uninstall', async () => {
+    // The junction stays while this app's own session shuttle goes through it (keepFor).
+    const entryPath = cliEntryPath()
+    await removeShuttle({
+      dir: cliBinDir(),
+      keepFor: entryPath ? { execPath: process.execPath, entryPath } : undefined
+    })
+    // win32: the folder's entry comes off the user Path too, and nothing else on it. The folder holds
+    // nothing of ours any more, so an entry for it (ours, or one the person added by the hint line)
+    // only points shells at an empty place.
+    let userPathError: string | undefined
+    let removed = false
+    if (process.platform === 'win32') {
+      try {
+        removed = (await removeFromUserPath({ dir: cliBinDir(), env: process.env })) === 'removed'
+      } catch (err) {
+        userPathError = err instanceof Error ? err.message : String(err)
+        orchLog(`the astera folder could not be taken off the user Path: ${userPathError}`)
+      }
+    }
+    return {
+      ...(await cliStatus()),
+      ...(removed ? { userPath: 'removed' as const } : {}),
+      ...(userPathError ? { userPathError } : {})
+    }
+  })
+  // 갱신(명세 §30). 앱이 옮겨 가면 깔아 둔 공개 셔틀은 예전 실행 파일을 가리킨다. 부팅마다 깔려 있는
+  // 것만 지금의 앱으로 다시 쓴다. 깔려 있지 않으면 깔지 않고, PATH 와 셸 프로필은 건드리지 않는다.
+  // 실패는 기록만 한다: 셔틀을 못 고쳤다고 앱이 서지 않을 이유는 없다.
+  //
+  // **설치본만 한다.** 폴더는 프로필을 가리지 않으므로(binDirFor), 개발본이 이것을 하면 사람이 설치본
+  // 으로 깐 셔틀을 저장소의 electron 으로 돌려 놓는다. 개발본에서 셔틀을 바꾸는 것은 버튼뿐이다.
+  if (app.isPackaged) {
+    const entryPath = cliEntryPath()
+    if (entryPath)
+      void syncShuttle({
+        dir: cliBinDir(),
+        ...publicShuttleTarget(entryPath),
+        onWarning: (w) => orchLog(`public astera shuttle: ${w.code}: ${w.detail}`)
+      }).then(
+        (plan) => {
+          if (plan === 'rewrite') orchLog(`public astera shuttle in ${cliBinDir()} now points at this app`)
+          else if (plan === 'foreign')
+            orchLog(`public astera shuttle in ${cliBinDir()} was left alone: a file there is not one Astera wrote`)
+        },
+        (err: unknown) =>
+          orchLog(`public astera shuttle sync failed: ${err instanceof Error ? err.message : String(err)}`)
+      )
+  }
 
   // The work unit tracking toggle. The same trust-boundary check as setLang — the value the renderer
   // sent is validated before being written to disk. Registered unconditionally here (not inside
-  // bootOrch, which only runs once orchestration is on) so the checkbox works on a default install
-  // exactly like every other setting.
+  // bootOrch, which only runs if the server comes up) so the checkbox works even on a start where it
+  // did not, exactly like every other setting.
   ipcMain.handle('settings.getWorkUnitTrackingEnabled', () =>
     core.appSettings.getWorkUnitTrackingEnabled()
   )
@@ -6021,10 +5473,12 @@ export function registerIpc(
     // 닫는다 — 스펙 §16.1 이다. 저장소를 다 읽기 전에 시작하지 않도록 load 를 먼저 기다린다.
     await workUnitsLoaded
     await workUnitCollector.onEnabledChanged(enabled)
-    // Same line the orchestration setter uses, for the same reason: /astera-task needs the server
-    // and the planted CLI. Turning it off does not close the server — see the startOrch comment.
+    // **A retry, not the reason the server exists.** It comes up at app start on its own; this only
+    // covers a start where that failed, so turning the toggle on gets a second chance rather than
+    // nothing. Turning it off does not close the server — see the startOrch comment.
     if (enabled && orchWiring) await startOrch()
-    // Same reasoning as the orchestration setter above — see installStubsForCurrentToggles's comment.
+    // The task stub has to reach every account now, and bootOrch's own install is long past — see
+    // installStubsForCurrentToggles's comment.
     if (enabled) installStubsForCurrentToggles()
   })
 
@@ -6033,8 +5487,19 @@ export function registerIpc(
   ipcMain.handle('settings.setAgentBrowserEnabled', async (_e, enabled: boolean) => {
     if (typeof enabled !== 'boolean') throw new Error(`INVALID_AGENT_BROWSER_ENABLED: ${String(enabled)}`)
     await core.appSettings.setAgentBrowserEnabled(enabled)
-    // Same line the other two setters use, for the same reason: browser-js needs the server and the
-    // planted CLI. Turning it off does not close the server — browserEnabled() is read per request.
+    // Same two lines the work-unit setter above uses, for the same two reasons. Turning it off does
+    // not close the server — browserEnabled() is read per request.
+    if (enabled && orchWiring) await startOrch()
+    if (enabled) installStubsForCurrentToggles()
+  })
+
+  // The agent app workspace toggle. Same trust boundary check and the same two lines as the agent
+  // browser's. The Host reads the file itself on every `app js` (readAgentAppEnabled), so nothing is
+  // sent to it: the write below is what it will read.
+  ipcMain.handle('settings.getAgentAppEnabled', () => core.appSettings.getAgentAppEnabled())
+  ipcMain.handle('settings.setAgentAppEnabled', async (_e, enabled: boolean) => {
+    if (typeof enabled !== 'boolean') throw new Error(`INVALID_AGENT_APP_ENABLED: ${String(enabled)}`)
+    await core.appSettings.setAgentAppEnabled(enabled)
     if (enabled && orchWiring) await startOrch()
     if (enabled) installStubsForCurrentToggles()
   })
@@ -6091,16 +5556,18 @@ export function registerIpc(
     if (strategy !== 'smart' && strategy !== 'original')
       throw new Error(`INVALID_RESUME_STRATEGY: ${String(strategy)}`)
     await core.appSettings.setResumeStrategy(strategy)
-    // Same two lines the other three toggles' setters use, for the same reason: `astera handoff`
-    // needs the server and the planted CLI, and the astera-handoff stub has to reach every account.
+    // Same two lines the other two toggles' setters use, for the same reasons: a retry for a start
+    // where the server did not come up, and the astera-handoff stub has to reach every account.
     // Turning it off does not close the server — handoffEnabled() is read per request.
     if (strategy === 'smart' && orchWiring) await startOrch()
     if (strategy === 'smart') installStubsForCurrentToggles()
+    // A Host that writes the journal reads the resume strategy for its checkpoints' handoff refs (P7).
+    appJournal.settingsChanged()
   })
 
   // 에이전트 권한 모드. 값 검사만 하고 부수 효과는 없다 — 이 값은 **다음 spawn 부터** 읽히고
   // (startWorker·startCoordinator 가 그때 getAgentPermissionMode 를 부른다), 이미 떠 있는 세션의
-  // 인수는 spawn 시점에 고정되므로 되돌릴 방법이 없다. 오케스트레이션 토글의 힌트가 같은 말을 한다.
+  // 인수는 spawn 시점에 고정되므로 되돌릴 방법이 없다. 이 토글의 힌트가 그 말을 한다.
   ipcMain.handle('settings.getAgentPermissionMode', () => core.appSettings.getAgentPermissionMode())
   ipcMain.handle('settings.setAgentPermissionMode', async (_e, mode: unknown) => {
     if (mode !== 'yolo' && mode !== 'manual') throw new Error(`INVALID_AGENT_PERMISSION_MODE: ${String(mode)}`)
@@ -6122,10 +5589,16 @@ export function registerIpc(
     if (enabled) installStubsForCurrentToggles()
     if (enabled && !was && orch) {
       // Turned on while Runs may be active: a baseline for every open worker, no invented history (spec §3.6)
+      // (here, or by the Host on journal-reload when it writes the journal, P7)
       openContinuity()
-      void continuity?.enable(orch.deps.getState()).catch((e) => orchLog(`continuity: enable failed: ${String(e)}`))
+      void appJournal.turnedOn(orch.deps.getState()).catch((e) => orchLog(`continuity: enable failed: ${String(e)}`))
     }
-    if (!enabled) closeContinuity() // the file stays; nothing is deleted (spec §3.4)
+    if (!enabled) {
+      // The file stays; nothing is deleted (spec §3.4). A Host that writes the journal reads the toggle
+      // only at start and on journal-reload, so it is told as well.
+      closeContinuity()
+      appJournal.settingsChanged()
+    }
     return r
   })
 
@@ -6157,6 +5630,8 @@ export function registerIpc(
    *  file counts. */
   ipcMain.handle('settings.getFirstRunAsked', () => core.appSettings.getFirstRunAsked())
   ipcMain.handle('settings.markFirstRunAsked', () => core.appSettings.markFirstRunAsked())
+  /** Whether this launch recovered app-settings.json from a damaged file — answered true once. */
+  ipcMain.handle('settings.takeRecoveryNotice', () => core.appSettings.takeRecoveryNotice())
   ipcMain.handle('settings.getDefaultSessionKind', () => core.appSettings.getDefaultSessionKind())
   ipcMain.handle('settings.setDefaultSessionKind', async (_e, kind: unknown) => {
     if (kind !== 'terminal' && kind !== 'chat')
@@ -6175,74 +5650,51 @@ export function registerIpc(
    * Windows update. macOS and Linux replace a running binary without complaint, so `hostRuntimeBase`
    * returns null there and nothing below runs.
    *
-   * Every failure here returns null rather than throwing. A Host spawned from the app executable is
-   * exactly today's behaviour — worse on update day, and completely fine otherwise — so there is no
-   * failure in this function worth refusing to start a Host over.
+   * Every failure here resolves to null rather than rejecting. A Host spawned from the app executable
+   * is exactly today's behaviour — worse on update day, and completely fine otherwise — so there is no
+   * failure in this function worth refusing to start a Host over. It is shown, though: the status bar
+   * says the runtime could not be prepared, and the next start tries again.
+   *
+   * **Off the main thread's sync fs, and one at a time** (stage 3 task 2). This used to run `cpSync`
+   * and `rmSync` right here, and a first install after an update — 87 MB of `node.exe`, then an
+   * antivirus scan — froze the window with nothing on screen. Now every call is `fs.promises`, the
+   * window is told while it runs (`host:runtime-install`), and everyone who needs the runtime awaits
+   * the one install in flight: `startHostClient` before anything else, and `spawnHost` before every
+   * spawn, so no Host is ever started from a runtime still being written. See host/runtimeInstall.ts.
    */
-  const prepareHostRuntimeFor = (profileDir: string, log: (m: string) => void): HostRuntimePaths | null => {
-    const base = hostRuntimeBase({
-      platform: process.platform,
-      localAppData: process.env.LOCALAPPDATA,
-      userData: profileDir,
-      appName: app.getName()
-    })
-    if (!base) return null
-    // **Packaged builds only**, unlike `skillsPath` above, which reads the same resource either way.
-    // The runtime carries a *copy* of host.js taken when the payload was assembled, and in development
-    // host.js is rebuilt constantly — a dev Host would silently run whatever `npm run host-runtime`
-    // last produced. `npm run dev` therefore keeps spawning from the Electron binary, which is what it
-    // has always done and what the packaged fallback does too.
-    if (!app.isPackaged) return null
-    const shippedRoot = path.join(process.resourcesPath, 'host-runtime')
-    // Which Node is actually in that directory is read from the directory, not from a constant in
-    // this file: the two can then never disagree about what was shipped.
-    let nodeVersion = ''
-    try {
-      const manifest: unknown = JSON.parse(readFileSync(path.join(shippedRoot, 'runtime.json'), 'utf8'))
-      if (manifest && typeof manifest === 'object' && typeof (manifest as { node?: unknown }).node === 'string') {
-        nodeVersion = (manifest as { node: string }).node.trim()
-      }
-    } catch {
-      /* nothing shipped, or unreadable — prepareHostRuntime says so below */
-    }
-    if (!nodeVersion) {
-      log('no host runtime shipped with this build — the Host runs from the app executable')
-      return null
-    }
-    const appVersion = app.getVersion()
-    const paths = hostRuntimePaths({ base, nodeVersion, appVersion })
-    // The shipped tree carries the same `node-<version>` directory the install uses, so putting it in
-    // place is one copy. scripts/host-runtime.mjs says why it is nested rather than flat.
-    const shipped = path.join(shippedRoot, path.basename(paths.nodeDir))
-    const runtimeFs: RuntimeFs = {
-      exists: existsSync,
-      readdir: (p) => {
-        try {
-          return readdirSync(p)
-        } catch {
-          return []
-        }
-      },
-      copy: (from, to) => cpSync(from, to, { recursive: true }),
-      rename: (from, to) => renameSync(from, to),
-      rm: (p) => rmSync(p, { recursive: true, force: true })
-    }
-    const installed = prepareHostRuntime({
-      paths,
-      shipped,
-      appVersion,
-      // Two app instances cannot share a profile (the single-instance lock), but they can share this
-      // machine-wide directory — a second profile, or another user's install. The pid keeps their
-      // staging directories apart; the rename decides who wins.
-      stamp: String(process.pid),
-      fs: runtimeFs,
-      log
-    })
-    if (!installed.ready) return null
-    if (installed.did !== 'nothing') log(`host runtime installed (${installed.did}): ${paths.exePath}`)
-    sweepHostRuntime({ paths, nodeVersion, appVersion, fs: runtimeFs, log })
-    return paths
-  }
+  const runtimeInstaller = createRuntimeInstaller<InstalledRuntime>({
+    run: async ({ installing }) => {
+      const base = hostRuntimeBase({
+        platform: process.platform,
+        localAppData: process.env.LOCALAPPDATA,
+        userData: app.getPath('userData'),
+        appName: app.getName()
+      })
+      if (!base) return { value: null, failure: null }
+      // **Packaged builds only**, unlike `skillsPath` above, which reads the same resource either way.
+      // The runtime carries a *copy* of host.js taken when the payload was assembled, and in development
+      // host.js is rebuilt constantly — a dev Host would silently run whatever `npm run host-runtime`
+      // last produced. `npm run dev` therefore keeps spawning from the Electron binary, which is what it
+      // has always done and what the packaged fallback does too.
+      if (!app.isPackaged) return { value: null, failure: null }
+      const r = await installHostRuntime({
+        base,
+        shippedRoot: path.join(process.resourcesPath, 'host-runtime'),
+        appVersion: app.getVersion(),
+        // Two app instances cannot share a profile (the single-instance lock), but they can share this
+        // machine-wide directory — a second profile, or another user's install. The pid keeps their
+        // staging directories apart; the rename decides who wins.
+        stamp: String(process.pid),
+        fs,
+        onInstall: installing,
+        log: (m) => hostWiring?.log(m)
+      })
+      return { value: r.runtime, failure: r.failure }
+    },
+    onState: (s) => send('host:runtime-install', s),
+    log: (m) => hostWiring?.log(m)
+  })
+  ipcMain.handle('host.runtimeInstall', () => runtimeInstaller.state())
 
   // Astera Host. Unconditional — the Host is not an orchestration feature, so this must not go inside
   // bootOrch, which only runs when that toggle is on. A missing out/main/host.js (a partial build, or
@@ -6269,7 +5721,25 @@ export function registerIpc(
     }
     // What the Host is actually started with. Null means `process.execPath` and the asar's host.js —
     // the arrangement every version before this one used, and the one a win32 installer has to fight.
-    const runtime = prepareHostRuntimeFor(profileDir, hostLog)
+    //
+    // **Reassigned before every spawn**, not settled once here. Putting the runtime in place is also
+    // what repairs one that is missing files, and the moment that repair can actually happen is the
+    // moment the Host holding those files has gone — which is exactly when the next spawn is about to
+    // run (design F6). Kept here as well so `hostSurvivesUpdate` and the first spawn have an answer.
+    //
+    // **Awaited, and first.** Nothing below may spawn a Host until the install has landed; the one
+    // install in flight is shared with every later `spawnHost`, and the window says "Preparing the
+    // Astera Host…" while it runs rather than freezing (stage 3 task 2).
+    let runtime: InstalledRuntime | null = await runtimeInstaller.ensure()
+    // The app may have started quitting — an update being installed among the reasons — while that
+    // install ran. `will-quit` only learns of the client through `onHostClientReady` at the end of
+    // this function, so a client built from here on would spawn a Host nobody stops, behind the
+    // update (review of stage 3 task 2). Nothing was taken back, and nothing will be.
+    if (quittingForHost) {
+      hostLog('the app is quitting — no Host is started')
+      settleSessionsTakenBack(null)
+      return
+    }
     hostSurvivesUpdate = process.platform !== 'win32' || runtime !== null
     // An update changes the protocol, and the Host from the previous version is still there holding
     // terminals this app cannot speak to. Ask it to leave first. A restart does not come through
@@ -6308,8 +5778,8 @@ export function registerIpc(
           sock.on('error', () => done(false))
           setTimeout(() => done(false), 1_000).unref?.()
         }),
-      // hostLog, not orchLog: this is a Host diagnostic, and it must still be recorded when
-      // orchestration is off, which is exactly when orchLog is a no-op.
+      // hostLog, not orchLog: this is a Host diagnostic, and it must still be recorded on a start
+      // where the orchestration wiring never came up, which is exactly when orchLog is a no-op.
       log: (m) => hostLog(m)
     })
     const addr = hostAddress({ profileDir, platform: process.platform, tmpDir: os.tmpdir(), protocol: HOST_PROTOCOL })
@@ -6317,13 +5787,34 @@ export function registerIpc(
       address: addr.address,
       appVersion: app.getVersion(),
       log: hostLog,
-      spawnHost: () => {
+      // Protocol 4: the Host's hello must carry the proof of this key (core/host/hostKey.ts)
+      hostKey: () => readHostKey(profileDir),
+      // Read at every handshake, so the notice belongs to the Host that just answered rather than to
+      // whatever the runtime looked like when the app started.
+      runtimeIncomplete: () => runtime?.incomplete ?? false,
+      // Slack in the Host, Task 8 carry 3: a hello sent while this app holds its Slack socket leaves the
+      // slack yield out, or a Slack-owning Host would open a second socket before this app hears it.
+      keepsSlack: () => slack?.ownership.helloKeeps() ?? false,
+      // Checked and repaired again before every spawn, not reused from startup: the old Host held its
+      // `node.exe` and nothing could be replaced while it did. By the time a spawn is wanted that Host
+      // is gone, which is the first moment a missing file can actually be put back (design F6). Costs a
+      // handful of asynchronous existence checks on a runtime that is whole. `spawnWhenInstalled`
+      // spawns only once that install has settled, and HostClient awaits it before it starts counting
+      // its attempts to reach the address.
+      spawnHost: spawnWhenInstalled(runtimeInstaller, (installed) => {
+        runtime = installed
+        // The three paths a Host needs to spawn workers itself (host S2 design §2.2). The same guard
+        // bootOrch applies: with either one missing the Host is started without any of them and
+        // spawns nothing, rather than being handed a path that is not there.
+        const cliEntry = cliEntryPath()
+        const skills = appSkillsPath()
         const plan = hostSpawnPlan({
-          execPath: runtime?.exePath ?? process.execPath,
-          entryPath: runtime?.entryPath ?? entry,
+          execPath: runtime?.paths.exePath ?? process.execPath,
+          entryPath: runtime?.paths.entryPath ?? entry,
           profileDir,
           logPath: path.join(profileDir, 'host', 'host.log'),
-          version: app.getVersion()
+          version: app.getVersion(),
+          cli: cliEntry && existsSync(skills) ? { exec: process.execPath, entry: cliEntry, skills } : undefined
         })
         const child = spawn(plan.command, plan.args, plan.options)
         // A spawn that fails arrives as an async 'error' event, not a throw, and an unhandled one is
@@ -6331,9 +5822,174 @@ export function registerIpc(
         // to the person; this only has to keep the failure from being fatal.
         child.on('error', (err) => hostLog(`the Host could not be started: ${String(err)}`))
         child.unref()
-      }
+      })
     })
     hostClient = client
+    // Slack in the Host (P17): the Host half of the ownership. slack-reload is an app-only orch-call the
+    // app awaits; slack-event is a plain client message. Both are sent only while the Host owns Slack.
+    slack?.ownership.setHost({
+      reload: async () => {
+        const r = await orchCall({ cmd: 'slack-reload', args: {}, sessionId: '' })
+        if (r.status !== 200) throw new Error(`slack-reload answered ${r.status}`)
+      },
+      forward: (event) => client.send({ t: 'slack-event', event })
+    })
+
+    // Limits L3: who drives, as a Host that announced `driver` says it, pushed to the window so its Jobs
+    // sidebar can say why a parked Host starts nothing. Neither callback throws (hostDriver.ts).
+    const driverView = createHostDriverView({
+      status: () => client.status(),
+      changed: (r) => send('host:driver', r),
+      log: hostLog
+    })
+    hostDriverView = driverView
+    client.onMessage((m) => driverView.pushed(m))
+    client.onStatusChange((s) => driverView.status(s))
+
+    // The agent app workspace mirror (agent workspace design): a Host that announced `workspace` pushes
+    // its events to this app, which yields `workspace` in its hello. After each handshake the view asks
+    // for the live ones. None of these callbacks throws (hostWorkspace.ts).
+    const workspaceView = createHostWorkspaceView({
+      status: () => client.status(),
+      call: orchCall,
+      changed: (e) => send('workspace:event', e),
+      log: hostLog
+    })
+    hostWorkspaceView = workspaceView
+    client.onMessage((m) => workspaceView.pushed(m))
+    client.onConnect(() => void workspaceView.connected())
+    client.onStatusChange((s) => workspaceView.status(s))
+
+    // S6 D4: the block records this app's coordinators found go to a Host that speaks `blocks`, whole
+    // after each handshake, and the Host's come back as `blocks` pushes. Sends nothing to an older Host.
+    // Neither callback throws (blockSync.ts).
+    if (hostWiring?.blocks) {
+      const blockSync = createBlockSync({
+        blocks: hostWiring.blocks,
+        status: () => client.status(),
+        send: (m) => client.send(m),
+        now: () => Date.now(),
+        log: hostLog
+      })
+      client.onMessage((m) => blockSync.pushed(m))
+      client.onConnect(() => blockSync.connected())
+    }
+
+    // S6 D6: what the Host rolled while no app was attached, told once after each adoption sweep (the
+    // startup chain and the reconnect handler below) and then acked. Asks nothing of a Host that does not
+    // announce `roll-journal`; never rejects (offlineRolls.ts).
+    const offlineRolls = createOfflineRolls({
+      status: () => client.status(),
+      call: orchCall,
+      isLive: (id) => allSessions().some((x) => x.id === id && x.status === 'running'),
+      accountLabel: (id) => {
+        const info = allSessions().find((x) => x.id === id)
+        return info ? core.accounts.get(info.accountId)?.label : undefined
+      },
+      lang: () => core.lang,
+      now: () => Date.now(),
+      slack: slack?.notifier,
+      desktop,
+      // spec §3.6: a Slack-owning Host posted its rolls as it made them.
+      hostPostsSlack: () => slack?.ownership.owner() === 'host',
+      log: hostLog
+    })
+    // Fix round 1 (I1, M1): a run whose Slack lines could not go out (slack.json not loaded yet, or a
+    // failed post) is retried when Slack next has a transport. The subscription lives as long as the app.
+    slack?.notifier.onTransportReady(() => void offlineRolls.slackReady())
+    /** The startup chain settled without a sweep (no Host answered in time). A first handshake that lands
+     *  later then runs no sweep either, so it fetches the journal itself (fix round 1, M2). */
+    let startupGaveUp = false
+
+    // Host S3: the app's worktree registry writes through the Host once it announces it owns
+    // worktrees.json, and mirrors the file it pushes back (ruling R1, R3); a merge the Host runs is
+    // registered as this app's own Work Unit operation the same way (ruling R7, §3.3).
+    const worktreeRoute = createWorktreeRoute({ registry: core.worktrees, call: orchCall, log: (m) => hostLog(`host: ${m}`) })
+    const hostGitOps = createHostGitOps(workUnitCollector)
+
+    client.onMessage((m) => {
+      // Every commit the Host made, pushed (design §5). The mirror swaps, and then this app pays the
+      // commit everything it owes — **the same list as for a commit it made itself** (ruling F54).
+      // Pushing the sidebar was only two of six; the missing four left a worker-driven Job that
+      // dispatched its first Task and then stopped, and every Host-committed transition unjournalled.
+      //
+      // `prev` is read before the mirror swaps, because that is what the journal and the finished-Run
+      // edge are diffed against. A mirror that holds nothing yet has no "before": `next` stands in,
+      // which makes both of those empty — the same rule the first write after boot uses.
+      if (m.t === 'orch-state') {
+        const prev = orchMirror.loaded() ? orchMirror.getState() : m.state
+        orchMirror.accept(m.state, m.version)
+        // Null until orchestration has started. `pushOrchState` is inside the hook, so a push that
+        // arrives before then is simply held in the mirror — which is right: `bootOrch` pushes once
+        // as soon as there is anything to draw.
+        if (onOrchCommit) onOrchCommit({ prev, next: m.state })
+        else pushOrchState(m.state)
+        return
+      }
+      if (m.t === 'orch-result') {
+        const waiting = pendingOrchCalls.get(m.call)
+        // An answer to a question nobody is waiting on any more — the deadline took it, or the
+        // socket dropped and everything pending was failed. Dropped rather than logged: the message
+        // is well formed and there is simply nobody left to hand it to.
+        if (!waiting) return
+        pendingOrchCalls.delete(m.call)
+        clearTimeout(waiting.timer)
+        waiting.resolve({ status: m.status, body: m.body })
+        return
+      }
+      if (m.t !== 'orch-act') return
+      // Asked before the Host removes a worktree folder (host S3, the ruling on plan risk 3):
+      // whatever this app runs itself, not through the Host, in or below the path — a local fallback
+      // session, terminal, run or chat session spawned while the Host was not answering. Not an
+      // `OrchServerDeps` name (protocol.ts's doc comment on HOST_ACT_PATH_IN_USE), so it is answered
+      // here rather than through the table below. The aggregation itself is `appPathInUse`
+      // (src/main/host/localPathInUse.ts), tested there; this is only the wiring.
+      if (m.act === HOST_ACT_PATH_IN_USE) {
+        const [p] = Array.isArray(m.args) ? m.args : []
+        // Fix round 1, M2: a malformed ask, or `appPathInUse` throwing, answers `ok:false` rather than
+        // `null` — `null` means "free", and the Host keeps the folder on anything but a clean answer
+        // (askApp in src/host/worktrees.ts turns a rejection into a reason to keep it).
+        if (typeof p !== 'string') {
+          client.send({ t: 'orch-acted', call: m.call, ok: false, error: `${HOST_ACT_PATH_IN_USE} needs a path` })
+          return
+        }
+        try {
+          const value = appPathInUse({ sessions: core.sessions, terminal: core.terminal, run: core.run, chat: core.chat }, p)
+          client.send({ t: 'orch-acted', call: m.call, ok: true, value })
+        } catch (err) {
+          client.send({ t: 'orch-acted', call: m.call, ok: false, error: err instanceof Error ? err.message : String(err) })
+        }
+        return
+      }
+      // Slack in the Host (P10): a Slack card answer for a chat this app writes. Not an OrchServerDeps name,
+      // like the one above. answerSlackCard never rejects; the catch is the net under it.
+      if (m.act === HOST_ACT_SLACK_ANSWER) {
+        void answerSlackCard(core.chat, m.args)
+          .then((value) => client.send({ t: 'orch-acted', call: m.call, ok: true, value }))
+          .catch((err: unknown) => client.send({ t: 'orch-acted', call: m.call, ok: false, error: err instanceof Error ? err.message : String(err) }))
+        return
+      }
+      // One thing the Host cannot do itself — spawn a session, touch a worktree (design §5). The
+      // table it is answered from is `orch.deps`, the one this process builds for the command layer;
+      // `answerOrchAct` has the reasoning, and never throws, because a rejection here would leave the
+      // Host waiting for a reply that is never coming.
+      // `yieldsDispatch`: the three S5 starts are not run for a Host that drives dispatch (m6 ruling,
+      // answerOrchAct's comment), read at the ask like every other `hostDrives()` answer.
+      void answerOrchAct({ deps: orch?.deps ?? null, act: m.act, args: m.args, yieldsDispatch: orchHostDrives() }).then((r) =>
+        client.send(
+          r.ok
+            ? { t: 'orch-acted', call: m.call, ok: true, value: r.value }
+            : { t: 'orch-acted', call: m.call, ok: false, error: r.error }
+        )
+      )
+    })
+    // Nothing is coming back on a socket that is gone. Armed before `start()` so the very first
+    // connection's drop is covered too. §3.3: also closes every Work Unit operation a merge's `begin`
+    // opened and whose `end` will now never come.
+    client.onDisconnect(() => {
+      failPendingOrchCalls('the connection to the Host dropped')
+      hostGitOps.hostGone()
+    })
     client.start()
 
     const transport = {
@@ -6342,8 +5998,17 @@ export function registerIpc(
       onHostGone: (cb: () => void) => hostClient?.onDisconnect(cb) ?? ((): void => {}),
       // hostLog, not orchLog: this is the Host failure log every other line in startHostClient uses,
       // and the one path here (a caller's onExit throwing while ptyFactory.ts ends a refused spawn)
-      // must still be recorded when orchestration is off, which is exactly when orchLog is a no-op.
-      log: (m: string) => hostLog(`host: ${m}`)
+      // must still be recorded on a start where the orchestration wiring never came up, which is
+      // exactly when orchLog is a no-op.
+      log: (m: string) => hostLog(`host: ${m}`),
+      // A spawn the Host never answered. **Only a Host too old for the heartbeat is judged by this.**
+      // One that answers pings is already being asked the question directly and far more often, and a
+      // spawn going missing there is a fault in that one spawn, not a Host that has stopped
+      // answering — calling it unresponsive would be undone by the next pong a few seconds later, and
+      // all it would leave behind is a banner that flickered (design F4).
+      unanswered: (what: string) => {
+        if (hostClient && !hostSpeaksPing(hostClient.status())) hostClient.markUnresponsive(`the Host is not answering — ${what}`)
+      }
     }
     const { factory, attach } = createHostPtyFactory(transport)
     // The same transport, for line processes (chat-sessions design §6.5).
@@ -6357,6 +6022,11 @@ export function registerIpc(
     // timeout smaller than that sum can expire mid-handshake — reading a merely slow Host the same as
     // no Host at all, permanently, since nothing re-checks a hello that lands after this has already
     // given up.
+    //
+    // Time spent installing the runtime inside `spawnHost` does not count against it (`ready`'s own
+    // note), and that install is itself bounded by INSTALL_TIMEOUT_MS — so this wait, and the
+    // `bootOrch` wait behind it, stay bounded while a slow first install is not read as "no Host".
+    // `host.replace` below waits through the same `ready()`, so it gets the same treatment.
     const HOST_READY_MS = READY_TIMEOUT_MS
 
     /** One round trip: ask for the list and resolve on the reply, giving up after five seconds so a
@@ -6404,6 +6074,75 @@ export function registerIpc(
       })
     hostProcList = () => listProcs(transport)
 
+    /** One command, its stdout, and a deadline. `shell: false` (the default): every argument here is
+     *  built in hostProcess.ts from a number, and a shell would only add a way to misread it. */
+    const run = (file: string, args: string[], timeout: number): Promise<string> =>
+      new Promise((resolve, reject) => {
+        execFile(file, args, { timeout, windowsHide: true }, (err, stdout) => {
+          if (err) reject(err)
+          else resolve(String(stdout))
+        })
+      })
+
+    /**
+     * Ends a Host that cannot be asked to leave, and answers what happened.
+     *
+     * `retire` is a message, and the Host this runs for does not read its socket — that is what makes
+     * it the case it is (design F5). So the pid is used instead, and because a pid is not a name, the
+     * executable behind it is read back first. Anything but a match leaves the process alone: the
+     * number can come from a file an earlier Host left behind, and Windows reuses pids.
+     */
+    const endUnresponsiveHost = async (): Promise<string | null> => {
+      const status = client.status()
+      // From the handshake when there was one; otherwise from what the Host wrote down at startup,
+      // which is the only source for the Host that never said hello (design F3).
+      let pid = status.pid
+      if (pid === null) {
+        try {
+          const rec = parseHostPidFile(readFileSync(hostPidFilePath(profileDir), 'utf8'))
+          pid = rec?.pid ?? null
+        } catch {
+          /* no file, or nothing readable in it — there is simply no pid to act on */
+        }
+      }
+      if (pid === null) return 'no pid to end'
+      const expectedExe = runtime?.paths.exePath ?? process.execPath
+      // A Host started before the runtime's executable was renamed runs from the old name, and is ours too
+      const expectedExes = runtime ? [runtime.paths.exePath, runtime.paths.legacyExePath] : [process.execPath]
+      const probe = executableProbe(process.platform, pid)
+      let actualExe: string | null = null
+      try {
+        actualExe = probe
+          ? parseExecutablePath(await run(probe.file, probe.args, 5_000))
+          : // linux: the kernel already knows, and reading a symlink beats spawning anything.
+            await fs.readlink(`/proc/${pid}/exe`).catch(() => null)
+      } catch (err) {
+        hostLog(`host: could not read what pid ${pid} is: ${String(err)}`)
+      }
+      const plan = hostKillPlan({ platform: process.platform, expectedExes, actualExe })
+      if (plan === 'skip-gone') {
+        hostLog(`host: pid ${pid} is no longer running — nothing to end`)
+        return null
+      }
+      if (plan === 'skip-mismatch') {
+        // Said in a sentence the Info tab shows, because this is the one outcome a person has to act
+        // on themselves: something else holds the address, and the app will not end a process it
+        // cannot prove is its own.
+        hostLog(`host: pid ${pid} is ${actualExe ?? 'unknown'}, not this app's Host (${expectedExe}) — left alone`)
+        return `pid ${pid} is not this app's Host, so it was not ended`
+      }
+      const kill = killHostCommand(process.platform, pid)
+      try {
+        if (kill) await run(kill.file, kill.args, 10_000)
+        else process.kill(pid, 'SIGKILL')
+        hostLog(`host: ended the Host that was not answering (pid ${pid})`)
+        return null
+      } catch (err) {
+        hostLog(`host: could not end pid ${pid}: ${String(err)}`)
+        return `the Host (pid ${pid}) could not be ended`
+      }
+    }
+
     /** One replacement at a time. Shared by the automatic rule and the Info tab's button, which is
      *  what keeps a click during an automatic replacement from retiring the Host that was just
      *  started. */
@@ -6414,20 +6153,44 @@ export function registerIpc(
       const was = client.status()
       hostLog(`host: replacing the Host (${was.hostVersion ?? '?'}, pid ${was.pid ?? '?'}) ${why}`)
       try {
+        // A Host that answers is asked to leave; one that does not is ended. Both paths then go
+        // through `restart()` below, which is what puts a new Host at the address either way.
+        if (was.unresponsive) {
+          const killProblem = await endUnresponsiveHost()
+          if (killProblem) {
+            // **Nothing was ended, so there is nothing to reconnect to but the same silent process.**
+            // Reconnecting anyway is what the first version of this did, and it lies twice over: the
+            // peer answers the handshake, so the app reports "connected" and logs a replacement that
+            // did not happen, and fifteen seconds later the heartbeat puts it back exactly where it
+            // was — with no trace of why the button did nothing. Measured in the dev app against a
+            // stand-in Host running from another executable, 2026-09-22.
+            hostLog(`host: the replacement stopped here — ${killProblem}`)
+            client.markUnresponsive(killProblem)
+            return client.status()
+          }
+        }
         // retire() stops the client too, which is what keeps the reconnect loop from putting the
         // very same Host back the moment the socket drops (the 1.3.18 failure, in the other
         // direction). restart() brings the loop back once the retire has settled.
         // announce: the Host ends what it holds on the way out, and the app must hear that even
-        // though it is the one that asked (see retire's own comment).
+        // though it is the one that asked (see retire's own comment). Harmless against a Host that
+        // has just been killed: the message goes nowhere and the announce is what ends the handles
+        // its ptys left behind.
         await client.retire({ announce: true })
         client.restart()
         await client.ready(READY_TIMEOUT_MS)
         const now = client.status()
-        hostLog(
-          now.connected
-            ? `host: replaced — now Host ${now.hostVersion} (pid ${now.pid})`
-            : `host: the replacement did not come up: ${now.problem ?? 'no answer'}`
-        )
+        // Signal 0 asks whether the pid exists, and does nothing to it; EPERM also means it does.
+        const oldAlive = ((): boolean => {
+          if (now.connected || was.pid === null) return false
+          try {
+            process.kill(was.pid, 0)
+            return true
+          } catch (err) {
+            return (err as NodeJS.ErrnoException).code === 'EPERM'
+          }
+        })()
+        hostLog(replacementLogLine({ now, oldPid: was.pid, oldAlive }))
         return now
       } finally {
         replacing = false
@@ -6435,20 +6198,23 @@ export function registerIpc(
     }
     hostReplace = () => replaceHost('on request')
 
-    /** The automatic rule: an outdated Host is replaced the first moment it holds nothing (design
-     *  §4). Asked after every `pty-exit` the Host reports and once after the startup sweep; each ask
-     *  is one `pty-list` round trip, plus one `proc-list` when the Host speaks procs, and they do not
-     *  overlap. */
+    /** The automatic rule: a Host that should not go on running is replaced the first moment it holds
+     *  nothing. Two reasons qualify — it is older than this app, or the runtime under it is missing
+     *  files (design F6). Asked after every `pty-exit` the Host reports and once after the startup
+     *  sweep; each ask is one `pty-list` round trip, plus one `proc-list` when the Host speaks procs,
+     *  and they do not overlap. */
     let checking = false
+    const replaceWorthy = (): boolean => client.status().outdated || client.status().runtimeIncomplete
     const maybeReplace = async (why: string): Promise<void> => {
-      if (checking || replacing || quittingForHost || !client.status().outdated) return
+      if (checking || replacing || quittingForHost || !replaceWorthy()) return
       checking = true
       try {
         const [entries, procEntries] = await Promise.all([listPtys(transport), speaksProcs() ? listProcs(transport) : Promise.resolve<PtyEntry[]>([])])
         // Unknown is not zero, for either list: a Host that should have answered and did not is not
         // replaced on a guess (hostReplaceDue's own rule).
         const holdings = entries !== null && procEntries !== null ? hostHoldings(entries, procEntries) : null
-        if (!hostReplaceDue({ outdated: client.status().outdated, holdings, inFlight: replacing, quitting: quittingForHost })) return
+        const s = client.status()
+        if (!hostReplaceDue({ outdated: s.outdated, runtimeIncomplete: s.runtimeIncomplete, holdings, inFlight: replacing, quitting: quittingForHost })) return
         await replaceHost(`${why}, and it holds nothing`)
       } catch (e) {
         hostLog(`host: the replacement check failed: ${String(e)}`)
@@ -6458,6 +6224,33 @@ export function registerIpc(
     }
     client.onMessage((m) => {
       if (m.t === 'pty-exit') void maybeReplace('after a pty exited')
+      // A session the Host started for a CLI call (Host S2 design §2.3), taken back the way a restart
+      // takes sessions back: its tab, rolling, attention and Slack all hang off the same adopter.
+      // Through the queue, so it cannot race a sweep already walking the same entry, and through a
+      // fresh `pty-list` rather than `m.entry`: an exit landing between this push and the queued
+      // sweep is then already in the list, so a dead pty is never adopted as running. Its exit is
+      // the Host's in that case, because nothing here sent `pty-attach` for it (R2).
+      if (m.t === 'pty-opened')
+        void takeSessionsBack('the Host opened a session', m.entry.id).catch((e) =>
+          hostLog(`host: could not take back the session the Host opened: ${String(e)}`)
+        )
+      // The chat twin (`sessions create --kind chat`, CLI spec §14): one line process, sent once its start
+      // settled, taken back through the same queue the way a Host chat roll's new proc is.
+      if (m.t === 'proc-opened')
+        void takeSessionsBack('the Host opened a chat session', undefined, m.procId).catch((e) =>
+          hostLog(`host: could not take back the chat session the Host opened: ${String(e)}`)
+        )
+    })
+    // Host S3 (R1, R7, §3.3): the file the Host just wrote, and a merge it ran. Neither throws, but
+    // wrapped anyway — a listener that threw here would be an uncaught exception in the main process,
+    // the same reasoning every other `onMessage` callback in this file is held to.
+    client.onMessage((m) => {
+      try {
+        worktreeRoute.pushed(m)
+        hostGitOps.pushed(m)
+      } catch (err) {
+        hostLog(`host: a worktrees-state or git-op push could not be applied: ${String(err)}`)
+      }
     })
 
     /** One sweep: ask the Host what it is holding, hand each entry to the manager its note names,
@@ -6470,18 +6263,31 @@ export function registerIpc(
      *  to replay the scrollback again. Queued rather than deduplicated: a sweep that came back with
      *  nothing is not an answer the next one can reuse. */
     let sweeps: Promise<unknown> = Promise.resolve()
-    const takeSessionsBack = (why: string): Promise<SessionsTakenBack> => {
-      const next = sweeps.then(() => sweep(why))
+    const takeSessionsBack = (why: string, only?: string, onlyProc?: string): Promise<SessionsTakenBack> => {
+      const next = sweeps.then(() => sweep(why, only, onlyProc))
       // The queue must not break on a sweep that threw — the caller keeps that rejection.
       sweeps = next.catch(() => undefined)
       return next
     }
-    const sweep = async (why: string): Promise<SessionsTakenBack> => {
+    // S6 §3.4: a Host roll's new pty is taken back through the same queue, ahead of its forwarded rekey.
+    // The Host's respawn also pushed `pty-opened` (before `session-rolled`, in the same turn), so the
+    // sweep that push queued usually adopts it first and this one finds it held — either way the pty is
+    // adopted before the rekey goes out, and hostRollView.adopting is already true when the adopter runs.
+    takeBackRolledPty = (ptyId) => takeSessionsBack('the Host rolled a session', ptyId)
+    // Chat takeover: a Host chat roll's new line process, the same way, limited to that one proc.
+    takeBackRolledProc = (procId) => takeSessionsBack('the Host rolled a chat session', undefined, procId)
+    // The two roll pushes. `pushed` never throws.
+    client.onMessage((m) => hostRollView.pushed(m))
+    /** `only`: the Host id of the one pty a `pty-opened` named. Every other entry is left alone, and
+     *  line processes are not asked for (`ReattachDeps.only`). `onlyProc`: the Host id of the one line
+     *  process a chat roll's `session-rolled` named; the pty list is then not asked for
+     *  (`ReattachDeps.onlyProc`). */
+    const sweep = async (why: string, only?: string, onlyProc?: string): Promise<SessionsTakenBack> => {
       // Asked here rather than from inside reattach's `list` dep so the unanswered case can be its
       // own answer: reattach has no way to say "I was told nothing", and an empty list would have
       // it adopt nothing and report nothing adopted, which reads identically to a Host that really
       // is holding nothing.
-      const entries = await listPtys(transport)
+      const entries = onlyProc !== undefined ? [] : await listPtys(transport)
       if (entries === null) {
         hostLog(
           'host: the Host did not answer the pty list — nothing was taken back, and what it is still running is unknown, so no worker is written off'
@@ -6491,7 +6297,8 @@ export function registerIpc(
       // Only a Host that announced the proc-* family is asked (protocol.ts's contract). A null answer
       // from one that did is "did not answer" — nothing is adopted, and the log says so. Hoisted once
       // for the three reads below rather than calling speaksProcs() again at each one.
-      const speaks = speaksProcs()
+      // Not asked at all for a sweep limited to one pty: a pty-opened never names a line process.
+      const speaks = only === undefined && speaksProcs()
       // A Host that announced procs but wedges adds proc-list's 5 s to the pty list's 5 s; sequential
       // on purpose so the pty list's null can return first.
       const procEntries = speaks ? await listProcs(transport) : []
@@ -6533,7 +6340,9 @@ export function registerIpc(
             // below want it: the rolling chain cannot find it again, and neither can the watcher.
             const codexNote = codexRolloutFromNote(a.restore)
             const coordinator = rollCoordinatorForSession(info.id, core.sessions.list(), (id) => core.accounts.get(id))
-            if ((info.rollAccountIds?.length ?? 0) >= 1) {
+            // The chain as it was registered before S6, moved into a function unchanged: a note with no
+            // snapshot, or one a restore refused.
+            const registerAsBefore = (): void => {
               // The `false` is `locate` (CodexRollingCoordinator.register's 4th argument): an adopted
               // session must not run the locate poll — see that parameter's own doc comment for why the
               // discovery it would run is actively harmful here, not merely useless. What it is handed
@@ -6559,6 +6368,51 @@ export function registerIpc(
                 )
               else if (coordinator === 'rolling') rolling?.register(info)
             }
+            // R18 (design §3A.5): who rolls this session, from its note and the Host's features, and its
+            // Work Unit fork (preflight C10) — applyAdoptRolling has every decision; these are its acts.
+            // `has` on the session's own coordinator (carry C-I1): a chain this app still holds is left as
+            // it is — never restored over, and never registered a second time as a refused restore's
+            // fallback. A coordinator of null (the account is gone) holds, restores and registers nothing.
+            applyAdoptRolling(
+              {
+                restore: a.restore,
+                hostRolls: hostSpeaksRolling(client.status()),
+                rollAccounts: info.rollAccountIds?.length ?? 0,
+                adopting: hostRollView.adopting(info.id),
+                pendingFork: hostRollView.takePendingFork(info.id)
+              },
+              {
+                has: () =>
+                  coordinator === 'codexRolling'
+                    ? (codexRolling?.has(info.id) ?? false)
+                    : coordinator === 'rolling'
+                      ? (rolling?.has(info.id) ?? false)
+                      : false,
+                restore: (snap, report) =>
+                  coordinator === 'codexRolling'
+                    ? (codexRolling?.restore(info, snap, { report }) ?? false)
+                    : coordinator === 'rolling'
+                      ? (rolling?.restore(info, snap, { report }) ?? false)
+                      : false,
+                registerAsBefore,
+                unregister: () => {
+                  rolling?.unregister(info.id)
+                  codexRolling?.unregister(info.id)
+                },
+                fork: (from) => {
+                  try {
+                    workUnitCollector.onSessionForked(info.id, undefined, from)
+                  } catch (err) {
+                    hostLog(`host: the Work Unit fork of adopted session ${info.id} failed: ${String(err)}`)
+                  }
+                },
+                rememberForkSeen: (from) => core.sessions.remember(info.id, { forkSeen: from })
+              }
+            )
+            // What rolling.state may ask the Host about (fix round 1, 4): a session its note says the Host rolls.
+            if (a.restore.rolledBy === 'host') hostOwned.add(info.id)
+            // The history guard's view of it (Task 13 wrote the native id into the note).
+            if (typeof a.restore.nativeSessionId === 'string') adoptedNative.set(info.id, a.restore.nativeSessionId)
             // codexRollout is registered from the note when the note has a mapping, and left to
             // find the file itself when it does not. The distinction used to be "note or nothing",
             // and that skipped session was mute for the rest of its life: no usage chips, no turn
@@ -6610,7 +6464,7 @@ export function registerIpc(
             }
             if (info.slackNotify === true) {
               try {
-                slack?.notifier.register(info)
+                slack?.notifier.register(info, { thread: notedThreadOf(a.restore) })
               } catch {
                 /* A failed Slack registration does not block taking the session back */
               }
@@ -6638,8 +6492,11 @@ export function registerIpc(
               scheduler?.register({ ...info, schedule }, providerOf(core.accounts.get(info.accountId)))
               hostLog(`host: re-armed the schedule of session ${info.id}`)
             })().catch((err) => hostLog(`host: could not re-arm the schedule of session ${info.id}: ${String(err)}`))
+            // The new half of a Host roll gets its tab from the forwarded `session:rolled`, which
+            // re-points the old one (announcesAdopted); a created event here put a second tab beside it.
             try {
-              send('session:created', info)
+              if (announcesAdopted(hostRollView, info.id, (old) => core.sessions.list().some((x) => x.id === old)))
+                send('session:created', info)
             } catch (err) {
               orchLog(`session:created emit failed session=${info.id}: ${String(err)}`)
             }
@@ -6680,8 +6537,22 @@ export function registerIpc(
           // session's. A note without the pair is left to that scan, which is safe here for the same
           // reason it is there — no mapping means the session had written no rollout to miss.
           chat: (a) => {
+            // Asked before the adoption replaces it: a record from before (a reconnect) had its tab.
+            const appHeldNew = core.chat.has(a.id)
             const info = core.chat.adopt(a)
             if (!info) return false
+            // Chat takeover (Task 9): who rolls it (R8) and whether its tab is announced. `defer` is
+            // already answered: reattach's `deferProc` never hands this adopter a proc the Host is
+            // still starting.
+            const plan = chatAdoptPlan({
+              restore: a.restore,
+              hostSpeaksChatTakeover: hostSpeaksChatTakeover(client.status()),
+              rollAccounts: info.rollAccountIds?.length ?? 0,
+              adopting: hostRollView.adopting(info.id),
+              appHoldsOld: (old) => core.chat.has(old),
+              rolledFrom: hostRollView.rolledFrom(info.id),
+              appHeldNew
+            })
             const rolloutPath = typeof a.restore.rolloutPath === 'string' ? a.restore.rolloutPath : undefined
             const threadId = typeof a.restore.threadId === 'string' ? a.restore.threadId : undefined
             // Everything but a thread-bearing note is registered here. A thread-bearing one makes
@@ -6714,11 +6585,52 @@ export function registerIpc(
             // calls find no chain and return. codex is handed the pair here instead; claude's arrives
             // just after, from the transcript lookup that same `ready` started — it resolves on a later
             // microtask, so it cannot run before this line.
+            //
+            // Chat takeover (Task 9, R8): a chain the Host marked (`rolledBy: 'host'`) in front of a Host
+            // that takes chats over stays the Host's — no chain here, and one this app still held from
+            // before a socket drop goes. Otherwise applyAdoptRolling decides as it does for a pty: the
+            // snapshot the note carries is restored (a Host-marked one in front of an older Host too,
+            // reported, since that Host ran it), and a note without one registers as before. Chat
+            // sessions make no Work Unit, so the fork acts are no-ops.
             if ((info.rollAccountIds?.length ?? 0) >= 1) {
               try {
                 const coordinator = rollCoordinatorForSession(info.id, core.chat.list(), (id) => core.accounts.get(id))
-                if (coordinator === 'codexRolling') codexRolling?.register(info, rolloutPath, false, false, threadId)
-                else if (coordinator === 'rolling') rolling?.register(info)
+                const unregister = (): void => {
+                  rolling?.unregister(info.id)
+                  codexRolling?.unregister(info.id)
+                }
+                if (plan.rolling === 'host') unregister()
+                else
+                  applyAdoptRolling(
+                    {
+                      restore: a.restore,
+                      hostRolls: hostSpeaksChatTakeover(client.status()),
+                      rollAccounts: info.rollAccountIds?.length ?? 0,
+                      adopting: hostRollView.adopting(info.id),
+                      pendingFork: hostRollView.takePendingFork(info.id)
+                    },
+                    {
+                      has: () =>
+                        coordinator === 'codexRolling'
+                          ? (codexRolling?.has(info.id) ?? false)
+                          : coordinator === 'rolling'
+                            ? (rolling?.has(info.id) ?? false)
+                            : false,
+                      restore: (snap, report) =>
+                        coordinator === 'codexRolling'
+                          ? (codexRolling?.restore(info, snap, { report }) ?? false)
+                          : coordinator === 'rolling'
+                            ? (rolling?.restore(info, snap, { report }) ?? false)
+                            : false,
+                      registerAsBefore: () => {
+                        if (coordinator === 'codexRolling') codexRolling?.register(info, rolloutPath, false, false, threadId)
+                        else if (coordinator === 'rolling') rolling?.register(info)
+                      },
+                      unregister,
+                      fork: () => {},
+                      rememberForkSeen: () => {}
+                    }
+                  )
               } catch (err) {
                 /* A failed rolling registration does not block taking the session back */
                 hostLog(`host: chat ${info.id} rolling registration failed: ${String(err)}`)
@@ -6741,20 +6653,40 @@ export function registerIpc(
             }
             if (info.slackNotify === true) {
               try {
-                slack?.notifier.register(info)
+                slack?.notifier.register(info, { thread: notedThreadOf(a.restore) })
               } catch {
                 /* A failed Slack registration does not block taking the session back */
               }
             }
-            try {
-              send('session:created', info)
-            } catch (err) {
-              hostLog(`host: session:created emit failed chat=${info.id}: ${String(err)}`)
+            // What rolling.state may ask the Host about, as for a pty: a chat its note says the Host rolls.
+            if (plan.rolling === 'host') hostOwned.add(info.id)
+            // The new half of a Host chat roll gets its tab from the forwarded `session:rolled`, which
+            // re-points the old one (Review Focus 1); a created event here would put a second tab beside it.
+            if (plan.announce) {
+              try {
+                send('session:created', info)
+              } catch (err) {
+                hostLog(`host: session:created emit failed chat=${info.id}: ${String(err)}`)
+              }
             }
+            // Fix round 1, M1: the new half of a Host roll found before its push (or with no push
+            // coming) re-points the old tab now, through the view, which then forwards no second rekey.
+            else if (plan.repoint !== null) hostRollView.repointed(plan.repoint, info, plan.dest)
             return true
           }
         },
-        log: (m) => hostLog(`host: ${m}`)
+        log: (m) => hostLog(`host: ${m}`),
+        // P5: a chat proc the Host is still starting (its handshake and carry-on) is left to it; the
+        // `session-rolled` push, which comes only after the key is cleared, takes it back.
+        deferProc: (e) => e.meta?.kind === 'chat' && hostStartingDefers(e.meta.restore, hostSpeaksChatTakeover(client.status())),
+        // Final review I1: the carry-on of a proc the Host rolled and could not type into (the app held
+        // it when the handshake ended) goes out now that this app is its writer, once, by P4's rule.
+        afterAttachProc: (e) => {
+          if (e.meta?.kind === 'chat' && hostCarryOnIsOurs(e.meta.restore, hostSpeaksChatTakeover(client.status())))
+            core.chat.sendCarryOn(e.meta.id)
+        },
+        only,
+        onlyProc
       })
       // procEntries === null here means a speaking Host did not answer the proc list: chats is then
       // not a fact, the same reason a null pty list returns 'unknown' above rather than an empty list.
@@ -6766,6 +6698,52 @@ export function registerIpc(
       void maybeReplace(`${why}, sweep done`)
       return res
     }
+
+    /**
+     * Where a new pty or line process goes: the Host, or this app's own child.
+     *
+     * **Driven by the status rather than by the handshake**, which is the difference that matters. A
+     * handshake is one direction only, and a Host that stops answering never has another one — so the
+     * routers stayed pointed at a Host that could not spawn anything, and every session started after
+     * that sat pending until its deadline (2026-09-22, design F1). Now the same rule runs on every
+     * transition: answering, route to it; not answering, route to the app, so a person can keep
+     * working while the Info tab offers to restart it.
+     *
+     * Only ever changes what the *next* spawn reaches — a handle already handed out keeps the factory
+     * it came from (see ptyRouter's own tests), which is what makes running this on every transition
+     * safe.
+     */
+    const routeByStatus = (s: HostStatus | undefined): void => {
+      const live = s?.connected === true && s.unresponsive === false
+      core.ptyRouter.use(live ? factory : null)
+      // A proc-spawn to a Host that does not speak procs gets neither proc-spawned nor proc-failed,
+      // so that handle would wait out its deadline for nothing. The app's own child is the honest
+      // answer until such a Host is replaced.
+      core.procRouter.use(live && speaksProcs() ? procFactory.factory : null)
+    }
+    client.onStatusChange((s) => {
+      routeByStatus(s)
+      // Who owns Slack follows the same status (P5): a Slack-owning Host takes it at once, and one that goes
+      // away hands it back after the grace.
+      try {
+        slack?.ownership.status(s)
+      } catch (err) {
+        hostLog(`host: the Slack ownership could not follow a status change: ${String(err)}`)
+      }
+      // Host S3 (R1, R3): the same transition this status subscription already drives ptyRouter and
+      // procRouter by also decides whether worktrees.json writes go to the Host or to the file here.
+      void worktreeRoute.status(s).catch((err) => hostLog(`host: worktrees status change failed: ${String(err)}`))
+      // **Pushed, not left to the Info tab's poll.** That poll runs every thirty seconds, which is
+      // fine for a Host that is merely outdated and wrong for one that has stopped answering: the
+      // person is looking at the screen at that exact moment, because a session did not open, and
+      // half a minute of a stale "연결됨" is the silence this whole change is about (measured in the
+      // dev app, 2026-09-22).
+      try {
+        send('host:status', s)
+      } catch (err) {
+        hostLog(`host: could not tell the window about a status change: ${String(err)}`)
+      }
+    })
 
     /** Which Host this app's ptys belong to, as `${pid}@${startedAt}` from the last `hello`, or null
      *  before the first one. The pair is what separates the two things a reconnect can mean. */
@@ -6787,33 +6765,47 @@ export function registerIpc(
       // safe either way.)
       // Idempotent: `use` is one assignment of the same object, and it only changes which factory the
       // *next* spawn reaches, never a handle already handed out (see ptyRouter's own tests).
-      core.ptyRouter.use(factory)
-      // Only a Host that speaks procs gets the router: against an older one a proc-spawn would get
-      // neither proc-spawned nor proc-failed and the handle would hang pending forever. The fallback
-      // (the app's own child, outlivesApp false) is the honest answer until that Host is replaced;
-      // this runs again on the next handshake.
-      core.procRouter.use(speaksProcs() ? procFactory.factory : null)
+      //
+      // The routing itself is now decided by the status subscription below, which covers this moment
+      // and the opposite one. Left here as well because this runs first for a handshake and the two
+      // agree: one assignment of the same object either way.
+      routeByStatus(hostClient?.status())
+      // Refill the mirror. **Every handshake, including one from a Host that just replaced the one
+      // that died** — the state is on disk and its successor opens the same file (design §6), so
+      // what this app holds is stale in exactly the same way either way. `remirrorOrchState` is null
+      // until `bootOrch` has filled the mirror itself, which is what keeps the first handshake from
+      // asking twice.
+      //
+      // And the journal's settings, again (final review I1): a Job Continuity setting changed while the
+      // socket was down sent a journal-reload that never arrived, so every greeting of a journal Host
+      // sends one. Idempotent, and cheap.
+      remirrorOrchState?.()
+      appJournal.greeted()
       // The first handshake belongs to the chain below, which is waiting on `ready()` for exactly this
       // moment; sweeping here as well would be the same sweep twice. It also covers the one case where
       // that chain has already given up before a peer ever said hello — a handshake that outlasts its
-      // deadline, fails, and succeeds on the retry. Nothing sweeps there, which is what happens today
-      // and is a gap of its own: the ptyRouter was never switched either, so the app is on node-pty
-      // beside a connected Host. Not made worse here, and not fixed here.
-      if (means === 'first') return
+      // deadline, fails, and succeeds on the retry.
+      if (means === 'first') {
+        if (startupGaveUp) void offlineRolls.attached('a first handshake after the startup chain gave up')
+        return
+      }
       if (means === 'other-host') {
         // The Host this app's ptys lived in really did die, and its successor's registry is empty.
         // Nothing to take back: the handles have already ended themselves through onHostGone and each
         // manager has marked its record exited, which is the path design §11 names for this case.
         hostLog(`host: a different Host answered (${answered}, was ${previous}) — the ptys the old one held are gone`)
+        // Its journal is the same file, so what it (or the one before it) rolled with no app is still
+        // there to tell (fix round 1, M2). Nothing was adopted: the desktop notice counts it.
+        void offlineRolls.attached('a different Host answered')
         return
       }
       // The same Host, still holding the ptys whose handles ended when the socket dropped. Take them
       // back by id: `reattachSessions` rebuilds each manager's record over the exited one and the ring
       // buffer covers the gap (design §11). The result is not reported to `hostSessionsTakenBack` —
       // that promise answers the boot cleanup's one question and has long since settled.
-      void takeSessionsBack('after a reconnect').catch((e) =>
-        hostLog(`host: taking sessions back after a reconnect failed: ${String(e)}`)
-      )
+      void takeSessionsBack('after a reconnect')
+        .then((r) => offlineRolls.swept('after a reconnect', r))
+        .catch((e) => hostLog(`host: taking sessions back after a reconnect failed: ${String(e)}`))
     })
 
     // Reported, not merely done: `bootOrch`'s restart cleanup waits on the outcome of this to learn
@@ -6829,18 +6821,29 @@ export function registerIpc(
           // says so — the pre-Host truth. Something did accept and then never finished the handshake,
           // or handshook and dropped: a Host is there, holding ptys we cannot enumerate, and `null`
           // there would have the cleanup close a live worker's Dispatch. `sawPeer` is the difference.
+          startupGaveUp = true
           if (!hostClient?.sawPeer()) {
             hostLog('host: no Host, so terminals stay in the app exactly as before')
             return null
           }
+          // Still not written off, and for the same reason: what that Host is running is unknown, and
+          // guessing "nothing" would close a live worker's Dispatch. What is new is that this is no
+          // longer where the story ends. The client has called it unresponsive, the routers have moved
+          // to the app's own factory so work can continue, and the Info tab offers to end it
+          // (docs/2026-09-22-host-unresponsive-recovery-design.md F1, F5). Before that, this line was
+          // the last thing that happened about it, for the rest of the app's life.
           hostLog(
             'host: a Host answered the address but never finished the handshake — what it is still running is unknown, so no worker is written off'
           )
           return 'unknown'
         }
-        // The router is already on the Host factory: `onConnect` above installs it the moment the
-        // handshake lands, which is what makes `status().connected` true here in the first place.
-        return takeSessionsBack('at startup')
+        // The routers are already on the Host: `routeByStatus` moved them the moment the handshake
+        // landed, which is what makes `status().connected` true here in the first place.
+        // Not awaited: the boot cleanup waits on this answer, not on Slack.
+        return takeSessionsBack('at startup').then((r) => {
+          void offlineRolls.swept('at startup', r)
+          return r
+        })
       })
       // Settles rather than rejecting, so `bootOrch` can await this without a try and nothing from
       // the Host throws into the app. `'unknown'`, not null: a reattach that blew up cannot say which
@@ -6881,20 +6884,35 @@ export function registerIpc(
     hostWiring?.log(`the Host wiring failed to start: ${String(err)} — the app runs without a Host`)
   })
 
-  ipcMain.handle(
-    'host.status',
-    () =>
-      hostClient?.status() ?? {
-        connected: false,
-        protocol: null,
-        hostVersion: null,
-        startedAt: null,
-        pid: null,
-        problem: 'out/main/host.js was not found',
-        outdated: false,
-        features: []
-      }
-  )
+  /** What the two handlers below answer when the Host wiring never ran at all — a partial build, or a
+   *  packaging mistake. One object rather than two copies, because every field added to HostStatus has
+   *  to reach both of them and a missed copy is a status that lies about itself. */
+  const noHostStatus: HostStatus = {
+    connected: false,
+    protocol: null,
+    hostVersion: null,
+    startedAt: null,
+    pid: null,
+    problem: 'out/main/host.js was not found',
+    outdated: false,
+    unresponsive: false,
+    runtimeIncomplete: false,
+    features: []
+  }
+  ipcMain.handle('host.status', () => hostClient?.status() ?? noHostStatus)
+  // Limits L3: the window reads it once at mount; changes arrive on 'host:driver'.
+  ipcMain.handle('host.driver', () => hostDriverView?.current() ?? null)
+  // The mirror tab reads the live workspaces once at mount; changes arrive on 'workspace:event'. Stop and
+  // Close go to the Host (workspace-stop, workspace-close).
+  ipcMain.handle('workspace.list', () => hostWorkspaceView?.current() ?? [])
+  ipcMain.handle('workspace.stop', async (_e, sessionId: unknown) => {
+    if (typeof sessionId !== 'string' || sessionId === '') throw new Error(`INVALID_SESSION_ID: ${String(sessionId)}`)
+    return (await hostWorkspaceView?.stop(sessionId)) ?? false
+  })
+  ipcMain.handle('workspace.close', async (_e, sessionId: unknown) => {
+    if (typeof sessionId !== 'string' || sessionId === '') throw new Error(`INVALID_SESSION_ID: ${String(sessionId)}`)
+    return (await hostWorkspaceView?.close(sessionId)) ?? false
+  })
   // How many of the running sessions would still be running after this app quits — the window-close
   // confirmation's question (App.tsx's closeWindow, then `quitConfirmBody`).
   //
@@ -6915,7 +6933,12 @@ export function registerIpc(
   // they survive this app process ending. On win32 they only do once the Host runs from its own
   // runtime; the renderer asks rather than assuming, because the fallback path (no runtime shipped,
   // or it could not be installed) is real and must not be promised over.
-  ipcMain.handle('host.survivesUpdate', () => hostSurvivesUpdate)
+  // Waits for an install in flight: until it lands, whether the Host can run from its own runtime is
+  // not known yet, and the install confirmation must not answer from a guess.
+  ipcMain.handle('host.survivesUpdate', async () => {
+    await runtimeInstaller.whenSettled()
+    return hostSurvivesUpdate
+  })
   // What the Host is holding, for the Info tab's Host row — the connection facts on their own say
   // nothing about whether a person's work survives closing the app.
   //
@@ -6937,18 +6960,7 @@ export function registerIpc(
   // Host wiring never ran.
   ipcMain.handle('host.replace', async (): Promise<HostStatus> => {
     if (hostReplace) return hostReplace()
-    return (
-      hostClient?.status() ?? {
-        connected: false,
-        protocol: null,
-        hostVersion: null,
-        startedAt: null,
-        pid: null,
-        problem: 'out/main/host.js was not found',
-        outdated: false,
-        features: []
-      }
-    )
+    return hostClient?.status() ?? noHostStatus
   })
 
   // The conversation view (main/conversation.ts). open/more answer null rather than reject on a
@@ -7039,13 +7051,17 @@ export function registerIpc(
   // person installs something, which is not while they are typing, and the pane asks once when it
   // opens. Answers an empty list rather than throwing for a session whose account has gone.
   // What `@` offers. The walk behind it is cached per project (main/fileIndex.ts), so this is one
-  // in-memory filter per keystroke rather than one tree walk.
+  // in-memory filter per keystroke rather than one tree walk. While the first walk of a project is
+  // still under way this answers at once with what it has found, and says it is still indexing.
   ipcMain.handle('conversation.files', async (_e, sessionId: string, query: string) => {
     const session = allSessions().find((s) => s.id === sessionId)
-    if (!session) return []
-    const files = session.cwd
-      ? await fileIndex.search(session.cwd, query, CONVERSATION_FILE_MATCHES)
-      : []
+    if (!session) return { paths: [], indexing: false }
+    const found = session.cwd
+      ? await fileIndex.lookup(session.cwd, query, CONVERSATION_FILE_MATCHES)
+      : { paths: [], indexing: false }
+    const files = found.paths
+    // A walk that failed or ran out of time (a dead share): the menu stops asking and says so
+    const unavailable = found.unavailable === true ? { unavailable: true as const } : {}
     // codex asks for a skill by mentioning it, the same way it mentions a file, so both belong in
     // the one list — skills first, being far fewer and named rather than found.
     let account: { provider?: string; configDir: string } | null = null
@@ -7054,13 +7070,17 @@ export function registerIpc(
     } catch {
       account = null
     }
-    if (account?.provider !== 'codex') return files
+    if (account?.provider !== 'codex') return { paths: files, indexing: found.indexing, ...unavailable }
     const skills = filterFilePaths(
       await listCodexMentions(account.configDir),
       query,
       CONVERSATION_FILE_MATCHES
     )
-    return [...skills, ...files].slice(0, CONVERSATION_FILE_MATCHES)
+    return {
+      paths: [...skills, ...files].slice(0, CONVERSATION_FILE_MATCHES),
+      indexing: found.indexing,
+      ...unavailable
+    }
   })
   ipcMain.handle('conversation.commands', async (_e, sessionId: string) => {
     const session = allSessions().find((s) => s.id === sessionId)
@@ -7077,7 +7097,7 @@ export function registerIpc(
     }
   })
 
-  // The chat pane (main/chat/manager.ts). The counterpart of the conversation block above for a
+  // The chat pane (core/chat/manager.ts). The counterpart of the conversation block above for a
   // session whose kind is 'chat': where a terminal session is driven by writing bytes into its pty,
   // this one is driven by these seven calls, and everything it says back arrives on 'chat:event'.
   //
@@ -7099,6 +7119,12 @@ export function registerIpc(
     if (!isPermissionMode(mode)) throw new Error(`INVALID_PERMISSION_MODE: ${String(mode)}`)
     return core.chat.setPermissionMode(sessionId, mode)
   })
+  // Chat takeover: the session's unattended permission policy (hold, or deny after 60 s), written into
+  // its note so a Host carrying it on reads it. A value that is not one of the two is a bug.
+  ipcMain.handle('chat.setUnattendedPermission', (_e, sid: string, v: unknown) => {
+    if (!isUnattendedPermission(v)) throw new Error(`INVALID_UNATTENDED_PERMISSION: ${String(v)}`)
+    return core.chat.setUnattendedPermission(sid, v)
+  })
   ipcMain.handle('chat.listPermissionModes', (_e, sessionId: string) =>
     core.chat.listPermissionModes(sessionId)
   )
@@ -7110,7 +7136,7 @@ export function registerIpc(
   // are the only source there is. Read in Claude's own order — local, then project, then user — and
   // read fresh rather than cached, since a person changing it is exactly why they would reopen a pane.
   // Never throws: a file that is missing or malformed is simply not a source.
-  ipcMain.handle('chat.configuredModel', (_e, sessionId: string) => {
+  ipcMain.handle('chat.configuredModel', async (_e, sessionId: string) => {
     const session = allSessions().find((x) => x.id === sessionId)
     if (!session) return null
     let account: { provider?: string; configDir: string } | null = null
@@ -7121,18 +7147,8 @@ export function registerIpc(
     }
     // codex keeps its model on the thread and reports it back at thread/start, so it never needs this.
     if (!account || account.provider === 'codex') return null
-    const read = (file: string): unknown => {
-      try {
-        return JSON.parse(readFileSync(file, 'utf8'))
-      } catch {
-        return null
-      }
-    }
-    return configuredModelOf([
-      session.cwd ? read(path.join(session.cwd, '.claude', 'settings.local.json')) : null,
-      session.cwd ? read(path.join(session.cwd, '.claude', 'settings.json')) : null,
-      read(path.join(account.configDir, 'settings.json'))
-    ])
+    // Async, each folder asked through the probe budget first (models/configuredModel.ts).
+    return readConfiguredModel({ cwd: session.cwd || undefined, configDir: account.configDir })
   })
   // What the pane reads once on mount, so a tab reopened (or a renderer reloaded) mid-conversation
   // shows the state the adapter is actually in rather than waiting for the next event to arrive.
@@ -7173,7 +7189,9 @@ export function registerIpc(
     }
     if (need.slack) {
       try {
-        slack?.notifier.register(info)
+        // With the thread its note names, like the adopters (Slack in the Host, the Task 4 carry): the
+        // retry keeps the id and the root, and the chat manager carries the thread keys into it.
+        slack?.notifier.register(info, { thread: notedThreadOf(core.chat.spawnNote(info.id) ?? {}) })
       } catch {
         /* A failed Slack re-registration does not block the retry */
       }
@@ -7226,13 +7244,27 @@ export function registerIpc(
   // (Volta 등)는 그 폴더의 프로젝트 manifest 를 읽어 도구 버전을 정하므로, 앱의 cwd 에서 검사하면
   // 읽을 manifest 가 없어 무조건 통과하고 세션만 죽는다(설계 D3). 실패의 첫 줄을 함께 돌려준다 —
   // "없음"과 "이 폴더에서는 안 돎"은 사람이 할 일이 다르다.
+  //
+  // **On win32 the CLI is spawned by where PATH says it is, never by name** (security review
+  // 2026-09-28, core/sessions/windowsExecutable.ts): this ran `cmd.exe /c claude --version` in the
+  // chosen folder, and cmd.exe looks a bare name up in its current directory before PATH — so a
+  // repository shipping a `claude.cmd` had it run the moment its folder was picked. A CLI PATH does
+  // not know is reported missing without asking the folder.
   ipcMain.handle('system.checkCli', async (_e, cwd?: string) => {
     const check = (cli: string): Promise<{ ok: boolean; version?: string; error?: string }> =>
       new Promise((resolve) => {
+        const spawn =
+          process.platform === 'win32'
+            ? (() => {
+                const found = resolveWindowsExecutable(cli)
+                return found === null ? null : { ...windowsSpawn(cli, ['--version'], () => found), shell: false }
+              })()
+            : { file: cli, args: ['--version'], shell: true }
+        if (spawn === null) return resolve({ ok: false })
         execFile(
-          cli,
-          ['--version'],
-          { shell: true, timeout: 10_000, windowsHide: true, ...(cwd ? { cwd } : {}) },
+          spawn.file,
+          spawn.args,
+          { shell: spawn.shell, timeout: 10_000, windowsHide: true, ...(cwd ? { cwd } : {}) },
           (err, stdout, stderr) => {
             if (!err) return resolve({ ok: true, version: stdout.trim() })
             const line = String(stderr)
@@ -7378,15 +7410,28 @@ export function registerIpc(
   // A rolling dev hook — forces the relay chain without a real limit (for manual end-to-end checks). Development only.
   if (!app.isPackaged)
     ipcMain.handle('rolling.forceRoll', async (_e, sessionId?: string) => {
+      // A chain neither coordinator here holds is the Host's when the Host rolls (S6 §3.4): it is asked
+      // to force it, and a refusal (404: not its chain either; 501: a Host too old) is thrown to the caller.
+      // A chain that declined (rolling, waiting, settling or quiet) answers 200 with `forced: false`: that
+      // resolves false, "nothing happened", as a local chain that declines does (S6 final review M1).
+      if (
+        sessionId &&
+        !rolling?.has(sessionId) &&
+        !codexRolling?.has(sessionId) &&
+        hostSpeaksRolling(hostClient?.status() ?? { connected: false, features: [] })
+      ) {
+        const r = await orchCall({ cmd: 'roll-force', args: { sessionId }, sessionId: '' })
+        if (r.status !== 200) throw new Error(`the Host refused roll-force (${r.status}): ${JSON.stringify(r.body)}`)
+        return hostForced(r.body, sessionId, (m) => hostWiring?.log(`host: ${m}`))
+      }
       // We do not know which coordinator holds that session, so try codex first and fall back to claude (dev hook)
       if (codexRolling) {
         try {
-          await codexRolling.forceRoll(sessionId)
-          return
+          return await codexRolling.forceRoll(sessionId)
         } catch {
           /* Not a codex chain — try claude */
         }
       }
-      await rolling?.forceRoll(sessionId)
+      return (await rolling?.forceRoll(sessionId)) ?? false
     })
 }

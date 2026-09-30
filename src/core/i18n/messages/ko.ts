@@ -18,15 +18,34 @@ export const ko = {
   // visible before picking it
   'settings.general.language.system': '시스템 설정 ({lang})',
   'settings.general.language.saveFailed': '언어 설정을 저장하지 못했습니다: {detail}',
-  // Agent orchestration
-  'settings.orchestration.label': '에이전트 오케스트레이션 (실험)',
-  'settings.orchestration.hint':
-    '켜면 앱이 띄운 에이전트 세션이 다른 벤더의 워커 세션을 띄울 수 있습니다. ' +
-    '에이전트가 앱의 어느 계정으로든 세션을 만들 수 있게 되므로 필요할 때만 켜세요. ' +
-    'git 저장소인 프로젝트에서만 작동합니다. ' +
-    '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다. ' +
-    '오케스트레이터로 쓸 세션에서 astera help 를 실행하게 하면 전체 사용법을 얻습니다.',
-  'settings.orchestration.saveFailed': '오케스트레이션 설정을 저장하지 못했습니다: {detail}',
+  // 명령줄 도구
+  'settings.cli.label': '명령줄 도구 (astera)',
+  'settings.cli.hint':
+    '설치하면 보통 셸에서도 astera 를 칠 수 있습니다. ' +
+    '앱이 셸 설정 파일을 고치지는 않습니다. PATH 에 없으면 넣는 방법을 보여 드립니다.',
+  'settings.cli.hint.win32':
+    '설치하면 PowerShell 이나 명령 프롬프트에서도 astera 를 칠 수 있습니다. ' +
+    '아래를 켜 두면 이 폴더를 사용자 PATH 에 넣고, 제거하면 그 항목만 뺍니다. 새로 여는 창부터 적용됩니다.',
+  'settings.cli.addToPath': '이 폴더를 사용자 PATH 에 추가',
+  'settings.cli.offer': '터미널에서도 astera 명령으로 세션과 Job 을 시작하고 다룰 수 있습니다. 앱을 꺼 둔 채로도 됩니다.',
+  'settings.cli.offer.open': '설정 열기',
+  'settings.cli.installed.pathAdded.toast': 'astera 명령을 설치하고 사용자 PATH 에 넣었습니다. 새로 여는 셸에서 쓸 수 있습니다.',
+  'settings.cli.pathFailed': 'astera 명령은 설치했지만 PATH 에 넣지 못했습니다: {detail}. 아래 한 줄을 직접 실행해 주세요.',
+  'settings.cli.uninstalled.pathRemoved.toast': 'astera 명령을 제거하고 사용자 PATH 에서 그 폴더를 뺐습니다.',
+  'settings.cli.installed': '설치됨',
+  'settings.cli.notInstalled': '설치되지 않음',
+  'settings.cli.install': 'astera 명령 설치',
+  'settings.cli.reinstall': '다시 설치',
+  'settings.cli.installed.toast': 'astera 명령을 설치했습니다.',
+  'settings.cli.failed': 'astera 명령을 설치하지 못했습니다: {detail}',
+  'settings.cli.uninstall': '제거',
+  'settings.cli.uninstalled.toast': 'astera 명령을 제거했습니다. 폴더와 그 안의 다른 파일은 그대로 둡니다.',
+  'settings.cli.uninstallFailed': 'astera 명령을 제거하지 못했습니다: {detail}',
+  // 사람이 직접 실행할 한 줄을 아래에 보여 준다
+  'settings.cli.pathMissing': '이 폴더가 PATH 에 없습니다. 아래 한 줄을 한 번 실행하면 들어갑니다.',
+  'settings.cli.onPath': '이 폴더가 PATH 에 있습니다.',
+  'settings.cli.copy': '복사',
+  'settings.cli.cmdRawPath': 'Astera 가 ASCII 가 아닌 이름의 폴더에 설치되어 있어 cmd 나 PowerShell 의 astera 가 돌지 않을 수 있습니다: {detail}. Git Bash 에서는 돕니다. ASCII 이름의 폴더에 다시 설치하면 고쳐집니다.',
   // 에이전트 권한 모드
   'settings.agentPermission.label': '권한 확인 없이 에이전트 실행',
   'settings.agentPermission.hint':
@@ -36,6 +55,11 @@ export const ko = {
     '프로젝트에 쌓아 둔 허용 목록(.claude/settings.local.json)도 따라오지 않아, 끄면 워커가 첫 명령에서 멈춥니다. ' +
     '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다.',
   'settings.agentPermission.saveFailed': '권한 모드를 저장하지 못했습니다: {detail}',
+  // app-settings.json 이 손상되어 복구했을 때 한 번 뜨는 알림. 권한 확인은 켜진 쪽으로 복구된다
+  'settings.recovered.toast':
+    '설정 파일(app-settings.json)이 손상되어 설정을 기본값으로 되돌렸습니다. 손상된 파일은 ' +
+    'app-settings.json.bak 에 남겨 두었습니다. 안전을 위해 권한 확인은 켜 두었습니다. ' +
+    '설정 > 에이전트에서 "권한 확인 없이 에이전트 실행"을 다시 켜면 확인 없이 실행됩니다.',
   // Work Unit 추적
   'settings.workUnit.label': '작업 단위 추적 (실험)',
   'settings.workUnit.hint':
@@ -50,6 +74,13 @@ export const ko = {
     '모든 계정에 astera-browser 스킬을 설치합니다. localhost 만 열 수 있습니다. ' +
     '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다.',
   'settings.agentBrowser.saveFailed': '에이전트 브라우저 설정을 저장하지 못했습니다: {detail}',
+  // 에이전트 앱 작업 공간
+  'settings.agentApp.label': '에이전트 앱 작업 공간 (실험)',
+  'settings.agentApp.hint':
+    '켜면 에이전트가 이 프로젝트의 앱을 사람이 보지 않는 곳(Windows 는 숨은 데스크톱, Linux 는 가상 디스플레이, macOS 는 백그라운드)에서 띄우고 조작하고 찍을 수 있습니다. ' +
+    '화면과 포인터는 건드리지 않습니다. Windows 와 macOS 에서는 클립보드를 함께 씁니다. 모든 계정에 astera-app 스킬을 설치합니다. ' +
+    '이미 열려 있는 세션에는 적용되지 않습니다. 새 세션부터 동작합니다.',
+  'settings.agentApp.saveFailed': '에이전트 앱 작업 공간 설정을 저장하지 못했습니다: {detail}',
   // 설명 생성 (How It Works)
   'settings.gen.label': '설명 생성 계정',
   'settings.gen.hint': '선택한 계정으로 기능 설명을 만듭니다.',
@@ -88,6 +119,7 @@ export const ko = {
   'files.error.alreadyExists': "'{name}' 이(가) 이미 있습니다",
   'files.error.alreadyExistsInDest': "'{name}' 이(가) 대상 폴더에 이미 있습니다",
   'files.error.renameStranded': "이름 변경에 실패했고 되돌리지도 못했습니다. 파일이 '{tmp}' 에 있습니다",
+  'files.error.unreachable': '폴더가 답하지 않아 아무것도 바꾸지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
   // worktrees/include.ts, worktrees/create.ts — worktree creation warnings
   'worktree.include.tooManyEntries': '.worktreeinclude 항목이 {max}개를 넘어 이후 줄은 무시했습니다',
   'worktree.include.globUnsupported': 'glob·부정 패턴 미지원: {line}',
@@ -98,7 +130,13 @@ export const ko = {
   'worktree.include.missing': '존재하지 않아 건너뜀: {entry}',
   'worktree.include.notIgnored': 'gitignore되지 않아 건너뜀: {entry}',
   'worktree.include.sizeFailed': '용량 계산 실패: {entry} ({detail})',
+  'worktree.include.unreachable': '프로젝트 폴더가 답하지 않아 .worktreeinclude 항목을 복사하지 않았습니다: {path}',
   'worktree.include.overLimit': '복사 상한(200MB) 초과로 건너뜀: {entry}',
+  'worktree.include.linkFailed': '링크를 다시 만들지 못해 이 항목은 복사하지 않음: {entry} ({detail})',
+  'worktree.include.unsafeDest': '복사할 자리로 가는 길에 링크({path})가 있어 그 아래는 복사하지 않음(워크트리 밖에 쓰지 않는다): {entry}',
+  'worktree.include.linkTargetMissing': '폴더 링크가 가리키는 저장소 안의 자리가 워크트리에 없어 링크를 다시 만들지 않음: {path} ({entry})',
+  'worktree.include.outsideLinkSkipped': '저장소 밖을 가리키는 폴더 링크를 심볼릭 링크로 만들지 못해 건너뜀({detail}). 필요하면 직접 만드세요: {path} ({entry})',
+  'worktree.include.overFileCount': '항목이 {max}개를 넘어 건너뜀: {entry}',
   'worktree.include.copyFailed': '복사 실패: {entry} ({detail})',
   'worktree.create.fetchFailed': '원격 갱신에 실패해 로컬에 있는 {baseRef} 기준으로 생성했습니다',
   'worktree.create.baseRecordFailed': 'branch.base 기록 실패 — 삭제 시 머지 판정이 HEAD 기준이 됩니다',
@@ -115,7 +153,16 @@ export const ko = {
   'worktree.error.orphanUnproven': '소유권을 확인할 수 없어 삭제하지 않았습니다. 수동으로 확인 후 삭제하세요.',
   'worktree.error.orphanUnverifiable': 'git이 이 폴더를 추적하지 않아 미커밋 변경 여부를 확인할 수 없습니다.',
   'worktree.error.gitAddFailed': 'git worktree 생성에 실패했습니다.',
+  'worktree.error.cancelled': 'worktree 만들기를 취소했습니다. 만들던 것은 모두 되돌렸습니다.',
+  'worktree.error.rollbackIncomplete': 'worktree 만들기를 되돌리지 못했습니다. 남은 폴더 {path} 와 브랜치 {branch} 를 직접 지워 주세요.',
   'worktree.error.gitRemoveFailed': 'git worktree 제거에 실패했습니다.',
+  'worktree.error.unreachable': '워크트리 폴더에 닿지 못했거나 확인하지 못해 아무것도 지우지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
+  'worktree.error.linksUnverified': '워크트리 폴더 안의 링크를 모두 확인하고 걷어내지 못해 아무것도 지우지 않았습니다. 그대로 지우면 정션을 타고 폴더 밖의 파일까지 지워질 수 있습니다. 다시 시도하거나 링크를 직접 지우세요.',
+  'worktree.error.locked': '워크트리가 잠겨 있어(git worktree lock) 아무것도 지우지 않았습니다. 먼저 잠금을 풀거나 강제로 지우세요.',
+  'worktree.error.hasSubmodules': '워크트리에 서브모듈이 있어 아무것도 지우지 않았습니다. git 은 서브모듈이 있는 워크트리를 강제로만 지웁니다. 강제로 지우세요.',
+  'worktree.error.rootUnreachable': '워크트리 폴더에 닿지 못했거나 확인하지 못해 워크트리를 만들지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
+  'worktree.error.repoUnreachable': '프로젝트 폴더에 닿지 못했거나 확인하지 못해 워크트리를 만들지 않았습니다(네트워크 드라이브가 끊겼을 수 있습니다). 닿을 수 있게 되면 다시 시도하세요.',
+  'worktree.error.noGit': 'git 을 실행하지 못해 워크트리를 만들지 않았습니다(git 이 설치되어 있고 PATH 에 있는지 확인하세요).',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session': "실행 중 세션 '{title}'이(가) 이 worktree를 사용 중입니다. 세션을 먼저 닫으세요.",
   'worktree.inUse.run': "실행 중 프로세스 '{name}'이(가) 이 worktree를 사용 중입니다. 실행을 먼저 중지하세요.",
@@ -123,6 +170,7 @@ export const ko = {
   // ROLL_MIXED_PROVIDER in sessions/manager.ts — a session-rolling constraint unrelated to worktrees, so it uses
   // session.* rather than worktree.*. The MESSAGES array in worktreeErrors.ts maps to this key
   'session.roll.mixedProvider': 'Claude와 Codex 계정을 섞어 롤링할 수 없습니다',
+  'session.resume.hostChatNotAdopted': '이 대화는 아직 Astera Host 에서 돌고 있고 이 창이 아직 넘겨받지 못했습니다. 잠시 뒤 다시 시도하세요.',
   // ---- github ----
   'github.settings.status': '연결 상태',
   'github.settings.connected': '연결됨 — {account}',
@@ -218,6 +266,8 @@ export const ko = {
   // 없었고, 그래서 한 번 다른 뷰를 열면 한 번의 누름으로는 돌아올 수 없었다.
   'session.rail.openSessions': '계정과 히스토리',
   'session.spawn.failed': '세션 시작 실패: {message}',
+  'session.spawn.cwdMissing': '폴더를 찾을 수 없습니다: {path}. 폴더를 다시 고르세요.',
+  'session.spawn.cwdUnreachable': '폴더가 제때 응답하지 않습니다: {path}. 네트워크 드라이브라면 연결을 확인하세요.',
   'session.spawn.failedWorktreeKept':
     '세션 시작 실패: {message} (worktree "{name}"는 남아 있으니 Worktrees 패널에서 삭제하세요)',
   // Rolling-resume guard hit — tells the user the tab was just focused and their chosen options were dropped
@@ -310,6 +360,33 @@ export const ko = {
   'settings.info.hostRestartConfirmBodyNone': 'Host 를 지금 종료하고 새 버전으로 다시 시작합니다. 유지 중인 것은 없습니다. 계속할까요?',
   'settings.info.hostNotConnected': '연결 안 됨',
   'settings.info.hostNotConnectedWhy': '연결 안 됨 · {detail}',
+  // 답을 멈춘 Host. 연결이 끊긴 것과 다르다 — 끊긴 연결은 다시 붙지만 이쪽은 스스로 풀리지 않는다.
+  // 그래서 이 줄은 상태만 말하지 않고 지금 무슨 일이 벌어지는지(새 세션은 앱 안에서 열린다)와
+  // 그 대가(앱을 끄면 함께 끝난다)를 함께 말한다. 2026-09-22 에 사람이 본 것은 "연결 안 됨" 한 줄뿐이었다.
+  'settings.info.hostUnresponsive': '응답 없음 · {detail}',
+  // 버튼을 가리키는 말은 넣지 않는다. 그 버튼이 Host 를 못 끝내는 경우가 있고(실행 파일이 우리 것이
+  // 아니면 손대지 않는다), 그때 이 줄이 "버튼으로 끝낼 수 있습니다" 라고 말하면 바로 윗줄과 모순된다.
+  // 버튼은 바로 옆에 있으므로 가리킬 필요도 없다.
+  'settings.info.hostUnresponsiveWhat': '새 세션은 앱 안에서 열리고 있습니다. 그 세션들은 앱을 끄면 함께 끝납니다.',
+  // 런타임 파일이 사라진 Host. 지금은 멀쩡해 보여도 다음 세션에서 멎는다.
+  'settings.info.hostRuntimeIncomplete':
+    'Host 가 쓰는 파일 일부가 사라졌습니다. 이대로 두면 다음 세션에서 응답이 멈춥니다. 유지 중인 것이 없어지면 자동으로 고쳐지고, 지금 재시작해도 됩니다.',
+  'settings.info.hostRestartUnresponsiveConfirmTitle': 'Host 끝내고 다시 시작',
+  // 몇 개가 끝나는지는 앱이 자기 기록으로 센다. 답하지 않는 Host 에게 물어볼 수는 없다.
+  'settings.info.hostRestartUnresponsiveConfirmBody':
+    '응답하지 않는 Host 를 강제로 끝내고 새로 시작합니다. 그 Host 가 들고 있던 세션 {kept}개가 함께 끝납니다. 계속할까요?',
+  'settings.info.hostRestartUnresponsiveConfirmBodyNone':
+    '응답하지 않는 Host 를 강제로 끝내고 새로 시작합니다. 그 Host 가 들고 있던 것은 없습니다. 계속할까요?',
+  'status.hostUnresponsive': '호스트 응답 없음',
+  'status.hostUnresponsiveTitle': 'Host 가 응답하지 않습니다. 새 세션은 앱 안에서 열리고 앱을 끄면 함께 끝납니다. 눌러서 Host 를 다시 시작합니다.',
+  // 업데이트 뒤 Host 실행 환경을 깔아 두는 동안(첫 설치는 node.exe 87MB 복사와 백신 검사). 1초를 넘기면 Slow 문구로 바뀐다
+  'status.hostPreparing': 'Astera Host 준비 중…',
+  'status.hostPreparingSlow': 'Astera Host 준비 중… 아직 진행 중입니다 ({seconds}초)',
+  'status.hostPrepareFailed': 'Astera Host 를 준비하지 못했습니다',
+  'status.hostPrepareFailedTitle': '{reason} ({detail}) 이번에는 앱 실행 파일로 Host 를 띄우고, 다음 시작 때 다시 준비합니다.',
+  'status.hostPrepareReason.copy': 'Host 실행 파일을 복사하지 못했습니다.',
+  'status.hostPrepareReason.timeout': '준비가 2분 안에 끝나지 않았습니다.',
+  'status.hostPrepareReason.unknown': '준비 중 알 수 없는 오류가 났습니다.',
   'settings.slack.save': '저장',
   'settings.slack.saved': '저장됨',
   'settings.slack.saveFailed': 'Slack 설정을 저장하지 못했습니다: {detail}',
@@ -398,10 +475,12 @@ export const ko = {
   // and the language switch on it are gone — it is hardcoded English in App.tsx instead.
   // App.tsx — update status (the title-bar UpdateIndicator / the settings Info tab)
   'update.tb.restartInstallVersion': '재시작하여 v{version} 설치',
+  'update.tb.manualInstallVersion': 'v{version} 직접 설치',
   'update.tb.checking': '업데이트 확인 중…',
   'update.tb.available': '새 버전 {version} 발견',
   'update.tb.downloading': '다운로드 중 {percent}%',
   'update.tb.error': '업데이트 오류',
+  'update.checkTimedOut': '업데이트 확인이 {seconds}초 안에 응답하지 않았습니다. 네트워크를 확인하고 다시 시도하세요.',
   // index.ts — diagnostic message for when the electron-updater module does not export properly (title-bar tooltip)
   'update.tb.autoUpdaterMissing': 'autoUpdater export를 찾지 못함',
   'update.info.downloading': '다운로드 중 {percent}%…',
@@ -414,6 +493,17 @@ export const ko = {
   'update.info.available': '새 버전 {version} 있음',
   'update.info.downloadVersion': '{version} 다운로드',
   'update.info.checkFailed': '확인 실패',
+  // macOS 전용. Squirrel 이 받은 빌드를 거부해 재시작으로는 설치되지 않는 상태 — 왜 되돌릴 수
+  // 없는 거부인지는 src/main/manualInstall.ts 에 있다. 이유를 한 줄 붙이는 것이 핵심이다:
+  // 예전에는 이 실패가 로그에만 남아서, 사람 눈에는 버튼이 죽은 것과 구별되지 않았다.
+  'update.info.manualInstallVersion': 'v{version} 직접 설치',
+  'update.info.manualWhy': '이 빌드는 자동 설치가 되지 않아 직접 옮겨야 합니다',
+  'update.manual.title': '직접 설치',
+  'update.manual.done':
+    '새 버전을 Finder 에 열었습니다. Astera 를 응용 프로그램 폴더로 끌어다 놓고 다시 실행하세요.\n\n{path}',
+  'update.manual.failed': '설치 파일을 준비하지 못했습니다: {message}',
+  'update.manual.noFile': '내려받은 설치 파일이 없습니다',
+  'update.manual.quit': '종료하고 옮기기',
   // App.tsx — the toast for a downloaded new version, and the session-kill confirmation when installing now
   'update.toast.available': '새 버전 v{version}이 나왔습니다',
   'update.toast.download': '다운로드',
@@ -493,7 +583,7 @@ export const ko = {
   'shortcut.explorer.cut': '잘라내기',
   'shortcut.explorer.copy': '복사',
   'shortcut.gesture.itemDrag': '항목 드래그',
-  'shortcut.explorer.move': '이동 · Ctrl 누르면 복사',
+  'shortcut.explorer.move': '이동 · {mod} 누르면 복사',
   'shortcut.explorer.undo': '되돌리기',
   'shortcut.run.run': '실행',
   'shortcut.run.stop': '실행 중지',
@@ -514,14 +604,21 @@ export const ko = {
   // useFileOps.ts — delete confirmation modal. The undoHint wording is settled —
   // the "up to" and "over 50MB excluded" specifics have to stay (no over-promising; see the undoHint declaration comment).
   'files.delete.undoHint':
-    'Ctrl+Z 또는 Local History에서 복구할 수 있습니다 (최대 30일 보관 · 50MB 초과 항목은 제외).',
+    '{mod}+Z 또는 Local History에서 복구할 수 있습니다 (최대 30일 보관 · 50MB 또는 5,000개 항목 초과는 제외).',
   'files.delete.confirmOne': "'{name}' 을(를) 삭제할까요?\n{undoHint}",
   'files.delete.confirmDirWithCount': "'{name}' 폴더와 하위 {count}개 항목을 삭제할까요?\n{undoHint}",
   'files.delete.confirmDirAll': "'{name}' 폴더와 하위 항목 전부를 삭제할까요?\n{undoHint}",
   'files.delete.confirmMany': '{shown}{more} — {total}개 항목을 삭제할까요?{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' 폴더 {count}개의 하위 항목이 함께 삭제됩니다.',
   'files.delete.moreNames': ' 외 {count}개',
-  'files.delete.skippedTooLarge': '항목이 너무 커서 Local History에 남기지 않았습니다',
+  'files.delete.skippedTooLarge': '항목이 너무 커서(50MB 또는 5,000개 항목 초과) Local History에 남기지 않았습니다',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': '삭제하는 중… {count}개 항목',
+  'files.op.snapshotting': 'Local History에 남기는 중… {count}개 항목',
+  'files.op.copying': '복사하는 중… {count}개 항목',
+  'files.op.deletingNoCount': '삭제하는 중…',
+  'files.op.copyingNoCount': '복사하는 중…',
+  'files.op.busy': '작업 중…',
   'files.delete.skippedFailed': 'Local History 스냅샷에 실패했습니다 — 삭제는 완료됐습니다',
   // useFileOps.ts — cut/copy and paste
   'files.clipboard.cutDone': '{count}개 항목을 잘라냈습니다',
@@ -541,7 +638,7 @@ export const ko = {
   'files.undo.partialFail': '되돌리기 {attempted}개 중 {failed}개 실패: {shown}{more}',
   'files.undo.partialMissing': '되돌리기 {total}개 중 {missing}개 실패: {shown}{more}',
   'files.undo.permanentTooLarge':
-    '되돌리기로 영구 삭제됐습니다 — 용량이 커 Local History에 남기지 않아 복구할 수 없습니다',
+    '되돌리기로 영구 삭제됐습니다 — 용량이 커(50MB 또는 5,000개 항목 초과) Local History에 남기지 않아 복구할 수 없습니다',
   'files.undo.permanentSnapshotFailed':
     '되돌리기로 지워졌습니다 — Local History 스냅샷에 실패해 복구할 수 없습니다',
   'files.undo.done': '{desc} 되돌렸습니다',
@@ -568,6 +665,7 @@ export const ko = {
   'explorer.noActiveSession': '활성 세션이 없습니다',
   // Folder state shown inside the tree (the .fx-note row)
   'explorer.dir.loading': '불러오는 중…',
+  'explorer.dir.reading': '폴더를 읽는 중…',
   'explorer.dir.readFailed': '읽기 실패: {detail}',
   'explorer.dir.empty': '비어 있음',
   'explorer.refresh': '새로고침',
@@ -575,21 +673,23 @@ export const ko = {
   'explorer.menu.newFile': '새 파일',
   'explorer.menu.newFolder': '새 폴더',
   'explorer.menu.rename': '이름 변경 (F2)',
-  'explorer.menu.delete': '삭제 (Del)',
-  'explorer.menu.deleteCount': '삭제 ({count}개, Del)',
+  'explorer.menu.delete': '삭제 ({del})',
+  'explorer.menu.deleteCount': '삭제 ({count}개, {del})',
   'explorer.menu.duplicateCount': '복제 ({count}개)',
-  'explorer.menu.cut': '잘라내기 (Ctrl+X)',
-  'explorer.menu.copy': '복사 (Ctrl+C)',
-  'explorer.menu.paste': '붙여넣기 (Ctrl+V)',
+  'explorer.menu.cut': '잘라내기 ({mod}+X)',
+  'explorer.menu.copy': '복사 ({mod}+C)',
+  'explorer.menu.paste': '붙여넣기 ({mod}+V)',
   'explorer.menu.copyPath': '경로 복사',
   'explorer.menu.copyRelativePath': '상대 경로 복사',
   'explorer.menu.reveal': '탐색기에서 열기',
+  'explorer.menu.revealMac': 'Finder에서 보기',
   // FileExplorer.tsx — git status on a tree row (tooltip, aria-label)
   'explorer.git.new': '새 파일',
   'explorer.git.modified': '수정됨',
   'explorer.git.deleted': '삭제됨',
   'explorer.git.conflict': '충돌',
   'explorer.git.folderCount': '변경 {count}건',
+  'explorer.git.unavailable': 'git 상태를 확인하지 못했습니다 — 표시는 마지막 결과입니다',
   'explorer.rail.toggle': '파일 탐색기',
   // WorkbenchTabs.tsx — the dirty marker on a file tab
   'explorer.tab.unsaved': '저장 안 됨',
@@ -715,6 +815,13 @@ export const ko = {
   'session.new.pickFolder': '선택…',
   'session.new.useWorktree': 'worktree로 분리해서 시작',
   'session.new.worktreeNoBase': '이 저장소에는 기준으로 삼을 브랜치가 없어 worktree 를 만들 수 없습니다. 커밋을 하나 만든 뒤 다시 시도하세요.',
+  'session.new.worktreeBranchesUnavailable': '브랜치 목록을 확인하지 못했습니다(git 이 응답하지 않음). 기준 브랜치는 자동으로 정합니다.',
+  'session.new.worktreeRepoUnknown': '이 폴더가 git 저장소인지 확인하지 못했습니다(git 이 제때 응답하지 않음 — 네트워크·WSL 경로는 느릴 수 있습니다). 여기서 세션은 시작할 수 있지만 worktree 로 분리해서는 시작할 수 없습니다.',
+  'session.new.worktreeRepoNoGit': 'git 을 실행하지 못해 이 폴더가 저장소인지 확인하지 못했습니다(git 이 설치돼 있고 PATH 에 있나요?). 여기서 세션은 시작할 수 있지만 worktree 로 분리해서는 시작할 수 없습니다.',
+  'session.new.worktreeRepoNoFolder': '이 폴더를 찾을 수 없습니다. 폴더를 다시 고르세요.',
+  'session.new.worktreeRepoError': '이 폴더가 git 저장소인지 확인하지 못했습니다. 여기서 세션은 시작할 수 있지만 worktree 로 분리해서는 시작할 수 없습니다.',
+  'session.new.checkingCli': '이 폴더에서 CLI 를 확인하는 중…',
+  'pr.create.branchesUnavailable': '브랜치 목록을 확인하지 못했습니다(git 이 응답하지 않음).',
   'session.new.worktreeBaseRef': '기준 브랜치',
   'session.new.worktreeBaseCurrent': '(현재 브랜치)',
   'session.new.worktreeBaseRemote': '원격',
@@ -769,11 +876,17 @@ export const ko = {
   'session.new.blocked.noAccount': '계정을 고르세요',
   'session.new.blocked.cliMissing': '이 계정의 CLI 를 찾지 못했습니다',
   'session.new.blocked.noSchedule': '예약 시각을 정하세요',
-  'session.new.blocked.checkingFolder': '프로젝트 폴더를 확인하는 중입니다',
+  'session.new.blocked.checkingFolder': '저장소를 확인하는 중…',
+  'startup.readingShellEnv': '셸 환경을 읽는 중…',
   // Waiting text between pressing Start and the tab opening. Splitting off a worktree chains fetch, worktree add and
   // the include copy, taking several seconds, so what is in progress is announced separately.
   'session.new.starting': '세션을 시작하는 중…',
   'session.new.startingWorktree': 'worktree를 만드는 중…',
+  'session.new.stage.fetch': '기준 브랜치를 가져오는 중…',
+  'session.new.stage.checkout': '파일을 체크아웃하는 중…',
+  'session.new.stage.copyIncludes': '포함 파일을 복사하는 중…',
+  'session.new.stage.copyCount': '{copied} / {total} · 파일 {files} / {filesTotal}',
+  'session.new.cancelling': '취소하는 중…',
   // NewSessionDialog.tsx scheduler UI — a merge from main brought in hardcoded text, later moved into this catalog
   'session.new.schedLabel': '스케쥴러 — 주기적으로 명령 자동 실행',
   'session.new.schedMode.interval': 'N분마다',
@@ -852,6 +965,7 @@ export const ko = {
   'history.panel.title': '히스토리',
   'history.panel.empty': '기록 없음',
   'history.loading': '불러오는 중…',
+  'history.scan.codex': 'Codex 기록을 훑는 중… {done}/{total}',
   'history.filter.deletedSuffix': ' (삭제됨)',
   'session.resume.originAccount': '원래 계정',
   'session.resume.originDeleted': '삭제된 계정',
@@ -869,6 +983,8 @@ export const ko = {
   'history.resume.pickFolder': '폴더 선택',
   // WorktreePanel.tsx — status labels (STATUS_LABEL; a module-level constant, so translated at render time)
   'worktree.status.orphanDir': 'git 등록 소실',
+  'worktree.status.unreachable': '폴더에 닿을 수 없음',
+  'worktree.status.gitUnchecked': 'git 확인 못 함',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'worktree 삭제',
   'worktree.remove.body':
@@ -1125,13 +1241,28 @@ export const ko = {
   'preview.agent.stop': '에이전트 스크립트 중단',
   'preview.agent.stopped': '에이전트 스크립트를 중단했습니다',
   'preview.agent.inUse': '에이전트가 컴퓨터를 사용 중입니다  ·  Esc로 취소',
+  // 에이전트 앱 작업 공간 미러 탭
+  'workspace.tab.tag': '앱',
+  'workspace.tab.running': '에이전트가 보이지 않는 데스크톱에서 앱을 조작하고 있습니다',
+  'workspace.pane.title': '{session} 의 앱',
+  'workspace.pane.running': '실행 중: {helper}',
+  'workspace.pane.launching': '앱을 시작하는 중… {seconds}초',
+  'workspace.pane.idle': '대기 중 (앱은 떠 있습니다)',
+  'workspace.pane.closed': '닫혔습니다',
+  'workspace.pane.waiting': '첫 화면을 기다리는 중',
+  'workspace.pane.stop': '중단',
+  'workspace.pane.close': '닫기',
+  'workspace.pane.alt': '에이전트의 앱 화면',
+  'workspace.pane.failed': '작업 공간에 전하지 못했습니다: {detail}',
+  'workspace.pane.nothingToStop': '중단할 스크립트가 없습니다',
+  'workspace.pane.nothingToClose': '닫을 작업 공간이 없습니다',
   // BottomPanel, the rail terminal button. The Run tab and the terminal tabs share the bottom panel.
   'terminal.rail.open': '터미널',
   'terminal.tab.label': '터미널 {n}',
   'terminal.tab.new': '새 터미널',
   'terminal.tab.close': '터미널 닫기',
   'terminal.open.failed': '터미널 열기 실패: {detail}',
-  // rolling.ts and codexRolling.ts — the default resume prompt main writes straight into the Claude PTY,
+  // claudeCoordinator.ts and codexCoordinator.ts — the default resume prompt main writes straight into the Claude PTY,
   // or passes as a Codex CLI argument, when rolling resumes after a limit. It is also the default for the
   // user's rollPrompt setting (session.new.rollPromptPlaceholder shows this value as its placeholder). It is
   // an instruction sent to a CLI, but it follows the app language by decision.
@@ -1164,7 +1295,7 @@ export const ko = {
   'slack.choice.singleOnlyAt': '{index}번째 질문: 하나만 고를 수 있습니다',
   'slack.choice.outOfRange': '{n}번은 없습니다 (1~{max})',
   'slack.choice.outOfRangeAt': '{index}번째 질문: {n}번은 없습니다 (1~{max})',
-  // slackInbox.ts — the notice left in the thread when a thread reply could not be injected into the session
+  // core/slack/inbox.ts — the notice left in the thread when a thread reply could not be injected into the session
   'slack.inbox.tooLong': '⚠️ 답장이 너무 길어 전달하지 않았습니다 ({max}자 이하만 가능)',
   'slack.inbox.sessionEnded': '⚠️ 이 세션은 종료되어 입력을 전달하지 못했습니다',
   'slack.inbox.injectFailed': '⚠️ 입력을 전달하지 못했습니다',
@@ -1177,12 +1308,23 @@ export const ko = {
   'slack.chat.turnFailed': '⚠️ 턴 실패 — {message}',
   'slack.limitNoResume': '⛔ 한도 도달 — 자동 재개 없음',
   'slack.limitNoResumeAt': '⛔ 한도 도달 — 자동 재개 없음 (리셋 {at})',
+  // main/host/rollJournalSummary.ts — what the Host rolled while no app was attached (closed, or a dropped socket), one line per session
+  // (S6 D6). {events} is the parts below joined by commas, in the order they happened.
+  'slack.offline.summary': '🕘 Astera 가 Host 와 끊겨 있던 사이: {events}',
+  'slack.offline.limit': '{time} 한도 도달',
+  'slack.offline.limitUntil': '{time} 한도 도달 ({at} 재개 예정)',
+  'slack.offline.switched': '{label} 로 전환',
+  'slack.offline.switchedAnon': '계정 전환',
+  'slack.offline.resumed': '{time} 재개',
+  'slack.offline.stalled': '{time} 멈춤, 확인 필요',
   // Desktop notification bodies. They follow the app language, the same way Slack's already do. The
   // title is the session's own title, so the body says only what happened.
   'notify.inputNeeded': '사용자 확인이 필요합니다',
   'notify.limitWaiting': '한도에 걸려 재개를 기다립니다',
   'notify.accountSwitched': '계정을 {label} 로 전환했습니다',
   'notify.fallbackTitle': 'Astera',
+  // The one desktop notice for everything the Host rolled while no app was attached (S6 D6).
+  'notify.offlineRolls': 'Astera 가 Host 와 끊겨 있던 사이 세션 {n}개가 한도에 걸렸습니다',
   // JobsView.tsx, App.tsx — the read-only Jobs sidebar (오케스트레이션 Run/Task 목록)
   // 'Jobs'는 번역하지 않는다 — '작업'은 이미 Task를 가리키는 말이라, 뷰 이름까지 '작업'이라 하면
   // 그 안의 Task 행들과 이름이 겹친다. catalog.test.ts의 LITERALS가 네 카탈로그 모두에서 그대로
@@ -1198,6 +1340,23 @@ export const ko = {
   // 적는 자리가 화면에 없으면 사람은 버튼이 사라진 줄 안다
   'jobs.noProject': '열린 프로젝트가 없습니다',
   'jobs.noProject.hint': '세션을 열면 그 폴더가 이 창의 프로젝트가 되고, 그때부터 여기서 작업을 만들 수 있습니다',
+  // Host 가 상태 파일의 주인이 된 뒤의 두 화면(호스트 제어면 설계 §6). 빈 사이드바로는 "아직
+  // 기다리는 중" 과 "못 붙었다" 가 같아 보이고, 둘 다 "작업이 없다" 로 읽힌다.
+  'jobs.host.waiting': 'Host 에 연결하는 중입니다',
+  'jobs.host.unreachable': 'Host 에 연결할 수 없습니다',
+  // **네 기능을 한자리에서 말한다**(판정 F35). 이 계획 전에는 넷 다 Host 없이 돌았으므로, 어느
+  // 하나만 적으면 /astera-task 가 멈춘 사람은 자기 기능이 왜 죽었는지 알 길이 없다. 기능마다
+  // 화면을 따로 만드는 대신 이 한 줄이 넷을 모두 이름으로 부른다.
+  'jobs.host.features': '작업(Jobs), 작업 단위 추적, 에이전트 브라우저, 스마트 재개가 이 연결을 기다리고 있습니다',
+  'jobs.host.retry': '설정을 바꾸거나 앱을 다시 켜면 다시 시도합니다',
+  'jobs.host.reason': '사유: {reason}',
+  'jobs.host.log': '자세한 기록: {path}',
+  // 한도 L3: 아무것도 움직이지 않을 때 그 까닭.
+  'jobs.stall.parked': 'Host 가 작업을 멈춰 둠: {reason}',
+  'jobs.stall.gate.unreadable': '설정 파일을 읽을 수 없습니다. Astera 를 다시 켜면 고칩니다',
+  'jobs.stall.gate.notMigrated': '설정 이전이 아직 끝나지 않았습니다. Astera 를 켜 두면 끝납니다',
+  'jobs.stall.unresponsive': 'Host 가 응답하지 않아 작업이 움직이지 않습니다. 설정의 정보 탭에서 Host 를 다시 시작할 수 있습니다',
+  'jobs.stall.reading': 'Host 가 아직 설정을 읽는 중이라 작업이 움직이지 않습니다',
   // 여덟 상태의 툴팁 — JobIcons.tsx 의 글리프가 달고 다닌다. 사이드바가 상태를 말로 적지 않게 된
   // 뒤로 이 문구들은 상시로 보이지 않는다: 아이콘을 처음 보는 사람이 배우는 자리다.
   // pending 과 blocked 를 다르게 적는 것이 특히 중요하다 — 앞은 의존이, 뒤는 사람이 막고 있다
@@ -1244,6 +1403,7 @@ export const ko = {
   'jobs.run.mergeConfirmBody': '워커가 워크트리에 커밋한 일을 프로젝트 폴더로 합칩니다 (워크트리 {count}개).\n\n프로젝트 폴더의 현재 브랜치에 커밋으로 추가됩니다.',
   'jobs.run.mergeNothing': '합칠 것이 남아 있지 않습니다 — 워크트리 폴더가 이미 사라졌습니다',
   'jobs.run.mergeUncommitted': '커밋되지 않은 변경 {count}개는 합쳐지지 않았습니다 — 워크트리에 그대로 있고, 폴더를 지우면 사라집니다',
+  'jobs.run.mergeUncommittedUnknown': '워크트리 {count}개의 커밋되지 않은 변경을 확인하지 못했습니다 — 폴더를 지우기 전에 직접 확인하세요',
   'jobs.run.mergeFailed': '합치지 못했습니다: {reason}',
   'jobs.run.notStarted': '실행 대기',
   'jobs.run.notStartedHint': '아직 실행하지 않았습니다 — 상세 창에서 실행을 누르면 시작합니다',
@@ -1258,6 +1418,7 @@ export const ko = {
   'jobs.run.deleteRetained': 'worker-retain 으로 붙잡아 둔 세션이 있어 지울 수 없습니다 — 먼저 놓아 주세요',
   'jobs.run.deleteBusy': '이 작업에 도는 워커가 있어 지울 수 없습니다 — 먼저 멈춰 주세요',
   'jobs.run.deleteFailed': '작업을 지우지 못했습니다',
+  'jobs.run.deleteKeptWorktrees': '워크트리 폴더 {count}개를 남겼습니다. 커밋되지 않은 변경이 있거나 상태를 확인하지 못했습니다. 내용을 확인한 뒤 워크트리 패널에서 지우세요.',
   'jobs.run.sharedFolder': '폴더 공유',
   'jobs.run.sharedFolderHint': '다른 작업의 워커와 같은 폴더에서 돌고 있습니다 — 서로의 편집이 섞일 수 있고, 앱은 그것을 막지도 알아채지도 못합니다',
   'jobs.run.scheduled': '예약',
@@ -1390,6 +1551,9 @@ export const ko = {
   'jobs.detail.cycle': '의존이 서로를 가리켜 순서를 정할 수 없습니다 — 이 Task 들은 영원히 시작되지 않습니다',
   'jobs.detail.hidden': '다른 Task 의 이벤트 {count}개 — 노드를 다시 눌러 해제',
   'jobs.detail.clearFilter': '필터 해제',
+  'jobs.detail.journalOlder': '이전 저널 기록 더 보기',
+  'jobs.detail.journalCapped': '더 오래된 저널 기록은 여기에 보이지 않습니다. 이 창은 최근 기록만 보여 줍니다.',
+  'jobs.detail.journalBusy': '지금은 저널이 사용 중이라 마지막으로 읽은 기록을 보여 줍니다. 다음 갱신 때 다시 읽습니다.',
   // 선 색의 뜻. 아이콘과 달리 선에는 툴팁을 달 곳이 없어 그래프 아래에 두 줄로 적는다
   'jobs.detail.edgeWaiting': '기다리는 중인 의존',
   'jobs.detail.edgeResolved': '이미 풀린 의존',
@@ -1427,6 +1591,7 @@ export const ko = {
   // 쓸 수 없는 경우다 — 지정을 무시하고 기본 계정으로 갈아타지 않으므로 사람에게 말해야 한다
   'jobs.gate.noAccountAssigned': '이 Task 에 계정이 지정되지 않아 어느 에이전트로 띄울지 알 수 없습니다 — 계정을 지정하세요',
   'jobs.gate.noAccount': '{provider} 계정에 로그인되어 있지 않아 이 Task 를 시작할 수 없습니다',
+  'jobs.gate.workerLostNoApp': '이 Task 의 워커가 복구해 줄 Astera 가 열려 있지 않은 동안 사라졌습니다(dispatch {dispatch}). 이 Gate 를 해결하면 다시 시작합니다.',
   'jobs.gate.assignedAccountUnusable':
     '이 Task 에 지정된 첫 계정을 쓸 수 없고, 그 뒤의 계정들은 나중에 갈아탈 순서일 뿐입니다 — 그 계정에 다시 로그인하거나 이 Task 의 계정 목록을 고치세요',
   // NewTaskModal.tsx — Task 를 짜는 동안 상세 창의 아래 칸(.detail-events)이 바뀌는 폼. deps 는
@@ -1489,6 +1654,7 @@ export const ko = {
   // 여전히 질문으로 읽히므로 잃는 것이 없다(가이드: a decision block for deciding the task DAG)
   'jobs.node.gateQuestion': '왜 세워 두는지',
   'jobs.node.failed': '이 동작을 하지 못했습니다',
+  'jobs.node.stopFailed': '워커를 멈추지 못했습니다: {detail}',
   // How It Works — 프로젝트 이해
   'hiw.rail.open': 'How It Works',
   'hiw.title': 'How It Works',
@@ -1502,6 +1668,7 @@ export const ko = {
   'hiw.record.reason.interrupted': '이 기록을 만드는 도중 앱이 꺼졌습니다 — 아래 버튼을 눌러 다시 만들어 주세요.',
   'hiw.record.reason.checkFailed': '에이전트가 돌린 검사가 통과하지 못했습니다 — 결과물을 확인해 보세요.',
   'hiw.record.reason.checkFailedJob': '앱이 돌린 검사가 통과하지 못했습니다 — 결과물을 확인해 보세요.',
+  'hiw.record.reason.evidenceUnreachable': '프로젝트 폴더가 답하지 않아 이 설명이 근거로 댄 파일을 확인하지 못했습니다. 폴더에 닿을 수 있게 되면 다시 만들어 보세요.',
   'hiw.pane.overview': '무엇을 하나요',
   'hiw.pane.userVisible': '무엇이 달라졌나요',
   'hiw.pane.flow': '어떻게 동작하나요',
@@ -1603,6 +1770,8 @@ export const ko = {
   'conversation.model.aria': '모델과 effort',
   'conversation.model.unknown': '모델',
   // ConversationPane.tsx — open() answering null, and a transcript that exists but has no turns yet.
+  'conversation.indexingFiles': '파일 목록을 만드는 중…',
+  'conversation.filesUnavailable': '이 폴더의 파일 목록을 가져올 수 없습니다.',
   'conversation.unavailable': '이 세션은 아직 기록이 없습니다',
   'conversation.empty': '아직 주고받은 것이 없습니다',
   'conversation.composer.placeholder': '무엇을 시킬까요',
@@ -1623,5 +1792,11 @@ export const ko = {
   'chat.mode.aria': '권한 모드',
   'chat.mode.default': '기본',
   'chat.mode.acceptEdits': '편집 자동 승인',
-  'chat.mode.plan': '플랜'
+  'chat.mode.plan': '플랜',
+  // chat takeover Task 10 — the mode menu's unattended-policy section and the New Session dialog's
+  // matching control (P8): what a chat session does with a permission prompt nobody answers while a
+  // Host holds the process as its writer.
+  'chat.unattended.heading': '자리에 아무도 없을 때',
+  'chat.unattended.hold': '질문을 붙잡아 둔다',
+  'chat.unattended.deny60': '60초 뒤 거절한다'
 } as const

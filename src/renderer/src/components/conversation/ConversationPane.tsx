@@ -44,7 +44,7 @@ import {
   type PendingSend
 } from "../../../../core/history/pendingSends";
 import { ChatRequestCard } from "./ChatRequestCard";
-import type { PermissionModeChoice } from "../../../../core/chat/types";
+import type { PermissionModeChoice, UnattendedPermission } from "../../../../core/chat/types";
 import type { MessageKey } from "../../../../core/i18n";
 import { useChatState } from "../../hooks/useChatState";
 import { toast } from "../../lib/toast";
@@ -52,6 +52,7 @@ import { useI18n } from "../../i18n/I18nProvider";
 import type { ConvPart, ConvTurn } from "../../../../core/history/convTypes";
 import type { RollStateEvent, SchedStateEvent } from "../../../../core/types";
 import { chatBannerFor, composerLockedFor } from "./paneTransport";
+import { pollFileIndex } from "../../lib/fileIndexPoll";
 import { SessionStateBanners, stateBannerHeight } from "../SessionStateBanners";
 
 export interface ConversationPaneProps {
@@ -295,6 +296,8 @@ const PENDING_SWEEP_MS = 5_000
  *  and short enough that a change the CLI quietly refused stops pretending. */
 const MODEL_BUSY_MAX_MS = 6_000
 
+/** How soon the `@` menu asks again while main says the project's first walk is still under way. */
+const FILE_INDEX_POLL_MS = 400
 
 /** How often a pane with nothing to show asks again whether a transcript has appeared. */
 const UNAVAILABLE_RETRY_MS = 2_000;
@@ -429,6 +432,9 @@ export function ConversationPane({
   const [composerText, setComposerText] = useState("");
   const [composerCaret, setComposerCaret] = useState(0);
   const [fileMatches, setFileMatches] = useState<readonly string[]>([]);
+  /** The project's first `@` walk is still under way — the menu says so instead of sitting empty. */
+  const [fileIndexing, setFileIndexing] = useState(false);
+  const [fileUnavailable, setFileUnavailable] = useState(false);
   const [slashActive, setSlashActive] = useState(0);
   /** What this session's CLI says it can run. Asked once per session — see conversation.models. */
   const [models, setModels] = useState<readonly ModelDescriptor[]>([]);
@@ -835,28 +841,40 @@ export function ConversationPane({
 
   // What `@` is asking for, fetched per keystroke. Cheap after the first one: main walks the project
   // once and keeps the list (main/fileIndex.ts), so this is an in-memory filter and a round trip.
+  // While the first walk of a large project (or a slow share) is under way, main answers with what it
+  // has found so far and `indexing`; this asks again shortly, so the menu fills in as the walk goes.
+  // It stops asking once the walk failed or ran out of time (a dead share: `unavailable`), and says so
+  // (lib/fileIndexPoll.ts).
   useEffect(() => {
     if (fileQuery === null) {
       setFileMatches([]);
+      setFileIndexing(false);
+      setFileUnavailable(false);
       return;
     }
     const generation = generationRef.current;
-    let cancelled = false;
-    void window.api.conversation
-      .files(sessionId, fileQuery)
-      .then((paths) => {
-        if (cancelled || generationRef.current !== generation) return;
+    const stop = pollFileIndex(
+      () => window.api.conversation.files(sessionId, fileQuery),
+      ({ paths, indexing, unavailable }) => {
+        if (generationRef.current !== generation) {
+          stop();
+          return;
+        }
         setFileMatches(paths);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+        setFileIndexing(indexing);
+        setFileUnavailable(unavailable);
+      },
+      () => setFileIndexing(false),
+      { pollMs: FILE_INDEX_POLL_MS }
+    );
+    return stop;
   }, [sessionId, fileQuery]);
 
   const rows: CompletionRow[] =
     fileToken === null ? [] : fileMatches.map((p) => ({ key: p, label: p }));
   const slashOpen = rows.length > 0;
+  const fileIndexingShown = fileToken !== null && fileIndexing;
+  const fileUnavailableShown = fileToken !== null && fileUnavailable;
   const slashOpenRef = useRef(slashOpen);
   slashOpenRef.current = slashOpen;
   const rowsRef = useRef(rows);
@@ -1153,6 +1171,43 @@ export function ConversationPane({
     };
   }, [sessionId]);
 
+  // chat takeover P8: whether this session was started with permissions already bypassed
+  // (--dangerously-skip-permissions and its codex twin). Asked once per session, the same "asked once
+  // on mount" pattern as the model list above — the flag is chosen at spawn and never changes while
+  // the session runs. A bypassed session never holds a permission prompt at all, so the unattended
+  // control below is not offered for one.
+  const [bypassPermissions, setBypassPermissions] = useState(false);
+  useEffect(() => {
+    let current = true;
+    setBypassPermissions(false);
+    void window.api.sessions
+      .list()
+      .then((list) => {
+        if (current) setBypassPermissions(list.find((s) => s.id === sessionId)?.bypassPermissions === true);
+      })
+      .catch(() => {});
+    return () => {
+      current = false;
+    };
+  }, [sessionId]);
+
+  // chat takeover P8: this session's unattended-permission policy, mirrored from `chat.state` — kept
+  // apart from `chat` itself because no `chat:event` carries a change to it (unlike the permission
+  // mode, which the CLI echoes back as a `model` event), so a pick has to re-pull `chat.state` rather
+  // than wait for the stream to catch up.
+  const [unattendedPermission, setUnattendedPermission] = useState<UnattendedPermission>("hold");
+  useEffect(() => {
+    setUnattendedPermission(chat?.unattendedPermission ?? "hold");
+  }, [sessionId, chat?.unattendedPermission]);
+  const refreshChatState = useCallback((): void => {
+    void window.api.chat
+      .state(sessionId)
+      .then((s) => {
+        if (s) setUnattendedPermission(s.unattendedPermission ?? "hold");
+      })
+      .catch(() => {});
+  }, [sessionId]);
+
   /** How much this session's CLI may do without asking, right now. */
   const permissionMode = chat === null ? "default" : chat.model.permissionMode;
   /** The rows its mode menu offers. Asked once per session beside the model list — Claude answers a
@@ -1225,9 +1280,35 @@ export function ConversationPane({
               ...choice,
               label: choice.label === "" ? t(`chat.mode.${choice.key}` as MessageKey) : choice.label
             })),
-            onPickPermissionMode: (mode) => sayIfFailed(window.api.chat.setPermissionMode(sessionId, mode))
+            onPickPermissionMode: (mode) => sayIfFailed(window.api.chat.setPermissionMode(sessionId, mode)),
+            // chat takeover P8: not offered for a session already running with permissions bypassed —
+            // it never holds a prompt for the policy to apply to.
+            ...(bypassPermissions
+              ? {}
+              : {
+                  unattended: {
+                    value: unattendedPermission,
+                    onPick: (v: UnattendedPermission) =>
+                      sayIfFailed(
+                        window.api.chat.setUnattendedPermission(sessionId, v).then(() => refreshChatState())
+                      )
+                  }
+                })
           }),
-    [permissionMode, permissionModes, modelLine, modelInfo.model, modelInfo.effort, modelInfo.cli, models, sessionId, t]
+    [
+      permissionMode,
+      permissionModes,
+      modelLine,
+      modelInfo.model,
+      modelInfo.effort,
+      modelInfo.cli,
+      models,
+      sessionId,
+      t,
+      bypassPermissions,
+      unattendedPermission,
+      refreshChatState
+    ]
   );
 
   // An answer that is actually being waited on outranks everything; after that, a list being typed
@@ -1264,6 +1345,14 @@ export function ConversationPane({
       active={Math.min(slashActive, Math.max(rows.length - 1, 0))}
       onPick={takeRow}
       onHover={setSlashActive}
+      status={
+        fileIndexingShown
+          ? t("conversation.indexingFiles")
+          : fileUnavailableShown
+            ? t("conversation.filesUnavailable")
+            : undefined
+      }
+      statusBusy={fileIndexingShown}
     />
   );
   /** What the banner slot is for, in the order paneTransport.ts sets out. */
@@ -1299,7 +1388,7 @@ export function ConversationPane({
     <ChatNotice text={t("chat.notice.checking")} />
   ) : chatBanner.kind === "endsWithApp" ? (
     <ChatNotice text={t("chat.notice.endsWithApp")} />
-  ) : slashOpen ? (
+  ) : slashOpen || fileIndexingShown || fileUnavailableShown ? (
     completionMenu
   ) : null;
 

@@ -10,7 +10,7 @@
 // **감시자를 띄우지 않는다.** 수집기는 의존을 밖에서 받고 방아쇠를 메서드로 노출하므로, 진짜
 // 트랜스크립트 파일을 임시 디렉터리에 쓰고 그 메서드를 직접 부르면 전부 확인된다. 디바운스는
 // `flush()` 로 건너뛴다 — 테스트가 150ms 를 기다리지 않게 하려고 남겨 둔 길이다.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -19,11 +19,17 @@ import {
   WorkUnitCollector,
   type CollectorDeps,
   type CollectorGit,
-  type CollectorSession
+  type CollectorSession,
+  GIT_COALESCE_MS
 } from './collector'
 import { OPERATION_GRACE_MS } from '../../core/git/provenance'
 import type { GitRef } from '../../core/git/types'
+import type { HostMergeRecord } from '../../core/git/hostMerges'
 import type { SessionWorkUnit } from '../../core/workUnit/types'
+import { foldsCaseHere } from '../../core/testPaths'
+import { readGitRef, isAncestorOf, readChangedFiles, readRange, probeGit, type GitRun } from './gitProbe'
+import { git } from '../../core/worktrees/git'
+import { makeRepo, gitSync } from '../../core/worktrees/testRepo'
 
 let dir: string
 let storeFile: string
@@ -70,9 +76,9 @@ const codexGoal = (status: string, objective = 'rpg 게임을 만들어줘'): st
 interface Fake {
   git: CollectorGit & {
     ref: GitRef
-    files: string[]
+    files: string[] | null
     ancestor: boolean | null
-    range: { commits: string[]; changedFiles: string[]; authors?: string[] }
+    range: { commits: string[]; changedFiles: string[]; authors?: string[] } | null
   }
   sessions: CollectorSession[]
   clock: number
@@ -320,6 +326,155 @@ describe('WorkUnitCollector — 선언으로 여닫는다', () => {
 
     expect(store.get(projectPath)!.units).toHaveLength(0) // sawWrite alone does not save it
     expect(closed).toHaveLength(0)
+  })
+
+  // git 이 답하지 못한 것(null)은 "바뀐 파일이 없다"가 아니다. 쓰기 증거가 있는 Unit 을 git 이 매달린
+  // 순간에 완료했다고 지우면, 실제로 한 일이 기록 없이 사라진다.
+  it('완료 순간 git 이 답하지 못하면(null) 쓰기 증거가 있는 Unit 을 지우지 않고 기록한다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    await collector.startTask('s1', '버그를 고쳐줘')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null // status 가 시간 초과 — 모른다
+
+    const result = await collector.completeTask('s1', { source: 'agent' })
+    expect(result.ok).toBe(true)
+    expect(store.get(projectPath)!.units).toHaveLength(1)
+    expect(store.get(projectPath)!.units[0].status).toBe('completed')
+    expect(closed).toHaveLength(1)
+  })
+
+  it('git 이 답하지 못해도(null) 쓰기 증거가 없는 Unit 은 그대로 지운다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+
+    await collector.startTask('s1', '설명해줘')
+    fake.git.files = null
+    await collector.completeTask('s1', { source: 'agent' })
+    expect(store.get(projectPath)!.units).toHaveLength(0)
+  })
+
+  // Spec §12: a completed record with no changed files is not recorded. A project that is not a git
+  // repository has nothing that could have changed as far as git can say, so a completion there is
+  // dropped and starts no write-up agent. The real probes run against the temp project folder, which
+  // is not a repository: this is the regression the fake git above could not show.
+  it('in a project that is not a git repository, a completed task with write evidence is dropped and starts no write-up', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const real: CollectorGit = { readRef: readGitRef, isAncestor: isAncestorOf, changedFiles: readChangedFiles, readRange }
+    const { collector, store, closed } = await makeCollector(fake, storeFile, undefined, { git: real })
+    await collector.start()
+
+    const started = await collector.startTask('s1', '고쳐줘')
+    if (!started.ok) throw new Error('unexpected')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBeUndefined()
+    const r = await collector.completeTaskById(projectPath, started.id)
+    expect(r).toEqual({ ok: true, recorded: false })
+    expect(store.get(projectPath)!.units).toHaveLength(0)
+    expect(closed).toHaveLength(0)
+  })
+
+  it('completeTaskById 도 git 이 답하지 못하면(null) 쓰기 증거가 있는 Unit 을 기록한다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    const started = await collector.startTask('s1', '고쳐줘')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null
+    const id = (started as { id: string }).id
+    const r = await collector.completeTaskById(projectPath, id)
+    expect(r).toEqual({ ok: true, recorded: true })
+    expect(store.get(projectPath)!.units).toHaveLength(1)
+    expect(closed).toHaveLength(1)
+  })
+
+  // 중단되는 순간의 읽기가 null 이면 그 Unit 의 관찰은 "모름"으로 얼어붙는다. 나중에 사람이 완료를
+  // 누를 때 그것을 "바뀐 파일 없음"으로 읽고 지우면, 쓰기 증거가 있는 일이 기록 없이 사라진다.
+  it('중단 순간 git 이 답하지 못한(null) Unit 은 나중에 완료해도 쓰기 증거가 있으면 기록된다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    const first = await collector.startTask('s1', '첫 작업')
+    if (!first.ok) throw new Error('unexpected')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null // 중단 직전의 읽기가 시간 초과
+    await collector.startTask('s1', '두 번째 작업') // 첫 작업을 중단으로 민다
+    const interrupted = store.get(projectPath)!.units.find((u) => u.id === first.id)!
+    expect(interrupted.status).toBe('interrupted')
+    expect(interrupted.git.observationUnknown).toBe(true)
+
+    fake.git.files = [] // 지금은 답한다 — 그래도 중단된 Unit 의 창은 이미 닫혔다
+    const result = await collector.completeTaskById(projectPath, first.id)
+    expect(result).toEqual({ ok: true, recorded: true })
+    expect(store.get(projectPath)!.units.find((u) => u.id === first.id)!.status).toBe('completed')
+    expect(closed).toHaveLength(1)
+  })
+
+  it('세션이 끝나는 순간 git 이 답하지 못한(null) Unit 도 완료하면 기록된다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store, closed } = await makeCollector(fake)
+    await collector.start()
+
+    const t = await collector.startTask('s1', '세션이 끝나기 전 작업')
+    if (!t.ok) throw new Error('unexpected')
+    await fs.appendFile(transcript, wrote(), 'utf8')
+    collector.onTranscriptChanged()
+    await collector.flush()
+    fake.git.files = null
+    fake.sessions = []
+    await collector.onSessionExit('s1')
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBe(true)
+
+    const result = await collector.completeTaskById(projectPath, t.id)
+    expect(result).toEqual({ ok: true, recorded: true })
+    expect(closed).toHaveLength(1)
+  })
+
+  it('한 번 답하지 못했어도 다음 읽기가 답하면 모름 표지는 걷힌다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    await collector.startTask('s1', '작업')
+    fake.git.files = null
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBe(true)
+    fake.git.files = []
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.units[0].git.observationUnknown).toBeUndefined()
+  })
+
+  // 기준선을 읽지 못했으면 기준선 자리를 비워 둔다(undefined) — [] 는 "열릴 때 깨끗했다"는 답이다.
+  it('시작할 때 git 이 답하지 못하면 baselineDirtyFiles 는 없다(undefined) — []가 아니다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    fake.git.files = null
+    await collector.startTask('s1', '작업')
+    const u = store.get(projectPath)!.units[0]
+    expect('baselineDirtyFiles' in u.git).toBe(false)
   })
 
   it('completeTaskById 는 중단된 것도 닫는다', async () => {
@@ -696,7 +851,7 @@ describe('WorkUnitCollector — 한도로 굴렀을 때 열린 작업이 살아�
     const started = await collector.startTask('s1', '한도 전에 하던 작업')
     expect(started.ok).toBe(true)
 
-    // rolling.ts's roll() goes kill → spawn → send('session:rolled') with no await in between —
+    // claudeCoordinator.ts's roll() goes kill → spawn → send('session:rolled') with no await in between —
     // the old session's real (asynchronous) exit event is guaranteed to arrive after this
     // notification. Passing oldSessionId relies on exactly that ordering (see onSessionForked's doc).
     collector.onSessionForked('s2', undefined, 's1')
@@ -815,6 +970,43 @@ describe('WorkUnitCollector — beginGitOperation/endGitOperation', () => {
   // threading 되는지는 이 자리 말고는 볼 데가 없다(gitProbe.test.ts 는 readRange 자신만 본다).
   // 그리고 **커밋과 같은 조건으로 버리는지**를 함께 본다: `git log before..after` 에서 온 값이라
   // fast-forward 밖에서는 커밋과 마찬가지로 뜻이 없다(EG §6·§7).
+  // 범위를 읽지 못했을 때(null) 빈 목록만 남기면 큰 pull 이 "아무 것도 안 바뀐 이동"으로 기록된다.
+  // 기록은 남기되 모른다는 표지를 단다.
+  it('범위를 읽지 못한 외부 변경은 rangeUnknown 표지를 달고 기록된다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+
+    collector.onGitChanged() // 기준선
+    await collector.flush()
+
+    fake.git.range = null
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+
+    const state = store.get(projectPath)!
+    expect(state.externalGitChanges).toHaveLength(1)
+    expect(state.externalGitChanges[0].rangeUnknown).toBe(true)
+    expect(state.externalGitChanges[0].commits).toEqual([])
+    expect(state.externalGitChanges[0].changedFiles).toEqual([])
+  })
+
+  it('범위를 읽은 외부 변경에는 rangeUnknown 이 없다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    collector.onGitChanged()
+    await collector.flush()
+    fake.git.range = { commits: ['c1'], changedFiles: ['a.txt'] }
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges[0].rangeUnknown).toBeUndefined()
+  })
+
   it('fast-forward 의 author 는 저장되고, 브랜치 전환의 author 는 버려진다', async () => {
     const fake = makeFake()
     fake.sessions = [session()]
@@ -930,7 +1122,8 @@ describe('WorkUnitCollector — beginGitOperation/endGitOperation', () => {
   // ipc.ts 의 mergeInto(run.worktree ?? run.cwd)와 이 프로젝트의 cwd 는 따로 기록되고, 대소문자나
   // 구분자만 다르게 적힐 수 있다(core/orchestration/integrate.ts 의 worktreeDeps 주석과 같은 문제) —
   // isAsteraOperation 에 isSamePath 를 넘기지 않으면 이 등록은 아무 것도 못 막는다.
-  it('등록된 경로 표기가 달라도(대소문자) Astera 의 병합으로 본다', async () => {
+  // 대소문자를 접는 것은 win32 와 darwin 뿐 — linux 에서 대문자로 바꾼 경로는 다른 폴더의 병합이다
+  it('등록된 경로 표기가 달라도(대소문자) Astera 의 병합으로 본다 (대소문자를 접는 플랫폼에서)', async () => {
     const fake = makeFake()
     fake.sessions = [session()]
     const { collector, store } = await makeCollector(fake)
@@ -945,7 +1138,7 @@ describe('WorkUnitCollector — beginGitOperation/endGitOperation', () => {
     await collector.flush()
     collector.endGitOperation(opId)
 
-    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(0)
+    expect(store.get(projectPath)!.externalGitChanges.length === 0).toBe(foldsCaseHere)
   })
 
   // beginGitOperation 의 프룬(pending 목록에서 유예 지난 것을 치우는 자리)은 규칙이 둘이고 서로
@@ -983,6 +1176,155 @@ describe('WorkUnitCollector — beginGitOperation/endGitOperation', () => {
     const ops = collector.getPendingGitOps()
     expect(ops.some((o) => o.id === first)).toBe(true)
     expect(ops.some((o) => o.id === second)).toBe(true)
+  })
+
+  it('a HEAD move the Host recorded as its own merge, made while the app was closed, is not an outside change (carry 1)', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const records: HostMergeRecord[] = []
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, { hostMerges: async () => records })
+    await collector.start()
+    collector.onGitChanged() // baseline at c0 — stamps gitSnapshot.capturedAt at fake.clock
+    await collector.flush()
+    // The merge ran (and ended) *after* the baseline was captured — while the app was closed, not
+    // before it (fix round 1, review I1's sinceMs bound: a record older than the stored snapshot's own
+    // capturedAt cannot explain a move discovered later).
+    records.push({ id: 'm1', projectPath, headBefore: 'c0', headAfter: 'c1', startedAt: new Date(fake.clock + 1_000).toISOString(), endedAt: new Date(fake.clock + 2_000).toISOString() })
+    fake.clock += OPERATION_GRACE_MS * 10 // long after any grace
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(0)
+  })
+  it('a move the records do not explain is still recorded (the control)', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, { hostMerges: async () => [] })
+    await collector.start()
+    collector.onGitChanged()
+    await collector.flush()
+    fake.clock += OPERATION_GRACE_MS * 10
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(1)
+  })
+
+  // fix round 1 (review m2) — the production reader (readHostMerges) never throws, but the injected
+  // dep's contract does not say it must not, and the round has already advanced state.gitSnapshot and
+  // every open unit's endHead by the time it is called.
+  it('a throwing hostMerges dep does not lose the change — a throw reads as no records (m2)', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, {
+      hostMerges: async () => {
+        throw new Error('merges.json is being written')
+      }
+    })
+    await collector.start()
+    collector.onGitChanged()
+    await collector.flush()
+    fake.clock += OPERATION_GRACE_MS * 10
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(1)
+  })
+
+  // fix round 1 (review m4) — the collector-level pin for the mid-merge attach the commit subject
+  // claims: an open record (no endedAt) present at the moment the move is seen, not one completed
+  // before the round even started (that is the "made while closed" test above).
+  it('an open record at the moment the move is seen explains it — the app attached mid-merge (m4)', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const records: HostMergeRecord[] = []
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, { hostMerges: async () => records })
+    await collector.start()
+    collector.onGitChanged() // baseline at c0
+    await collector.flush()
+    records.push({ id: 'm1', projectPath, headBefore: 'c0', startedAt: new Date(fake.clock).toISOString() }) // still open
+    fake.clock += OPERATION_GRACE_MS * 10 // well short of MERGE_OPEN_MAX_MS
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(0)
+  })
+
+  // fix round 2 (review N1) — I1's logic is proven at the pure explainedByHostMerges level, but nothing
+  // proved gitRound actually threads `sameBranch`/`sinceMs` through to it: a refactor that drops
+  // `sameBranch` or passes `0` for `sinceMs` brought I1 back with the whole suite green (the reviewer's
+  // own mutation). These two pin the wiring itself.
+  it('a same-head branch switch after an aborted or no-op merge\'s a→a record is still recorded (N1, I1)', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const records: HostMergeRecord[] = [
+      { id: 'm1', projectPath, headBefore: 'c0', headAfter: 'c0', startedAt: new Date(fake.clock).toISOString(), endedAt: new Date(fake.clock).toISOString() }
+    ]
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, { hostMerges: async () => records })
+    await collector.start()
+    collector.onGitChanged() // baseline at main@c0
+    await collector.flush()
+    fake.git.ref = { branch: 'feature', head: 'c0' } // branch switch only — HEAD unchanged
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(1)
+  })
+  it('a redo — HEAD moved back to a head the Host once produced, after the app already caught up past it — is still recorded (N1, I1)', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const records: HostMergeRecord[] = [
+      { id: 'm1', projectPath, headBefore: 'c0', headAfter: 'c1', startedAt: new Date(fake.clock).toISOString(), endedAt: new Date(fake.clock).toISOString() }
+    ]
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, { hostMerges: async () => records })
+    await collector.start()
+    collector.onGitChanged() // baseline at main@c0
+    await collector.flush()
+
+    // 1. The app sees c1 — explained by the Host's completed record, so nothing is recorded yet.
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(0)
+
+    // Time passes before the person resets, so the snapshot this round captures (and step 3's sinceMs
+    // reads) lands after the Host record's endedAt — otherwise every timestamp in this test ties at the
+    // same instant and the `>=` in the sinceMs check would trivially let the old record through again.
+    fake.clock += 60_000
+
+    // 2. HEAD is reset back to c0 — a real, unrelated move (nothing in the records explains c1→c0).
+    fake.git.ancestor = false // c1 is not an ancestor of c0 — a reset, not a fast-forward
+    fake.git.ref = { branch: 'main', head: 'c0' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(1)
+
+    // 3. HEAD moves to c1 again — the same heads the old record already explained once, but the
+    //    snapshot has since moved past that record's endedAt (step 2 captured a new one), so it must
+    //    not explain this new move too.
+    fake.git.ancestor = true
+    fake.git.ref = { branch: 'main', head: 'c1' }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.externalGitChanges).toHaveLength(2)
+  })
+
+  // fix round 2 (review m5) — readRef spawns processes and can take tens of milliseconds; stamping
+  // capturedAt only after it returns would let a Host merge that ends while the read is still in
+  // flight land after the stamp, failing the sinceMs check on the very move it should explain.
+  it('capturedAt is stamped from before the HEAD read, not after it returns (m5)', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    const beforeRead = fake.clock
+    const originalReadRef = fake.git.readRef
+    fake.git.readRef = async (repoPath: string) => {
+      fake.clock += 5_000 // time passes while the read is "in flight"
+      return originalReadRef(repoPath)
+    }
+    collector.onGitChanged()
+    await collector.flush()
+    expect(store.get(projectPath)!.gitSnapshot?.capturedAt).toBe(new Date(beforeRead).toISOString())
   })
 })
 
@@ -1865,7 +2207,7 @@ describe('네이티브 /goal 이 작업 하나를 연다', () => {
     )
     await collector.flush() // opens the unit under s1
 
-    // rolling.ts's roll(): kill(old) → spawn(new) → send('session:rolled'), no await in between —
+    // claudeCoordinator.ts's roll(): kill(old) → spawn(new) → send('session:rolled'), no await in between —
     // the old session's own exit event is guaranteed to arrive after this notification.
     collector.onSessionForked('s2', undefined, 's1')
     fake.sessions = [session({ sessionId: 's2' })] // s1 is already dead
@@ -2009,7 +2351,7 @@ describe('네이티브 /goal 이 작업 하나를 연다', () => {
     await collector.flush() // blocked — deferred under s1
     expect(ignored).toHaveLength(1)
 
-    // rolling.ts's roll(): kill(old) → spawn(new) → send('session:rolled'), no await in between —
+    // claudeCoordinator.ts's roll(): kill(old) → spawn(new) → send('session:rolled'), no await in between —
     // the old session's own exit event is guaranteed to arrive after this notification.
     collector.onSessionForked('s2', undefined, 's1')
     fake.sessions = [session({ sessionId: 's2' })] // s1 is already dead
@@ -2055,7 +2397,7 @@ describe('네이티브 /goal 이 작업 하나를 연다', () => {
     await collector.cancelTaskById(projectPath, started.id)
     expect(store.get(projectPath)!.units.filter((u) => u.status === 'active')).toHaveLength(0)
 
-    // rolling.ts's roll(): kill(old) → spawn(new) → send('session:rolled'), no await in between —
+    // claudeCoordinator.ts's roll(): kill(old) → spawn(new) → send('session:rolled'), no await in between —
     // the old session's own exit event is guaranteed to arrive after this notification.
     collector.onSessionForked('s2', undefined, 's1')
     fake.sessions = [session({ sessionId: 's2' })] // s1 is already dead
@@ -2198,3 +2540,255 @@ describe('네이티브 /goal 이 작업 하나를 연다', () => {
   })
 })
 
+
+// ── git 회차를 모으고 나눠 쓴다 (stage 4, task 4) ─────────────────────────
+//
+// 회차 하나가 git 을 몇 번 띄우는지가 곧 그 회차의 값이다 — Windows 에서는 바이러스 백신이 프로세스
+// 하나마다 값을 매긴다. 여기서는 세 가지를 본다: 회차가 도는 동안 온 이벤트가 회차를 하나만 더
+// 부르는가, 같은 저장소를 두 번 묻지 않는가, 회차 하나가 띄우는 git 이 몇 개인가.
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+/** 이 창을 넘겨 기다려야 모인 이벤트가 회차로 이어진다 */
+const WINDOW_MS: number = GIT_COALESCE_MS ?? 300
+
+describe('WorkUnitCollector — git 회차 모으기', () => {
+  it('회차가 도는 동안 온 git 이벤트 N 개는 그 뒤 회차 하나로 모인다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    let lists = 0
+    let refs = 0
+    let hold = false
+    let release: (() => void) | null = null
+    fake.git.readRef = async () => {
+      refs += 1
+      if (hold) await new Promise<void>((r) => (release = r))
+      return fake.git.ref
+    }
+    const { collector } = await makeCollector(fake, storeFile, undefined, {
+      listSessions: async () => {
+        lists += 1
+        return fake.sessions
+      }
+    })
+    await collector.start()
+    lists = 0
+    refs = 0
+
+    hold = true
+    collector.onGitChanged()
+    const first = collector.flush()
+    await vi.waitFor(() => expect(release).not.toBeNull(), { timeout: 3_000 }) // 첫 회차가 readRef 안에서 서 있다
+    hold = false
+    // 회차가 도는 동안 이벤트가 두 무더기로 온다 — 디바운스 창을 넘길 만큼 사이를 두고
+    for (let i = 0; i < 5; i++) collector.onGitChanged()
+    await sleep(WINDOW_MS + 100)
+    for (let i = 0; i < 5; i++) collector.onGitChanged()
+    await sleep(WINDOW_MS + 100)
+    release!()
+    await first
+
+    await vi.waitFor(() => expect(refs).toBe(2), { timeout: 3_000 })
+    await sleep(WINDOW_MS * 2 + 100) // 더 오는 회차가 없는지 본다
+    expect(refs).toBe(2)
+    expect(lists).toBe(2) // 첫 회차 + 뒤따르는 회차 하나
+    await collector.stop()
+  })
+
+  it('아직 시작하지 않은 회차가 있으면 flush 는 그 회차에 합류한다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    let lists = 0
+    const { collector } = await makeCollector(fake, storeFile, undefined, {
+      listSessions: async () => {
+        lists += 1
+        return fake.sessions
+      }
+    })
+    await collector.start()
+    lists = 0
+    collector.onGitChanged()
+    await Promise.all([collector.flush(), collector.flush(), collector.flush()])
+    expect(lists).toBe(1)
+  })
+
+  // 같은 폴더를 다른 철자로 적은 두 프로젝트(대소문자만 다르다). 한 회차 안에서 같은 저장소에 같은
+  // 질문을 두 번 하지 않는다 — ref 도 status 도 한 번씩이다.
+  it.runIf(foldsCaseHere)('같은 저장소를 가리키는 두 프로젝트는 한 회차에서 읽기를 나눠 쓴다', async () => {
+    const fake = makeFake()
+    const other = projectPath.toUpperCase()
+    fake.sessions = [session(), session({ sessionId: 's2', projectPath: other })]
+    let refs = 0
+    let status = 0
+    fake.git.readRef = async () => {
+      refs += 1
+      return fake.git.ref
+    }
+    fake.git.changedFiles = async () => {
+      status += 1
+      return fake.git.files
+    }
+    const { collector, store } = await makeCollector(fake)
+    await collector.start()
+    await collector.startTask('s1', '하나')
+    await collector.startTask('s2', '둘')
+    refs = 0
+    status = 0
+    fake.git.files = ['src/a.ts'] // 열린 뒤에 바뀌었다 — 기준선에 들지 않는다
+
+    collector.onGitChanged()
+    await collector.flush()
+    expect(refs).toBe(1)
+    expect(status).toBe(1)
+    // 나눠 쓴 답이 두 프로젝트 모두에 그대로 들어간다
+    expect(store.get(projectPath)!.units[0].git.observedChangedFiles).toEqual(['src/a.ts'])
+    expect(store.get(other)!.units[0].git.observedChangedFiles).toEqual(['src/a.ts'])
+  })
+
+  it('열린 Unit 이 없는 프로젝트의 git 회차는 status 를 묻지 않는다 — 열려 있으면 한 번 묻는다', async () => {
+    const fake = makeFake()
+    fake.sessions = [session()]
+    let status = 0
+    fake.git.changedFiles = async () => {
+      status += 1
+      return fake.git.files
+    }
+    const { collector } = await makeCollector(fake)
+    await collector.start()
+    collector.onGitChanged() // 기준선 — 견줄 앞이 없어 여기서는 어차피 묻지 않는다
+    await collector.flush()
+    collector.onGitChanged()
+    await collector.flush()
+    expect(status).toBe(0)
+
+    await collector.startTask('s1', '작업')
+    status = 0
+    collector.onGitChanged()
+    await collector.flush()
+    expect(status).toBe(1)
+  })
+})
+
+describe('WorkUnitCollector — 회차 하나가 띄우는 git 수 (진짜 저장소)', () => {
+  const counting = (): { calls: string[][]; run: GitRun } => {
+    const calls: string[][] = []
+    return {
+      calls,
+      run: (args, opts) => {
+        calls.push(args)
+        return git(args, opts)
+      }
+    }
+  }
+
+  async function setup(openUnit: boolean) {
+    const repo = await makeRepo('astera-wu-spawns-')
+    const fake = makeFake()
+    fake.sessions = [session({ projectPath: repo })]
+    const { calls, run } = counting()
+    const made = await makeCollector(fake, storeFile, undefined, { git: probeGit(run) })
+    await made.collector.start()
+    if (openUnit) await made.collector.startTask('s1', '작업')
+    made.collector.onGitChanged() // 기준선
+    await made.collector.flush()
+    calls.length = 0
+    return { repo, calls, ...made }
+  }
+
+  it('HEAD 가 그대로이고 열린 Unit 이 없으면 git 1번 (전에는 3번)', async () => {
+    const { calls, collector } = await setup(false)
+    collector.onGitChanged()
+    await collector.flush()
+    expect(calls).toHaveLength(1)
+  })
+
+  it('HEAD 가 그대로이고 열린 Unit 이 있으면 git 2번, status 는 한 번 (전에는 3번)', async () => {
+    const { repo, calls, collector, store } = await setup(true)
+    await fs.writeFile(path.join(repo, 'n.txt'), 'n', 'utf8')
+    collector.onGitChanged()
+    await collector.flush()
+    expect(calls).toHaveLength(2)
+    expect(calls.filter((a) => a.includes('status'))).toHaveLength(1)
+    expect(store.get(repo)!.units[0].git.observedChangedFiles).toEqual(['n.txt'])
+  })
+
+  it('같은 브랜치의 바깥 커밋이면 git 7번 (전에는 10번) — 기록은 그대로다', async () => {
+    const { repo, calls, collector, store } = await setup(true)
+    const before = gitSync(repo, ['rev-parse', 'HEAD']).trim()
+    await fs.writeFile(path.join(repo, 'g.txt'), 'y', 'utf8')
+    gitSync(repo, ['add', 'g.txt'])
+    gitSync(repo, ['commit', '-m', 'second'])
+    const after = gitSync(repo, ['rev-parse', 'HEAD']).trim()
+    collector.onGitChanged()
+    await collector.flush()
+    expect(calls).toHaveLength(7)
+
+    const state = store.get(repo)!
+    expect(state.externalGitChanges).toHaveLength(1)
+    const change = state.externalGitChanges[0]
+    expect(change.type).toBe('fast-forward')
+    expect(change.before).toEqual({ branch: 'main', head: before })
+    expect(change.after).toEqual({ branch: 'main', head: after })
+    expect(change.commits).toEqual([after])
+    expect(change.changedFiles).toEqual(['g.txt'])
+    expect(change.authors).toEqual(['Test User'])
+    expect(change.rangeUnknown).toBeUndefined()
+    expect(state.units[0].git.endHead).toBe(after)
+    expect(state.units[0].encounteredExternalGitChangeIds).toEqual([change.id])
+  })
+})
+
+// 모름(null)은 모름 그대로다 — 읽기를 줄이고 나눠 써도. 진짜 probe 를 쓰되 한 명령만 시간 초과로
+// 답하게 해서, stage 1 의 모름 규칙이 끝(저장된 기록)까지 그대로인지 본다.
+describe('WorkUnitCollector — 줄인 읽기에서도 모름은 모름이다', () => {
+  const timingOut = (which: string): GitRun => (args, opts) =>
+    args.includes(which)
+      ? Promise.resolve({ ok: false, stdout: '', stderr: 'timed out', timedOut: true as const })
+      : git(args, opts)
+
+  it('merge-base 가 답하지 못하면 전이는 unknown 으로 남는다 — history-rewritten 을 지어내지 않는다', async () => {
+    const repo = await makeRepo('astera-wu-unknown-')
+    const fake = makeFake()
+    fake.sessions = [session({ projectPath: repo })]
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, {
+      git: probeGit(timingOut('merge-base'))
+    })
+    await collector.start()
+    collector.onGitChanged() // 기준선
+    await collector.flush()
+    await fs.writeFile(path.join(repo, 'g.txt'), 'y', 'utf8')
+    gitSync(repo, ['add', 'g.txt'])
+    gitSync(repo, ['commit', '-m', 'second'])
+    collector.onGitChanged()
+    await collector.flush()
+    const changes = store.get(repo)!.externalGitChanges
+    expect(changes).toHaveLength(1)
+    expect(changes[0].type).toBe('unknown')
+    expect(changes[0].commits).toEqual([]) // fast-forward 가 아니면 범위를 커밋 목록으로 믿지 않는다
+  })
+
+  it('status 가 답하지 못하면 나눠 쓴 두 프로젝트의 열린 Unit 모두 모름 표지를 단다', async () => {
+    const repo = await makeRepo('astera-wu-unknown-')
+    const other = foldsCaseHere ? repo.toUpperCase() : repo
+    const fake = makeFake()
+    fake.sessions = [session({ projectPath: repo }), session({ sessionId: 's2', projectPath: other })]
+    let broken = false
+    const calls: string[][] = []
+    const run: GitRun = (args, opts) => {
+      calls.push(args)
+      return broken && args.includes('status')
+        ? Promise.resolve({ ok: false, stdout: '', stderr: 'timed out', timedOut: true as const })
+        : git(args, opts)
+    }
+    const { collector, store } = await makeCollector(fake, storeFile, undefined, { git: probeGit(run) })
+    await collector.start()
+    await collector.startTask('s1', '하나')
+    await collector.startTask('s2', '둘')
+    broken = true
+    calls.length = 0
+    collector.onGitChanged()
+    await collector.flush()
+    expect(calls.filter((a) => a.includes('status'))).toHaveLength(1)
+    expect(store.get(repo)!.units.find((u) => u.sessionId === 's1')!.git.observationUnknown).toBe(true)
+    expect(store.get(other)!.units.find((u) => u.sessionId === 's2')!.git.observationUnknown).toBe(true)
+  })
+})

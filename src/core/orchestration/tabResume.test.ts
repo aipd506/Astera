@@ -167,6 +167,12 @@ describe('formatTabResume — update', () => {
     const out = formatTabResume({ ...base, git: { ...git, changed: [] } }, 'update')!
     expect(out).toContain('no uncommitted changes')
   })
+
+  it('status 를 못 읽었으면 변경이 없다고 하지 않고 확인하지 못했다고 한다', () => {
+    const out = formatTabResume({ ...base, git: { ...git, changed: [], changedUnknown: true } }, 'update')!
+    expect(out).not.toContain('no uncommitted changes')
+    expect(out).toContain('Could not check for uncommitted changes')
+  })
 })
 
 // fix wave 최종, F9: git 목록으로 내려간 손댄 파일은 "이 대화에서 손댔다"는 증거가 아니다 — 지금

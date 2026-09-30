@@ -1,0 +1,1058 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { promises as fs, readFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { OrchestrationStore, RUN_TTL_MS } from './store'
+import { emptyState, type OrchState } from './state'
+import { stateFromLegacy } from './legacyState'
+
+let dir: string
+beforeEach(async () => {
+  dir = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-orch-'))
+})
+afterEach(async () => {
+  await fs.rm(dir, { recursive: true, force: true })
+})
+
+// "지금"이지 특정 날짜가 아니다. 리터럴로 박아 두면 시한폭탄이 된다 — load() 의 TTL 정리는
+// 실제 Date.now() 로 판정하므로, 고정 날짜는 작성 시점으로부터 RUN_TTL_MS(30일)가 지나는 순간
+// 조용히 만료되어 이 파일의 여러 테스트가 한꺼번에 깨진다(실제로 2026-09-03 에 그렇게 깨졌다).
+// 과거를 만드는 테스트들이 이미 쓰는 `Date.now() - RUN_TTL_MS` 와 같은 기준으로 맞춘다.
+const NOW = new Date().toISOString()
+const withOpenDispatch = (): OrchState =>
+  stateFromLegacy({
+  runs: [{ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: NOW }],
+  tasks: [
+    {
+      id: 'tsk_1',
+      runId: 'run_1',
+      title: 't',
+      spec: 's',
+      deps: [],
+      status: 'dispatched',
+      consecutiveFailures: 0,
+      createdAt: NOW,
+      updatedAt: NOW
+    }
+  ],
+  dispatches: [
+    {
+      id: 'dsp_1',
+      taskId: 'tsk_1',
+      provider: 'codex',
+      accountId: 'acc1',
+      sessionId: 'sess1',
+      cwd: 'D:/p',
+      specPath: 'D:/p/orch/specs/x.md',
+      startedAt: NOW,
+      workerState: 'ready',
+      retained: false
+    }
+  ]
+})
+
+describe('OrchestrationStore', () => {
+  it('상태를 저장하고 새 인스턴스가 다시 읽는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const a = new OrchestrationStore(file)
+    await a.load()
+    const s = withOpenDispatch()
+    // 열린 dispatch는 재시작 정리 대상이므로 완료된 상태로 저장한다
+    s.dispatches[0].endedAt = NOW
+    s.dispatches[0].outcome = 'succeeded'
+    s.tasks[0].status = 'completed'
+    await a.save(s)
+
+    const b = new OrchestrationStore(file)
+    await b.load()
+    expect(b.get().runs).toHaveLength(1)
+    expect(b.get().tasks[0].status).toBe('completed')
+  })
+
+  it('손상 파일은 .bak을 남기고 빈 상태로 복구한다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, '{ broken', 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.recovered).toBe(true)
+    expect(store.get()).toEqual(emptyState())
+    await expect(fs.stat(file + '.bak')).resolves.toBeTruthy()
+  })
+
+  it('최상위가 배열이면 손상으로 본다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, '[]', 'utf8')
+    const r = await new OrchestrationStore(file).load()
+    expect(r.recovered).toBe(true)
+  })
+
+  it('파일이 없으면 빈 상태로 시작하고 복구가 아니다', async () => {
+    const r = await new OrchestrationStore(path.join(dir, 'none.json')).load()
+    expect(r.recovered).toBe(false)
+  })
+
+  it('재시작 시 열린 Dispatch를 outcome_unknown으로 표시한다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.unknownOutcomes).toBe(1)
+    expect(store.get().dispatches[0].workerState).toBe('outcome_unknown')
+    expect(store.get().dispatches[0].endedAt).toBeTruthy()
+  })
+
+  // Once the Host owns the terminals, a worker outlives the app. Closing its Dispatch as
+  // outcome_unknown would make P1's reconciler start a second agent on the same Task.
+  it('leaves a Dispatch open when its session is still alive in the Host', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ aliveSessionIds: new Set(['sess1']) })
+    expect(res.unknownOutcomes).toBe(0)
+    expect(store.get().dispatches[0].endedAt).toBeUndefined()
+  })
+
+  it('still closes a Dispatch whose session the Host does not have', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ aliveSessionIds: new Set(['someone-else']) })
+    expect(res.unknownOutcomes).toBe(1)
+    expect(store.get().dispatches[0].workerState).toBe('outcome_unknown')
+  })
+
+  // A worker that finished while the app was closed left its report in a file. Closing its Dispatch
+  // as outcome_unknown throws that report away — applyWorkerDone answers alreadyReported for a
+  // Dispatch that already has endedAt — and hands the recovery reconciler a worker it reads as lost,
+  // which is a second agent in a worktree the first one just committed in.
+  it('leaves a Dispatch open when an undelivered report already speaks for it', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ reportedDispatchIds: new Set(['dsp_1']) })
+    expect(res.unknownOutcomes).toBe(0)
+    expect(store.get().dispatches[0].endedAt).toBeUndefined()
+    expect(store.get().dispatches[0].workerState).toBe('ready')
+  })
+
+  it('still closes a Dispatch no queued report names', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ reportedDispatchIds: new Set(['dsp_other']) })
+    expect(res.unknownOutcomes).toBe(1)
+    expect(store.get().dispatches[0].workerState).toBe('outcome_unknown')
+  })
+
+  it('closes every open Dispatch when it is told nothing, exactly as before', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    expect((await store.load()).unknownOutcomes).toBe(1)
+  })
+
+  // "we could not ask the Host" is not "the Host has nothing". Reading the first as the second closes
+  // a Dispatch whose worker is demonstrably still running, and the reconciler then starts a second
+  // agent in its worktree.
+  it('leaves every open Dispatch alone when it could not be told what is alive', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ aliveSessionIds: 'unknown' })
+    expect(res.unknownOutcomes).toBe(0)
+    expect(store.get().dispatches[0].endedAt).toBeUndefined()
+    expect(store.get().dispatches[0].workerState).toBe('ready')
+  })
+
+  // createGate refuses to gate a Task whose Dispatch is open, and this is the one restart that can
+  // hand it one. The Task stays validating; the count is what keeps that from being silent.
+  it('counts a validating Task it could not interrupt because the Dispatch stayed open', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks[0].status = 'validating'
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ aliveSessionIds: new Set(['sess1']) })
+    expect(res.staleValidations).toBe(0)
+    expect(res.stuckInterruptions).toBe(1)
+    expect(store.get().tasks[0].status).toBe('validating')
+    expect(store.get().gates).toHaveLength(0)
+  })
+
+  // The case the whole restart cleanup shape turns on, and the one no other test covered: a Task
+  // the app was validating whose Dispatch was **already** closed on disk before this boot. Nothing
+  // is written off here, so a cleanup expressed per closed Dispatch would never look at this Task
+  // and it would stay validating forever. The gate is owed to the Task, not to a Dispatch.
+  it('gates a validating Task whose Dispatch was already closed in the file', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.dispatches[0].endedAt = NOW
+    s.dispatches[0].outcome = 'succeeded'
+    s.tasks[0].status = 'validating'
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load()
+    expect(res.unknownOutcomes).toBe(0) // nothing was written off this boot
+    expect(res.staleValidations).toBe(1)
+    expect(res.stuckInterruptions).toBe(0)
+    expect(store.get().tasks[0].status).toBe('blocked')
+    expect(store.get().gates).toHaveLength(1)
+  })
+
+  it('counts nothing stuck when the Dispatch closed and the gate could open', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks[0].status = 'validating'
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load()
+    expect(res.staleValidations).toBe(1)
+    expect(res.stuckInterruptions).toBe(0)
+  })
+
+  // provider 가 Run 에서 Task 로 내려간 뒤 남는 칸 — 두 칸을 함께 두면 어느 쪽이 정본인지
+  // 코드마다 달라진다(위 accountId 이행과 같은 이유)
+  it('옛 Run.provider 를 지운다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    ;(s.runs[0] as unknown as Record<string, unknown>).provider = 'codex'
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect((store.get().runs[0] as unknown as Record<string, unknown>).provider).toBeUndefined()
+  })
+
+  // 프로젝트 배열이 생기기 전의 파일에는 그 칸이 없다. isValidState 에 넣지 않은 것이 이것 때문이고
+  // (넣었으면 기존 파일이 전부 손상으로 읽혀 통째로 버려진다) 여기서 빈 배열로 받는다.
+  it('프로젝트 칸이 없는 파일을 손상으로 읽지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    delete (s as unknown as Record<string, unknown>).projects
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.recovered).toBe(false)
+    expect(store.get().projects).toEqual([])
+    // 같이 실린 Run 이 살아남았는지 — 통째로 버려졌다면 여기서 드러난다
+    expect(store.get().runs.map((x) => x.id)).toEqual(['run_1'])
+  })
+
+  // 채워 넣지 않는 이유는 아래 provider 이행과 같다: 어느 Run 이 어느 저장소의 것인지는 워크트리
+  // 레지스트리를 봐야 알 수 있고 이 층은 그것을 모른다. 옛 Run 은 경로 유도로 그대로 보인다
+  it('옛 Run 에 projectId 를 지어 넣지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().jobs[0].projectId).toBeUndefined()
+  })
+
+  // **계정을 대신 채워 넣지 않는다.** 옛 provider 로 기본 계정을 찾아 넣으면 사람이 아끼려던
+  // 계정에 일이 갈 수 있고, 무엇이 기본 계정인지 이 자리에서는 알 수도 없다. 계정 없는 Task 는
+  // 자동 배치에서 빠지고 디스패치 시점에 Gate 를 연다.
+  it('provider 를 지우면서 Task 에 계정을 지어 넣지는 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    ;(s.runs[0] as unknown as Record<string, unknown>).provider = 'codex'
+    delete (s.tasks[0] as unknown as Record<string, unknown>).accountIds
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toBeUndefined()
+  })
+
+  it('옛 accountId 하나짜리 Task 를 accountIds 로 옮긴다 (이 칸이 생기기 전에 만든 Job)', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    // 손으로 만든 옛 모양 — accountId 는 이제 스키마에 없다
+    ;(s.tasks[0] as unknown as Record<string, unknown>).accountId = 'acc-1'
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toEqual(['acc-1'])
+    // 옛 칸은 남기지 않는다 — 두 칸이 어긋나면 어느 쪽이 정본인지 코드마다 달라진다
+    expect((store.get().tasks[0] as unknown as Record<string, unknown>).accountId).toBeUndefined()
+  })
+
+  it('옛 accountId 아래 목록이 들어 있으면 그 순서째 옮긴다 (이름만 옛것인 손질)', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    ;(s.tasks[0] as unknown as Record<string, unknown>).accountId = ['acc-1', 'acc-2']
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toEqual(['acc-1', 'acc-2'])
+  })
+
+  // **읽을 수 없는 원소는 그 원소만 버린다.** 전부 아니면 전무로 보면 읽히는 'acc-1' 까지 함께
+  // 사라지고, 그것도 사람이 아끼려던 계정을 지우는 일이다 — 이 이행이 막으려는 바로 그것이다
+  it('옛 목록에 읽을 수 없는 원소가 섞여 있으면 그 원소만 버린다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    ;(s.tasks[0] as unknown as Record<string, unknown>).accountId = ['acc-1', '']
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toEqual(['acc-1'])
+    expect((store.get().tasks[0] as unknown as Record<string, unknown>).accountId).toBeUndefined()
+  })
+
+  // 문자열이 아닌 원소도 같다 — JSON 은 무엇이든 담을 수 있고 이 파일은 손으로 고쳐진다
+  it('옛 목록의 문자열 아닌 원소만 버리고 읽히는 것은 남긴다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    ;(s.tasks[0] as unknown as Record<string, unknown>).accountId = ['acc-1', 3]
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toEqual(['acc-1'])
+  })
+
+  // 남는 것이 하나도 없으면 칸을 만들지 않는다 — 빈 배열을 실으면 "지정 없음"과 값이 갈라지고,
+  // 그것을 체인으로 넘기면 롤링이 계정 아닌 것으로 갈아타려 한다
+  it('옛 목록에 읽을 수 있는 원소가 하나도 없으면 지정을 만들지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    ;(s.tasks[0] as unknown as Record<string, unknown>).accountId = ['', 3]
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toBeUndefined()
+    expect((store.get().tasks[0] as unknown as Record<string, unknown>).accountId).toBeUndefined()
+  })
+
+  // **두 칸이 함께 있는 파일** — 손으로 고치다 만 모양이고, 이 이행이 있는 이유가 바로 그런 편집이다.
+  // 새 칸이 "있는가"만 보면 빈 목록 그대로 돌아오고 옛 칸은 지워져 지정이 통째로 사라진다.
+  // 빈 배열은 "지정 없음"이므로(Task.accountIds 의 JSDoc) 옛 값이 이긴다
+  it('새 칸이 빈 목록이면 옛 accountId 를 그 자리로 옮긴다 (고치다 만 파일)', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    const t = s.tasks[0] as unknown as Record<string, unknown>
+    t.accountId = 'acc-1'
+    t.accountIds = []
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toEqual(['acc-1'])
+    expect((store.get().tasks[0] as unknown as Record<string, unknown>).accountId).toBeUndefined()
+  })
+
+  // 새 칸에 값이 들어 있으면 그것이 정본이다 — 옛 칸은 읽지 않고 지운다
+  it('새 칸에 값이 있으면 옛 accountId 는 그것을 덮지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    const t = s.tasks[0] as unknown as Record<string, unknown>
+    t.accountId = 'acc-old'
+    t.accountIds = ['acc-1', 'acc-2']
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].accountIds).toEqual(['acc-1', 'acc-2'])
+    expect((store.get().tasks[0] as unknown as Record<string, unknown>).accountId).toBeUndefined()
+  })
+
+  it('재시작 정리가 Task를 failed로 옮기지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].status).toBe('dispatched')
+  })
+
+  it('30일 지난 종료 Run과 그에 속한 항목을 정리한다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const old = new Date(Date.now() - RUN_TTL_MS - 1000).toISOString()
+    const s = withOpenDispatch()
+    s.runs[0] = { ...s.runs[0], createdAt: old }
+    s.dispatches[0] = { ...s.dispatches[0], endedAt: old, outcome: 'succeeded' }
+    s.tasks[0] = { ...s.tasks[0], status: 'completed', updatedAt: old }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.pruned).toBe(1)
+    expect(store.get().runs).toHaveLength(0)
+    expect(store.get().tasks).toHaveLength(0)
+    expect(store.get().dispatches).toHaveLength(0)
+  })
+
+  it('TTL 이내의 종료 Run은 남긴다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.dispatches[0] = { ...s.dispatches[0], endedAt: NOW, outcome: 'succeeded' }
+    s.tasks[0] = { ...s.tasks[0], status: 'completed' }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.pruned).toBe(0)
+    expect(store.get().runs).toHaveLength(1)
+  })
+
+  // 예약이 30일 뒤 조용히 사라지면 안 된다. 템플릿의 Task 는 배치되지 않아 terminal 이 되지
+  // 않으므로 지금은 저절로 남지만, 그 성질이 우연히 깨지는 것을 여기서 잡는다
+  it('30일이 지나도 예약 계획은 남기고 그 회차만 지운다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const old = new Date(Date.now() - RUN_TTL_MS - 1000).toISOString()
+    const s: OrchState = stateFromLegacy({
+      runs: [
+        { id: 'tmpl', objective: '매일', cwd: 'D:/p', createdAt: old, schedule: { kind: 'daily', time: '09:00' } },
+        { id: 'kid', objective: '매일', cwd: 'D:/p', createdAt: old, templateId: 'tmpl', autoDispatch: true }
+      ],
+      tasks: [
+        { id: 't_tmpl', runId: 'tmpl', title: 'A', spec: 's', deps: [], status: 'ready', consecutiveFailures: 0, createdAt: old, updatedAt: old },
+        { id: 't_kid', runId: 'kid', title: 'A', spec: 's', deps: [], status: 'completed', consecutiveFailures: 0, createdAt: old, updatedAt: old }
+      ]
+    })
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.pruned).toBe(1)
+    // 계획은 회차와 함께 지워지지 않는다 — 다음 발화가 베낄 정의가 거기 있다
+    expect(store.get().runs).toEqual([])
+    expect(store.get().jobs).toHaveLength(1)
+    expect(store.get().tasks.map((t) => t.id)).toEqual(['t_tmpl'])
+  })
+
+  it('원자 쓰기 — tmp 파일을 남기지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    await store.save(emptyState())
+    const files = await fs.readdir(dir)
+    expect(files.filter((f) => f.endsWith('.tmp'))).toEqual([])
+  })
+
+  it('오래 생성된 Run도 최근에 활동했으면 유지한다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const old = new Date(Date.now() - RUN_TTL_MS - 1000).toISOString()
+    const s = withOpenDispatch()
+    s.runs[0] = { ...s.runs[0], createdAt: old }
+    s.dispatches[0] = { ...s.dispatches[0], endedAt: NOW, outcome: 'succeeded' }
+    s.tasks[0] = { ...s.tasks[0], status: 'completed', updatedAt: NOW }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.pruned).toBe(0)
+    expect(store.get().runs).toHaveLength(1)
+  })
+
+  it('활동도 오래된 종료 Run과 그 항목들을 정리한다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const old = new Date(Date.now() - RUN_TTL_MS - 1000).toISOString()
+    const s = withOpenDispatch()
+    s.runs[0] = { ...s.runs[0], createdAt: old }
+    s.dispatches[0] = { ...s.dispatches[0], endedAt: old, outcome: 'succeeded' }
+    s.tasks[0] = { ...s.tasks[0], status: 'completed', updatedAt: old }
+    s.messages = [
+      {
+        id: 'msg_1',
+        runId: 'run_1',
+        type: 'status',
+        subject: 'test',
+        body: 'test',
+        answered: false,
+        createdAt: old
+      }
+    ]
+    s.deliveries = [
+      {
+        id: 'dlv_1',
+        runId: 'run_1',
+        messageIds: ['msg_1'],
+        createdAt: old
+      }
+    ]
+    s.gates = [
+      {
+        id: 'gat_1',
+        runId: 'run_1',
+        taskId: 'tsk_1',
+        question: 'test?',
+        status: 'open',
+        createdAt: old
+      }
+    ]
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.pruned).toBe(1)
+    expect(store.get().runs).toHaveLength(0)
+    expect(store.get().tasks).toHaveLength(0)
+    expect(store.get().dispatches).toHaveLength(0)
+    expect(store.get().messages).toHaveLength(0)
+    expect(store.get().deliveries).toHaveLength(0)
+    expect(store.get().gates).toHaveLength(0)
+  })
+
+  // **파일은 한 줄의 압축 JSON 으로 쓰인다.** 들여쓰기는 커질수록 쓰기·읽기·전송 모두에 값을 더
+  // 치르게 하고(164 KB 에서 자라는 파일), 읽는 쪽은 JSON.parse 뿐이라 모양을 가리지 않는다. 이 앞의
+  // 판들이 남긴 들여쓴 파일도 그대로 읽혀야 한다 — 이 파일은 프로세스보다 오래 산다.
+  it('압축 JSON 한 줄로 쓰고 다시 읽으며, 예전의 들여쓴 파일도 읽는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const a = new OrchestrationStore(file)
+    await a.load()
+    const s = withOpenDispatch()
+    s.dispatches[0].endedAt = NOW
+    s.dispatches[0].outcome = 'succeeded'
+    s.tasks[0].status = 'completed'
+    await a.save(s)
+    const raw = await fs.readFile(file, 'utf8')
+    expect(raw).toBe(JSON.stringify(s))
+    expect(raw).not.toContain('\n')
+    const b = new OrchestrationStore(file)
+    await b.load()
+    expect(b.get()).toEqual(a.get())
+
+    // 예전 판이 쓴 모양
+    await fs.writeFile(file, JSON.stringify(s, null, 2), 'utf8')
+    const c = new OrchestrationStore(file)
+    const r = await c.load()
+    expect(r.recovered).toBe(false)
+    expect(c.get().tasks[0].status).toBe('completed')
+    expect(c.get().runs).toHaveLength(1)
+  })
+
+  describe('save 직렬화', () => {
+    const runState = (id: string): OrchState =>
+  stateFromLegacy({
+      runs: [{ id, objective: id, cwd: 'D:/p', createdAt: NOW }]
+    })
+
+    /** 그 tmp 파일이 first의 상태를 담고 있는가. 도착 순서(몇 번째 rename인가)로 판정하면
+     *  두 save의 mkdir·writeFile 완료 순서가 libuv 스레드풀에 달려 있어 어느 쪽이 먼저
+     *  rename에 닿는지가 실행마다 바뀐다 — 내용으로 판정해야 결정적이다. */
+    const isFirst = async (tmp: Parameters<typeof fs.rename>[0]): Promise<boolean> =>
+      (await fs.readFile(tmp as string, 'utf8')).includes('run_first')
+
+    it('겹쳐 부른 두 save의 순서가 뒤집히지 않는다 — 디스크가 두 번째 상태다', async () => {
+      // 큐가 없으면 두 save()가 동시 in-flight가 되고 두 rename의 착륙 순서가 보장되지 않아
+      // 디스크는 첫 번째, 메모리는 두 번째가 된다. 메모리가 항상 정확하므로 실사용 중에는
+      // 증상이 없고 다음 앱 재시작에서만 드러난다 — 느린 첫 rename을 주입해 결정적으로 재현한다.
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      const realRename = fs.rename
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        if (await isFirst(from)) await new Promise((r) => setTimeout(r, 30))
+        await realRename(from, to)
+      })
+      try {
+        // 두 번째는 첫 쓰기가 이미 디스크로 떠난 뒤에 부른다 — 같은 틱에 부르면 두 save 가 한 번의
+        // 쓰기로 합쳐지고(아래 '합친다' 테스트), 그러면 이 테스트가 보려는 큐의 순서가 사라진다.
+        const first = store.save(runState('run_first'))
+        await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
+        await Promise.all([first, store.save(runState('run_second'))])
+      } finally {
+        spy.mockRestore()
+      }
+      const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+      expect(disk.runs[0].id).toBe('run_second')
+      expect(store.get().runs[0].id).toBe('run_second')
+    })
+
+    it('앞 쓰기가 실패해도 뒤 쓰기는 진행된다 — 큐가 한 번의 실패로 막히지 않는다', async () => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      const realRename = fs.rename
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        if (await isFirst(from)) throw new Error('rename failed')
+        await realRename(from, to)
+      })
+      const first = store.save(runState('run_first'))
+      // 기다리는 동안 거절이 먼저 올 수 있다 — 붙잡아 두고 아래에서 본다
+      first.catch(() => {})
+      // 첫 쓰기가 떠난 뒤에 — 같은 틱이면 한 번의 쓰기로 합쳐진다(위 테스트의 주석)
+      await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1))
+      const second = store.save(runState('run_second'))
+      try {
+        await expect(first).rejects.toThrow('rename failed')
+        await second
+      } finally {
+        spy.mockRestore()
+      }
+      const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+      expect(disk.runs[0].id).toBe('run_second')
+    })
+    /** 첫 rename 을 붙잡아 두는 문. 열 때까지 첫 쓰기는 디스크에 닿지 않는다. */
+    const holdFirstRename = (): { renames: string[]; open(): void; spy: { mockRestore(): void } } => {
+      const realRename = fs.rename
+      const renames: string[] = []
+      let open!: () => void
+      const gate = new Promise<void>((r) => (open = r))
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        renames.push(String(from))
+        if (renames.length === 1) await gate
+        await realRename(from, to)
+      })
+      return { renames, open, spy }
+    }
+
+    // **쓰는 동안 들어온 커밋들은 그다음 한 번의 쓰기로 합쳐진다** — 가장 새 상태 하나만. 시간 창을
+    // 두지 않는다: 창은 모든 커밋의 응답을 그만큼 늦추고, 합칠 것이 없을 때에도 치른다. 쓰기가
+    // 이미 도는 동안에는 어차피 기다려야 하므로, 그 기다림 동안 쌓인 것만 한 번에 쓴다.
+    //
+    // **응답은 디스크 뒤다.** 각 save 의 promise 는 자기 상태(또는 그 뒤의 상태)가 파일에 닿은 뒤에만
+    // 풀린다 — CLI 의 응답·영수증이 "이 일은 일어났다" 라고 말하는 근거가 그것이다. 합친 쓰기가 닿기
+    // 전에 죽으면 파일에는 그 앞 상태가 있고, 그때 풀린 save 는 하나도 없어야 한다.
+    it('쓰는 동안 들어온 커밋들을 가장 새 상태 하나의 쓰기로 합치고, 디스크에 닿기 전에는 풀지 않는다', async () => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      const h = holdFirstRename()
+      try {
+        const settled: string[] = []
+        const first = store.save(runState('run_1'))
+        void first.then(() => settled.push('run_1'))
+        await vi.waitFor(() => expect(h.renames).toHaveLength(1))
+        const later = ['run_2', 'run_3', 'run_4'].map((id) => {
+          const p = store.save(runState(id))
+          // 풀리는 그 순간 파일을 동기로 읽는다: 응답을 받은 쪽이 믿는 것이 디스크에 있는가
+          void p.then(() => {
+            const disk = JSON.parse(readFileSync(file, 'utf8')) as OrchState
+            settled.push(`${id}@${disk.runs[0].id}`)
+          })
+          return p
+        })
+        expect(store.get().runs[0].id).toBe('run_4')
+        // 여기서 죽는다면: 파일에는 아직 아무 커밋도 없고, 풀린 save 도 없다
+        await new Promise((r) => setTimeout(r, 20))
+        expect(settled).toEqual([])
+        const crashed = new OrchestrationStore(file)
+        await crashed.load()
+        expect(crashed.get().runs).toHaveLength(0)
+
+        h.open()
+        await Promise.all([first, ...later])
+        // 두 번의 쓰기: 첫 커밋, 그리고 그동안 쌓인 셋을 합친 하나
+        expect(h.renames).toHaveLength(2)
+        expect(settled).toEqual(['run_1', 'run_2@run_4', 'run_3@run_4', 'run_4@run_4'])
+        const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+        expect(disk.runs[0].id).toBe('run_4')
+      } finally {
+        h.spy.mockRestore()
+      }
+    })
+
+    // backup 은 큐 안의 한 자리다 — 그 앞의 저장 뒤, 그 뒤의 저장 앞. 합치기가 backup 을 건너
+    // 뒤의 저장을 앞 쓰기로 끌어오면 .bak 에 reset 이 지우려던 것이 아니라 그 뒤의 상태가 남는다.
+    it('backup 을 건너서 합치지 않는다 — .bak 은 그 앞의 상태다', async () => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      await store.save(runState('run_before'))
+      const h = holdFirstRename()
+      try {
+        const a = store.save(runState('run_a'))
+        const b = store.save(runState('run_b'))
+        const bak = store.backup()
+        const c = store.save(runState('run_c'))
+        h.open()
+        await Promise.all([a, b, bak, c])
+        const backup = JSON.parse(await fs.readFile(file + '.bak', 'utf8')) as OrchState
+        expect(backup.runs[0].id).toBe('run_b')
+        const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+        expect(disk.runs[0].id).toBe('run_c')
+        expect(h.renames).toHaveLength(2)
+      } finally {
+        h.spy.mockRestore()
+      }
+    })
+
+    // 합친 쓰기가 실패하면 합쳐진 save 가 모두 그 실패를 받는다 — 하나라도 풀리면 디스크에 없는
+    // 커밋을 있다고 말한다. 그 뒤의 저장은 여전히 진행된다.
+    it('합친 쓰기가 실패하면 합쳐진 save 모두가 거절되고, 다음 저장은 진행된다', async () => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      const realRename = fs.rename
+      let calls = 0
+      const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+        calls++
+        if (calls === 1) throw new Error('rename failed')
+        await realRename(from, to)
+      })
+      try {
+        const a = store.save(runState('run_a'))
+        const b = store.save(runState('run_b'))
+        await expect(a).rejects.toThrow('rename failed')
+        await expect(b).rejects.toThrow('rename failed')
+        await store.save(runState('run_c'))
+        const disk = JSON.parse(await fs.readFile(file, 'utf8')) as OrchState
+        expect(disk.runs[0].id).toBe('run_c')
+      } finally {
+        spy.mockRestore()
+      }
+    })
+  })
+
+  it('재시작하면 validating 이던 Task 를 blocked 로 보내고 Gate 를 연다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks[0] = { ...s.tasks[0], status: 'validating' }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.staleValidations).toBe(1)
+    expect(store.get().tasks[0].status).toBe('blocked')
+    expect(store.get().gates).toHaveLength(1)
+    expect(store.get().gates[0].taskId).toBe(s.tasks[0].id)
+  })
+
+  // 연속 실패로 세지 않는다 — 인프라 사정이지 작업이 틀린 것이 아니다
+  it('정리된 검증은 consecutiveFailures 를 올리지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks[0] = { ...s.tasks[0], status: 'validating', consecutiveFailures: 1 }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    expect(store.get().tasks[0].consecutiveFailures).toBe(1)
+  })
+
+  // **한 Run 에 stale validating Task 가 둘 이상인 경우.** 정리 루프는 st.tasks 를 돌면서
+  // withGates 를 이어 간다 — 그 이어짐이 유일한 누적 경로이므로, 두 번째 createGate 가 첫 번째의
+  // 결과 위에서 돌지 않으면 첫 Gate 와 그 decision_gate 메시지가 조용히 사라진다. 이 슬라이스의
+  // Important 하나가 정확히 그 기제에서 깨졌다.
+  it('한 Run 의 validating Task 가 둘이면 둘 다 Gate 가 되고 메시지도 둘 다 남는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks = [
+      { ...s.tasks[0], status: 'validating' },
+      { ...s.tasks[0], id: 'tsk_2', status: 'validating' }
+    ]
+    // 두 번째 Task 에도 자기 Dispatch 가 있다 — 열린 dispatch 는 createGate 가 거절하므로,
+    // 재시작 정리가 먼저 endedAt 을 채워 주는 것에 이 케이스가 기대고 있다는 것까지 함께 고정한다
+    s.dispatches = [s.dispatches[0], { ...s.dispatches[0], id: 'dsp_2', taskId: 'tsk_2', sessionId: 'sess2' }]
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.staleValidations).toBe(2)
+    expect(store.get().tasks.map((t) => t.status)).toEqual(['blocked', 'blocked'])
+    expect(store.get().gates.map((g) => g.taskId).sort()).toEqual(['tsk_1', 'tsk_2'])
+    const gateMessages = store.get().messages.filter((m) => m.type === 'decision_gate')
+    expect(gateMessages.map((m) => m.taskId).sort()).toEqual(['tsk_1', 'tsk_2'])
+  })
+
+  // **reviewing 도 같은 정리 대상이다.** 검토자는 별도의 세션이라 앱과 함께 죽었고, 그것을 다시 띄우는
+  // 명령은 코디네이터에게 없다 — reviewing -> dispatched 전이가 없어 --retry-of 도 거절되므로, Gate 가
+  // 없으면 Task 는 영원히 reviewing 이고 의존 Task 는 영원히 pending 이다.
+  it('재시작하면 reviewing 이던 Task 도 blocked 로 보내고 Gate 를 연다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks[0] = { ...s.tasks[0], status: 'reviewing', consecutiveFailures: 1 }
+    s.dispatches[0] = { ...s.dispatches[0], review: true }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.staleReviews).toBe(1)
+    expect(r.staleValidations).toBe(0) // 검증과 섞이지 않는다 — 시작 로그가 둘을 구별해 적는다
+    expect(store.get().tasks[0].status).toBe('blocked')
+    expect(store.get().gates).toHaveLength(1)
+    // 끝난 일을 버리지 않는 탈출구가 질문에 실린다(blockForReview) — resolveGate 로 풀면 Task 가
+    // pending 으로 돌아가 이미 끝난 구현이 버려진다
+    expect(store.get().gates[0].question).toContain('task-update --status completed')
+    // 코디네이터를 깨우는 수단은 메시지뿐이다
+    expect(store.get().messages.some((m) => m.type === 'decision_gate')).toBe(true)
+    // 연속 실패로 세지 않는다 — 인프라 사정이지 작업이 틀린 것이 아니다(검증 쪽과 같은 규칙)
+    expect(store.get().tasks[0].consecutiveFailures).toBe(1)
+  })
+
+  it('reviewing 도 validating 도 없으면 두 카운터가 0 이다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.staleReviews).toBe(0)
+    expect(r.staleValidations).toBe(0)
+  })
+
+  it('validating 이 없으면 staleValidations 가 0 이고 Gate 도 생기지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.staleValidations).toBe(0)
+    expect(store.get().gates).toHaveLength(0)
+  })
+
+  // Gate가 tasks/gates뿐 아니라 decision_gate 메시지도 만든다 — 그 메시지가 최종 상태에서
+  // 누락되면 Gate 자체는 멀쩡해 보여도 delivery 스트림(check/nextDelivery)에는 알림이 가지 않는다.
+  it('재시작 Gate 가 만든 decision_gate 메시지도 최종 상태에 남는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks[0] = { ...s.tasks[0], status: 'validating' }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    await store.load()
+    const msg = store
+      .get()
+      .messages.find((m) => m.type === 'decision_gate' && m.taskId === s.tasks[0].id)
+    expect(msg).toBeTruthy()
+  })
+
+  it('Message 활동도 TTL 판정에 반영된다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const old = new Date(Date.now() - RUN_TTL_MS - 1000).toISOString()
+    const s = withOpenDispatch()
+    s.runs[0] = { ...s.runs[0], createdAt: old }
+    s.dispatches[0] = { ...s.dispatches[0], endedAt: old, outcome: 'succeeded' }
+    s.tasks[0] = { ...s.tasks[0], status: 'completed', updatedAt: old }
+    s.messages = [
+      {
+        id: 'msg_1',
+        runId: 'run_1',
+        type: 'status',
+        subject: 'test',
+        body: 'test',
+        answered: false,
+        createdAt: NOW
+      }
+    ]
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const r = await store.load()
+    expect(r.pruned).toBe(0)
+    expect(store.get().runs).toHaveLength(1)
+    expect(store.get().messages).toHaveLength(1)
+  })
+
+  it('load returns the state as read, before the restart cleanup', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const loaded = await store.load()
+    expect(loaded.before?.dispatches[0].endedAt).toBeUndefined()
+    expect(loaded.before?.dispatches[0].workerState).toBe('ready')
+    expect(store.get().dispatches[0].workerState).toBe('outcome_unknown')
+  })
+
+  it('load returns before: null when there is no file or it is unreadable', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    expect((await new OrchestrationStore(file).load()).before).toBeNull()
+    await fs.writeFile(file, '{ not json', 'utf8')
+    expect((await new OrchestrationStore(file).load()).before).toBeNull()
+  })
+
+  // convergence Run 은 재시작으로 끊긴 validating·reviewing 을 Gate 로 묻지 않는다(interruptStalledTask
+  // 의 resume, 설계 §10) — 대신 다시 돌릴 목록에 싣는다. load() 는 아무것도 시작하지 않으므로 목록만
+  // 확인한다.
+  it('convergence Run 의 validating·reviewing Task 는 Gate 없이 재실행 목록에 실린다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s: OrchState = stateFromLegacy({
+      runs: [{ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: NOW, convergence: {} }],
+      tasks: [
+        {
+          id: 'tsk_v', runId: 'run_1', title: 't', spec: 's', deps: [], status: 'validating',
+          validateConfigIds: ['c1'], consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW
+        },
+        {
+          id: 'tsk_r', runId: 'run_1', title: 't', spec: 's', deps: [], status: 'reviewing',
+          consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW
+        }
+      ],
+      dispatches: [
+        {
+          id: 'dsp_v', taskId: 'tsk_v', provider: 'codex', accountId: 'acc1', sessionId: 'sess_v',
+          cwd: 'D:/wt', specPath: 'D:/p/orch/specs/v.md', startedAt: NOW, endedAt: NOW,
+          outcome: 'succeeded', workerState: 'ready', retained: false
+        },
+        {
+          id: 'dsp_r', taskId: 'tsk_r', provider: 'codex', accountId: 'acc1', sessionId: 'sess_r',
+          cwd: 'D:/wt', specPath: 'D:/p/orch/specs/r.md', startedAt: NOW, endedAt: NOW,
+          outcome: 'succeeded', workerState: 'ready', retained: false
+        }
+      ]
+    })
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const loaded = await store.load({ aliveSessionIds: new Set() })
+    expect(loaded.staleValidations).toBe(0)
+    expect(loaded.staleReviews).toBe(0)
+    expect(loaded.revalidate).toEqual([{ taskId: 'tsk_v', cwd: 'D:/wt' }])
+    expect(loaded.rereview).toEqual(['tsk_r'])
+    expect(store.get().gates).toHaveLength(0)
+  })
+
+  // interruptStalledTask 는 convergence Run 에서 Dispatch 를 전혀 보지 않으므로, 구현 Dispatch 가
+  // 없는(예: 손으로 고친 파일) validating Task 는 revalidate 에도 안 실리고 Gate 도 안 열린다 — 아무도
+  // 모르게 멈춘다. stuckInterruptions 는 정확히 이런 "묻지도 못하고 세지도 못한 채 멈췄다"를 들리게
+  // 하려고 있다.
+  it('구현 Dispatch 가 없는 validating Task 는 stuckInterruptions 로 센다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s: OrchState = stateFromLegacy({
+      runs: [{ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: NOW, convergence: {} }],
+      tasks: [
+        {
+          id: 'tsk_v', runId: 'run_1', title: 't', spec: 's', deps: [], status: 'validating',
+          validateConfigIds: ['c1'], consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW
+        }
+      ],
+      dispatches: []
+    })
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const loaded = await store.load({ aliveSessionIds: new Set() })
+    expect(loaded.revalidate).toEqual([])
+    expect(loaded.stuckInterruptions).toBe(1)
+    expect(store.get().gates).toHaveLength(0)
+  })
+
+  // recovery 의 candidates() 가 지키는 세 Run 게이트(paused·schedule template·pendingStart)를 재실행
+  // 목록도 지켜야 한다 — 이 목록에는 runId 가 없어 받는 쪽이 다시 판정할 길이 없으므로 원천에서 거른다.
+  it('일시 중지된 Run 의 validating Task 는 재실행 목록에 실리지 않는다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s: OrchState = stateFromLegacy({
+      runs: [{ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: NOW, convergence: {}, paused: true }],
+      tasks: [
+        {
+          id: 'tsk_v', runId: 'run_1', title: 't', spec: 's', deps: [], status: 'validating',
+          validateConfigIds: ['c1'], consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW
+        }
+      ],
+      dispatches: [
+        {
+          id: 'dsp_v', taskId: 'tsk_v', provider: 'codex', accountId: 'acc1', sessionId: 'sess_v',
+          cwd: 'D:/wt', specPath: 'D:/p/orch/specs/v.md', startedAt: NOW, endedAt: NOW,
+          outcome: 'succeeded', workerState: 'ready', retained: false
+        }
+      ]
+    })
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const loaded = await store.load({ aliveSessionIds: new Set() })
+    expect(loaded.revalidate).toEqual([])
+    expect(loaded.stuckInterruptions).toBe(0)
+    expect(store.get().gates).toHaveLength(0)
+  })
+
+  // Host 가 검토자 세션을 되돌려 받았으면(reattach) 그 워커는 지금도 검토하고 있다 — 다시 검토하라고
+  // 목록에 실으면 그 목록을 받는 쪽(openReviewDispatch)이 "dispatch already open" 으로 거절한다.
+  it('세션이 아직 살아 있는 reviewing Task 는 재검토 목록에서 빠진다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s: OrchState = stateFromLegacy({
+      runs: [{ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: NOW, convergence: {} }],
+      tasks: [
+        {
+          id: 'tsk_r', runId: 'run_1', title: 't', spec: 's', deps: [], status: 'reviewing',
+          consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW
+        }
+      ],
+      dispatches: [
+        {
+          id: 'dsp_r', taskId: 'tsk_r', provider: 'codex', accountId: 'acc1', sessionId: 'sess_r',
+          cwd: 'D:/wt', specPath: 'D:/p/orch/specs/r.md', startedAt: NOW,
+          workerState: 'ready', retained: false
+        }
+      ]
+    })
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    // 그 세션이 Host 에 아직 살아 있다고 답하면, 재시작 정리는 위 Dispatch 를 열어 둔 채 둔다.
+    const loaded = await store.load({ aliveSessionIds: new Set(['sess_r']) })
+    expect(store.get().dispatches[0].endedAt).toBeUndefined()
+    expect(loaded.rereview).toEqual([])
+    expect(loaded.stuckInterruptions).toBe(0)
+    expect(store.get().gates).toHaveLength(0)
+  })
+
+  // convergence 가 없는 Run 은 지금과 똑같이 Gate 를 연다 — 재실행 목록은 그 Run 몫이 아니므로 비어
+  // 있다.
+  it('꺼진 Run 은 지금처럼 Gate 를 열고 목록은 비어 있다', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    const s = withOpenDispatch()
+    s.tasks[0] = { ...s.tasks[0], status: 'validating' }
+    await fs.writeFile(file, JSON.stringify(s), 'utf8')
+    const store = new OrchestrationStore(file)
+    const loaded = await store.load()
+    expect(loaded.staleValidations).toBe(1)
+    expect(loaded.revalidate).toEqual([])
+    expect(store.get().gates).toHaveLength(1)
+  })
+})
+
+// One stale field disables both ways back. `inbox.ts` only nets Runs whose coordinatorSessionId is
+// absent, and `view.ts` only offers the restart button then — so a slot still naming a session that
+// died with its Host leaves a Job with no one to answer its workers and no button to fix it. Measured:
+// a worker asked a question and nothing answered it until a person ran the CLI by hand.
+describe('a coordinator that did not survive the restart', () => {
+  const withCoordinator = (): OrchState =>
+    stateFromLegacy({
+    runs: [
+      {
+        id: 'run_1',
+        objective: 'o',
+        cwd: 'D:/p',
+        createdAt: NOW,
+        coordinatorAccountId: 'acc1',
+        coordinatorSessionId: 'coord1'
+      }
+    ]
+  })
+
+  it('empties the slot when the Host does not have that session', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withCoordinator()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ aliveSessionIds: new Set(['someone-else']) })
+    expect(res.coordinatorsLost).toBe(1)
+    expect(store.get().runs[0].coordinatorSessionId).toBeUndefined()
+    // The account is what the restart button starts the next one on — losing it loses the button too.
+    expect(store.get().jobs[0].coordinatorAccountId).toBe('acc1')
+  })
+
+  it('keeps the slot when the Host handed that session back', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withCoordinator()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ aliveSessionIds: new Set(['coord1']) })
+    expect(res.coordinatorsLost).toBe(0)
+    expect(store.get().runs[0].coordinatorSessionId).toBe('coord1')
+  })
+
+  // Emptying a slot whose session is in fact alive puts "restart the coordinator" on that Run's line,
+  // and one click is a second coordinator in a worktree the first is still working in — the accident
+  // releaseCoordinator's own note exists to prevent. "Could not ask" is not "nothing is there".
+  it('leaves the slot alone when it could not be told what is alive', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withCoordinator()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load({ aliveSessionIds: 'unknown' })
+    expect(res.coordinatorsLost).toBe(0)
+    expect(store.get().runs[0].coordinatorSessionId).toBe('coord1')
+  })
+
+  // No Host at all is a real answer: nothing could have outlived the app, so nothing did.
+  it('empties the slot when there was no Host to outlive the app', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withCoordinator()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load()
+    expect(res.coordinatorsLost).toBe(1)
+    expect(store.get().runs[0].coordinatorSessionId).toBeUndefined()
+  })
+
+  // S6 limits D2: a stop left on a slot whose session died would end every `runs wait` limited.
+  it('drops a coordinator stop with the slot, and keeps it with a slot the Host handed back', async () => {
+    const stopped = (): OrchState => {
+      const s = withCoordinator()
+      return { ...s, runs: s.runs.map((r) => ({ ...r, coordinatorStop: { since: NOW, resetsAt: NOW } })) }
+    }
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(stopped()), 'utf8')
+    const gone = new OrchestrationStore(file)
+    await gone.load({ aliveSessionIds: new Set(['someone-else']) })
+    expect(gone.get().runs[0].coordinatorStop).toBeUndefined()
+    await fs.writeFile(file, JSON.stringify(stopped()), 'utf8')
+    const kept = new OrchestrationStore(file)
+    await kept.load({ aliveSessionIds: new Set(['coord1']) })
+    expect(kept.get().runs[0].coordinatorStop).toEqual({ since: NOW, resetsAt: NOW })
+  })
+
+  it('says nothing happened for a Run that never had a coordinator', async () => {
+    const file = path.join(dir, 'orchestration.json')
+    await fs.writeFile(file, JSON.stringify(withOpenDispatch()), 'utf8')
+    const store = new OrchestrationStore(file)
+    const res = await store.load()
+    expect(res.coordinatorsLost).toBe(0)
+  })
+})

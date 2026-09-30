@@ -1,12 +1,15 @@
 import { describe, it, expect } from 'vitest'
-import { timelineFor, eventCountFor } from './timeline'
+import { timelineFor, eventCountFor, timelineWith } from './timeline'
+import type { JobEvent } from '../types'
 import { emptyState } from './state'
 import type { OrchState } from './state'
-import type { Dispatch, Gate, Message, ResumeEntry, Run, Task } from './types'
+import type { Dispatch, Gate, Message, ResumeEntry, Task } from './types'
+import { stateFromLegacy } from './legacyState'
+import type { LegacyRun } from './legacy'
 import { absPath } from '../testPaths'
 
 const T = (n: number): string => `2026-08-18T00:0${n}:00.000Z`
-const run = (id: string): Run => ({
+const run = (id: string): LegacyRun => ({
   id, objective: `objective ${id}`, cwd: absPath('p'), createdAt: T(0)
 })
 const task = (id: string, runId: string, createdAt = T(1)): Task => ({
@@ -23,7 +26,7 @@ const message = (id: string, runId: string, type: Message['type'], createdAt = T
 const gate = (id: string, taskId: string, createdAt = T(4)): Gate => ({
   id, runId: 'r1', taskId, question: 'first line\nsecond line', status: 'open', createdAt
 })
-const state = (p: Partial<OrchState>): OrchState => ({ ...emptyState(), ...p })
+const state = (p: Parameters<typeof stateFromLegacy>[0]): OrchState => stateFromLegacy(p)
 const anySession = (): boolean => true
 const noSession = (): boolean => false
 
@@ -257,5 +260,16 @@ describe('eventCountFor', () => {
 
   it('없는 Run 은 0 이다', () => {
     expect(eventCountFor(emptyState(), 'nope')).toBe(0)
+  })
+})
+
+describe('timelineWith', () => {
+  it('sorts rows from elsewhere into the timeline by the same order', () => {
+    // the file's one-run fixture; `extra` at the run's own createdAt sorts after run-created by KIND_RANK
+    const s = state({ runs: [run('r1')], tasks: [task('t1', 'r1')] })
+    const extra: JobEvent[] = [{ at: s.runs[0].createdAt, kind: 'recovery', sourceId: 'evt_r', summary: 'redispatch' }]
+    const merged = timelineWith(s, s.runs[0].id, () => false, extra)
+    expect(merged.map((e) => e.kind).indexOf('recovery')).toBeGreaterThan(merged.map((e) => e.kind).indexOf('run-created'))
+    expect(timelineWith(s, s.runs[0].id, () => false, [])).toEqual(timelineFor(s, s.runs[0].id, () => false))
   })
 })

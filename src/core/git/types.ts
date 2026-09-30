@@ -34,6 +34,9 @@ export interface ExternalGitChange {
    *  `ExternalGitChange` 에는 이 값이 실제로 없다. */
   authors?: string[]
   changedFiles: string[]
+  /** git 이 before..after 범위를 읽지 못했다(실패·시간 초과·출력 한도) — 그래서 `commits`·`authors`·
+   *  `changedFiles` 가 비어 있는 것은 "바뀐 것이 없다"가 아니라 "모른다"이다. 읽었으면 없다. */
+  rangeUnknown?: true
   detectedAt: string
 }
 

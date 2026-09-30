@@ -20,6 +20,24 @@ describe('parseArgs', () => {
     expect(r).toMatchObject({ cmd: 'run-create', json: true })
     expect((r as { args: Record<string, unknown> }).args.objective).toBe('인증 리팩터')
   })
+
+  // 값이 아니라 모드다 — args 에 둘어가면 앱에게 보내는 인자가 된다
+  it('--quiet 은 모드지 인자가 아니다', () => {
+    const r = parseArgs(['jobs', 'list', '--quiet'])
+    expect(r).toMatchObject({ cmd: 'jobs-list', quiet: true })
+    expect((r as { args: Record<string, unknown> }).args.quiet).toBeUndefined()
+  })
+  // 모드지 인자가 아니다 — args 에 들어가면 앱에게 보내는 인자가 되고, 뒤의 토큰을 값으로 먹는다
+  it('--no-keepalive 도 모드다', () => {
+    const r = parseArgs(['runs', 'wait', '--no-keepalive', '--id', 'run_1'])
+    expect(r).toMatchObject({ cmd: 'runs-wait', noKeepalive: true })
+    const args = (r as { args: Record<string, unknown> }).args
+    expect(args.noKeepalive).toBeUndefined()
+    expect(args.id).toBe('run_1')
+  })
+  it('주지 않으면 켜져 있다 — 기다리는 동안 아무 말도 없는 것이 고쳐야 할 쪽이다', () => {
+    expect(parseArgs(['runs', 'wait', '--id', 'run_1'])).toMatchObject({ noKeepalive: false })
+  })
   it('값이 없는 플래그는 true다', () => {
     const r = parseArgs(['check', '--wait', '--json']) as { args: Record<string, unknown> }
     expect(r.args.wait).toBe(true)
@@ -120,5 +138,229 @@ describe('반복되는 플래그', () => {
   })
   it('browser with an unknown subcommand is refused', () => {
     expect(parseArgs(['browser', 'fly'])).toEqual({ error: 'unknown browser subcommand: fly (expected js or help)' })
+  })
+  it('app js is one command, app-js, and reads its script from stdin by default', () => {
+    expect(parseArgs(['app', 'js'])).toMatchObject({ cmd: 'app-js', wantsStdin: ['script'] })
+    expect(parseArgs(['app', 'js', '--script', '-'])).toMatchObject({ cmd: 'app-js', wantsStdin: ['script'] })
+    const r = parseArgs(['app', 'js', '--file', 'check.js']) as { cmd: string; args: Record<string, unknown>; wantsStdin: string[] }
+    expect(r).toMatchObject({ cmd: 'app-js', args: { file: 'check.js' }, wantsStdin: [] })
+  })
+  it('app js takes one script', () => {
+    expect(parseArgs(['app', 'js', '--file', 'a.js', '--script', 'log(1)'])).toEqual({ error: 'app js takes one script: --file or --script, not both' })
+  })
+  it('app help is app-help; app alone and an unknown verb name the subcommands', () => {
+    expect(parseArgs(['app', 'help'])).toMatchObject({ cmd: 'app-help', wantsStdin: [] })
+    expect(parseArgs(['app'])).toEqual({ error: 'app needs a subcommand: js or help' })
+    expect(parseArgs(['app', 'run'])).toEqual({ error: 'unknown app subcommand: run (expected js or help)' })
+  })
+})
+
+describe('공개 표면 — 두 낱말 명령', () => {
+  it('명사와 동사를 한 토큰으로 잇는다', () => {
+    expect(parseArgs(['jobs', 'list'])).toMatchObject({ cmd: 'jobs-list' })
+    expect(parseArgs(['jobs', 'get', '--id', 'job_1'])).toMatchObject({
+      cmd: 'jobs-get',
+      args: { id: 'job_1' }
+    })
+  })
+
+  it('host 의 세 동사를 읽는다', () => {
+    expect(parseArgs(['host', 'status'])).toMatchObject({ cmd: 'host-status' })
+    expect(parseArgs(['host', 'start'])).toMatchObject({ cmd: 'host-start' })
+    expect(parseArgs(['host', 'stop'])).toMatchObject({ cmd: 'host-stop' })
+  })
+
+  it('읽기 표면의 다섯 명사를 전부 잇는다', () => {
+    expect(parseArgs(['projects', 'list'])).toMatchObject({ cmd: 'projects-list' })
+    expect(parseArgs(['projects', 'find', '--path', 'D:/p'])).toMatchObject({
+      cmd: 'projects-find',
+      args: { path: 'D:/p' }
+    })
+    expect(parseArgs(['runs', 'list', '--job', 'job_1'])).toMatchObject({
+      cmd: 'runs-list',
+      args: { job: 'job_1' }
+    })
+    expect(parseArgs(['runs', 'get', '--id', 'run_1'])).toMatchObject({ cmd: 'runs-get' })
+    expect(parseArgs(['questions', 'get', '--id', 'gate_1'])).toMatchObject({
+      cmd: 'questions-get'
+    })
+    expect(parseArgs(['jobs', 'wait', '--id', 'job_1'])).toMatchObject({ cmd: 'jobs-wait' })
+    expect(parseArgs(['jobs', 'run', '--id', 'job_1'])).toMatchObject({ cmd: 'jobs-run' })
+    expect(parseArgs(['runs', 'wait', '--id', 'run_1'])).toMatchObject({ cmd: 'runs-wait' })
+    expect(parseArgs(['runs', 'stop', '--id', 'run_1'])).toMatchObject({ cmd: 'runs-stop' })
+    expect(parseArgs(['runs', 'resume', '--id', 'run_1'])).toMatchObject({ cmd: 'runs-resume' })
+    expect(parseArgs(['questions', 'answer', '--id', 'g', '--answer', 'A'])).toMatchObject({
+      cmd: 'questions-answer',
+      args: { id: 'g', answer: 'A' }
+    })
+  })
+
+  it('동사가 없으면 무엇을 칠 수 있는지 말한다', () => {
+    expect(parseArgs(['projects'])).toEqual({ error: 'projects needs one of: list, get, find' })
+    expect(parseArgs(['jobs'])).toEqual({ error: 'jobs needs one of: list, get, wait, run, create' })
+  })
+
+  it('모르는 동사는 거절하고 목록을 보여 준다', () => {
+    expect(parseArgs(['jobs', 'fly'])).toEqual({
+      error: 'unknown jobs subcommand: fly (expected list, get, wait, run, create)'
+    })
+  })
+
+  // 플래그가 동사 자리에 오면 동사를 안 준 것이다 — `--json` 을 동사로 읽으면 엉뚱한 오류가 난다
+  it('플래그를 동사로 읽지 않는다', () => {
+    expect(parseArgs(['tasks', '--json'])).toEqual({
+      error: 'tasks needs one of: list, add, dispatch'
+    })
+  })
+
+  it('phase C 의 세 동사', () => {
+    expect(parseArgs(['jobs', 'create', '--objective', 'o'])).toMatchObject({
+      cmd: 'jobs-create',
+      args: { objective: 'o' }
+    })
+    expect(parseArgs(['tasks', 'add', '--job', 'job_1', '--deps', '["tsk_1"]'])).toMatchObject({
+      cmd: 'tasks-add',
+      args: { job: 'job_1', deps: ['tsk_1'] }
+    })
+    expect(parseArgs(['accounts', 'list', '--agent', 'codex'])).toMatchObject({
+      cmd: 'accounts-list',
+      args: { agent: 'codex' }
+    })
+  })
+
+  // **가이드가 가르치는 `astera accounts --json` 은 그대로 돈다.** 명사가 된 뒤에도 동사 없는
+  // `accounts` 는 세션 전용 명령 그 자체다 — 가이드를 고쳐 쓰지 않아도 된다.
+  it('동사 없는 accounts 는 옛 한 낱말 명령이다', () => {
+    expect(parseArgs(['accounts'])).toMatchObject({ cmd: 'accounts' })
+    expect(parseArgs(['accounts', '--json'])).toMatchObject({ cmd: 'accounts', json: true })
+    expect(parseArgs(['accounts', '--agent', 'claude'])).toMatchObject({
+      cmd: 'accounts',
+      args: { agent: 'claude' }
+    })
+    expect(parseArgs(['accounts', 'fly'])).toEqual({
+      error: 'unknown accounts subcommand: fly (expected list)'
+    })
+  })
+
+  // phase D. `run-configs` 도 accounts 처럼 가이드가 동사 없이 가르치는 세션 명령이다.
+  it('run-configs list 는 공개 명령이고, 동사 없는 run-configs 는 옛 세션 명령이다', () => {
+    expect(parseArgs(['run-configs', 'list', '--job', 'job_1'])).toMatchObject({
+      cmd: 'run-configs-list',
+      args: { job: 'job_1' }
+    })
+    expect(parseArgs(['run-configs'])).toMatchObject({ cmd: 'run-configs' })
+    expect(parseArgs(['run-configs', '--json'])).toMatchObject({ cmd: 'run-configs', json: true })
+    expect(parseArgs(['run-configs', 'fly'])).toEqual({
+      error: 'unknown run-configs subcommand: fly (expected list)'
+    })
+  })
+
+  // skills 는 동사가 있어야 한다 — 동사 없는 옛 명령이 없으므로 BARE_NOUNS 가 아니다.
+  it('skills list 와 skills install', () => {
+    expect(parseArgs(['skills', 'list'])).toMatchObject({ cmd: 'skills-list', args: {} })
+    expect(parseArgs(['skills', 'install', '--account', 'acc_1'])).toMatchObject({
+      cmd: 'skills-install',
+      args: { account: 'acc_1' }
+    })
+    expect(parseArgs(['skills'])).toEqual({ error: 'skills needs one of: list, install' })
+  })
+
+  // sessions 도 동사가 있어야 한다. `--no-enter` 는 다른 플래그처럼 camelCase 로 온다.
+  it('sessions list, read, send, create', () => {
+    expect(parseArgs(['sessions', 'list'])).toMatchObject({ cmd: 'sessions-list', args: {} })
+    expect(parseArgs(['sessions', 'read', '--id', 's1', '--lines', '50'])).toMatchObject({
+      cmd: 'sessions-read',
+      args: { id: 's1', lines: '50' }
+    })
+    expect(parseArgs(['sessions', 'send', '--id', 's1', '--text', 'echo hi', '--no-enter'])).toMatchObject({
+      cmd: 'sessions-send',
+      args: { id: 's1', text: 'echo hi', noEnter: true }
+    })
+    expect(parseArgs(['sessions', 'create', '--account', 'a', '--cwd', '.', '--roll-accounts', 'a,b'])).toMatchObject({
+      cmd: 'sessions-create',
+      args: { account: 'a', cwd: '.', rollAccounts: 'a,b' }
+    })
+    expect(parseArgs(['sessions'])).toEqual({ error: 'sessions needs one of: list, read, send, create' })
+  })
+
+  // 코디네이터 전용 명령은 한 낱말 그대로다 — 개명이 가이드 재작성만 사고 아무것도 주지 않는다
+  it('한 낱말 명령은 그대로 지나간다', () => {
+    expect(parseArgs(['worker-start', '--task', 'tsk_1'])).toMatchObject({ cmd: 'worker-start' })
+    expect(parseArgs(['task-create', '--spec', 's'])).toMatchObject({ cmd: 'task-create' })
+  })
+})
+
+describe('없어진 이름', () => {
+  // **별칭이 아니다 — 명령은 돌지 않는다.** 대신 무엇을 치면 되는지 말한다. 옛 이름을 쓰던 것은
+  // 매번 astera help 를 읽고 시작하는 에이전트이고, 그쪽은 이 한 줄로 스스로 고친다.
+  it('대신 칠 이름을 말한다', () => {
+    expect(parseArgs(['run-list'])).toEqual({
+      error: 'run-list was renamed to `jobs list` (astera help)'
+    })
+    expect(parseArgs(['gate-list', '--status', 'open'])).toEqual({
+      error: 'gate-list was renamed to `questions list` (astera help)'
+    })
+  })
+
+  it('옛 이름은 실행되지 않는다 — 인자를 붙여도 같다', () => {
+    const r = parseArgs(['run-show', '--id', 'run_1'])
+    expect('error' in r).toBe(true)
+  })
+
+  // 두 표 다 맨 객체라 Object.prototype 의 이름에 무언가를 답한다. 막기 전에는
+  // `constructor` 가 "function Object() {…} 로 개명됐다" 는 문장을 받았고, RENAMED 를 지나면
+  // NOUNS 쪽에서 verbs.join 이 함수 위에서 터졌다. 모르는 명령은 모르는 명령으로 지나가야 한다.
+  it('Object.prototype 의 이름을 표에 있는 것으로 읽지 않는다', () => {
+    expect(parseArgs(['constructor'])).toMatchObject({ cmd: 'constructor' })
+    expect(parseArgs(['toString', '--json'])).toMatchObject({ cmd: 'toString', json: true })
+    expect(parseArgs(['hasOwnProperty'])).toMatchObject({ cmd: 'hasOwnProperty' })
+  })
+
+  // 아직 공개 동사가 없는 명령은 표에 없다 — 안내가 404 를 가리키면 오타와 구별되지 않는다
+  it('공개 이름이 아직 없는 명령은 그대로 돈다', () => {
+    expect(parseArgs(['run-start', '--run', 'run_1'])).toMatchObject({ cmd: 'run-start' })
+    expect(parseArgs(['gate-resolve', '--id', 'g1'])).toMatchObject({ cmd: 'gate-resolve' })
+  })
+})
+
+describe('parseArgs — --verbose and the globals before the command', () => {
+  it('--verbose is a mode, not an argument, after the command', () => {
+    const r = parseArgs(['jobs', 'list', '--verbose'])
+    expect(r).toMatchObject({ cmd: 'jobs-list', verbose: true })
+    expect((r as { args: Record<string, unknown> }).args.verbose).toBeUndefined()
+  })
+
+  it('it is off unless given', () => {
+    expect(parseArgs(['jobs', 'list'])).toMatchObject({ verbose: false })
+  })
+
+  it('the mode flags may also come before the command', () => {
+    const r = parseArgs(['--verbose', '--human', 'jobs', 'list'])
+    expect(r).toMatchObject({ cmd: 'jobs-list', verbose: true, human: true })
+  })
+
+  it('any other flag before the command is still refused', () => {
+    expect(parseArgs(['--id', 'x', 'jobs', 'list'])).toEqual({ error: 'expected a command, got flag: --id' })
+    expect(parseArgs(['--verbose'])).toEqual({ error: 'a command is required (try: help)' })
+  })
+})
+
+describe('parseArgs — the global --project, before the command', () => {
+  it('is read before the command and kept out of args', () => {
+    const r = parseArgs(['--project', '/work/p', 'jobs', 'list'])
+    expect(r).toMatchObject({ cmd: 'jobs-list', project: '/work/p' })
+    expect((r as { args: Record<string, unknown> }).args.project).toBeUndefined()
+  })
+
+  it("after the command it is that command's own flag, in args", () => {
+    const r = parseArgs(['jobs', 'list', '--project', '/work/q'])
+    expect(r).toMatchObject({ cmd: 'jobs-list', args: { project: '/work/q' } })
+    expect((r as { project?: string }).project).toBeUndefined()
+  })
+
+  it('needs a value', () => {
+    expect(parseArgs(['--project', 'jobs'])).toEqual({ error: 'a command is required (try: help)' })
+    expect(parseArgs(['--project', '--verbose', 'jobs', 'list'])).toEqual({ error: '--project needs a path' })
+    expect(parseArgs(['--project'])).toEqual({ error: '--project needs a path' })
   })
 })

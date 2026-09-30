@@ -23,6 +23,16 @@ describe('git 어댑터', () => {
     expect(await repoRoot(out)).toBeNull()
   })
 
+  // git 을 시작조차 못 한 실패는 종료 코드가 없고, 대신 spawn 의 오류 코드를 싣는다 — 저장소 검사가
+  // "느린 공유" 와 "git 없음·폴더 없음" 을 가르는 근거다
+  it('git: 시작하지 못한 실패는 exitCode 없이 errorCode 를 싣는다', async () => {
+    const gone = path.join(await tempDir('astera-wt-gone-'), 'nope')
+    const r = await git(['--version'], { cwd: gone })
+    expect(r.ok).toBe(false)
+    expect(r.exitCode).toBeUndefined()
+    expect(r.errorCode).toBe('ENOENT')
+  })
+
   it('gitUserName: 설정값 반환', async () => {
     expect(await gitUserName(repo)).toBe('Test User')
   })
@@ -98,7 +108,7 @@ describe('git 어댑터', () => {
   it('listBranches: 로컬과 원격을 모두 짧은 이름으로 돌려주고 origin/HEAD는 제외한다', async () => {
     await addOrigin(repo) // origin/main + origin/HEAD(symref)를 만든다
     execFileSync('git', ['branch', 'feature/x'], { cwd: repo, windowsHide: true })
-    const names = (await listBranches(repo)).map((b) => b.name)
+    const names = (await listBranches(repo))!.map((b) => b.name)
     expect(names).toContain('main')
     expect(names).toContain('feature/x')
     expect(names).toContain('origin/main')
@@ -108,7 +118,7 @@ describe('git 어댑터', () => {
 
   it('listBranches: remote 플래그로 원격과 로컬을 구분한다', async () => {
     await addOrigin(repo)
-    const byName = new Map((await listBranches(repo)).map((b) => [b.name, b]))
+    const byName = new Map((await listBranches(repo))!.map((b) => [b.name, b]))
     expect(byName.get('main')?.remote).toBe(false)
     expect(byName.get('origin/main')?.remote).toBe(true)
   })
@@ -125,26 +135,39 @@ describe('git 어댑터', () => {
       windowsHide: true,
       env: { ...process.env, GIT_COMMITTER_DATE: '2030-01-01T00:00:00', GIT_AUTHOR_DATE: '2030-01-01T00:00:00' }
     })
-    const locals = (await listBranches(repo)).filter((b) => !b.remote).map((b) => b.name)
+    const locals = (await listBranches(repo))!.filter((b) => !b.remote).map((b) => b.name)
     expect(locals.indexOf('zzz-newer')).toBeLessThan(locals.indexOf('main'))
   })
 
   it('listBranches: 현재 브랜치에만 current가 붙는다', async () => {
     execFileSync('git', ['branch', 'other'], { cwd: repo, windowsHide: true })
-    const list = await listBranches(repo)
+    const list = (await listBranches(repo))!
     expect(list.filter((b) => b.current).map((b) => b.name)).toEqual(['main'])
+  })
+
+  // "모른다"는 "없다"가 아니다. 저장소가 아닌 곳(= git 이 실패한 곳)에서 빈 목록을 주면 피커는
+  // 브랜치가 하나도 없는 저장소와 구별할 수 없다 — null 이 그 둘을 가른다.
+  it('listBranches: git 이 실패하면 빈 목록이 아니라 null(모름)을 준다', async () => {
+    const out = await tempDir('astera-wt-nobranch-')
+    expect(await listBranches(out)).toBeNull()
+  })
+
+  it('listBranches: 커밋이 없는 저장소는 null 이 아니라 빈 목록이다', async () => {
+    const empty = await tempDir('astera-wt-emptyrepo-')
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: empty, windowsHide: true })
+    expect(await listBranches(empty)).toEqual([])
   })
 
   it('listBranches: detached HEAD면 current인 항목이 없다', async () => {
     const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, windowsHide: true, encoding: 'utf8' }).trim()
     execFileSync('git', ['checkout', '-q', head], { cwd: repo, windowsHide: true })
-    const list = await listBranches(repo)
+    const list = (await listBranches(repo))!
     expect(list.length).toBeGreaterThan(0)
     expect(list.some((b) => b.current)).toBe(false)
   })
 
   it('listBranches: updatedAt이 파싱 가능한 날짜다', async () => {
-    const list = await listBranches(repo)
+    const list = (await listBranches(repo))!
     expect(Number.isNaN(Date.parse(list[0].updatedAt))).toBe(false)
   })
 
@@ -238,4 +261,48 @@ describe('gitDir', () => {
     const plain = await tempDir('astera-git-plain-')
     expect(await gitDir(plain)).toBeNull()
   })
+})
+
+// 중단 신호: 걸린 git 을 (Windows 에서는 자식까지) 죽이고 곧바로 답한다. git 이 띄운 자식이 출력
+// 파이프를 쥐고 있어도 기다리지 않는다 — 'close' 가 아니라 git 자신의 종료만 본다.
+describe('git 어댑터 — 중단', () => {
+  it('도는 중에 중단하면 git 을 죽이고 cancelled 로 곧바로 답한다', async () => {
+    const ac = new AbortController()
+    const started = Date.now()
+    const p = git(['-c', 'alias.slow=!sleep 30', 'slow'], { cwd: repo, signal: ac.signal })
+    setTimeout(() => ac.abort(), 300)
+    const r = await p
+    expect(r.ok).toBe(false)
+    expect(r.cancelled).toBe(true)
+    expect(r.exitCode).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(8_000)
+  }, 15_000)
+
+  it('이미 중단된 신호면 git 을 띄우지 않는다', async () => {
+    const ac = new AbortController()
+    ac.abort()
+    const r = await git(['--version'], { signal: ac.signal })
+    expect(r).toMatchObject({ ok: false, cancelled: true })
+    expect(r.stdout).toBe('')
+  })
+
+  it('신호를 주지 않는 호출은 그대로다', async () => {
+    const r = await git(['--version'])
+    expect(r.ok).toBe(true)
+    expect(r.cancelled).toBeUndefined()
+  })
+})
+
+// 시간 제한도 중단과 같게: git 을(Windows 에서는 나무째) 죽이고, 자식이 파이프를 쥐고 있어도
+// git 이 끝나는 대로 답한다. 예전에는 git.exe 하나만 죽이고 파이프가 닫히기를 — 자식이 끝나기를 —
+// 기다렸다.
+describe('git 어댑터 — 시간 제한', () => {
+  it('시간이 지나면 git 과 그 자식을 죽이고 곧바로 timedOut 으로 답한다 — exitCode 는 없다', async () => {
+    const started = Date.now()
+    const r = await git(['-c', 'alias.slow=!sleep 30', 'slow'], { cwd: repo, timeoutMs: 500 })
+    expect(r.ok).toBe(false)
+    expect(r.timedOut).toBe(true)
+    expect(r.exitCode).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(8_000)
+  }, 40_000)
 })

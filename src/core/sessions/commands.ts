@@ -1,4 +1,10 @@
 import { claudeLaunchArgs } from '../chat/claudeProtocol'
+import { resolveWindowsExecutable, windowsSpawn } from './windowsExecutable'
+
+/** Where a CLI is on win32, by PATH alone — injected so a test can say where `claude` lives. The
+ *  default asks this process's PATH (windowsExecutable.ts says why the working directory never takes
+ *  part). */
+export type ResolveExecutable = (name: string) => string | null
 
 export interface SpawnCommand {
   file: string
@@ -19,7 +25,7 @@ export type CommandBuilder = (opts: {
   initialPrompt?: string
 }) => SpawnCommand
 
-export function buildClaudeCommand(platform: NodeJS.Platform): CommandBuilder {
+export function buildClaudeCommand(platform: NodeJS.Platform, resolve: ResolveExecutable = resolveWindowsExecutable): CommandBuilder {
   return ({ resumeSessionId, settingsFile, bypassPermissions, addDirs, initialPrompt }) => {
     const args: string[] = []
     // Injects a session-scoped statusLine via --settings (the global settings.json is left alone) — goes before resume
@@ -41,10 +47,9 @@ export function buildClaudeCommand(platform: NodeJS.Platform): CommandBuilder {
     // Unconditional rather than only when addDirs is set: the fence costs one token and states the
     // rule once, where a condition would have to be revisited by whoever adds the next option.
     if (initialPrompt) args.push('--', initialPrompt)
-    // On win32 claude may be a .cmd shim, so it is spawned through a cmd.exe wrapper
-    return platform === 'win32'
-      ? { file: 'cmd.exe', args: ['/c', 'claude', ...args] }
-      : { file: 'claude', args }
+    // On win32 claude may be a .cmd shim, which only cmd.exe can start — by its absolute path, never
+    // by name (windowsExecutable.ts: a name would be looked up in the session's own folder first)
+    return platform === 'win32' ? windowsSpawn('claude', args, resolve) : { file: 'claude', args }
   }
 }
 
@@ -69,8 +74,15 @@ export function buildClaudeCommand(platform: NodeJS.Platform): CommandBuilder {
  *  a different sentence reaches codex.
  *
  *  Exported so a second argv call site can reuse the same rule instead of inventing its own — see
- *  codexRolling.ts's blank-slate roll, which sanitizes a conversation briefing before it becomes
+ *  codexCoordinator.ts's blank-slate roll, which sanitizes a conversation briefing before it becomes
  *  initialPrompt (the initialPrompt field above deliberately does not sanitize on its own). */
+/** The characters a prompt handed to a CLI on its command line must not carry: on win32 the launch
+ *  goes through cmd.exe, which reads `"` `&` `|` `<` `>` `^` as syntax and expands `%NAME%`, and a
+ *  line break ends the command line. A caller that puts an outside text on the command line checks
+ *  this first and refuses, rather than stripping (the coordinator's worker launch, `sessions create`).
+ *  Common to every platform on purpose, so a prompt that works here works there. */
+export const LAUNCH_FORBIDDEN = /["&|<>^%\r\n]/
+
 export function sanitizeResumePrompt(prompt: string): string {
   return prompt
     .replace(/["&|<>^%]/g, ' ')
@@ -81,7 +93,7 @@ export function sanitizeResumePrompt(prompt: string): string {
 /** The codex CLI command builder. settingsFile (Claude statusLine only) is ignored.
  *  resumePrompt is an optional argument of codex resume — unlike Claude's, it does not need to be typed into
  *  the PTY. */
-export function buildCodexCommand(platform: NodeJS.Platform): CommandBuilder {
+export function buildCodexCommand(platform: NodeJS.Platform, resolve: ResolveExecutable = resolveWindowsExecutable): CommandBuilder {
   return ({ resumeSessionId, bypassPermissions, resumePrompt, initialPrompt }) => {
     const args: string[] = []
     if (resumeSessionId) {
@@ -92,9 +104,7 @@ export function buildCodexCommand(platform: NodeJS.Platform): CommandBuilder {
     // Starts without permission prompts — the counterpart to Claude's --dangerously-skip-permissions (measured on codex 0.143)
     if (bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox')
     if (initialPrompt) args.push(initialPrompt)
-    return platform === 'win32'
-      ? { file: 'cmd.exe', args: ['/c', 'codex', ...args] }
-      : { file: 'codex', args }
+    return platform === 'win32' ? windowsSpawn('codex', args, resolve) : { file: 'codex', args }
   }
 }
 
@@ -102,10 +112,11 @@ export function buildCodexCommand(platform: NodeJS.Platform): CommandBuilder {
  *  core/chat/codexProtocol.ts). No resume/bypass/prompt args here — those are protocol calls the
  *  adapter makes once the process is up (thread/start, thread/resume), not argv. Same win32 wrapping
  *  as buildCodexCommand, for the same reason: on win32 codex may be a shim the shell must resolve. */
-export function buildCodexAppServerCommand(platform: NodeJS.Platform): { file: string; args: string[] } {
-  return platform === 'win32'
-    ? { file: 'cmd.exe', args: ['/c', 'codex', 'app-server'] }
-    : { file: 'codex', args: ['app-server'] }
+export function buildCodexAppServerCommand(
+  platform: NodeJS.Platform,
+  resolve: ResolveExecutable = resolveWindowsExecutable
+): { file: string; args: string[] } {
+  return platform === 'win32' ? windowsSpawn('codex', ['app-server'], resolve) : { file: 'codex', args: ['app-server'] }
 }
 
 /** A chat session's line process for Claude: `claude --output-format stream-json …`, spoken over stdio
@@ -116,10 +127,9 @@ export function buildCodexAppServerCommand(platform: NodeJS.Platform): { file: s
  *  shell must resolve. */
 export function buildClaudeChatCommand(
   platform: NodeJS.Platform,
-  opts: { resumeSessionId?: string; bypass: boolean; model?: string | null }
+  opts: { resumeSessionId?: string; bypass: boolean; model?: string | null },
+  resolve: ResolveExecutable = resolveWindowsExecutable
 ): { file: string; args: string[] } {
   const args = claudeLaunchArgs(opts)
-  return platform === 'win32'
-    ? { file: 'cmd.exe', args: ['/c', 'claude', ...args] }
-    : { file: 'claude', args }
+  return platform === 'win32' ? windowsSpawn('claude', args, resolve) : { file: 'claude', args }
 }

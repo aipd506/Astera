@@ -1,0 +1,2648 @@
+// The account rolling coordinator. Limit detection → transcript copy → kill → --resume on the next
+// account → auto-accepting the trust prompt → automatically sending "carry on with the work". The pure
+// decisions live in core/rolling and every side effect is injected through deps — it does not depend on
+// electron, so it is verified with vitest. The app's wiring is in src/main/index.ts; the Host's in
+// src/host/rolling.ts (S6).
+//
+// A chain whose session is a chat session (kind 'chat') rolls through the same middle and differs only
+// at the two ends, because it has no terminal: the identity a statusLine would report is pushed in by
+// ipc (onChatMeta), the limit a screen would print arrives as an event (onChatLimit), and the carry-on
+// prompt a screen would be typed into rides along with the respawn as the new process's first turn —
+// so no readiness poll, no trust dialog and no post-switch cooldown. See those three sites.
+import type {
+  Account,
+  Attention,
+  RateLimitPeak,
+  ResumeStrategy,
+  SessionInfo,
+  SessionKind,
+  RollStateEvent,
+  SessionUsage
+} from '../types'
+import type { RateLimitInfo } from '../chat/types'
+import { sessionKindOf } from '../sessions/kind'
+import type { RollConfig } from './config'
+import {
+  OutputScanner,
+  findWaitChoice,
+  hasWaitChoiceLabel,
+  looksLikeChoicePrompt,
+  maskLimitPhrase
+} from './detect'
+import { RollCycle } from './cycle'
+import {
+  laterBlock,
+  pickAvailable,
+  planRetry,
+  type BlockRecord,
+  type RetryState
+} from './retry'
+import { BlockRegistry } from './blockRegistry'
+import { copyTranscript } from './transcript'
+import { claudeHistoryStrategy } from '../history/strategies/claude'
+import { parseStatusLinePayload, extractStatusLineSession } from '../usage/statusline'
+import { lastActivityAt, readPendingWorkflowCount } from './activity'
+import {
+  isIdleNotification,
+  isUnknownNotificationType,
+  type NotificationPayload
+} from '../hooks/notification'
+import { t, type Lang } from '../i18n'
+import { ClaudeTranscriptTail } from './claudeSignal'
+import { ROLL_SNAPSHOT_VERSION, MAX_SNAPSHOT_PROMPT_CHARS, snapshotKey, type RollSnapshot, type RollRespawnExtra } from './snapshot'
+import { parseResetTime } from './resetTime'
+
+/** A blank-slate respawn's note: owed the briefing, and the briefing's text (Task 12 fix round 1). A text
+ *  past the parser's bound is left out rather than written — parseRollSnapshot would refuse the whole
+ *  snapshot over it — and the restore then asks for the briefing again, as it did before the text was kept. */
+const briefingNote = (prompt: string): { promptKind: 'briefing'; prompt?: string } =>
+  prompt.length <= MAX_SNAPSHOT_PROMPT_CHARS ? { promptKind: 'briefing', prompt } : { promptKind: 'briefing' }
+
+const GATE_PCT = 90 // The bar for choosing which window goes into a block record — only the reset of a window exhausted at or above this is kept by recordRecovery (it is no longer used as a gate for accepting a limit phrase)
+const FALLBACK_SILENCE_MS = 30_000 // the fallback trigger: five_hour at 100% plus this long with no output
+const TICK_MS = 15_000 // how often metadata is refreshed and the fallback trigger checked
+const READY_POLL_MS = 1_000 // how often statusline is polled after a respawn
+const READY_FALLBACK_MS = 30_000 // the fallback that sends the prompt even without statusline (only when no trust prompt was detected)
+const READY_TIMEOUT_MS = 120_000 // the deadline for giving up on the automatic prompt
+const HEALTHY_MS = 60_000 // no limit detected for this long after a switch → reset the consecutive block count
+const ENTER_DELAY_MS = 150 // the gap between the prompt text and Enter
+const TRUST_ENTER_DELAY_MS = 400 // the gap between detecting the trust prompt and Enter
+// Blind-spot detection: only the retrospective single-account reset-anchor verdict (3-b) remains. The
+// multi-account real-time stall (3-a) was removed once the transcript began recording subagent limit
+// errors directly, which achieved the same purpose — BLIND_PROBE_MIN_MS survives as the file-tree stat
+// throttle for idleNudgeCheck.
+const BLIND_PROBE_MIN_MS = 60_000 // the file-tree stat throttle
+const RESET_GRACE_MS = 5 * 60_000 // how long to wait for the harness to resume itself after a reset — one prompt is harmless even if this misjudges
+const IDLE_STALL_MS = 10 * 60_000 // a stall persisting this long after an (idle) Notification → nudge
+const NUDGE_ECHO_GRACE_MS = 2_000 // the grace period that keeps the echo of a nudge's own prompt from being read as resumed activity
+// The window in which a PTY limit phrase is ignored right after a roll. A --resume replays the whole
+// conversation onto the screen, and that conversation contains the limit phrase that caused the roll.
+// The awaitingReady cooldown cannot stop it — that flag is released the moment the automatic prompt is
+// sent, and the prompt goes out as soon as the first statusline appears (measured: 4 seconds after the
+// roll), while the replay is still streaming. Delaying the release of awaitingReady is not the answer
+// because that flag also blocks tick, limitTailCheck and the fallback trigger — delaying it would
+// equally delay catching "the account we just switched to is already exhausted" (measured: weekly=100
+// detected 45 seconds after a switch). Holding back only the PTY path leaves transcript detection and
+// the fallback trigger as the safety net.
+const REPLAY_GRACE_MS = 60_000
+// After matching a limit phrase without finding the choice number, keep looking in later chunks for this long
+const CHOICE_WATCH_MS = 30_000
+// The bar for accepting a limit on a directly queried usage figure. It carries no margin like GATE_PCT
+// (90) — that margin corrects for a value that may have frozen, and a figure fetched from the account
+// API cannot freeze. Measured (2026-08-08): three genuine limits read 103-110%, while the two false
+// positives had a single-digit 5-hour window.
+const LIMIT_PCT = 100
+// Throttle for the rejection log. The lookups themselves are throttled by the cache age the readUsage
+// wiring asks for (index.ts), so what this limits is the log line alone.
+const REJECT_LOG_MS = 30_000
+
+export interface RollingDeps {
+  spawn(opts: {
+    account: Account
+    cwd: string
+    resumeSessionId?: string
+    rollAccountIds?: string[]
+    slackNotify?: boolean
+    bypassPermissions?: boolean
+    /** 탭 이름. 롤은 같은 작업이 계정만 바꿔 이어지는 것이라 사람이 붙인 이름을 넘겨준다 —
+     *  넘기지 않으면 spawn 이 폴더 이름으로 되돌린다 */
+    title?: string
+    /** astera CLI 환경. 배선이 넘긴다 — 없으면 세션은 CLI 없이 뜬다 */
+    orchEnv?: { cliPath: string; skillsPath: string; profileDir: string }
+    /** Which kind of session to respawn — the chain's own kind, carried through every roll. The wiring
+     *  routes on it (index.ts): 'chat' goes to the chat manager, anything else to the pty manager.
+     *  Absent means 'terminal', so a caller that predates chat sessions keeps working. */
+    kind?: SessionKind
+    /** Chat only: the carry-on prompt, as the new process's first turn. A chat session has no screen to
+     *  type into — the manager sends this once the protocol handshake is done — so what a pty roll does
+     *  afterwards (poll for readiness, then write the prompt and Enter) is done here instead, in one go. */
+    initialPrompt?: string
+    /** The user's carry-on prompt as they typed it (empty/undefined means the default). Carried onto
+     *  every roll so the respawned session's note keeps it — without it a restart re-registers the
+     *  chain with the UI-language default. This is `liveInfo.rollPrompt`, not `chain.prompt`: the
+     *  latter has the default already resolved, and writing a resolved default into the note pins the
+     *  language it was resolved in. */
+    rollPrompt?: string
+    /** Chat only, Claude only: start the next process on this model. See `chosenModelOf` below. */
+    model?: string | null
+    /** design F5 fix round 1 (Important 3, the roll-inheritance fix): start the respawned process
+     *  with the toolchain bypass already applied, because the chain being rolled had already been
+     *  granted it. See `bypassedOf` below for the read and why it has to happen before the kill.
+     *  `bypassSignal` itself (which detection signal main found) is not threaded through here — the
+     *  wiring's own `spawn` callback (index.ts) computes it the same way ipc.ts's `spawnSession` does,
+     *  straight off `core.bypassSignalFor`, since it already has the target account in hand and that
+     *  fact is about this machine's PATH, not about the chain. */
+    startWithBypass?: boolean
+    /** Extra keys for the new pty's note (S6 R6) — `rolledFrom` and the chain's snapshot on its new
+     *  account. The manager merges them into `meta.restore` under its own keys. */
+    restoreExtra?: RollRespawnExtra
+  }): SessionInfo
+  /** Everything a respawn needs that can wait or refuse, done while the old session still lives (S6 R5).
+   *  A rejection aborts the roll before the kill and reschedules it. Absent: nothing to prepare. */
+  prepareSpawn?(account: Account, cwd: string): Promise<void>
+  /** The model the person picked in this session, or null when they picked none.
+   *
+   *  A roll has to carry it because Claude's model is argv and nothing about it survives the process —
+   *  `--resume` restores the conversation, not a mid-session `set_model` — so a respawn without it puts
+   *  the next account's process on the CLI's own default. Someone who picked Opus watched it turn into
+   *  the default partway through a chain, which is how this was found. codex needs nothing here: its
+   *  model lives on the thread and `thread/resume` reports it back.
+   *
+   *  Optional, so a wiring that predates this (and every terminal chain, which has no such choice to
+   *  make) behaves exactly as before. */
+  chosenModelOf?(sessionId: string): string | null
+  /** design F5 fix round 1 (Important 3): whether the session being rolled away from had already been
+   *  granted the toolchain bypass — read the same way `chosenModelOf` is, and for the same reason:
+   *  "read before the kill, not after" (the manager drops the session together with its process, and
+   *  the fact lives only there). Dropping consent already given at the roll boundary is the same
+   *  silent-override harm design S7 exists to forbid, just moved to a different door — a chain is one
+   *  thing to the person, and a roll that silently drops what they agreed to is the same silence this
+   *  whole branch exists to remove. Optional so a wiring that predates this behaves exactly as before
+   *  (no bypass ever inherited, which is what every terminal chain and every wiring before F5 did). */
+  bypassedOf?(sessionId: string): boolean
+  write(sessionId: string, data: string): void
+  kill(sessionId: string): void
+  getAccount(id: string): Account | null
+  readStatusPayload(sessionId: string): Promise<unknown | null>
+  send(channel: 'session:rolled' | 'session:rollState', payload: unknown): void
+  log(message: string): void
+  lang: () => Lang // taken as a getter rather than a value so the latest language is used even after setLang
+  /** Block records shared with every other rolling chain, in both coordinators (SPEC §11.2/6).
+   *
+   *  **The wiring passes one instance to both.** That is the whole point: three workers rolling through
+   *  the same accounts used to each rediscover every block themselves, wasting a kill+respawn per
+   *  worker per account. It is **required, not optional**, because an optional field can be dropped
+   *  from the wiring without a single test failing — and the failure mode is this feature silently
+   *  reverting to per-chain isolation. The same reasoning made rollAccountIds required. */
+  blocks: BlockRegistry
+  persistConfig?: (claudeSessionId: string, config: RollConfig) => void // saves the rolling config
+  /** Job Continuity: the provider's own session id, the moment it is first learned for a live session
+   *  and again when it changes (a respawn). Optional — without the feature nothing listens. */
+  onNativeSession?: (sessionId: string, nativeSessionId: string) => void
+  copy?: (src: string, dest: string) => Promise<void> // for test injection — defaults to copyTranscript
+  now?: () => number
+  probeActivity?: (transcriptPath: string) => Promise<number | null> // for test injection — defaults to lastActivityAt
+  readPending?: (transcriptPath: string) => Promise<number | null> // for test injection — defaults to readPendingWorkflowCount
+  /** Asks the account for its real usage (the highest % across every limit bucket). null when it cannot
+   *  be read. The default is "cannot be read" because the real implementation (RateLimitFetcher) uses
+   *  the electron net module, and this file has to stay free of electron to be testable under vitest.
+   *  index.ts does the wiring. */
+  /** Ask the account what its usage is. Carries the fullest bucket's reset time with the figure —
+   *  that time is the only reliable one when a session halts at a limit, because the phrase may never
+   *  be printed and the statusLine snapshot freezes (see RateLimitPeak). */
+  readUsage?: (configDir: string) => Promise<RateLimitPeak | null>
+  /** 롤로 띄우는 세션에 실을 astera CLI 환경.
+   *
+   *  **왜 dep 이고 왜 getter 인가.** 롤링 코디네이터는 `ipc.ts` 의 `spawnSession` 을 우회해
+   *  `core.sessions.spawn` 을 직접 부른다(index.ts 의 배선). 그 우회로에는 `ASTERA_CLI`·`ASTERA_PROFILE_DIR`·
+   *  `ASTERA_SKILLS` 와 PATH 주입이 붙지 않아서, **롤 뒤의 워커는 `astera` 로 아무것도 보고할 수
+   *  없었다** — 조용히 끝나지 않는 Task 가 된다. `ipc.ts` 의 그 함수를 그대로 넘길 수는 없다: 그것이
+   *  롤링 등록까지 하므로 재귀한다. 그래서 값만 따로 받는다.
+   *
+   *  getter 인 이유는 값이 앱 수명 중간에 생기기 때문이다 — 오케스트레이션 서버는 앱이 뜬 뒤에
+   *  서고, 롤링 코디네이터는 그보다 먼저 만들어진다.
+   *
+   *  주입되지 않으면 아무것도 실리지 않는다(기존 동작) — now?/log? 와 같은 관례다. */
+  orchEnv?(): { cliPath: string; skillsPath: string; profileDir: string } | undefined
+  /** 재개 직전에 쓸 텍스트를 물어본다. **`chain.prompt` 가 정적이라서 필요하다** — 그 값은
+   *  register 시점에 고정되는데, 재개 자료는 재개 직전의 상태(git·보고·결정)에서 조립해야
+   *  정확하다.
+   *
+   *  **sessionId 로 열린 Job Dispatch 를 찾으면 그 packet 을 돌린다. 못 찾으면(사용자 탭 세션)
+   *  `tabFallback` 이 참일 때만 탭 브리핑으로 저하하고, 거짓이면 곧바로 `null` 이다.** Job 도 탭도
+   *  못 찾거나 만들지 못하면 `null` 이다. `null` 이면 `chain.prompt` 를 그대로 쓴다 — 주입되지
+   *  않아도 기존 동작 그대로다. 구현은 `core/orchestration/exec/resumePacket.ts`, 그 자체는 절대
+   *  던지지 않는다(계약). 그래도 이 dep 을 부르는 자리는 그 위에 자기 자신의 try/catch 를 또
+   *  두른다(`resumePromptFor`) — 이 자리를 부르는 쪽이 전부 fire-and-forget 이라, 언젠가 이 계약이
+   *  깨지면 처리되지 않는 예외가 되는 대신 로그로만 남고 고정 문장으로 저하하게 하려는 것이다
+   *  (server.ts 가 probeLimit 을 부르는 것과 같은 태도).
+   *
+   *  **`form` 이 어느 모양을 원하는지 말한다** — 이 코디네이터가 자기가 어느 재개 경로에 있는지
+   *  아는 유일한 쪽이기 때문이다(packet 을 만드는 쪽은 모른다). 'handover' 는 전체 인계이고
+   *  'update' 는 덧붙일 한 줄이다. 가르는 기준은 `SPEC §11.5`: `--resume` 을 부르는가.
+   *  `resumePromptFor` 의 주석에 이 파일의 어느 자리가 어느 쪽인지 적어 두었다.
+   *
+   *  **`tabFallback` 이 거짓이면 탭 세션이라도 저하하지 않는다.** `--resume` 뒤 이미 살아 있는
+   *  프로세스에 다시 'handover' 를 묻는 자리(`scheduleAutoPrompt`)가 이 값을 거짓으로 준다 — 그
+   *  프로세스는 이미 대화를 통째로 이어받았으므로 탭 세션에는 인계할 것이 없고, 있으면
+   *  `chain.prompt`(사용자가 New Session 대화상자에서 직접 지정했을 수 있는 문구)를 지운다. Job
+   *  워커는 이 값과 무관하게 packet 을 그대로 받는다 — 이 dep 이 처음 생기기 전부터의 동작이다. */
+  resumeText?(sessionId: string, form: 'handover' | 'update', tabFallback: boolean): Promise<string | null>
+  /** 한도에 걸린 세션을 어떻게 이어갈지 — Task 1 의 설정값. **getter 로 받는다** — `orchEnv?` 와
+   *  같은 이유다: 값이 설정 화면에서 앱 수명 중간에 바뀌고, 이 코디네이터는 그 값이 존재하기 전에
+   *  만들어진다. 주입되지 않으면 `'original'`(기존 동작)로 본다.
+   *
+   *  `'smart'` 라고 곧바로 백지 재개가 되는 것은 아니다 — `resumeText` 가 브리핑을 만들어 줄 때만
+   *  적용된다(계획의 지배 제약: 브리핑을 못 만들면 백지 재개를 하지 않는다). `roll()` 을 보라.
+   *  codexCoordinator.ts 의 같은 이름 dep 과 같은 계약이다. */
+  resumeStrategy?(): ResumeStrategy
+  /** Is this account logged in right now. Optional: without it a chain behaves exactly as it did before
+   *  this was added — every account is treated as usable and only block records steer the choice. The
+   *  wiring passes `core.accounts.loginStatus`, the same verdict the account panel and the resume dialog
+   *  show (spec §15.2). It is asked on the tick rather than on the limit path: it is a file read per
+   *  account, and a filter that is one tick stale is worth more than a file read inside a limit verdict. */
+  loginStatus?: (accountId: string) => Promise<boolean>
+  /** Where a chain's snapshot goes (S6 R4, design §3A.2): the wiring writes it into the session's pty
+   *  note, so another process — the Host when the app closes — can carry the chain on with `restore`
+   *  instead of starting it from zero. Called only when something a restore reads changed (snapshotKey).
+   *  Optional: without it nothing is written and a takeover registers from zero, as before. */
+  snapshot?(sessionId: string, snap: RollSnapshot): void
+  /** Whether this process may act on this session's chain right now (S6 R1): false quiets the chain.
+   *  A quiet chain still reads its tails and statusline and learns identity (R27), but takes no action:
+   *  no roll (gated inside roll() at entry and again right before the kill, R26), no wait resume, no
+   *  typing, no recorded block. A roll already past its kill finishes. Absent: always true (the app). */
+  mayAct?(sessionId: string): boolean
+}
+
+interface Chain {
+  accountIds: string[]
+  /** What kind of session this chain is rolling. A 'chat' chain has no pty: the fields a statusLine
+   *  fills in are pushed in by ipc (onChatMeta), the limit arrives as an event (onChatLimit), and the
+   *  prompt goes out with the spawn rather than being typed into a screen. Every other path — the
+   *  evidence gate, the block records, the retry plan, the copy and the re-key — is shared. */
+  kind: SessionKind
+  prompt: string // the text sent on a rolling resume (user-specified, or the default t('rolling.continuePrompt'))
+  cycle: RollCycle
+  liveId: string // the app session id (changes on every roll)
+  liveInfo: SessionInfo
+  cwd: string
+  scanner: OutputScanner
+  claudeSessionId: string | null // the statusline session_id — the same throughout the relay
+  transcriptPath: string | null // the path of the current live transcript
+  // 히스토리에서 대화를 다시 열 때 ipc 가 이미 알던 두 값 — 그 대화의 claude 세션 id 와, 대상 계정
+  // 폴더로 복사해 둔 파일 경로. **roll() 의 폴백으로만 쓴다.** claudeSessionId·transcriptPath 가
+  // null 인지로 "statusLine 이 아직 안 왔는가" 를 묻는 자리(findLiveByClaudeSession, applyMeta 의
+  // 저장 게이트, settleInPlace 의 건강 판정, idleNudgeCheck 와 blind-spot 프로브)는 이 값을 절대
+  // 읽어서는 안 된다 — 그 물음에 미리 답을 채워 넣으면 그 판정 자체가 항상 참이 되어 무의미해진다.
+  resumeSeedSessionId: string | null
+  resumeSeedTranscriptPath: string | null
+  lastOutputAt: number
+  rolling: boolean // the re-trigger guard while a roll is running
+  awaitingReady: boolean // true from a respawn until the automatic prompt (auto-accepting trust is limited to this window too)
+  /** Which prompt the respawn awaiting it is owed (S6 Task 12, carry C-c): 'briefing' after a blank-slate
+   *  roll, 'handover' otherwise. Read only while awaitingReady holds; written into the snapshot for it. */
+  promptKind: 'handover' | 'briefing'
+  /** The briefing text itself while promptKind is 'briefing' (Task 12 fix round 1): a takeover types it
+   *  as it is, because it cannot be rebuilt from the new, blank session. */
+  briefingPrompt: string | null
+  trustSeen: boolean
+  /** The most recent stripped screen text. The automatic prompt's fallback reads it to see whether a
+   *  dialog is still waiting, and logs it when it types anyway — a trust prompt we fail to recognise
+   *  leaves no trace of its own, so without this the next miss is undiagnosable again. */
+  lastScreen: string
+  waitTimer: ReturnType<typeof setTimeout> | null
+  healthyTimer: ReturnType<typeof setTimeout> | null
+  // Whether an in-place resume was already used for this blocked episode. A health declaration releases
+  // it — the 60-second post-switch timer for a pty chain (declareHealthy), a clean completed turn
+  // consumed on the tick for a chat chain (spec §14.6) — as does a successful in-place settle
+  // (settleInPlace).
+  inPlaceUsed: boolean
+  promptTimer: ReturnType<typeof setTimeout> | null
+  trustTimer: ReturnType<typeof setTimeout> | null
+  disposed: boolean
+  // Per-account block records: index → a record, or none (null). Whenever we get blocked on an account,
+  // the latest reset among that account's over-limit windows is kept. Expiry is decided by time — wiping
+  // the lot per lap would forget a weekly exhaustion (valid for days) after one 60-second healthy period
+  // or one wait firing, and switch back to that account.
+  recovery: (BlockRecord | null)[]
+  /** Accounts of this chain that answered "not logged in" on the most recent refresh. Per-chain on
+   *  purpose — a login is a fact about this machine's account folder, not a usage verdict to broadcast
+   *  through the shared BlockRegistry, and every chain learns it from the same source on its own tick. */
+  loggedOut: Set<string>
+  /** The in-flight latch of refreshLoginState. One round at a time per chain: the probes are I/O and the
+   *  tick is 15 seconds, so two overlapping rounds could resolve out of order and leave the older
+   *  verdict standing. */
+  loginRefreshing: boolean
+  lastBlindProbeAt: number // the file-tree stat throttle — used by idleNudgeCheck (it survived the removal of 3-a)
+  resetCheckAt: number | null // the scheduled time (ms) of the single-account reset anchor — prevents rescheduling the same time (3-b)
+  resetTimer: ReturnType<typeof setTimeout> | null
+  // The state-publication generation counter, incremented on every pushState. A deferred 'none' (the
+  // 150ms Enter timers in sendPrompt and resetAnchorCheck) captures the generation at scheduling time; on
+  // firing it publishes if the generation is unchanged, and skips as stale if it has already advanced
+  // (i.e. a 'waiting' or 'switching' has published something more recent in the meantime).
+  stateSeq: number
+  // The last lasting rollState payload pushState published — null once it was 'none' (or nothing has
+  // published yet). Read back by stateOf for a renderer that mounts after the push already happened.
+  lastState: RollStateEvent | null
+  // idle nudge: when the (idle) Notification arrived, when the nudge was sent, and whether the
+  // intervention is over. All three are cleared once activity resumes, so the next stall gets one go again.
+  idleSince: number | null // when the idle Notification arrived — null means this is not a stall candidate
+  idleNudgedAt: number | null // when the nudge was sent in this stall — null means not yet
+  idleHandled: boolean // true once both the one nudge and the one stalled have been used — blocks repeat intervention in the same stall
+  // When the last roll finished — the reference point of the PTY replay grace. null on the first session (no grace).
+  rolledAt: number | null
+  // Throttles the "ignored by replay grace" log to once per roll — the same convention as limitTailReadFailWarned
+  replayGraceWarned: boolean
+  // The deadline (ms) for continuing to look for a choice number after failing to find one — null means not watching
+  choiceWatchUntil: number | null
+  // When the rejection log may be written again (ms) — 0 means right away
+  rejectLogUntil: number
+  // Did we see the limit choice list on screen and fail to clear it?
+  // Writing a prompt plus Enter into a live PTY in that state has the Enter approve whatever item is
+  // highlighted, and item 1 of that list is "Adjust monthly spend limit". So this is the one case that
+  // falls back to the old kill path — kill wipes the screen, which removes the hazard.
+  //
+  // The condition is "the label was on screen but we could not press it", not "no number was found",
+  // and that distinction is the whole point. Across 53 measured matches the label appeared 0 times
+  // (a managed account has no spend-limit or upgrade item, so the CLI shows a sentence instead of a
+  // list); keying off a failed number search alone would leave this flag permanently on and make the
+  // fallback the default path rather than the exception.
+  choicePending: boolean
+  // The usage percentage last observed (the higher of session and weekly) — the input of the
+  // limit-evidence gate (limitEvidence). It is null when the snapshot could not be read, and that counts
+  // as no evidence, so nothing intervenes.
+  lastUsagePct: number | null
+  // Transcript limit detection. It is created after the path has been learned, so it starts as null.
+  // When the path changes (a roll) it is rebuilt with a new since — so it does not bite on old errors in the copy.
+  limitTail: ClaudeTranscriptTail | null
+  // Throttles the limitTail read-failure log to once per chain — the same convention as unmappedWarned
+  // (codexCoordinator.ts). A path that fails keeps failing, so there is no reason to log it again every 15-second tick.
+  limitTailReadFailWarned: boolean
+  // Throttles onChatLimit's "not rejected" log to once per chain — the same convention as the two flags
+  // above. A chat session reports its rate limit on every turn, so the warning-level statuses ('allowed',
+  // 'allowed_warning') arrive continuously and logging each one would bury everything else.
+  chatLimitIgnoredWarned: boolean
+  // A chat chain's health evidence (spec §14.6) — the pair of flags onChatStatus keeps and the tick
+  // consumes. chatTurnDone: a turn ended and no rejection landed during it, so the account took the
+  // work; the tick clears it and declares health once its own limit checks have come up empty.
+  // chatLimitInTurn: a rejection arrived inside the turn that is running now, which disqualifies its
+  // completion as evidence. Both are meaningless for a pty chain, which still declares health off the
+  // 60-second timer (armHealthy).
+  chatTurnDone: boolean
+  chatLimitInTurn: boolean
+  // The previous status onChatStatus saw, so chatLimitInTurn is cleared on the idle→non-idle **edge**
+  // rather than on every non-idle status (Ruling 4d-6). A permission card opening mid-turn reports
+  // 'waiting' and then 'working' again without the turn ever having ended (adapterCore.ts's
+  // dropRequest); clearing on each of those wiped a disqualification the transcript tail had already
+  // recorded, and the 'idle' that closed that same turn then counted as health.
+  chatPrevStatus: Attention
+  // Whether this chain has already spent its **shared** registry clear on the account it is sitting on
+  // (Ruling 4d-7). A chat chain declares health off every clean turn, so without a latch the valve
+  // blockRegistry.clear documents as "armed once per arrival" would fire for the chain's whole life and
+  // erase every record another chain ever wrote about the account. It is reset at every arrival — a
+  // roll, and an in-place resume — and read only at the tick's chat consumption site, so the pty timer
+  // path is untouched. The per-chain half of a health declaration still runs on every clean turn.
+  chatValveSpent: boolean
+  // The wait armWait armed, for the snapshot (S6 R4): when it fires, the account it aims at and the limit
+  // it waits out. null whenever no wait is armed — cleared the moment the timer fires.
+  waitPlan: { retryAt: number; target: number; weekly: boolean } | null
+  // A roll held while another process holds the pty (S6 R26, requeueRoll). Its own timer, not waitTimer:
+  // the tick skips a waiting chain, and a held one must go on reading its tails (R27).
+  heldTimer: ReturnType<typeof setTimeout> | null
+  // snapshotKey of the last snapshot written, so an unchanged chain is not written again on every tick.
+  snapKey: string
+}
+
+/** Extracts just the part of a Chain the retry verdict needs (the input of core/rolling/retry.ts).
+ *
+ *  The recovery array is the chain's own record **merged with what other chains found** — a block on
+ *  an account is a fact about the account, so a chain that has not hit it yet should still skip it
+ *  (SPEC §11.2/6). laterBlock keeps whichever side justifies the longer block. `chain.recovery` is left
+ *  untouched: it still answers the per-chain question limitEvidence asks.
+ *
+ *  **This feeds planRetry as well as pickAvailable, and that is the expensive half.** planRetry walks
+ *  every index including currentIndex, so a record another chain wrote about the account this chain is
+ *  sitting on does not only steer this chain away from an account — it can extend and relabel this
+ *  chain's own wait on the account it currently holds. Measured on a single-account chain whose own
+ *  evidence said "session window resets in 2 minutes": t0+3min/session on its own, t0+61min/weekly
+ *  once another chain had recorded that same account weekly-exhausted first (a real weekly reset is
+ *  days). That is correct when the record is right — a weekly-exhausted account is unusable whatever
+ *  its session window says — and it is where a wrong record costs the most: the chain is now waiting
+ *  rather than arriving, and only an arrival arms the healthy timer that would tear the record up
+ *  (blockRegistry.clear).
+ *
+ *  The merge also carries login state: a logged-out account (chain.loggedOut) is folded in as a
+ *  BlockRecord with `at: null` — unusable now, reset time unknown — exactly like a block record whose
+ *  reset could not be parsed (spec §15.2). */
+const retryState = (chain: Chain, blocks: BlockRegistry, now: number): RetryState => ({
+  accountIds: chain.accountIds,
+  currentIndex: chain.cycle.currentIndex,
+  recovery: chain.accountIds.map((id, i) =>
+    laterBlock(
+      laterBlock(chain.recovery[i] ?? null, blocks.get(id, now)),
+      // A logged-out account is unusable now with no known reset — exactly what an `at: null` record
+      // means to this layer, so `retry.ts` needs no new concept (spec §15.2). `pickAvailable` skips it;
+      // `planRetry` reads it as now + RETRY_FALLBACK_MS, which is the re-check cadence we want: if the
+      // person logs back in, the next tick drops the id and the account is a candidate again — the next
+      // tick **including while this chain is waiting**, since tick() refreshes login state before it
+      // skips a chain whose wait is armed (ruling 4e-3). Were that not so, this sentence would be false
+      // for exactly the chain that most needs it: one sitting in the logged-out reschedule loop.
+      chain.loggedOut.has(id) ? { at: null, weekly: false, since: now } : null
+    )
+  )
+})
+
+export class RollingCoordinator {
+  private chains = new Map<string, Chain>() // liveId → chain
+  private ticker: ReturnType<typeof setInterval> | null = null
+  private readonly copy: (src: string, dest: string) => Promise<void>
+  private readonly now: () => number
+  private readonly probeActivity: (transcriptPath: string) => Promise<number | null>
+  private readonly readPending: (transcriptPath: string) => Promise<number | null>
+  private readonly readUsage: (configDir: string) => Promise<RateLimitPeak | null>
+  private readonly resumeStrategy: () => ResumeStrategy
+
+  constructor(private deps: RollingDeps) {
+    this.copy = deps.copy ?? copyTranscript
+    this.now = deps.now ?? Date.now
+    this.probeActivity = deps.probeActivity ?? lastActivityAt
+    this.readPending = deps.readPending ?? readPendingWorkflowCount
+    this.readUsage = deps.readUsage ?? ((): Promise<RateLimitPeak | null> => Promise.resolve(null))
+    this.resumeStrategy = deps.resumeStrategy ?? (() => 'original')
+  }
+
+  /** Called by ipc right after a spawn that has rollAccountIds (rolling active) — starts tracking the
+   *  chain. One account means single-account auto-resume (count=1: on detecting a limit, wait until the
+   *  reset and resume on the same account); two or more means switching accounts.
+   *
+   *  resumeTranscriptPath: when info is a history resume, the path ipc already copied the conversation to
+   *  under the target account. Together with info.resumeSessionId it seeds resumeSeedSessionId /
+   *  resumeSeedTranscriptPath below — **not** claudeSessionId / transcriptPath, which stay null until a
+   *  real statusLine reports them. A conversation reopened from history while already limited never calls
+   *  that hook, so roll() falls back to the seed when it has nothing else — see the Chain fields' comment
+   *  for why nothing else may. codex's register already takes the equivalent path. */
+  register(info: SessionInfo, resumeTranscriptPath?: string): void {
+    const ids = info.rollAccountIds ?? []
+    if (ids.length < 1) return
+    // **Where in the chain this session already is.** The cycle's own start is 0, which is right for
+    // every caller that spawns a session and then registers it — all of them put the account they
+    // spawned on at the head of the chain (the renderer passes `accountIds[0]` as the account it is
+    // spawning; `rollChainFor` builds a worker's chain with the requested account first; a coordinator
+    // session's chain is that one account). Adoption is the caller that does not: a session taken back
+    // from the Host may have rolled onto a later account before the restart, and it comes back with the
+    // account it is really running under in `SessionInfo.accountId`. Left at 0, its first limit would be
+    // wrong three ways over — the block recorded against the account at index 0, that record broadcast
+    // to every other chain through `blocks.record`, and the roll aimed at index 1, the exhausted account
+    // it is already sitting on.
+    //
+    // Positioned for every caller rather than behind an adopted flag, because for all the others this is
+    // the identity: their account *is* `ids[0]`, so it reads 0 and nothing moves. A caller whose session
+    // starts on a later account would want this too, which is why there is nothing to gate.
+    //
+    // `indexOf` cannot answer -1 here. The two fields are written together by one `spawn` call — the
+    // account it was given and the chain it was given — and adoption restores them from one note written
+    // by that same call; a note whose `rollAccountIds` cannot be read leaves the field absent, and this
+    // function has already returned above on the empty chain.
+    //
+    // `> 0` rather than `>= 0` reads oddly against that: 0 is already where the cycle starts, so the
+    // condition only ever guards the -1 the paragraph above says cannot arrive. Kept because the
+    // alternative is a branch whose only reachable case is the impossible one — and if a future note
+    // writer does break the argument, staying at 0 is what every caller did before this line existed.
+    const cycle = new RollCycle(ids.length)
+    const at = ids.indexOf(info.accountId)
+    if (at > 0) cycle.advanceTo(at)
+    this.chains.set(info.id, {
+      accountIds: ids,
+      kind: sessionKindOf(info), // absent means 'terminal', which is every caller that predates chat sessions
+      prompt: info.rollPrompt?.trim() || t(this.deps.lang(), 'rolling.continuePrompt'), // user-specified text, or the default when empty
+      cycle,
+      liveId: info.id,
+      liveInfo: info,
+      cwd: info.cwd,
+      scanner: new OutputScanner(),
+      claudeSessionId: null,
+      transcriptPath: null,
+      resumeSeedSessionId: info.resumeSessionId ?? null,
+      resumeSeedTranscriptPath: resumeTranscriptPath ?? null,
+      lastOutputAt: this.now(),
+      rolling: false,
+      awaitingReady: false, // the first session — the user answers the trust prompt themselves
+      promptKind: 'handover',
+      briefingPrompt: null,
+      trustSeen: false,
+      lastScreen: '',
+      waitTimer: null,
+      healthyTimer: null,
+      inPlaceUsed: false,
+      promptTimer: null,
+      trustTimer: null,
+      disposed: false,
+      recovery: ids.map(() => null),
+      loggedOut: new Set(),
+      loginRefreshing: false,
+      lastBlindProbeAt: 0,
+      resetCheckAt: null,
+      resetTimer: null,
+      stateSeq: 0,
+      lastState: null,
+      idleSince: null,
+      idleNudgedAt: null,
+      idleHandled: false,
+      rolledAt: null,
+      replayGraceWarned: false,
+      choiceWatchUntil: null,
+      rejectLogUntil: 0,
+      choicePending: false,
+      lastUsagePct: null,
+      limitTail: null,
+      limitTailReadFailWarned: false,
+      chatLimitIgnoredWarned: false,
+      chatTurnDone: false,
+      chatLimitInTurn: false,
+      chatPrevStatus: 'idle',
+      chatValveSpent: false,
+      waitPlan: null,
+      heldTimer: null,
+      snapKey: ''
+    })
+    this.ensureTicker()
+    this.deps.log(`chain registered session=${info.id} accounts=${ids.join(',')}`)
+    const chain = this.chains.get(info.id)
+    if (chain) this.snap(chain)
+  }
+
+  /** Carries on a chain another process wrote down (S6 R4, design §3A.2): the Host taking over an app's
+   *  session, or a new app instance taking over a gone one's. False, with nothing registered, when the
+   *  snapshot does not describe this session, and **false when a chain for this session already exists**
+   *  — that chain is left exactly as it is. Registering over it would orphan its timers (a second wait
+   *  firing, a second prompt typed), so a restore only ever lands on a session with no chain. Synchronous:
+   *  the takeover's mark and this restore share a turn (R2).
+   *
+   *  It starts no second chain and repeats nothing already done. An armed wait is re-armed as a
+   *  re-publish (`reattach: true`, preflight R5) — the stop was already announced by the process that
+   *  wrote it — and a wait whose time passed during the handover fires at once, once. A respawn whose
+   *  carry-on prompt had not gone out yet goes back to waiting for its statusline; one that had is not
+   *  prompted again, because `awaitingPrompt` was cleared the moment it was sent. The transcript tail
+   *  picks up at the byte the writer had reached, so a limit record already acted on is not read twice.
+   *
+   *  The snapshot is taken as given — the caller parses it with parseRollSnapshot, which refuses
+   *  anything partial, and registers from zero when that answers null.
+   *
+   *  **`report` is the Host's takeover (Task 12, carry C-a).** A process that restores a chain it never
+   *  ran has neither heard its native session id nor written its roll config — the app that wrote the
+   *  snapshot did both into its own state. With `report`, a known session id is told to onNativeSession
+   *  and the config is persisted under it, as applyMeta does on first learning the id. Without it (an app
+   *  instance taking over a gone one's, which shares that state) nothing is reported, as before. A
+   *  snapshot with no session id yet reports nothing here: applyMeta does both when the statusline lands. */
+  restore(info: SessionInfo, snap: RollSnapshot, opts: { report?: boolean } = {}): boolean {
+    const ids = info.rollAccountIds ?? []
+    if (this.chains.has(info.id)) {
+      this.deps.log(`chain restore refused — a chain already exists session=${info.id}`)
+      return false
+    }
+    if (snap.provider !== 'claude') return false
+    if (ids.length !== snap.accountIds.length || ids.some((id, i) => id !== snap.accountIds[i])) return false
+    if (ids[snap.currentIndex] !== info.accountId) return false
+    this.register(info)
+    const chain = this.chains.get(info.id)
+    if (!chain) return false
+    const now = this.now()
+    chain.cycle.restore(snap.currentIndex, snap.streak)
+    chain.recovery = ids.map((_, i) => snap.recovery[i] ?? null)
+    for (const [id, rec] of Object.entries(snap.blocks)) if (ids.includes(id)) this.deps.blocks.record(id, rec, now)
+    chain.inPlaceUsed = snap.inPlaceUsed
+    chain.rolledAt = snap.rolledAt
+    const c = snap.claude
+    if (c) {
+      chain.claudeSessionId = c.sessionId
+      chain.transcriptPath = c.transcriptPath
+      if (opts.report && c.sessionId) {
+        this.deps.persistConfig?.(c.sessionId, { accountIds: chain.accountIds, prompt: chain.prompt })
+        this.deps.onNativeSession?.(chain.liveId, c.sessionId)
+      }
+      if (c.transcriptPath)
+        chain.limitTail =
+          c.tailOffset !== null
+            ? new ClaudeTranscriptTail(c.transcriptPath, c.tailSince ?? now, { offset: c.tailOffset })
+            : this.newLimitTail(chain, c.transcriptPath, now)
+    }
+    this.deps.log(
+      `chain restored session=${info.id} index=${snap.currentIndex} wait=${snap.wait ? new Date(snap.wait.retryAt).toISOString() : '-'} ` +
+        `awaitingPrompt=${snap.awaitingPrompt} age=${now - snap.writtenAt}ms`
+    )
+    if (snap.wait) this.armWait(chain, snap.wait, { reattach: true })
+    else if (snap.awaitingPrompt && chain.kind !== 'chat') {
+      chain.awaitingReady = true
+      // Carry C-c: a blank-slate respawn is owed its briefing, which the writer never got to type and
+      // the snapshot does not carry — so it is asked for again, the way roll() asked for it.
+      chain.promptKind = c?.promptKind ?? 'handover'
+      // Fix round 1: the stored text when there is one, typed as it is — asking again would read the new,
+      // blank session's transcript for a tab, and re-run resumeText's side effect for a Job.
+      chain.briefingPrompt = chain.promptKind === 'briefing' ? (c?.prompt ?? null) : null
+      this.scheduleAutoPrompt(chain, chain.briefingPrompt ?? undefined, chain.promptKind)
+    }
+    this.snap(chain)
+    return true
+  }
+
+  /** Whether this is the conversation of an active rolling chain — the history resume guard */
+  findLiveByClaudeSession(claudeSessionId: string): SessionInfo | null {
+    for (const chain of this.chains.values())
+      if (!chain.disposed && chain.claudeSessionId === claudeSessionId) return chain.liveInfo
+    return null
+  }
+
+  /** Taps hook events. The idle Notification that Claude Code fires after a turn has been left alone for
+   *  60 seconds is used as the stall signal. It is unrelated to statusLine, so it is unaffected by a
+   *  frozen snapshot. Nothing intervenes immediately — only the time is recorded, because a notice raised
+   *  after 60 idle seconds may catch the user just as they start typing. The actual verdict is made by
+   *  idleNudgeCheck on the tick. */
+  /** The tab was renamed. Updates the chain's copy so the next roll respawns under the new name.
+   *
+   *  `liveInfo` is a snapshot from spawn, and the respawn passes `liveInfo.title` — without this the
+   *  name a person gave the tab would quietly become the folder name again the moment a usage limit
+   *  moved the work to another account. */
+  rename(sessionId: string, title: string): void {
+    const chain = this.chains.get(sessionId)
+    if (chain) chain.liveInfo = { ...chain.liveInfo, title }
+  }
+
+  onHookEvent(sessionId: string, payload: unknown): void {
+    const chain = this.chains.get(sessionId)
+    if (!chain || chain.disposed) return
+    if (typeof payload !== 'object' || payload === null) return
+    const p = payload as { hook_event_name?: unknown } & NotificationPayload
+    if (p.hook_event_name !== 'Notification') return
+    // A Notification that is not idle (a permission request and the like) means a choice is on screen —
+    // sending text to that screen would have Enter approve the highlighted item, so nothing intervenes.
+    if (!isIdleNotification(p)) {
+      // An unfamiliar type is logged. If Claude Code renames the idle type, it would be filtered out
+      // silently here and neither the nudge nor 'stalled' would ever fire again — the same failure this
+      // feature already had with a phrase regex, reproduced through a renamed field. This line would be
+      // the only clue when that happens (the same role as 'limit choice not found' in answerLimitChoice).
+      if (isUnknownNotificationType(p))
+        this.deps.log(`unknown notification_type=${String(p.notification_type)} session=${sessionId}`)
+      return
+    }
+    // Once this is already a stall candidate (idleSince !== null) the time is not refreshed; the first
+    // value is pinned. The first gate in idleNudgeCheck is now - idleSince < IDLE_STALL_MS (10 minutes) —
+    // allowing a refresh would restart that 10-minute clock every time the Notification re-fired within
+    // the same stall, and the nudge and the promotion to 'stalled' would never fire.
+    // Measured: "Claude is waiting for your input" fired once at +61s after the turn ended and then went
+    // quiet for 347s — the observation window (408s) was shorter than the 10-minute (600s) threshold, so
+    // re-firing itself was never seen, but there is no guarantee it does not happen. The costs are
+    // asymmetric: pinning is harmless if there is no repeat, while refreshing kills the whole feature
+    // silently if there is. Semantically too, this field has to answer "when did the stall begin", not
+    // "when did the most recent notice arrive", so pinning is correct.
+    if (chain.idleSince === null) chain.idleSince = this.now()
+    // idleNudgedAt and idleHandled are deliberately untouched here — the only thing that closes a stall is
+    // activity resuming (handleData). An idle notice arriving again with no response after a nudge is not a
+    // new stall but a continuation of the same one, so the next verdict has to go to 'stalled' rather than
+    // to another nudge.
+    this.deps.log(`idle notification session=${sessionId}`)
+  }
+
+  handleData(e: { sessionId: string; data: string }): void {
+    const chain = this.chains.get(e.sessionId)
+    if (!chain || chain.disposed) return
+    chain.lastOutputAt = this.now()
+    // Output arriving means the stall has broken — the state is cleared so the next stall gets one nudge
+    // again. The user typing also lands here as an echo, so the verdict cannot hold while a human is at
+    // the keyboard.
+    //
+    // A grace period right after a nudge is required: the nudge itself writes a prompt into the PTY, so
+    // its echo comes straight back here. Mistaking that for resumed activity and clearing the state would
+    // break the "once only" rule and repeat the nudge every cycle. Locking it forever after a nudge
+    // instead would miss the next stall even once the session resumes normally. The echo arrives
+    // immediately (within ENTER_DELAY_MS) and Claude's real response later, so the two are separated by time.
+    if (
+      chain.idleSince !== null &&
+      (chain.idleNudgedAt === null || this.now() - chain.idleNudgedAt > NUDGE_ECHO_GRACE_MS)
+    ) {
+      chain.idleSince = null
+      chain.idleNudgedAt = null
+      chain.idleHandled = false
+    }
+    const hit = chain.scanner.push(e.data)
+    chain.lastScreen = hit.text
+    if (hit.trust && chain.awaitingReady && !chain.trustSeen) {
+      // The trust prompt on a rolling respawn — the first account already approved this folder, so it is accepted automatically
+      chain.trustSeen = true
+      this.pushState(chain, 'trust')
+      this.deps.log(`trust dialog → auto-accept session=${chain.liveId}`)
+      const liveId = chain.liveId // captured so nothing is written to a stale session even if a re-roll finishes within 400ms
+      chain.trustTimer = setTimeout(() => {
+        chain.trustTimer = null
+        if (!chain.disposed && chain.liveId === liveId) this.deps.write(liveId, '\r')
+      }, TRUST_ENTER_DELAY_MS)
+    }
+    // If the choice list was not yet on screen when the limit phrase matched, keep looking in later chunks.
+    // A hit.limit chunk is excluded because the branch below handles it directly — the same text is not tried twice.
+    if (!hit.limit && chain.choiceWatchUntil !== null && this.acts(chain)) this.watchLimitChoice(chain, hit.text)
+    // The cooldown right after a switch: limit phrases are ignored while awaitingReady (i.e. the window
+    // where statusLine is absent and the resume replays), preventing a replay false positive from re-rolling
+    if (hit.limit && !chain.awaitingReady) {
+      // The replay grace is not decided here — onLimitCandidate decides it after re-reading the statusline,
+      // so that the verdict is made on the latest usage figure. Dismissing the choice is attempted
+      // regardless of the grace: input is only sent once a number has definitely been found, so nothing
+      // happens during a replay, whereas missing a genuine limit that raised a choice inside that window
+      // would stop the session at an input wait, freeze statusLine, and kill every later detection.
+      //
+      // A limit choice on screen is cleared first. Leaving that prompt up stops the session at an input
+      // wait, and in that state statusLine freezes and every subsequent detection dies.
+      // No prompt is sent — sending one before the reset would just hit the limit again. Waiting and
+      // resuming are planRetry's job.
+      //
+      // A quiet chain (S6 R1) does neither: the process that holds this pty sees the same bytes and
+      // answers them itself, and two answers would be two keystrokes.
+      if (!this.acts(chain)) return
+      this.answerLimitChoice(chain, hit.text)
+      void this.onLimitCandidate(chain, hit.text)
+    }
+  }
+
+  /** ipc's chat subscriber: the CLI session id (the protocol's threadId) and the transcript path a chat
+   *  session has learned — exactly the two facts a pty chain reads off its statusLine.
+   *
+   *  **Why they are pushed in rather than read.** A chat session runs the CLI over a protocol, not a
+   *  terminal, so it never calls the statusLine hook: `readStatusPayload` answers null for it forever.
+   *  The same two values arrive on the protocol's own events instead, and the wiring hands them here.
+   *
+   *  Either may arrive first and each call applies what it has, so the payload is built with the
+   *  statusLine's own field names and handed to the same learner the pty path uses — the persist-once
+   *  gate, the native-session report and the transcript tail then all behave identically. `parsed` is
+   *  null on purpose: this payload carries no usage windows, and letting applyMeta parse it would only
+   *  re-derive the same nothing.
+   *
+   *  **This is identity only — it touches nothing about usage.** A chat chain's usage arrives on the
+   *  rateLimit event instead (`onChatLimit`), and it survives a later meta: the payload built here
+   *  carries no window at all, so the apply's last act — refreshing `lastUsagePct` from that payload —
+   *  has nothing to say and its verdict is put back. Without that the figure was nulled by every
+   *  `/clear` and every late transcript lookup, which handed the replay grace back its blindfold. */
+  onChatMeta(
+    sessionId: string,
+    meta: { claudeSessionId: string | null; transcriptPath: string | null }
+  ): void {
+    const chain = this.chains.get(sessionId)
+    if (!chain || chain.disposed) return
+    // A `/clear` starts a new conversation under a new id, and the file the old one was written to is
+    // not this one's. The path (and the tail reading it) go before the apply, so roll() cannot copy the
+    // dead conversation into the target account and resume the new id against it. Nothing is lost by
+    // dropping them: the transcript lookup this same event arms reports the new path a moment later,
+    // and applyMeta builds the tail for it then.
+    if (meta.claudeSessionId !== null && meta.claudeSessionId !== chain.claudeSessionId) {
+      chain.transcriptPath = null
+      chain.limitTail = null
+      // The seed goes with them (spec §14.6). It describes the conversation this session was *opened*
+      // with, and after a `/clear` that is not this conversation — but it is what roll() falls back to
+      // when the new file has not been found yet, so leaving it would have the roll copy the dead file
+      // and resume the new id against it. Cleared, that roll takes the "no session metadata" path and
+      // retries instead, which is the honest answer while the lookup is still in flight.
+      chain.resumeSeedSessionId = null
+      chain.resumeSeedTranscriptPath = null
+    }
+    // applyMeta ends by refreshing lastUsagePct out of the payload's usage windows, and this payload has
+    // none — so the figure onChatLimit recorded is carried across rather than nulled by an identity update.
+    const usagePct = chain.lastUsagePct
+    this.applyMeta(
+      chain,
+      { session_id: meta.claudeSessionId ?? undefined, transcript_path: meta.transcriptPath ?? undefined },
+      null
+    )
+    chain.lastUsagePct = usagePct
+  }
+
+  /** ipc's chat subscriber: a chat session's rateLimit event — what the limit phrase in the pty bytes is
+   *  to `handleData`.
+   *
+   *  Only `'rejected'` counts. The other statuses ('allowed', 'allowed_warning') ride along with every
+   *  turn and say the account still answers; acting on them would roll a chain that is working. A
+   *  rejection means the CLI refused the turn, which is the same event a pty session prints its limit
+   *  phrase for — so from here on it is the shared path: `onLimitCandidate` asks the account itself and
+   *  decides, exactly as it does for a phrase.
+   *
+   *  `awaitingReady` is honoured for the same reason the pty branch in `handleData` honours it: it is
+   *  the post-switch cooldown, and a limit reported against the account we have just left must not
+   *  re-roll the account we have just arrived on. It is not gated on the chain's kind — the wiring only
+   *  calls this for a chat session, and a chain that answers to it while holding the flag is telling the
+   *  truth whatever kind it is.
+   *
+   *  No text is passed on: there is no phrase here to read a reset time out of. `info.resetsAt` is
+   *  deliberately not turned into a synthetic line — `recordRecovery` already takes the account's own
+   *  answer (the `queried` argument, from the lookup `onLimitCandidate` just made) and that is the same
+   *  fact from the same source, without inventing a sentence to parse.
+   *
+   *  **This is where a chat chain's usage arrives** (spec §8.1's utilization clause, Ruling 4c-7). It is
+   *  recorded from every status, not just a rejection: the useful readings ride on the 'allowed_warning'
+   *  events, and a rejection carries none of its own. It is the statusLine's `usedPercent` counterpart —
+   *  the number `inReplayGrace`, `limitEvidence` and the single-account reset anchor all read — and
+   *  without it a chat chain's figure is null for its whole life, which makes the replay grace
+   *  unconditional for the 60 seconds after a roll. */
+  onChatLimit(sessionId: string, info: RateLimitInfo): void {
+    const chain = this.chains.get(sessionId)
+    if (!chain || chain.disposed) return
+    if (info.utilization !== null) chain.lastUsagePct = Math.round(info.utilization * 100)
+    if (info.status !== 'rejected') {
+      if (!chain.chatLimitIgnoredWarned) {
+        chain.chatLimitIgnoredWarned = true
+        this.deps.log(
+          `chat rate limit not rejected — no action status=${info.status} window=${info.window ?? '-'} ` +
+            `utilization=${info.utilization ?? '-'} session=${chain.liveId}`
+        )
+      }
+      return
+    }
+    // The turn this rejection landed in is disqualified as health evidence (spec §14.6), and that is
+    // recorded before the cooldown gate below: a rejection the replay grace or `awaitingReady` refuses
+    // to *act* on is still a turn the CLI refused, so its completion says nothing about the account.
+    chain.chatLimitInTurn = true
+    if (chain.awaitingReady) return
+    void this.onLimitCandidate(chain, undefined)
+  }
+
+  /** ipc's chat subscriber: the adapter's turn status (`idle → working|waiting → idle`). A chat chain
+   *  declares its health off a turn that ended without a rejected limit rather than off the pty's
+   *  60-seconds-with-no-limit timer — the protocol says outright when a turn ran, which a screen can
+   *  only infer (spec §14.6). Unregistered ids do nothing; the wiring calls both coordinators.
+   *
+   *  **Nothing is declared here.** This only sets the flag; `tickChain` consumes it, after its own limit
+   *  checks have come up empty. The tail can record a refusal a beat after the status flips back to
+   *  idle, so reading it first is what keeps a turn that ended in a limit from being counted. */
+  onChatStatus(sessionId: string, status: Attention): void {
+    const chain = this.chains.get(sessionId)
+    if (!chain || chain.disposed) return
+    // Harmless today — the wiring only emits this for a chat session — but it keeps the two flags'
+    // scope on the face of the code: they are a chat chain's health evidence and nothing else reads them.
+    if (chain.kind !== 'chat') return
+    if (status !== 'idle') {
+      // Only the idle→non-idle edge is a new turn beginning. A status change inside a turn — a
+      // permission card opening ('waiting') and closing again ('working') — is not, and treating it as
+      // one would clear a rejection this turn has already been disqualified by.
+      if (chain.chatPrevStatus === 'idle') chain.chatLimitInTurn = false
+      chain.chatPrevStatus = status
+      return
+    }
+    chain.chatPrevStatus = 'idle'
+    if (!chain.chatLimitInTurn) chain.chatTurnDone = true
+  }
+
+  /** Session exit — the chain is not disposed while a roll is in progress (roll() owns the old→new
+   *  lifecycle).
+   *  RollingDeps.kill() does not force an asynchronous exit, so this guard stops a synchronous exit
+   *  arriving between kill and the map swap from disposing the chain before re-keying completes, which
+   *  would leave the new session permanently inert.
+   *  Reaching here while not rolling means the user closed the tab or claude died on its own (or a normal
+   *  exit arriving after a failed spawn set rolling=false) → dispose the chain. */
+  handleExit(e: { sessionId: string }): void {
+    const chain = this.chains.get(e.sessionId)
+    if (chain && !chain.rolling) this.disposeChain(chain)
+  }
+
+  /** 세션은 살려 둔 채 그 세션의 체인만 버린다 — **kill 하지 않는다.**
+   *
+   *  오케스트레이션 배선이 부른다. 워커 세션은 `worker_done` 을 보고한 뒤에도 일부러 살아 있고
+   *  (가이드 8절: 보고하고 프롬프트에서 대기, 정리는 코디네이터의 나중 판단이다), 체인은 세션이
+   *  죽을 때만 버려졌다. 그 사이 — Dispatch 는 닫혔고 체인은 살아 있는 창 — 에서 이 파일의 두
+   *  경로가 그 세션에 재개 프롬프트를 타이핑할 수 있었다(idleNudgeCheck 와 resetAnchorCheck). 방금
+   *  한도를 태운 워커는 그 게이트(사용률 ≥ GATE_PCT)를 지나기 쉽고, 그렇게 들어간 프롬프트는
+   *  **아무도 요청하지 않은 작업**이 된다 — 워크트리라면 커밋 의무까지 딸린 작업이다.
+   *
+   *  그래서 체인의 수명을 일의 수명에 묶는다: Dispatch 가 닫히면 체인도 사라진다. 등록되지 않은
+   *  id 는 아무 일도 하지 않는다(handleExit 과 같다) — 배선은 provider 를 가리지 않고 두 코디네이터
+   *  모두에게 부르므로, 무해한 것이 이 메서드의 계약이다.
+   *
+   *  복사 진행 중 폐기되면 roll() 의 disposed 가드(복사 await 뒤, kill 앞)가 kill 과 respawn 을 막고
+   *  폐기된 체인이 맵에 재삽입되지 않도록 하므로 — codex 와 일치하게 — 진정으로 깨끗하다. */
+  unregister(sessionId: string): void {
+    const chain = this.chains.get(sessionId)
+    if (chain) this.disposeChain(chain)
+  }
+
+  /** A dev hook — forces a roll as if a real limit had hit, bypassing the gates (for manual end-to-end checks).
+   *  Resolves with whether the chain acted: false when it was rolling, waiting, settling after a roll, or
+   *  quiet (S6 final review M1), so the caller does not report a no-op as a forced roll. */
+  async forceRoll(sessionId?: string): Promise<boolean> {
+    const chain = sessionId ? this.chains.get(sessionId) : [...this.chains.values()][0]
+    if (!chain || chain.disposed) throw new Error('no active rolling chain')
+    await this.refreshMeta(chain)
+    return this.onLimit(chain)
+  }
+
+  /** The roll banner's snapshot, read once as the renderer adopts a session — session:rollState is
+   *  pushed on changes only, so a renderer that mounted after the state was published (a reload) would
+   *  wear no banner. The payload is re-stamped with the chain's current liveId: the recorded one was
+   *  right when it was sent, but a later reattach moved the chain to a new id. */
+  stateOf(sessionId: string): RollStateEvent | null {
+    const chain = this.chains.get(sessionId)
+    if (!chain || chain.disposed || !chain.lastState) return null
+    return { ...chain.lastState, sessionId: chain.liveId }
+  }
+
+  /** Whether a live chain answers to this session id (S6: the Host asks before it restores or forces). */
+  has(sessionId: string): boolean {
+    const chain = this.chains.get(sessionId)
+    return chain !== undefined && !chain.disposed
+  }
+
+  /** Every chain disposed and the ticker cleared — the Host's dispose, and the codex side's `stop`. */
+  stop(): void {
+    for (const chain of [...this.chains.values()]) this.disposeChain(chain)
+    if (this.ticker) {
+      clearInterval(this.ticker)
+      this.ticker = null
+    }
+  }
+
+  // ---- internals -------------------------------------------------------
+
+  /** S6 R1: whether this process may act on the chain now. Asked by the live id, which is what the
+   *  wiring can map to a pty. */
+  private acts(chain: Chain): boolean {
+    return this.deps.mayAct?.(chain.liveId) ?? true
+  }
+
+  /** Dismisses the limit choice dialog by pressing the number of the "Wait for limit to reset" item.
+   *  If the item cannot be found, nothing is written — pressing Enter on an unknown choice approves
+   *  whatever is highlighted, and the default may be adjust (raising the spend limit).
+   *  The input is the accumulated text the scanner returned at match time — the choice list and the limit
+   *  phrase can arrive split across different chunks, so looking at the current chunk alone misses the number. */
+  private answerLimitChoice(chain: Chain, matchedText: string): void {
+    const n = findWaitChoice(matchedText)
+    if (n === null) {
+      // The list may simply not be on screen yet — this is the order actually observed in the field: the
+      // limit phrase is printed first and the list is rendered after it. The scanner clears its buffer on a
+      // match and the choice text alone does not match LIMIT_RE, so without opening a watch window there is
+      // never a second chance to find the number. Leaving the window open is harmless — input is only sent
+      // once a number has definitely been found.
+      chain.choiceWatchUntil = this.now() + CHOICE_WATCH_MS
+      // The choice number could not be found — the screen may be rendering without numbers.
+      // roll() is about to clear the screen, so not recording it now loses the evidence for the next fix.
+      // The limit phrase is masked (maskLimitPhrase) — this log was about to carry the limit phrase and
+      // the reset time verbatim, and keeping that text would make rolling.log itself a new trigger source
+      // (answerLimitChoice is entered on hit.limit, so matchedText always contains that phrase). The
+      // diagnostic value of the tail itself (the choice list and so on) is kept — only the trigger is removed.
+      //
+      // waitPhrase and textLen go alongside it. The tail keeps only the last 300 characters, so the previous
+      // form of this log could not separate "the list was on screen but the numbering differs" from "the
+      // list had not arrived yet" — a distinction that could not be settled during the investigation.
+      //
+      // The label actually being on screen means the list is up, and going into a wait in that state
+      // rules out the in-place resume — resumeAfterWait falls back to the kill path instead. A failed
+      // number search on its own does not set it (the label appeared in 0 of 53 measured matches, so
+      // keying off that would make the fallback the default path).
+      if (hasWaitChoiceLabel(matchedText)) chain.choicePending = true
+      this.deps.log(
+        `limit choice not found session=${chain.liveId} ` +
+          `waitPhrase=${hasWaitChoiceLabel(matchedText)} textLen=${matchedText.length} ` +
+          `tail=${maskLimitPhrase(matchedText).slice(-300)}`
+      )
+      return
+    }
+    chain.choiceWatchUntil = null // found, so no watch is needed
+    this.deps.log(`limit choice → wait(${n}) session=${chain.liveId}`)
+    this.sendChoice(chain, n)
+  }
+
+  /** The choice watch. When the list was not yet on screen at the moment the limit phrase matched, press
+   *  the number once the list arrives in a later chunk. No separate buffer is needed — the text
+   *  OutputScanner returns when there is no match is the current accumulated tail as it stands, so a list
+   *  split across several chunks is already joined there. */
+  private watchLimitChoice(chain: Chain, text: string): void {
+    if (chain.choiceWatchUntil === null) return
+    if (this.now() > chain.choiceWatchUntil) {
+      chain.choiceWatchUntil = null
+      // The window passing means either the list never came or it renders without numbers. Which one is
+      // answered by waitPhrase in the "not found" log above — separating those two is what this pair of logs is for.
+      this.deps.log(`limit choice watch expired session=${chain.liveId}`)
+      return
+    }
+    const n = findWaitChoice(text)
+    if (n === null) return
+    chain.choiceWatchUntil = null
+    this.deps.log(`limit choice → wait(${n}) (late) session=${chain.liveId}`)
+    this.sendChoice(chain, n)
+  }
+
+  /** Sends the choice number plus Enter. Shared by answerLimitChoice and watchLimitChoice. */
+  private sendChoice(chain: Chain, n: number): void {
+    chain.choicePending = false // cleared away — nothing left to block the in-place resume
+    const liveId = chain.liveId // captured so nothing is written to a stale session even if a roll finishes within 150ms
+    this.deps.write(liveId, String(n))
+    setTimeout(() => {
+      // No liveId guard here: a roll following immediately is the normal path in this case (with multiple
+      // accounts, detection is followed straight away by kill and respawn). A guard would block Enter on
+      // that normal path and dismissing the choice would only work on the single-account wait path — half
+      // a feature. A '\r' that reaches the old session late is absorbed by the exited guard in
+      // SessionManager.write, and what was captured is only the old id, so it cannot end up in the new
+      // session either. The trust prompt and the automatic prompt use a stricter guard because on those
+      // paths a re-roll is the exceptional case.
+      if (!chain.disposed) this.deps.write(liveId, '\r')
+    }, ENTER_DELAY_MS)
+  }
+
+  /** The entry point once a limit phrase has been matched. There is deliberately no usage-percentage gate.
+   *
+   *  It used to accept the phrase only when five or seven was at or above GATE_PCT, but by the moment a
+   *  limit blocks the session and the choice appears, statusLine has already stopped updating (measured: 0
+   *  updates across 88 idle seconds), so what the gate sees is a stale snapshot from just before the limit.
+   *  In other words the gate was filtering out legitimate limit phrases, not false positives.
+   *  codexSignal.ts reached the same conclusion for codex first, and its comment assumed "Claude keeps
+   *  statusLine updating, so the gate is safe" — which this measurement disproved.
+   *
+   *  **The two providers diverged here, and the reason is worth knowing.** codex retired the screen
+   *  phrase as a verdict outright (2026-08-28, limitReached) once its field log showed the phrase-only
+   *  branch producing every false positive and no real hit. This path cannot do the same: claude's
+   *  structured coverage is only partial — parseClaudeLimitLine reads a structured error for the main
+   *  loop, but a subagent limit has no structured field at all and is sifted by the phrase. So the
+   *  phrase stays, and what does the job a retirement would have done is the evidence gate below,
+   *  which asks the account directly instead of trusting a snapshot that freezes the moment it matters. */
+  private async onLimitCandidate(chain: Chain, text?: string): Promise<void> {
+    if (chain.rolling || chain.waitTimer) return // ignore a re-trigger while rolling or waiting
+    if (!this.acts(chain)) return // quiet (S6 R1): chat limits come here without passing handleData
+    const payload = await this.deps.readStatusPayload(chain.liveId)
+    if (payload) this.applyMeta(chain, payload, parseStatusLinePayload(payload))
+    // An old phrase echoed back by the replay right after a roll is cut off here. The verdict is made at
+    // this point rather than in handleData because the readStatusPayload just above fetches the latest
+    // snapshot of the account we have just resumed on, and that is the value inReplayGrace has to see for
+    // "is this account already exhausted" to be answered correctly. The value at handleData time is the
+    // snapshot the ready polling read right after the resume, which is one step stale.
+    if (this.inReplayGrace(chain)) {
+      if (!chain.replayGraceWarned) {
+        chain.replayGraceWarned = true
+        this.deps.log(
+          `limit phrase ignored — replay grace (usage=${chain.lastUsagePct ?? 'unknown'}) session=${chain.liveId}`
+        )
+      }
+      return
+    }
+    // The evidence gate. A screen phrase on its own no longer starts a roll or a wait — the scanner
+    // cannot tell a banner Claude printed from a document or a tool output that happens to be on screen.
+    // Across a month of rolling.log every one of the four unjustified verdicts came through this path,
+    // and two of them killed a background workflow.
+    //
+    // The verdict runs on a direct account-usage lookup. The statusLine snapshot is not used for the
+    // same reason the usage gate was removed from the detection paths: once a session halts on a limit
+    // that snapshot stops updating and freezes at a stale value. An account query is independent of
+    // session state and has no such failure.
+    //
+    // The gate lives at this one spot only. Clearing the choice list (answerLimitChoice) stays where it
+    // is, handled synchronously by handleData — moving it behind this await would miss a choice list
+    // that arrives while the lookup is in flight, leaving the dialog up forever; in that state the
+    // session stops at an input wait, statusLine freezes and every later detection dies. The cost is
+    // that a false-positive phrase carrying a numbered list gets a digit plus Enter, which is far
+    // cheaper than losing detection altogether.
+    const liveId = chain.liveId
+    const usage = await this.readAccountUsage(chain)
+    // liveId is checked too: this await is a network round trip (up to 10 seconds), and another path can
+    // finish a roll inside it — the rest of this function would then stamp a block record on the *new*
+    // session from the old phrase and roll again immediately.
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return
+    if (chain.liveId !== liveId) return
+    // The lookup is an await, and another process may have attached this pty inside it (S6 R1): no record.
+    if (!this.acts(chain)) return
+    // **화면에 한도 선택 대화상자가 떠 있으면 사용량 수치로 기각하지 않는다.**
+    //
+    // 게이트가 막으려는 것은 "문서나 도구 출력에 우연히 한도 문구가 있는 것" 이다. 그런 텍스트는
+    // 대화상자를 그리지 않는다 — 그래서 대화상자의 존재는 CLI 자신의 판정이고, 계정 API 수치보다
+    // 강한 증거다. 두 조건을 함께 요구해 좁게 잡는다: 대기 항목의 라벨이 있고(hasWaitChoiceLabel),
+    // 실제로 입력을 기다리는 선택 목록이다(looksLikeChoicePrompt).
+    //
+    // **실측이 이 예외를 요구했다(2026-08-26).** 관리자 통제 플랜에서 한도에 걸렸는데 계정 조회는
+    // 73% 였다 — `maxPercent` 는 5시간·주간 창만 보고, 그 한도는 그 창들의 것이 아니었다. 그래서
+    // 문구가 두 번 기각되고(rolling.log: `limit phrase rejected — account usage 73%`) 대기도 재개도
+    // 일어나지 않아, 세션이 대화상자 앞에서 밤새 멈춰 있었다. 같은 날 5시간 창에 걸린 건은 정상
+    // 동작했다(`limit confirmed via usage 100%` → `limit reset → resume in place`).
+    const dialogOnScreen =
+      hasWaitChoiceLabel(chain.lastScreen) && looksLikeChoicePrompt(chain.lastScreen)
+    if (usage !== null && usage.percent < LIMIT_PCT && !dialogOnScreen) {
+      // Rejection happens only on positive evidence that the account is fine, and it changes no state at
+      // all (no recordRecovery, no pushState, no waitTimer) — half the cost of a false positive is not
+      // the verdict itself but being stuck in 'waiting' afterwards, where tick() skips the chain and
+      // detection, the fallback trigger and the idle nudge all stop with it.
+      if (this.now() >= chain.rejectLogUntil) {
+        chain.rejectLogUntil = this.now() + REJECT_LOG_MS
+        this.deps.log(`limit phrase rejected — account usage ${usage.percent}% session=${chain.liveId}`)
+      }
+      return
+    }
+    // usage=null (the lookup failed) falls back to the old behaviour and accepts. Rejecting on "we do
+    // not know" would kill detection, and detection dying quietly is a far more expensive failure in
+    // this app than a false positive.
+    // 어느 증거가 이겼는지 로그에 남긴다 — 대화상자로 통과한 건을 `usage 73%` 로 적으면 읽는 사람이
+    // 게이트가 고장 난 것으로 읽는다.
+    const evidence =
+      usage === null
+        ? 'phrase (usage unavailable)'
+        : usage.percent < LIMIT_PCT
+          ? `wait-choice dialog on screen (usage ${usage.percent}%)`
+          : `usage ${usage.percent}%`
+    this.deps.log(`limit confirmed via ${evidence} session=${chain.liveId}`)
+    // Called even with no payload — when the phrase itself carries the time, an accurate wait can be
+    // recorded regardless of a missing capture file. With payload=null the snapshot candidates are empty
+    // and at becomes null, which is the same outcome as previously skipping the record entirely.
+    this.recordRecovery(chain, payload, text, undefined, usage)
+    this.onLimit(chain)
+  }
+
+  /** The current account's real usage (the highest % across every limit bucket). null when the account
+   *  cannot be found or the lookup fails.
+   *  It matters that the target is the *current* account — only that one has a session running, so only
+   *  its accessToken is fresh (Claude Code refreshes it at session start). An account with no session
+   *  has an expired token and fails with a 401; opening that path would need the app to refresh tokens
+   *  itself, which is separate work. */
+  private async readAccountUsage(chain: Chain): Promise<RateLimitPeak | null> {
+    const account = this.deps.getAccount(chain.accountIds[chain.cycle.currentIndex])
+    if (!account) return null
+    return this.readUsage(account.configDir)
+  }
+
+  /** The block record for the current account (currentIndex). Priority order:
+   *
+   *    1. the reset time carried in the limit phrase — independent of the snapshot
+   *    2. the latest reset among the snapshot's over-limit (≥GATE) windows
+   *    3. otherwise at=null (unknown) → blockedUntil falls back to since + 15 minutes
+   *
+   *  If 1 succeeds, 2 is not consulted. The cost is clear — the phrase names only the one window that just
+   *  blocked us, so being blocked on session while weekly is also at 95% means retrying right after the
+   *  session reset and getting blocked again. Even so, that retry takes a fresh 429 and records the weekly
+   *  phrase this time, so it self-corrects after one wasted attempt. Combining the two with max instead
+   *  would let a stale weekly value in a frozen snapshot (already reset but frozen at 91%) produce a wait
+   *  of several days. A value that can freeze is not allowed to intervene in the direction of a longer
+   *  wait — not trusting the snapshot is the whole point here.
+   *
+   *  refAt: the reference time for interpreting the phrase (the now argument of parseResetTime). The PTY
+   *  path (where a hit has no timestamp of its own) omits it and this.now() is used — that path is a live
+   *  scan, so the moment of detection is the reference. The transcript path (limitTailCheck) passes hit.at
+   *  (the record's own timestamp) — using a this.now() that is only reached after a 15-second tick plus a
+   *  readStatusPayload await would misjudge a record written a few seconds before its own reset time
+   *  (measured at 7.2s and 9s) as "already past" and add a whole day. since (when the record was made) is
+   *  always this.now() regardless of this argument — retry.ts depends on that field for the separate
+   *  meaning of "when was this record written". */
+  private recordRecovery(
+    chain: Chain,
+    payload: unknown,
+    text?: string,
+    refAt?: number,
+    /** What the account itself said, when the caller had already asked. **The only source that does
+     *  not depend on the session being alive** — the phrase may never be printed and the statusLine
+     *  snapshot freezes the moment a session halts, which is exactly when this record is written. */
+    queried?: RateLimitPeak | null
+  ): void {
+    const now = this.now()
+    const fromText = text ? parseResetTime(text, refAt ?? now) : null
+    if (fromText) {
+      this.deps.log(
+        `reset from text: at=${new Date(fromText.at).toISOString()} ` +
+          `weekly=${fromText.weekly} session=${chain.liveId}`
+      )
+    }
+    // The snapshot path — the fallback when the phrase is missing or malformed. The code already exists, so it costs nothing extra.
+    const u = fromText ? null : parseStatusLinePayload(payload)
+    const cand: { at: number; weekly: boolean }[] = []
+    const five = u?.session?.usedPercent
+    if (typeof five === 'number' && five >= GATE_PCT) {
+      const at = u?.session?.resetsAt ? Date.parse(u.session.resetsAt) : NaN
+      if (Number.isFinite(at)) cand.push({ at, weekly: false })
+    }
+    const seven = u?.weekly?.usedPercent
+    if (typeof seven === 'number' && seven >= GATE_PCT) {
+      const at = u?.weekly?.resetsAt ? Date.parse(u.weekly.resetsAt) : NaN
+      if (Number.isFinite(at)) cand.push({ at, weekly: true })
+    }
+    // The account's own answer, used when neither the phrase nor the snapshot produced one. It is
+    // last rather than first because the phrase names the window that actually blocked, while this is
+    // the fullest bucket — usually the same one, but the phrase is the more direct evidence when both
+    // are present. Its own gate is the same GATE_PCT the snapshot candidates use: a bucket well short
+    // of full is not the one that stopped the session, and its reset would aim the wait at the wrong
+    // time.
+    const fromQuery =
+      queried && queried.resetsAt && queried.percent >= GATE_PCT
+        ? ((): { at: number; weekly: boolean } | null => {
+            const at = Date.parse(queried.resetsAt)
+            return Number.isFinite(at) ? { at, weekly: queried.weekly } : null
+          })()
+        : null
+    const worst =
+      fromText ?? (cand.length ? cand.reduce((a, b) => (b.at > a.at ? b : a)) : null) ?? fromQuery
+    const record: BlockRecord = {
+      at: worst ? worst.at : null,
+      weekly: worst ? worst.weekly : false,
+      since: now
+    }
+    chain.recovery[chain.cycle.currentIndex] = record
+  }
+
+  /** True when the chain acted on the limit (a roll or a wait), false when a guard below declined it. */
+  private onLimit(chain: Chain): boolean {
+    // The awaitingReady (post-switch cooldown) guard — onLimitCandidate, the tick's fallback .then, and
+    // forceRoll all come through here, so this one line protects all three at once. Without it, within a
+    // single tick limitTailCheck could finish a roll first (setting awaitingReady=true) and then the
+    // fallback's readStatusPayload, dispatched concurrently in the same tick, would come back late holding
+    // the old session's stale payload; onLimit would pass unguarded with that payload and re-roll
+    // immediately (a2→a3) — replacing a healthy account we had just switched to, for no reason. This
+    // mirrors the same cooldown the PTY path in handleData already applies (the !chain.awaitingReady in
+    // the hit.limit branch above).
+    if (chain.rolling || chain.waitTimer || chain.disposed || chain.awaitingReady) return false
+    // Quiet (S6 R1): no verdict, no shared record, no roll or wait. forceRoll and the tick reach here too.
+    if (!this.acts(chain)) return false
+    if (chain.healthyTimer) {
+      clearTimeout(chain.healthyTimer)
+      chain.healthyTimer = null
+    }
+    // The chat counterpart of clearing the healthy timer just above (spec §14.6).
+    //
+    // **Both halves, because the rateLimit event is not the only way a chat chain's limit arrives.** It
+    // can also be read off the transcript by `limitTailCheck` on the tick — a subagent's rate_limit
+    // record, say, where the main turn then completes normally and no rejected event ever fires. That
+    // path reaches here without `onChatLimit` having marked anything, so the turn is disqualified here;
+    // otherwise the `idle` that follows makes the turn look clean, the wait holds the tick off, and the
+    // first tick after the in-place resume (whose re-anchored tail is past the record) declares health
+    // on an account that is genuinely blocked. Nothing afterwards corrects that. The event path sets the
+    // same flag in `onChatLimit`, before its own gate; setting it twice costs nothing.
+    if (chain.kind === 'chat') chain.chatLimitInTurn = true
+    // And a turn that completed *before* this limit says nothing about the account we are now about to
+    // leave or wait on, so it stops being evidence too.
+    chain.chatTurnDone = false
+    const action = chain.cycle.onLimit()
+    // One clock reading for the whole verdict. pickAvailable and planRetry below have to judge the same
+    // instant — if time moves between them, an account pickAvailable called unusable can look usable to
+    // planRetry microseconds later, and the wait would target an account it had just refused.
+    const now = this.now()
+    // The shared write is here rather than in recordRecovery because recordRecovery runs at three call
+    // sites and every one of them is ahead of the guards above — writing there would broadcast to every
+    // other chain a verdict this coordinator has just declined to act on. It re-reads the record
+    // recordRecovery stored instead of building a second one, so the two stores hold the same object and
+    // cannot drift (SPEC §11.2/6). forceRoll reaches here without a record; there is then nothing to say.
+    const record = chain.recovery[chain.cycle.currentIndex]
+    if (record) this.deps.blocks.record(chain.accountIds[chain.cycle.currentIndex], record, now)
+    // Skips an account the round robin suggests if it is already exhausted (weekly at 100%, say). With
+    // nowhere to go, it waits — switching to an exhausted account only blocks again immediately and wastes
+    // a transcript copy and a respawn.
+    const target =
+      action.type === 'roll'
+        ? pickAvailable(retryState(chain, this.deps.blocks, now), action.toIndex, now)
+        : null
+    // 'shared' marks a detour around an account **this chain never touched** — the block came from another
+    // chain's record. Without it the log cannot answer "why did this worker skip an account it had no
+    // history with", which is the first question an incident asks now that a block can arrive from
+    // elsewhere (SPEC §11.2/6).
+    const skipShared =
+      action.type === 'roll' &&
+      !chain.recovery[action.toIndex] &&
+      this.deps.blocks.get(chain.accountIds[action.toIndex], now) !== null
+    const skipLoggedOut =
+      action.type === 'roll' && chain.loggedOut.has(chain.accountIds[action.toIndex])
+    const detour =
+      action.type === 'roll' && target !== action.toIndex
+        ? ` blocked(${action.toIndex}${skipShared ? ',shared' : ''}${skipLoggedOut ? ',loggedOut' : ''})→${target === null ? 'wait' : target}`
+        : ''
+    this.deps.log(`limit detected session=${chain.liveId} action=${JSON.stringify(action)}${detour}`)
+    if (target === null) {
+      // Reset-time-based targeted retry: schedules the account that recovers soonest at that time, and on
+      // firing rolls straight to that account rather than to the next in the round robin. RollCycle's
+      // retryAt and onWaitElapsed are unused.
+      // The records are not cleared when it fires — the target account's record expires naturally once
+      // its reset passes, and the blocks still standing on other accounts (weekly and so on) have to stay valid.
+      this.armWait(chain, planRetry(retryState(chain, this.deps.blocks, now), now))
+    } else {
+      void this.roll(chain, target)
+    }
+    this.snap(chain)
+    return true
+  }
+
+  /** Arms a planned wait: the banner, the timer, and the plan a snapshot carries (S6 R4). */
+  private armWait(
+    chain: Chain,
+    plan: { target: number; retryAt: number; weekly: boolean },
+    opts: { reattach?: boolean } = {}
+  ): void {
+    chain.waitPlan = { retryAt: plan.retryAt, target: plan.target, weekly: plan.weekly }
+    this.pushState(chain, 'waiting', {
+      nextRetryAt: new Date(plan.retryAt).toISOString(),
+      scope: plan.weekly ? 'weekly' : 'session',
+      // A restored wait is the same stop another process already published (preflight R5): marked as a
+      // re-publish, so the roll tap (it skips reattach) and Slack do not record it a second time.
+      ...(opts.reattach ? { reattach: true } : {})
+    })
+    chain.waitTimer = setTimeout(() => this.fireWait(chain, plan), Math.max(0, plan.retryAt - this.now()))
+    this.snap(chain)
+  }
+
+  /** A planned wait's end. Quiet (S6 R1), it keeps the plan and looks again in a tick rather than resume
+   *  under another process that holds this pty; the plan stays in the snapshot meanwhile. */
+  private fireWait(chain: Chain, plan: { target: number; retryAt: number; weekly: boolean }): void {
+    chain.waitTimer = null
+    if (chain.disposed) return
+    if (!this.acts(chain)) {
+      chain.waitTimer = setTimeout(() => this.fireWait(chain, plan), TICK_MS)
+      return
+    }
+    chain.waitPlan = null
+    // Written twice: once for what the resume changed synchronously (the wait gone, the in-place
+    // latch, a rebuilt tail), once when it settles (a roll's re-key or its own new wait). The key
+    // dedup drops whichever says nothing new.
+    const resumed = this.resumeAfterWait(chain, plan.target)
+    this.snap(chain)
+    void resumed.finally(() => this.snap(chain))
+  }
+
+  /** A same-account resume the chain may not make now (S6 R26): no banner, no typing, and the episode's
+   *  one in-place resume not spent — the same wait, looked at again in a tick through `fireWait`. */
+  private requeueResume(chain: Chain, why: string): void {
+    if (chain.waitTimer || chain.disposed) return
+    this.deps.log(`resume in place held — another process holds this pty (${why}) session=${chain.liveId}`)
+    const plan = { target: chain.cycle.currentIndex, retryAt: this.now() + TICK_MS, weekly: false }
+    chain.waitPlan = plan
+    chain.waitTimer = setTimeout(() => this.fireWait(chain, plan), TICK_MS)
+    this.snap(chain)
+  }
+
+  /** Resuming once the wait expires. There is no reason to kill the process when the account is not
+   *  changing — a background Dynamic Workflow is a child of the claude CLI and dies with that kill alone.
+   *
+   *  It deliberately does not ask "is the session working right now". Once the evidence gate filters out
+   *  the false positives, a wait only ever happens on a genuine limit, and Claude Code does not carry on
+   *  by itself when the limit lifts — so the session at this moment is necessarily halted. An early
+   *  design tried to stack that verdict three ways and produced a fresh defect each time (the threshold
+   *  collided with the retry floor, the coordinator's own key input was read back as activity, and the
+   *  no-action branch had no correct way to handle the block record).
+   *
+   *  Exactly one thing is checked: is the limit choice list still on screen (choicePending). If it is,
+   *  the Enter that follows the prompt would approve the highlighted item, so it falls back to the old
+   *  kill path, which clears the screen. */
+  private resumeAfterWait(chain: Chain, toIndex: number): Promise<void> {
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady)
+      return Promise.resolve()
+    // The wait was planned minutes ago; the target may have been logged out since. Rolling onto it
+    // would copy the transcript and respawn into a CLI that cannot authenticate, so the chain
+    // reschedules instead — the same path every other aborted roll takes (spec §15.3).
+    if (toIndex !== chain.cycle.currentIndex && chain.loggedOut.has(chain.accountIds[toIndex])) {
+      this.rescheduleAbortedRoll(chain, 'target logged out')
+      return Promise.resolve()
+    }
+    if (toIndex !== chain.cycle.currentIndex) return this.roll(chain, toIndex) // the account changes — a new process is unavoidable
+    if (chain.inPlaceUsed) {
+      // 지난 제자리 재개가 정착 판정에 닿지 못했다 = 그 줄이 세션을 되살리지 못했다. 그래서 이번에는
+      // 새 프로세스를 띄운다. onLimit 은 판정 전에 healthyTimer 를 지우므로 이 플래그는 건강
+      // 창 안에 들어온 두 번째 한도를 넘어 살아남는다. 줄이 삼켜지고 두 번째 한도가 아예 오지 않는
+      // 경우는 이 분기에 닿지 못한다 — 그쪽을 덮는 것이 settleInPlace 다. codex 쪽과 같은 설계.
+      this.deps.log(`resume in place did not recover — falling back to attempt a respawn session=${chain.liveId}`)
+      return this.roll(chain, toIndex)
+    }
+    if (chain.choicePending) {
+      this.deps.log(`resume in place skipped — limit choice still on screen session=${chain.liveId}`)
+      return this.roll(chain, toIndex)
+    }
+    return this.resumeInPlace(chain)
+  }
+
+  /** 재개 자리에 실을 텍스트를 정한다. **어느 모양을 물을지는 이 함수를 부르는 자리가 정한다** —
+   *  가르는 기준은 `SPEC §11.5` 하나다: 그 경로가 `--resume` 을 부르는가(또는 백지 재개로 그 자리를
+   *  대신하는가).
+   *   - 'handover'(전체 인계): 두 자리다.
+   *     - `roll()` 이 kill 하기 **직전**, `resumeStrategy() === 'smart'` 일 때만: 백지 재개로 갈지
+   *       정하는 바로 그 브리핑을 여기서 미리 짓는다(`tabFallback: true` — Job 도 탭도 브리핑이
+   *       있으면 후보로 쓴다). 브리핑이 있으면(`briefed`) 새 프로세스는 `--resume` 없이 빈 대화로
+   *       뜨고 이 문자열이 그 자리에 타이핑된다; 없으면 아래로 내려가 지금까지의 경로(복사 +
+   *       `--resume`)를 그대로 탄다.
+   *     - `scheduleAutoPrompt` 의 sendPrompt — 백지 재개로 가지 않은(강도가 'smart'가 아니었거나,
+   *       'smart'였지만 이번 롤은 브리핑을 못 만든) 모든 롤에서, `--resume` 으로 다시 뜬 뒤 실제로
+   *       타이핑할 프롬프트를 여기서 묻는다(`tabFallback: false`). 이 프로세스는 방금 `--resume`
+   *       으로 대화를 통째로 이어받았으므로 탭 세션에는 인계할 것이 없다 — Job 워커의 packet
+   *       갱신(spec 파일에 최신 Checkpoint 를 다시 적는 부수 효과)만 이 값과 무관하게 그대로
+   *       유지된다(F3, 이 dep 이 생기기 전부터의 동작).
+   *   - 'update'(덧붙일 한 줄): `resumeInPlace` · idle nudge · 리셋 앵커. **세션이 살아 있다** —
+   *     떨어뜨린 것이 없으니 인계할 것도 없고(§11.5), 대화가 온전한 에이전트에게 Task 지시문과
+   *     의존성 목록을 다시 읽히는 것은 방금 리셋된 할당량을 이미 아는 것에 쓰는 일이다. 그래서
+   *     기다리는 동안 무엇이 바뀌었는지만 덧붙인다. 세 자리 모두 `tabFallback: true` 다 —
+   *     대체가 아니라 덧붙임이라 사용자 문구를 잃을 위험이 없다(바로 아래 문단).
+   *
+   *  'update' 를 **덧붙이는** 이유: 이 경로에서 `chain.prompt` 는 잃을 것이 없는 값이고, 사용자가
+   *  직접 지정한 문구일 수도 있다(register 의 prompt). 대체하면 그것을 버린다.
+   *
+   *  `resumeText` 는 던지지 않는다는 계약이지만(resumePacket.ts) 이 함수를 부르는 자리는 전부
+   *  fire-and-forget 이라 예외가 새면 잡아 줄 곳이 없다 — 그래서 여기서 한 번 감싸고 로그만 남긴
+   *  뒤 고정 문장으로 저하한다. 이 파일에 같은 try/catch 가 네 벌 있었는데, 이유가 적힌 자리는
+   *  `RollingDeps.resumeText` 의 JSDoc 뿐이고 네 벌의 주석은 서로를 가리키고만 있었다.
+   *
+   *  **`briefed` 를 함께 돌려주는 이유.** `text` 가 `null`/`undefined` 면 이 함수는 `chain.prompt` 로
+   *  저하하므로, 돌려주는 문자열 하나만으로는 호출한 쪽이 "브리핑이 있었는가"를 알 수 없다 — 실패해서
+   *  고정 문장이 된 것과 원래 고정 문장을 쓰려 한 것이 같은 모양이 되어 버린다. `roll()` 은 바로 그
+   *  사실로 백지 재개 여부를 가른다(계획의 지배 제약: 브리핑을 못 만들면 백지 재개를 하지 않는다).
+   *  codexCoordinator.ts 의 같은 이름 함수와 같은 계약이다.
+   *
+   *  **빈 문자열도 같은 저하를 탄다.** 오늘 어떤 producer 도 `''`를 돌리지 않지만, 돌린다면 백지
+   *  재개가 빈 프롬프트로 새 프로세스를 띄우는 꼴이 된다 — 그래서 `null`/`undefined` 와 같은 취급이다:
+   *  `briefed: false`. */
+  private async resumePromptFor(
+    chain: Chain,
+    liveId: string,
+    form: 'handover' | 'update',
+    tabFallback: boolean
+  ): Promise<{ prompt: string; briefed: boolean }> {
+    try {
+      const text = await this.deps.resumeText?.(liveId, form, tabFallback)
+      if (text === null || text === undefined || text === '') return { prompt: chain.prompt, briefed: false }
+      return { prompt: form === 'update' ? `${chain.prompt} ${text}` : text, briefed: true }
+    } catch (err) {
+      this.deps.log(
+        `resume packet hook failed session=${liveId}: ${err instanceof Error ? err.message : String(err)}`
+      )
+      return { prompt: chain.prompt, briefed: false }
+    }
+  }
+
+  /** Resuming on the same account — the prompt goes into the live PTY with no kill, no spawn and no
+   *  transcript copy. Everything roll() does that belongs to switching accounts (publishing 'switching',
+   *  the copy, re-keying, auto-accepting trust, the ready polling, the replay grace) does not apply here
+   *  and is therefore not done. */
+  private async resumeInPlace(chain: Chain): Promise<void> {
+    if (!this.acts(chain)) return this.requeueResume(chain, 'quiet at entry')
+    // Through the wait, tick() skipped this chain (the waitTimer guard) so limitTailCheck never ran.
+    // JsonlTail hands the bytes accumulated in the meantime to the next read, and since is the tail's
+    // creation time (much earlier), so the first tick after the resume would read the very record that
+    // caused this wait and fire the limit again. roll() already does this for the same reason, on the copy.
+    if (chain.transcriptPath) {
+      chain.limitTail = this.newLimitTail(chain, chain.transcriptPath, this.now())
+      chain.limitTailReadFailWarned = false
+    }
+    // The same refresh roll() does after a respawn. Without it the first tick after the resume sees
+    // "30 seconds of silence plus a 100% snapshot that has not refreshed yet", fires the fallback trigger
+    // again and pushes the session we just resumed straight back into a wait.
+    chain.lastOutputAt = this.now()
+    chain.inPlaceUsed = true
+    // A resume in place is an arrival too — on the account the chain already holds — so the
+    // shared-clear valve re-opens here exactly as it does on a roll (Ruling 4d-7). Without this the
+    // chain would sit on a reset account for the rest of its life unable to tear up a false record
+    // another chain wrote about it.
+    chain.chatValveSpent = false
+    // 'nudged' is the right state: this is a reset resume rather than an account switch, the renderer
+    // treats it as a momentary event, and the Slack mapping (slack.limitReset) already exists. It is the
+    // same sequence resetAnchorCheck uses.
+    this.pushState(chain, 'nudged')
+    this.deps.log(`limit reset → resume in place session=${chain.liveId}`)
+    const liveId = chain.liveId
+    const stateSeq = chain.stateSeq // captures the generation at scheduling time — the same convention as elsewhere
+    const { prompt } = await this.resumePromptFor(chain, liveId, 'update', true)
+    if (chain.disposed || chain.liveId !== liveId) return // the across-await state guard
+    // The prompt build is an await, and another process may have attached this pty inside it (S6 R26).
+    // Nothing was typed, so the episode's one in-place resume is given back.
+    if (!this.acts(chain)) {
+      chain.inPlaceUsed = false
+      this.requeueResume(chain, 'quiet before the write')
+      return
+    }
+    this.deps.write(liveId, prompt)
+    this.snap(chain)
+    setTimeout(() => {
+      if (!chain.disposed && chain.liveId === liveId) {
+        this.deps.write(liveId, '\r')
+        // 'none' has to be published after Enter for the scheduler's suppression to lift. If a more
+        // recent state was published in between, ours is stale and is skipped.
+        if (chain.stateSeq === stateSeq) this.pushState(chain, 'none')
+      }
+    }, ENTER_DELAY_MS)
+    // On the roll path this timer is scheduled by sendPrompt. Without it recovery[current] stays set,
+    // limitEvidence() latches true (leaving the idle nudge and the reset anchor permanently armed), and
+    // with several accounts cycle.streak never resets so the next limit is misread as a whole lap blocked.
+    chain.healthyTimer = setTimeout(() => {
+      void this.settleInPlace(chain, liveId)
+    }, HEALTHY_MS)
+  }
+
+  /** 제자리 재개의 마감 시각: 줄을 넣고 HEALTHY_MS 뒤, 그 줄이 정말 턴을 시작했는가?
+   *
+   *  **왜 필요한가.** 이 자리는 예전에 무조건 "건강하다"를 선언했다. 그런데 세션 메타를 못 배운
+   *  체인(히스토리에서 다시 연 대화 — 한도에 걸린 claude 는 statusLine 훅을 아예 부르지 않는다)은
+   *  그 뒤로 잡아낼 방법이 하나도 없다: limitTail 이 없어 ①이 즉시 반환하고, 페이로드가 없어
+   *  fallback 트리거가 발화할 수 없고, Notification 이 없어 idle nudge 도 뜨지 않는다. 실측하면
+   *  선언 뒤 45분 동안 이벤트·입력·게시가 모두 0이었다(2026-08-27).
+   *
+   *  **왜 증거가 codex 와 다른가.** codex 의 같은 판정(settleInPlace)은 rollout 의 바이트 증가를
+   *  본다 — codex 는 그 경로를 파일시스템 스캔으로 스스로 찾으므로 훅과 무관하게 안다. claude 의
+   *  transcript 경로는 statusLine 페이로드에서만 오고, 침묵하는 바로 그 경우에 그 페이로드가 없다.
+   *  그래서 여기서 묻는 증거는 "그동안 세션 메타가 도착했는가" 하나다. 도착했다면 statusLine 이
+   *  돌아왔다는 뜻이고, 메타를 배운 경우는 얼어붙은 페이로드가 fallback 트리거를 다시 살려 스스로
+   *  복구된다는 것도 같은 실측에서 확인됐다 — 그 갈래를 여기서 또 판정할 이유가 없다.
+   *
+   *  **왜 행동이 roll() 하나인가.** roll() 은 먼저 refreshMeta 를 부르므로 늦게 도착한 페이로드를
+   *  한 번 더 집어 준다. 그래도 없으면 rescheduleAbortedRoll 로 넘어가 **보이는 대기**가 예약된다 —
+   *  고치기 전의 침묵 대신. 그 대기의 재시도가 다시 이 함수에 닿는 루프는 inPlaceUsed 가 묶는다.
+   *
+   *  **왜 판정 전에 메타를 다시 읽는가.** chain.claudeSessionId·chain.transcriptPath 는
+   *  tickChain 이 15초마다만 새로 쓰는 캐시값이라 최대 한 tick 만큼 낡아 있을 수 있다. 그 마지막 tick
+   *  간격 안에 statusLine 페이로드가 돌아오면 이 판정은 그것을 못 보는데 roll() 은 스스로 부르는
+   *  refreshMeta 로 그것을 본다 — 판정과 행동이 서로 다른 신선도를 보고 판정만 낡은 값으로 respawn
+   *  을 고르는 비대칭이 생긴다. 대가는 resumeAfterWait 의 JSDoc 이 kill 을 피하는 바로 그것이다:
+   *  막 되살아난 세션을 배경 작업째 죽이는 것. 그래서 여기서도 같은 것을 먼저 새로고친 뒤에 같은
+   *  값을 본다.
+   *
+   *  **왜 refreshMeta 를 그대로 부르지 않고 페이로드를 직접 읽어 적용을 미루는가.** refreshMeta 는
+   *  읽은 페이로드를 자신의 프로미스 체인 안에서 곧바로 applyMeta 에 넘긴다 — 그 적용은 이 함수의
+   *  가드보다 먼저, await 이 여기로 돌아오기도 전에 이미 끝나 버린다. fix wave 전에는 settleInPlace
+   *  에 await 이 하나도 없어 원자적으로 실행됐으므로 이 창은 없었다. 그 창 안에서 다른 곳이
+   *  chain.liveId 를 재키하면(roll) 방금 읽은 옛 계정의 값이 새로 세운 transcriptPath·limitTail 을
+   *  덮어쓸 수 있고, liveId 를 바꾸지 않는 판정(onLimit 이 재키 없이 waitTimer 만 세운 경우)이
+   *  끼어들면 이 함수의 건강 판정이 그 판정이 막 남긴 차단 기록을 지워 버릴 수 있다. 그래서 여기서는
+   *  읽기만 하고, 가드를 다시 확인한 뒤에만 applyMeta 를 부른다 — 그 가드는 tickChain 의
+   *  across-await 가드와 같은 집합(rolling·waitTimer·awaitingReady)에 liveId 비교를 더한 것이다:
+   *  liveId 비교는 재키가 이미 끝나 그 세 플래그마저 원래대로 돌아온 뒤에도 옛 페이로드가 새 체인에
+   *  적용되는 것을 막는다.
+   *
+   *  타이머 콜백에서 예외가 새면 잡아 줄 곳이 없다. roll() 은 스스로 try/catch 하고 rolling 가드도
+   *  자체로 갖고 있지만, deps.readStatusPayload 자체는 재던지지 않는다는 계약이 없다. 그래서
+   *  resumePromptFor 가 deps.resumeText 를 감싸는 것과 같은 자리에서 직접 감싸 로그만 남기고
+   *  넘어간다. 그 await 뒤에는 이 넓어진 가드를 다시 확인한다 — 새로 연 await 창이기 때문이다(위
+   *  첫 가드와 같은 이유이나, 이번에는 적용 자체를 아직 하지 않았다는 점이 다르다).
+   *
+   *  **A chat chain has no verdict to reach here (Ruling 4c-6).** The question this function asks is
+   *  "did the statusLine come back", and a chat session never calls that hook — `readStatusPayload`
+   *  answers null for it forever. The two fields the answer is read off, `claudeSessionId` and
+   *  `transcriptPath`, were pushed in by `onChatMeta` long before the limit, so every one of them is
+   *  already non-null and the function would fall straight through to declaring health: resetting the
+   *  cycle's streak and this chain's record, and clearing the account's entry in the **shared** block
+   *  registry — every other chain in both coordinators reads that entry — on the evidence of nothing.
+   *  So a chat chain returns before any of it. Nothing is scheduled in its place and nothing needs to
+   *  be: the block record ages out at its own reset, the tick has the chain back (the wait timer is
+   *  gone), and a fresh rateLimit event re-plans from scratch. */
+  private async settleInPlace(chain: Chain, liveId: string): Promise<void> {
+    chain.healthyTimer = null
+    if (chain.disposed || chain.liveId !== liveId) return
+    if (chain.kind === 'chat') {
+      this.deps.log(
+        `in-place resume on a chat chain: no verdict — the block record ages out at its reset; ` +
+          `a fresh rateLimit re-plans session=${liveId}`
+      )
+      return
+    }
+    let payload: unknown | null = null
+    try {
+      payload = await this.deps.readStatusPayload(chain.liveId)
+    } catch (err) {
+      this.deps.log(
+        `resume in place metadata refresh failed session=${liveId}: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+    // The across-await state guard, widened to the same set tickChain uses for exactly this question (a
+    // roll may have re-keyed the chain, or onLimit may have armed a wait without re-keying) — plus the
+    // liveId comparison this function already had, which is what still catches a re-key once it has
+    // finished and cleared those three flags again. Only once this passes is the payload applied — see
+    // the JSDoc above for why the apply itself has to wait for this check rather than run inside the read.
+    if (
+      chain.disposed ||
+      chain.liveId !== liveId ||
+      chain.rolling ||
+      chain.waitTimer ||
+      chain.awaitingReady
+    )
+      return
+    if (payload) this.applyMeta(chain, payload)
+    if (!chain.claudeSessionId || !chain.transcriptPath) {
+      this.deps.log(
+        `resume in place produced no session metadata — attempting a respawn session=${liveId}`
+      )
+      await this.roll(chain, chain.cycle.currentIndex)
+      return
+    }
+    // 메타가 있다 — 예전 healthyTimer 가 하던 것 그대로. 이것을 하지 않으면 recovery[current] 가
+    // 남아 limitEvidence 가 계속 참이고(idle nudge·리셋 앵커가 영구 무장), 계정이 여럿이면
+    // cycle.streak 가 리셋되지 않아 다음 한도가 "한 바퀴 전체 차단"으로 잘못 읽힌다. 이 판정이 본
+    // 것은 "60초 동안 한도가 감지되지 않았다"에 "statusLine 이 돌아왔다"가 더해진 것이고, 그래서
+    // 공유 기록도 함께 지운다 — declareHealthy 가 그 네 문장을 그대로 들고 있다(Ruling 4d-8: 여기에
+    // 다시 적어 두면 둘이 갈라진다). pty 전용 자리이므로 clearShared 는 기본값 그대로다.
+    // Quiet (S6 R1): a health verdict clears shared state, so it is the holding process's to make.
+    if (!this.acts(chain)) return
+    this.declareHealthy(chain)
+  }
+
+  /** A roll gave up. Schedule the next attempt instead of leaving the chain idle.
+   *
+   *  **Why this exists.** These abort paths used to publish 'none' and return, which schedules nothing:
+   *  the session is still blocked by its limit, nothing else will detect it (the limit was already
+   *  consumed), and the worker sits idle until a human notices. It surfaced twice — an account removed
+   *  from the chain while it ran (pickAvailable sees ids only, so it hands roll() an account that cannot
+   *  be resolved), and a conversation reopened from history whose session metadata was never learned
+   *  because the limit stops the statusLine from being called at all.
+   *
+   *  **Why the wait machinery and not a new timer.** onLimit's "no usable account" branch already
+   *  publishes 'waiting' with a retry time and arms waitTimer. Reusing it means the renderer's waiting
+   *  row, the scheduler's suppression and the Slack mapping all keep working here — a new state or a
+   *  private timer would have to be taught to each of them.
+   *
+   *  **Why 'waiting' replaces the 'none' rather than following it.** Publishing 'none' first lifts the
+   *  scheduler's suppression and clears the banner, and then puts it straight back.
+   *
+   *  **Why retrying an abort that will abort again is right, and what the loop costs.** If the account
+   *  is gone for good this repeats at the interval planRetry computes — the recorded reset plus the
+   *  margin, or the 15-minute fallback when no reset is known. (The 60-second floor only applies when
+   *  that time has already passed, so it is not the loop's normal period for the 'no such account' and
+   *  'roll failed' aborts — but the 'no session metadata' abort settleInPlace feeds always arrives
+   *  after its own reset has already passed, so there the floor *is* the period: measured 45 rounds in
+   *  45 minutes.) Each round logs. And a round is not always only a log line: when planRetry's target
+   *  resolves to the account this chain is already on, resumeAfterWait resumes in place, which types
+   *  the prompt and Enter into the live PTY — but inPlaceUsed limits that to the first such round in a
+   *  blocked episode; every round after it goes through roll() instead, which finds the same metadata
+   *  still missing and aborts before the PTY is touched at all. That is the same loop shape the
+   *  ordinary wait path has always had, so none of it is new behaviour — and it is still better than
+   *  silence, because the log is the only thing that can tell someone to re-add the account or close
+   *  the session. */
+  private rescheduleAbortedRoll(chain: Chain, why: string): void {
+    // Defensive. No caller can actually reach here with a wait already armed — onLimit's wait branch
+    // does not call roll() — but it is checked because being wrong once costs a second timer on the
+    // same chain: one of the two leaks with nothing left holding its handle, and the session resumes
+    // twice.
+    if (chain.waitTimer || chain.disposed) return
+    // One clock reading, for the same reason onLimit takes one: the block records retryState merges and
+    // the instant planRetry judges them against have to be the same moment.
+    const now = this.now()
+    const plan = planRetry(retryState(chain, this.deps.blocks, now), now)
+    this.deps.log(
+      `roll retry scheduled after abort (${why}) at=${new Date(plan.retryAt).toISOString()} session=${chain.liveId}`
+    )
+    this.armWait(chain, plan)
+  }
+
+  /** Executing a roll: copy → kill → respawn under the same ID → schedule the automatic prompt (the
+   *  order is fixed). When Smart Resume is on and a briefing was built, the copy and `resumeSessionId`
+   *  are skipped instead — the new session starts blank, carrying only the briefing (see the `smart`
+   *  branch below). */
+  private async roll(chain: Chain, toIndex: number): Promise<void> {
+    if (chain.rolling || chain.disposed) return
+    // S6 R26: settleInPlace, resumeAfterWait and forceRoll reach here without passing onLimit.
+    if (!this.acts(chain)) return this.requeueRoll(chain, toIndex, 'quiet at entry')
+    // A roll that goes ahead supersedes one held earlier (a fresh limit verdict, or the hold's own fire).
+    if (chain.heldTimer) {
+      clearTimeout(chain.heldTimer)
+      chain.heldTimer = null
+    }
+    chain.rolling = true
+    if (chain.promptTimer) {
+      clearTimeout(chain.promptTimer)
+      chain.promptTimer = null
+    }
+    try {
+      const target = this.deps.getAccount(chain.accountIds[toIndex])
+      if (!target) {
+        this.deps.log(`roll aborted — no such account id=${chain.accountIds[toIndex]}`)
+        this.rescheduleAbortedRoll(chain, 'no such account')
+        return
+      }
+      if (!chain.claudeSessionId || !chain.transcriptPath) await this.refreshMeta(chain)
+      // The learned value wins when it exists; the register-time seed (a history resume's own id and the
+      // path ipc already copied it to) only fills the gap for a chain a limited claude's statusLine never
+      // reported to. Nothing upstream of this line may fall back the same way — see the Chain fields' comment.
+      const sessionId = chain.claudeSessionId ?? chain.resumeSeedSessionId
+      const transcriptPath = chain.transcriptPath ?? chain.resumeSeedTranscriptPath
+      if (!sessionId || !transcriptPath) {
+        this.deps.log(`roll aborted — no session metadata (statusline never recorded) session=${chain.liveId}`)
+        this.rescheduleAbortedRoll(chain, 'no session metadata')
+        return
+      }
+      // resumeText 는 spec 파일에 쓰는 부수 효과가 있는 await 이므로 kill 과 재키잉 사이에는 두지
+      // 않는다 — 아래 kill/spawn 의 불변(그 구간에 await 를 두지 않는다)을 지키려면 kill 앞에서,
+      // 세션이 아직 살아 있을 때 물어 둔다. **'smart' 일 때만 여기서 묻는다** — 'original' 이면
+      // 복사할지(백지 재개인지) 정할 것이 없으므로 묻지 않고, sendPrompt 가 지금까지처럼 respawn
+      // 뒤에 스스로 한 번만 묻는다(Step 4) — 두 번 다 물으면 부수 효과도 두 번 일어난다.
+      const strategy = this.resumeStrategy()
+      let briefing: { prompt: string; briefed: boolean } | null = null
+      if (strategy === 'smart') {
+        briefing = await this.resumePromptFor(chain, chain.liveId, 'handover', true)
+        if (chain.disposed) {
+          this.deps.log(
+            `roll aborted — chain disposed while building the resume prompt session=${chain.liveId}`
+          )
+          return
+        }
+      }
+      // Smart Resume: 설정이 켜져 있고 브리핑이 실제로 있을 때만 백지 재개다. 브리핑을 못 만들면
+      // (!briefed) 이 스위치가 켜져 있어도 적용하지 않는다 — 계획의 지배 제약이고, 그 경우 아래는
+      // 오늘과 같은 경로(복사 + `--resume`)를 그대로 지난다.
+      const smart = briefing !== null && briefing.briefed
+      // A chat chain's carry-on prompt, resolved here for the same two reasons the briefing above is: it
+      // is an await with a side effect (resumeText rewrites a Job worker's spec file), and the kill→spawn
+      // →re-key sequence below admits no await at all. A pty roll asks this question after the respawn
+      // instead (sendPrompt), because there it has to wait for a screen to type into; a chat roll has
+      // nowhere to type it later — it goes with the spawn — so it has to be in hand before the kill.
+      //
+      // The expression is sendPrompt's, verbatim, so both kinds say the same thing on the same roll: the
+      // briefing when Smart Resume produced one, otherwise a fresh 'handover' ask with tabFallback false
+      // (this process is about to be handed the whole conversation by its resume, so a tab session has
+      // nothing left to hand over — see resumePromptFor). The id asked about is the old one, as the smart
+      // branch above already asks: the new session does not exist yet.
+      let chatPrompt: string | undefined
+      if (chain.kind === 'chat') {
+        chatPrompt = smart
+          ? briefing?.prompt
+          : (await this.resumePromptFor(chain, chain.liveId, 'handover', false)).prompt
+        if (chain.disposed) {
+          this.deps.log(
+            `roll aborted — chain disposed while building the resume prompt session=${chain.liveId}`
+          )
+          return
+        }
+      }
+      // Published only once both aborts above are behind us — matches codexCoordinator.ts. Publishing this
+      // before the metadata check announced a switch to Slack that never happens, and it also claimed the
+      // stop episode in the orchestration tap with reason 'switching' (no reset time), so the reschedule's
+      // own 'waiting' publication just below was then ignored as a repeat of the same stop.
+      this.pushState(chain, 'switching', { accountLabel: target.label })
+      // ① copy — a claude blocked by a limit is idle, so there is no write contention. Smart Resume
+      // skips this: the new session starts blank, so there is no transcript to hand it.
+      let dest: string | undefined
+      if (!smart) {
+        dest = claudeHistoryStrategy.mapTargetPath(transcriptPath, target.configDir)
+        await this.copy(transcriptPath, dest)
+        // 복사 대기 중에 unregister()가 체인을 폐기했으면 여기서 멈춘다 — ② kill·③ spawn을 하지 않고,
+        // 폐기된 체인이 맵에 다시 들어가지 않도록 한다. 아래로 진행하면 새로 띄운 세션이 좀비가 되고
+        // 어떤 코디네이터도 다시 수거하지 못한다.
+        if (chain.disposed) {
+          this.deps.log(`roll aborted — chain disposed during the copy session=${chain.liveId}`)
+          return
+        }
+      }
+      // S6 R5: what a respawn can wait for or be refused over happens while the old session lives —
+      // the kill below starts the await-free stretch (constraint 12).
+      if (this.deps.prepareSpawn) {
+        try {
+          await this.deps.prepareSpawn(target, chain.cwd)
+        } catch (err) {
+          const why = err instanceof Error ? err.message : String(err)
+          this.deps.log(`roll aborted — the respawn would be refused: ${why} session=${chain.liveId}`)
+          this.rescheduleAbortedRoll(chain, `spawn refused: ${why}`)
+          return
+        }
+        if (chain.disposed) {
+          this.deps.log(`roll aborted — chain disposed while preparing the respawn session=${chain.liveId}`)
+          return
+        }
+      }
+      // ── The last await before the kill is behind us. Anything that must be re-checked after it goes
+      // here, in this one place — from the next line on there is no await. ──
+      // The copy and prepareSpawn were awaited, and an older app may have attached the pty in between
+      // (S6 R26): the roll is looked at again in a tick instead of killing a pty another process holds.
+      // The 'switching' published above is taken down: nothing switches now, and a 'waiting' would promise
+      // a retry time that nothing has planned.
+      if (!this.acts(chain)) {
+        this.pushState(chain, 'none')
+        this.requeueRoll(chain, toIndex, 'quiet before the kill')
+        return
+      }
+      // ② kill the existing PTY → ③ respawn under the same ID. There is no await from here until
+      // re-keying — even if the exit event arrives under the old key, the chain has already moved to the
+      // new one, so disposeChain does not misfire. A blank-slate roll omits resumeSessionId entirely —
+      // the new process is a fresh `claude`, not a `claude --resume`, and the briefing is typed into it
+      // by scheduleAutoPrompt once it is ready, the same channel every ordinary roll already uses.
+      // Read before the kill, not after: the manager drops the session together with its process, and
+      // the person's model choice is held there. Reading it afterwards returns null every time.
+      const chosenModel = this.deps.chosenModelOf?.(chain.liveId) ?? null
+      // design F5 fix round 1 (Important 3): same "read before the kill" rule, for the toolchain
+      // bypass a person already consented to for this chain.
+      const wasBypassed = this.deps.bypassedOf?.(chain.liveId) ?? false
+      this.deps.kill(chain.liveId)
+      const oldId = chain.liveId
+      const info = this.deps.spawn({
+        account: target,
+        cwd: chain.cwd,
+        resumeSessionId: smart ? undefined : sessionId,
+        rollAccountIds: chain.accountIds,
+        slackNotify: chain.liveInfo.slackNotify, // Slack notifications are kept per chain
+        bypassPermissions: chain.liveInfo.bypassPermissions, // bypass is kept per chain
+        // The tab's name is kept per chain too. A roll is the same piece of work continuing on
+        // another account, so a name a person gave it must not be traded back for the folder name
+        // halfway through — spawn's default would do exactly that if this were omitted.
+        title: chain.liveInfo.title,
+        orchEnv: this.deps.orchEnv?.(),
+        // The chain's kind decides which manager the wiring respawns it through, and a chat respawn
+        // carries its first turn with it — there is no screen to type one into afterwards. A pty chain
+        // passes 'terminal' and no prompt, which is what every caller did before chat sessions existed.
+        kind: chain.kind,
+        initialPrompt: chatPrompt,
+        rollPrompt: chain.liveInfo.rollPrompt,
+        // Carried so the chain keeps running on what the person chose. The respawned session records it
+        // as its own choice, so the roll after this one reads it back the same way.
+        model: chosenModel,
+        startWithBypass: wasBypassed,
+        // S6 R6: the new pty is born with what a takeover needs if this process dies before the
+        // rekey commits: where it came from, and the chain on its new account awaiting its prompt.
+        restoreExtra: {
+          rolledFrom: chain.liveId,
+          roll: {
+            ...this.snapshotOf(chain),
+            currentIndex: toIndex,
+            wait: null,
+            rolledAt: this.now(),
+            awaitingPrompt: chain.kind !== 'chat',
+            claude: {
+              sessionId: smart ? null : sessionId,
+              transcriptPath: dest ?? null,
+              tailOffset: null,
+              tailSince: this.now(),
+              // Carry C-c: the blank slate is owed the briefing, not the handover line.
+              ...(smart && briefing ? briefingNote(briefing.prompt) : {})
+            }
+          } satisfies RollSnapshot
+        }
+      })
+      this.chains.delete(oldId)
+      chain.liveId = info.id
+      chain.liveInfo = info
+      chain.scanner = new OutputScanner()
+      if (dest !== undefined) {
+        chain.transcriptPath = dest // the live transcript now lives on the target account's side
+        // The copy still contains the limit error we just detected — since is set to now to exclude it.
+        // Leaving this to applyMeta alone would have it decide "the path has not changed" when the new
+        // account's statusLine reports the same path, and keep the old tail — and that tail is looking at
+        // the old account's file, so it reads nothing.
+        chain.limitTail = this.newLimitTail(chain, dest, this.now())
+        chain.limitTailReadFailWarned = false // a failure on the new path is reported again
+      } else {
+        // 백지 재개 — 새 세션은 다른 대화다. 신원 필드를 비운다: 비우지 않으면 다음 롤이 지금
+        // 일부러 두고 온 이 transcript 를 복사한다("백지 재개에서 반드시 지워야 하는 것" — 계획
+        // 문서). 두 시드 필드도 함께 비운다 — 남겨 두면 이 함수 위쪽의 sessionId/transcriptPath
+        // 폴백이 방금 버린 대화를 되살린다. claudeSessionId·transcriptPath 는 applyMeta 가 새
+        // 세션 자신의 statusLine 이 도착하는 대로 다시 채운다 — 갓 register 된 세션과 같은 경로다.
+        chain.claudeSessionId = null
+        chain.transcriptPath = null
+        chain.limitTail = null
+        chain.resumeSeedSessionId = null
+        chain.resumeSeedTranscriptPath = null
+        this.deps.log(
+          `smart resume — rolled ${oldId} into a blank-slate session ${info.id} account=${target.label}`
+        )
+      }
+      chain.lastOutputAt = this.now()
+      chain.trustSeen = false
+      chain.awaitingReady = true
+      chain.promptKind = smart ? 'briefing' : 'handover'
+      chain.briefingPrompt = smart && briefing ? briefing.prompt : null
+      chain.lastScreen = '' // kill wiped the screen — the old session's dialog must not gate the new one's prompt
+      // The reference point of the replay grace. A new roll has to be able to report its grace again, so
+      // the throttle is released too. The choice watch is dropped — kill removed the old screen, so that
+      // watch has nothing to do with the new session.
+      chain.rolledAt = this.now()
+      chain.replayGraceWarned = false
+      chain.choiceWatchUntil = null
+      chain.choicePending = false // kill wiped the screen — the old list has nothing to do with the new session
+      // The old account's usage must not be used to judge the new one — the replay grace reads this value
+      // to answer "is this account already exhausted", so leaving the 100% of the account we just left
+      // behind would make the grace permanently ineffective.
+      chain.lastUsagePct = null
+      chain.cycle.advanceTo(toIndex)
+      this.chains.set(info.id, chain)
+      this.snap(chain)
+      this.deps.send('session:rolled', { oldSessionId: oldId, info })
+      // A re-publish that reattaches the banner to the new sessionId — not a new switch, so Slack does not announce it
+      this.pushState(chain, 'switching', { accountLabel: target.label, reattach: true })
+      this.deps.log(`rolled ${oldId} → ${info.id} account=${target.label}`)
+      if (chain.kind === 'chat') {
+        // A chat roll is already finished here, which is why it does not go through scheduleAutoPrompt:
+        //   - no readiness poll. That poll exists to find the moment a pty has a prompt line to type
+        //     into; this prompt left with the spawn and the chat manager sends it once the protocol
+        //     handshake is done, so there is nothing to wait for and nothing to time out into 'stalled'.
+        //   - no trust dialog. That is a screen a fresh `claude` draws in a terminal, and the auto-accept
+        //     only ever runs inside this same window.
+        //   - the cooldown is over. awaitingReady holds off limit detection while a `--resume` replays
+        //     the old conversation — including the very limit phrase that caused this roll — onto the new
+        //     session's screen. A chat process replays nothing: it reports what happens from now on, so
+        //     the first rejection it reports is a new one. (The separate 60-second replay grace still
+        //     refuses one that arrives inside it, because that grace is keyed off the roll rather than
+        //     off this flag; an account that is already exhausted is then caught the way it is on a pty
+        //     roll, by the transcript tail on the 15-second tick — see inReplayGrace.)
+        // What is not shared is the healthy timer. A pty chain arms it here and declares itself healthy
+        // 60 seconds later if no limit was detected; a chat chain declares health off the first turn
+        // that completes without a rejection instead (spec §14.6), because the protocol says outright
+        // when a turn ran. So the two flags that carry that evidence start this arrival clean — no turn
+        // of the old session's, and no rejection of it, may be read as this account's. The status the
+        // edge is measured from starts clean with them (Ruling 4d-6) — the new session has run no turn
+        // yet, so its first non-idle status is a turn beginning — and so does the shared-clear valve
+        // (Ruling 4d-7): this is an arrival, which is exactly what re-opens it.
+        chain.chatTurnDone = false
+        chain.chatLimitInTurn = false
+        chain.chatPrevStatus = 'idle'
+        chain.chatValveSpent = false
+        chain.awaitingReady = false
+        this.pushState(chain, 'none')
+      } else {
+        // The briefing built above is passed down so sendPrompt does not ask resumeText a second time
+        // (Step 4) — undefined on the ordinary path, where sendPrompt keeps asking for itself as before.
+        this.scheduleAutoPrompt(chain, smart ? briefing?.prompt : undefined)
+      }
+    } catch (err) {
+      this.deps.log(`roll failed: ${err instanceof Error ? err.message : String(err)}`)
+      // **The state published here can be optimistic.** If the throw landed between the kill and the
+      // re-key, this 'waiting' — and the resume the timer eventually fires — is addressed to a session
+      // id that no longer exists; 'none' was the more honest state for that one window. The session was
+      // already lost at that point and that fatality is pre-existing, not something the reschedule adds.
+      // It is deliberately not distinguished: a flag saying "the kill already happened" would have to be
+      // threaded through the whole kill→spawn→re-key sequence to be correct, and a wrong flag would
+      // silence the reschedule on the aborts that need it.
+      this.rescheduleAbortedRoll(chain, 'roll failed')
+    } finally {
+      chain.rolling = false
+    }
+  }
+
+  /** A roll the chain may not make now (S6 R26): looked at again every tick, with no banner, no record
+   *  and no kill, on its own timer so the tick goes on reading the chain meanwhile (R27). Called from
+   *  inside roll(), whose finally clears `rolling` before the timer fires.
+   *
+   *  **The decision is stale by the time the gate opens.** A session sitting at its limit prints nothing,
+   *  so output since the hold began means the process that held the pty resumed it — the roll is dropped
+   *  then, not made: killing a session that is working again is the one thing this must not do. If it is
+   *  still limited, the tail, the phrase or the fallback finds that again. */
+  private requeueRoll(chain: Chain, toIndex: number, why: string): void {
+    if (chain.heldTimer || chain.disposed) return
+    this.deps.log(`roll held — another process holds this pty (${why}) session=${chain.liveId}`)
+    const outputAt = chain.lastOutputAt
+    const fire = (): void => {
+      chain.heldTimer = null
+      if (chain.disposed) return
+      if (!this.acts(chain)) {
+        chain.heldTimer = setTimeout(fire, TICK_MS)
+        return
+      }
+      if (chain.lastOutputAt > outputAt) {
+        this.deps.log(`held roll dropped — the session printed output while held session=${chain.liveId}`)
+        return
+      }
+      void this.roll(chain, toIndex).catch((err) => this.deps.log(`requeued roll failed: ${String(err)}`))
+    }
+    chain.heldTimer = setTimeout(fire, TICK_MS)
+  }
+
+  /** Polls for the ready signal after a respawn (the first statusline record) and then sends the carry-on
+   *  prompt.
+   *
+   *  briefing: the Smart Resume briefing roll() already built (and used to decide the blank-slate
+   *  branch) — undefined on the ordinary path. When present, sendPrompt writes it as-is instead of
+   *  asking resumeText again; asking twice would write the Job worker's spec file twice (resumeText's
+   *  side effect).
+   *
+   *  **The ordinary-path ask passes `tabFallback: false` (F3).** This process was just `--resume`d, so
+   *  it already has the whole conversation — a tab session has nothing left to hand over, and asking
+   *  for one anyway would replace `chain.prompt` (possibly the user's own text from the New Session
+   *  dialog) with a pointer to a briefing file nobody needs. A Job worker's packet refresh is
+   *  unaffected — `tabFallback` only gates the tab-session fallback, not the Job Dispatch lookup. */
+  private scheduleAutoPrompt(chain: Chain, briefing?: string, kind: 'handover' | 'briefing' = 'handover'): void {
+    const liveId = chain.liveId
+    const startedAt = this.now()
+    const sendPrompt = async (): Promise<void> => {
+      if (chain.disposed || chain.liveId !== liveId) return
+      // `kind` 'briefing' is a restore's (carry C-c): the blank slate's briefing was never typed, and it
+      // is asked for as roll()'s smart branch asked — tabFallback true — rather than as the handover a
+      // `--resume`d process gets. The id is the live one now; the old session is gone.
+      const prompt = briefing ?? (await this.resumePromptFor(chain, liveId, 'handover', kind === 'briefing')).prompt
+      if (chain.disposed || chain.liveId !== liveId) return // the across-await state guard
+      this.deps.write(liveId, prompt)
+      const stateSeq = chain.stateSeq // captures the generation at scheduling time — the same place and convention as liveId
+      setTimeout(() => {
+        if (!chain.disposed && chain.liveId === liveId) {
+          this.deps.write(liveId, '\r')
+          // Publishing 'none' is deferred until after Enter is sent — this stops the scheduler's
+          // handleRollState('none') from lifting its suppression and slipping a scheduled command into the
+          // same input line before the prompt is actually submitted. The scheduler-side
+          // do-not-fire-immediately alone leaves a residual chance (~1%) of the ticker happening to run
+          // inside this 150ms window, so it is closed here as well.
+          // A more recent state may have been published by onLimitCandidate or roll() during these 150ms —
+          // for 'waiting' the chain really is waiting, so the banner and the suppression have to stay and
+          // rolling will publish its own terminal state later; for 'switching' the liveId has changed and
+          // the liveId guard above already blocks it. So if the generation has advanced, our 'none' is
+          // stale and publishing is skipped.
+          if (chain.stateSeq === stateSeq) this.pushState(chain, 'none')
+        }
+      }, ENTER_DELAY_MS)
+      chain.awaitingReady = false
+      this.snap(chain)
+      this.deps.log(`auto-prompt sent session=${liveId}`)
+      this.armHealthy(chain)
+    }
+    const tick = async (): Promise<void> => {
+      if (chain.disposed || chain.liveId !== liveId || chain.rolling) return
+      const payload = await this.deps.readStatusPayload(liveId)
+      if (payload) {
+        this.applyMeta(chain, payload)
+        await sendPrompt()
+        return
+      }
+      const elapsed = this.now() - startedAt
+      if (elapsed >= READY_TIMEOUT_MS) {
+        // awaitingReady must be cleared. The flag is a post-switch cooldown, but every path of limit
+        // detection passes through it — onLimit, handleData, limitTailCheck, and the tick's fallback
+        // trigger too, by way of onLimit. Returning without clearing it means this chain never detects a
+        // limit again: quietly, with the state published so the UI looks normal, and with no recovery path
+        // short of closing the session and making a new one.
+        //
+        // The trade-off points one way. Clearing it means, at worst, a resume replay echoing an old limit
+        // phrase and one false-positive re-roll; not clearing it means detection is dead for good. And by
+        // this point 120 seconds have passed, so the replay is most likely already over and even that
+        // false positive is unlikely.
+        chain.awaitingReady = false
+        this.snap(chain)
+        this.deps.log(`auto-prompt timeout session=${liveId}`)
+        // Published as 'stalled' rather than 'none' — auto-resume having finally failed is an event a
+        // person has to see, and 'none' is indistinguishable from normal in the UI. That is exactly what
+        // 'stalled' was introduced for (the machine calls a person instead of repeating the same attempt),
+        // and the Slack path was widened at the same time. The tick returns here without rescheduling, so
+        // it fires only once.
+        this.pushState(chain, 'stalled')
+        return
+      }
+      if (elapsed >= READY_FALLBACK_MS && !chain.trustSeen) {
+        // If statusline never appears and no trust prompt showed either, send the fallback.
+        //
+        // But "we did not recognise a trust prompt" is not "no dialog is up". A dialog we failed to
+        // match swallows the carry-on text and turns the Enter that follows into an arbitrary menu
+        // press — and statusline is absent precisely while a modal holds the screen, so this fallback
+        // is guaranteed to fire in exactly that case. That happened: a folder-trust prompt whose
+        // wording was soft-wrapped went unmatched and the prompt was typed into it.
+        //
+        // So the screen is asked whether anything is waiting. If something is, we keep waiting and let
+        // the 120-second deadline publish 'stalled' — calling a person is the right failure here,
+        // because the alternative is sending input we cannot predict the effect of.
+        if (looksLikeChoicePrompt(chain.lastScreen)) {
+          this.deps.log(
+            `auto-prompt held — unrecognised dialog on screen session=${liveId} tail=${maskLimitPhrase(chain.lastScreen.slice(-400))}`
+          )
+          chain.promptTimer = setTimeout(() => void tick(), READY_POLL_MS)
+          return
+        }
+        // Logged with the screen so a missed dialog is diagnosable next time — a trust prompt that goes
+        // unmatched leaves no record of its own
+        this.deps.log(
+          `auto-prompt fallback — no statusline session=${liveId} tail=${maskLimitPhrase(chain.lastScreen.slice(-400))}`
+        )
+        await sendPrompt()
+        return
+      }
+      chain.promptTimer = setTimeout(() => void tick(), READY_POLL_MS)
+    }
+    chain.promptTimer = setTimeout(() => void tick(), READY_POLL_MS)
+  }
+
+  /** Arms the post-switch healthy timer: no limit detected for 60 seconds after a switch → reset the
+   *  consecutive block count (the timer is cleared if onLimit arrives first).
+   *
+   *  A pty chain arms it once its automatic prompt has gone out (sendPrompt), because that is the moment
+   *  it stops waiting and starts working. A chat chain no longer arms it at all — it has a better answer
+   *  to the same question, the first turn that completes with no rejection in it (spec §14.6). */
+  private armHealthy(chain: Chain): void {
+    chain.healthyTimer = setTimeout(() => {
+      chain.healthyTimer = null
+      this.declareHealthy(chain)
+    }, HEALTHY_MS)
+  }
+
+  /** What the timer above declares, made callable so a chat chain can declare the same thing off a
+   *  completed turn instead (spec §14.6, `tickChain`). It is one function so the two evidences cannot
+   *  drift: what it clears is shared state — the cycle's streak, this chain's record, the registry every
+   *  other chain reads, and the in-place latch.
+   *
+   *  **What the evidence is worth differs by caller, and the pty side is the weaker one.** The timer says
+   *  60 seconds passed with **no limit detected** — not that a turn actually ran (codex's settleInPlace
+   *  is the only other site with that evidence; the claude-side settleInPlace asks a weaker question
+   *  still — whether the statusLine came back). A chat chain's turn is the direct claim.
+   *
+   *  **`clearShared`** is how the once-per-arrival valve is kept (Ruling 4d-7). The pty callers leave it
+   *  at true: each of them fires once per arrival, so they are their own latch. The chat consumption
+   *  site in the tick fires on every clean turn, so it passes false after the first one — the per-chain
+   *  statements below still run each time, only the registry every other chain reads is spared. */
+  private declareHealthy(chain: Chain, clearShared = true): void {
+    chain.cycle.onHealthy()
+    // The only account this says anything about is the current one — the block records of other accounts (a weekly exhaustion, say) are kept
+    chain.recovery[chain.cycle.currentIndex] = null
+    // The shared record goes with it because a false one keeps every other chain off the account until
+    // its recorded reset time passes; the price is that a *true* record another chain wrote inside this
+    // window is erased by a session that has not produced any work of its own yet (blockRegistry.clear).
+    if (clearShared) this.deps.blocks.clear(chain.accountIds[chain.cycle.currentIndex], this.now())
+    // 플래그는 *이전* 계정의 차단 에피소드를 가리킨다. 남겨 두면 새 계정에서의 첫 대기가
+    // 제자리 재개를 건너뛰고 쓸데없이 respawn 한다. codex 쪽도 같은 자리에서 무조건 해제한다.
+    chain.inPlaceUsed = false
+    this.snap(chain)
+  }
+
+  /** The 15-second tick — refreshes session metadata, evaluates the fallback trigger (five_hour or
+   *  seven_day at 100% plus 30 seconds of no output), makes the idle nudge verdict, and runs transcript
+   *  limit detection.
+   *
+   *  tickChain is thrown fire-and-forget per chain — independence between chains is preserved (one chain's
+   *  slow I/O does not delay another's tick). The ordering *within* a chain is enforced by tickChain. */
+  private tick(): void {
+    for (const chain of this.chains.values()) {
+      if (chain.disposed) continue
+      // Above the rolling/waitTimer guard on purpose (ruling 4e-3). A waiting chain still relearns
+      // login state, because the wait's target is re-checked at fire time against **this** set: frozen
+      // for the wait's duration it would miss a target that logged out during the wait — the exact
+      // failure §15 exists to stop — and a chain already in the logged-out reschedule loop would never
+      // see the account come back, since rescheduleAbortedRoll re-arms waitTimer inside its own fire
+      // callback. Nothing else in tickChain may move up here: this call touches only chain.loggedOut,
+      // which no roll in flight reads.
+      void this.refreshLoginState(chain)
+      if (chain.rolling || chain.waitTimer || chain.awaitingReady) continue
+      void this.tickChain(chain)
+    }
+  }
+
+  /** Refreshes `chain.loggedOut` from the login probe. Fire-and-forget from the tick: the verdict is a
+   *  filter, not a gate, so a refresh that lands a tick late costs one attempt at most — the same
+   *  attempt the chain made before this existed. Guarded across the await like every other tick worker:
+   *  a chain disposed or re-keyed while the probes were in flight must not have a stale set written back.
+   *
+   *  **It runs for a waiting chain too** (ruling 4e-3) — see tick(), which calls it above the waitTimer
+   *  guard. That is the only reason resumeAfterWait's check is worth anything: it reads a set refreshed
+   *  within the last tick rather than one frozen when the wait was planned, and it is what lets the
+   *  reschedule loop end when the person logs back in.
+   *
+   *  `loginRefreshing` latches one round at a time. The probes are I/O and the tick is 15 seconds; two
+   *  slow rounds overlapping could otherwise resolve out of order and write an older verdict last. */
+  private async refreshLoginState(chain: Chain): Promise<void> {
+    const probe = this.deps.loginStatus
+    if (!probe || chain.loginRefreshing) return
+    chain.loginRefreshing = true
+    const liveId = chain.liveId
+    try {
+      const pairs = await Promise.all(
+        chain.accountIds.map(async (id) => [id, await probe(id).catch(() => true)] as const)
+      )
+      if (chain.disposed || chain.liveId !== liveId) return
+      const out = new Set(pairs.filter(([, ok]) => !ok).map(([id]) => id))
+      if (out.size !== chain.loggedOut.size || [...out].some((id) => !chain.loggedOut.has(id)))
+        this.deps.log(
+          out.size === 0
+            ? `all accounts logged in session=${chain.liveId}`
+            : `logged-out accounts session=${chain.liveId} ids=${[...out].join(',')}`
+        )
+      chain.loggedOut = out
+    } finally {
+      chain.loginRefreshing = false
+    }
+  }
+
+  /** The processing order for a single chain's tick. It used to throw limitTailCheck (①) and the fallback
+   *  (②) side by side as fire-and-forget — `void limitTailCheck(...); void readStatusPayload(...).then(...)`.
+   *  ① comes first in the text, but since neither is awaited, call order does not guarantee completion
+   *  order. ② reaches onLimit through a single readStatusPayload and an unconditional log, whereas ① has to
+   *  go through real file I/O (open/stat/read/close, jsonlTail.ts) and its own readStatusPayload first — so
+   *  in practice ② almost always started the roll and ① arrived late, was blocked by the chain.rolling
+   *  guard, and ended quietly. The design intent of ① being the primary signal (the one that survives a
+   *  frozen snapshot) was never realised.
+   *
+   *  await pins the order inside a chain: the idle nudge and the fallback are evaluated only after ① has
+   *  completed. Chains remain independent of each other — tick()'s for loop calls each chain's tickChain
+   *  fire-and-forget, so one chain's slow I/O does not hold up another's tick. */
+  private async tickChain(chain: Chain): Promise<void> {
+    // refreshLoginState is deliberately NOT here — it moved up into tick(), above the waitTimer guard
+    // that keeps this method from being called at all for a waiting chain (ruling 4e-3).
+    await this.limitTailCheck(chain) // independent of statusLine — completes ① before the fallback
+    // The across-await state guard — ① may have caught a hit and already started a roll (rolling) or set a
+    // wait (waitTimer). onLimit sets those fields synchronously on that path, so if ① fired we skip the
+    // fallback and the idle nudge here — which is precisely the point of this restructuring.
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return
+    // A chat chain's health evidence (spec §14.6), consumed **here** and not lower down. The rule is
+    // "after this chain's own limit check found nothing", and ① — the transcript tail — is the only
+    // limit check a chat chain has: everything below this line hangs off `readStatusPayload`, which
+    // answers null for a chat session forever, so the method returns two lines further on and anything
+    // placed after that is unreachable for this kind. Reading the tail first is the point of the
+    // ordering: a rejection can be recorded a beat after the status flips back to idle, and a turn that
+    // ended in a limit must not be counted. The guard above has already established that ① did not fire.
+    //
+    // The **shared** clear is passed only on the first clean turn after an arrival (Ruling 4d-7). It is
+    // latched here rather than inside declareHealthy so the pty timer path stays exactly what it was —
+    // that path arms its timer once per arrival and so is its own latch already.
+    //
+    // A quiet chain (S6 R27) skips the health, the nudge and the fallback below, and still reads the
+    // statusline for identity and usage, so it wakes knowing what the process that held the pty learned.
+    const quiet = !this.acts(chain)
+    if (!quiet && chain.kind === 'chat' && chain.chatTurnDone) {
+      chain.chatTurnDone = false
+      this.declareHealthy(chain, !chain.chatValveSpent)
+      chain.chatValveSpent = true
+    }
+    if (!quiet) void this.idleNudgeCheck(chain) // independent of statusLine — does not wait for a payload
+    const payload = await this.deps.readStatusPayload(chain.liveId)
+    if (chain.disposed) return
+    if (!payload) {
+      // A chain with no statusline (a chat session, or one halted where the hook never runs) still moved
+      // its tail offset on this tick; that is what a restore reads, so it is written.
+      this.snap(chain)
+      return
+    }
+    const u = parseStatusLinePayload(payload)
+    // The tail state is read *before* applyMeta. applyMeta creates a fresh limitTail when it first learns
+    // the transcript path, and that object has never had read() called on it while readFailed starts as
+    // false — logging that state would make 'ok' mean "not checked yet" rather than "checked and no hit",
+    // defeating the field's purpose. What the await above completed is the limitTail as it stands at this
+    // moment, so that value is pinned here: if the path was learned for the first time on this tick, ① read
+    // nothing on this tick, and that is exactly what 'none' means.
+    const tailState = chain.limitTail ? (chain.limitTail.readFailed ? 'readFailed' : 'ok') : 'none'
+    this.applyMeta(chain, payload, u)
+    if (!this.acts(chain)) {
+      this.snap(chain)
+      return
+    }
+    const five = u?.session?.usedPercent
+    const seven = u?.weekly?.usedPercent
+    const maxed =
+      (typeof five === 'number' && five >= 100) || (typeof seven === 'number' && seven >= 100)
+    const silent = this.now() - chain.lastOutputAt > FALLBACK_SILENCE_MS
+    // **A silent session is exactly when this snapshot cannot be trusted.** statusLine stops updating
+    // the moment the session halts at an input wait, so its figures freeze at whatever they were before
+    // the limit — and this trigger, which exists to catch a limit no other path saw, was reading that
+    // frozen value and concluding everything was fine.
+    //
+    // Measured 2026-08-30: a session sat at a limit dialog for ten hours and twenty-four minutes. The
+    // phrase path saw no banner (there was none), the transcript recorded no error entry, and this
+    // trigger read a stale snapshot under 100%. All three safety nets were looking at the same dead
+    // information. Asking the account is the one question that answers regardless of session state.
+    //
+    // Only asked when the snapshot has already failed to justify a roll and the session has gone quiet,
+    // so a working session never reaches it; the lookup's own five-minute cache holds the rate down
+    // across the 15-second ticks that do.
+    const queried = silent && !maxed ? await this.readAccountUsage(chain) : null
+    // The across-await guard, for the reason the gate gives above — a roll can finish inside the lookup.
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return
+    const queriedMaxed = queried !== null && queried.percent >= LIMIT_PCT
+    if ((maxed || queriedMaxed) && silent) {
+      // claudeSession and tail exist to measure ①'s (the transcript's) coverage after the fact.
+      // ① (limitTailCheck) was already awaited to completion above, and if ① had caught a hit we would have
+      // returned at the guard — so this log surviving now genuinely guarantees that ① did not catch
+      // anything on this tick (previously only the call order claimed that, not the completion order).
+      // Telling whether that miss was something missed (a record existed but could not be read) or
+      // something not yet there (the record is written a few seconds later) requires knowing which
+      // transcript the chain was watching, and session= is an internal app id from which the transcript
+      // file cannot be found.
+      //   claudeSession — the transcript filename. Cross-reference that file's rate_limit record time
+      //                   against this log's time.
+      //   tail          — the value pinned before applyMeta above (tailState). none means ① had no tail to
+      //                   read on this tick (the path was not learned yet), readFailed means ① was dead,
+      //                   and ok means the read() of this tick, completed by the await above, succeeded
+      //                   with no hit — it cannot be confused with "not checked yet".
+      // The limit phrase is deliberately not included (it stopped a loop in which the log itself became a trigger).
+      // queried= tells the reader which evidence fired. `-` means the snapshot was already at 100%
+      // and no lookup was needed; a number means the snapshot said otherwise and the account overruled
+      // it — the shape of the ten-hour stall.
+      this.deps.log(
+        `fallback trigger (five=${five}, weekly=${seven}, queried=${queried ? `${queried.percent}%` : '-'}, ` +
+          `silent>30s) session=${chain.liveId} ` +
+          `claudeSession=${chain.claudeSessionId ?? 'unknown'} tail=${tailState}`
+      )
+      this.recordRecovery(chain, payload, undefined, undefined, queried)
+      this.onLimit(chain)
+    }
+    this.snap(chain)
+  }
+
+  /** Transcript limit detection. This is the primary signal, independent of the statusLine snapshot —
+   *  that snapshot stops updating once the session halts at an input wait and its usage figures freeze at
+   *  a stale value, whereas the transcript is append-only and cannot freeze. */
+  private async limitTailCheck(chain: Chain): Promise<void> {
+    if (!chain.limitTail) return
+    const hit = await chain.limitTail.read()
+    if (!hit) {
+      // "No hit" and "the read itself failed" are different — the latter is what happens when the learned
+      // path is wrong or becomes inaccessible, and it used to be logged only when there was a hit, so
+      // rolling.log could never report this death (exactly the silent failure shape this line of work set
+      // out to eliminate). A path that fails once keeps failing (unless the file reappears), so it is
+      // recorded once per chain — the same convention as unmappedWarned in codexCoordinator.ts. Filling it in
+      // every 15 seconds would render the log meaningless.
+      if (chain.limitTail.readFailed && !chain.limitTailReadFailWarned) {
+        chain.limitTailReadFailWarned = true
+        this.deps.log(`transcript tail read failed — detection may have stopped session=${chain.liveId}`)
+      }
+      return
+    }
+    // The across-await state guard — a roll may have started or a wait been set while probing
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return
+    // Read past and dropped while quiet (S6 R27, preflight R2): the tail has moved beyond the record, so
+    // this chain does not act on it again at wake — the process that holds the pty answers it now.
+    if (!this.acts(chain)) {
+      this.deps.log(`limit record seen while quiet — the process that holds this pty handles it session=${chain.liveId}`)
+      return
+    }
+    // hit.text (the excerpt of the original) is not put in the log — with source=main that excerpt is the
+    // user-facing limit phrase verbatim. Writing that phrase into the log makes rolling.log itself a new
+    // trigger source: once a real limit fires, the phrase is embedded in this file, and from then on merely
+    // cat-ing, grep-ing, or tail-ing this log (especially inside a rolling session) can re-fire the
+    // terminal scanner and the subagent rule. The source, timestamp, and length are enough for calibration
+    // (which rule actually fired, and whether the excerpt is abnormally long).
+    this.deps.log(
+      `limit detected via transcript source=${hit.source} session=${chain.liveId} ` +
+        `at=${new Date(hit.at).toISOString()} textLen=${hit.text.length}`
+    )
+    const payload = await this.deps.readStatusPayload(chain.liveId)
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return
+    if (!this.acts(chain)) return
+    // hit.at (the record's own timestamp) is passed as the reference time — using this.now() (the moment of
+    // detection) comes after a 15-second tick plus the await above, and would misjudge a record written a
+    // few seconds before its own reset time as "already past" and add a whole day.
+    this.recordRecovery(chain, payload, hit.text, hit.at)
+    this.onLimit(chain)
+  }
+
+  /** Is the limit phrase we just matched an old one echoed back by the replay right after a roll?
+   *
+   *  Being inside the window (REPLAY_GRACE_MS) is not enough on its own — switching to an account that is
+   *  already exhausted and getting a genuine limit straight after the resume does happen (measured: a
+   *  `fallback trigger (five=1, weekly=100)` 45 seconds after a switch), and that case has to re-roll
+   *  immediately. So when the snapshot of the account we have just resumed on is already near the limit,
+   *  it is taken as genuine rather than a replay. The measured value on the false-positive side was the
+   *  opposite — `Usage 0%` right after the resume.
+   *
+   *  The snapshot is filled in within seconds of a roll: the ready polling in scheduleAutoPrompt reads the
+   *  first statusline and hands it to applyMeta, and that value is the answer to "is the new account
+   *  already exhausted". When there is still no value (null) the grace applies — in that case a genuine
+   *  limit is still caught by transcript detection and the fallback trigger on the 15-second tick. */
+  private inReplayGrace(chain: Chain): boolean {
+    if (chain.rolledAt === null || this.now() - chain.rolledAt >= REPLAY_GRACE_MS) return false
+    return !(chain.lastUsagePct !== null && chain.lastUsagePct >= GATE_PCT)
+  }
+
+  /** Is there ground to believe this chain is blocked by a limit — the shared precondition of the idle
+   *  nudge and the reset anchor.
+   *
+   *  Those two are inference paths: with no direct evidence such as a limit phrase or a transcript error,
+   *  they push a prompt into a live PTY on nothing more than "the halt is continuing". Without a gate, a
+   *  perfectly normal session whose user has stepped away becomes a target for intervention — and that is
+   *  an observed incident, not a hypothetical: in a session with no limit detection on record at all, a
+   *  nudge fired 10 minutes after an idle_prompt Notification (which means the turn ended normally and it
+   *  is the user's turn, core/hooks/notification.ts) and resumed work the user had not asked for.
+   *
+   *  This does not contradict the earlier removal of the usage gate from the detection paths. What was
+   *  removed there guarded a path that has direct evidence (handleData, limitTailCheck), and the harm was
+   *  a snapshot frozen at the moment of blocking rejecting a legitimate phrase. Here there is no direct
+   *  evidence at all, so the snapshot is the only ground available — and the same freezing now works in
+   *  our favour: a blocked session's frozen value is the high one from just before the limit, whereas a
+   *  merely idle session's is low.
+   *
+   *  Either of the two is enough:
+   *
+   *    ① A block record on the current account — a history of actually detecting a limit. The combination
+   *       where the snapshot is frozen at a low value rather than just below the limit does occur in
+   *       practice, so ② alone would block that session entirely. The record is cleared by healthyTimer 60
+   *       seconds after a successful switch — that is, it survives only when the roll or the wait failed
+   *       and the session is left stuck.
+   *    ② The last snapshot's usage >= GATE_PCT — for the blind spot where the detection itself was missed.
+   *       That blind spot (a single account that never caught the limit phrase) is the entire reason
+   *       resetAnchorCheck exists, so requiring ① alone would leave that path unable to do its job. */
+  private limitEvidence(chain: Chain): boolean {
+    if (chain.recovery[chain.cycle.currentIndex]) return true
+    return chain.lastUsagePct !== null && chain.lastUsagePct >= GATE_PCT
+  }
+
+  /** The idle nudge verdict. When there has been neither PTY output nor file activity for IDLE_STALL_MS
+   *  after a Notification, the prompt is re-sent once. If the stall continues after that, it publishes
+   *  'stalled' to call a person and intervenes no further in that stall — the machine does not repeat the
+   *  same attempt.
+   *
+   *  Unlike blind spot 3-a (removed), there is no pendingWorkflowCount gate: that one was about isolating a
+   *  "limit stall" whereas this is an "input-wait stall", and pendingWorkflowCount is a conditional field
+   *  recorded only when a background workflow exists, so in this scenario it is always null. A usage gate
+   *  is a different matter and this path does have one — see limitEvidence for why an input-wait stall
+   *  still has to prove it is a limit before anything is sent. */
+  private async idleNudgeCheck(chain: Chain): Promise<void> {
+    if (chain.idleSince === null || chain.idleHandled) return
+    if (!this.acts(chain)) return // quiet (S6 R1): the process that holds the pty nudges, if anyone does
+    const now = this.now()
+    if (now - chain.idleSince < IDLE_STALL_MS) return
+    if (now - chain.lastOutputAt < IDLE_STALL_MS) return
+    if (!this.limitEvidence(chain)) {
+      // No trace of a limit block — this is a normal session whose user stepped away, so we do not
+      // intervene. Tracking of this stall ends here (idleSince = null) so the log does not repeat every 15
+      // seconds. While halted the statusLine does not refresh, so usage cannot climb later and there is
+      // nothing to re-evaluate — if a limit really does arrive, the direct detection paths (handleData,
+      // limitTailCheck) catch it.
+      chain.idleSince = null
+      this.deps.log(
+        `idle stall but no limit evidence (usage=${chain.lastUsagePct ?? 'unknown'}) — no action session=${chain.liveId}`
+      )
+      return
+    }
+    if (!chain.transcriptPath) return
+    if (now - chain.lastBlindProbeAt < BLIND_PROBE_MIN_MS) return // shares the file-tree stat throttle
+    chain.lastBlindProbeAt = now
+    const probed = await this.probeActivity(chain.transcriptPath)
+    if (probed !== null && now - probed < IDLE_STALL_MS) return // a subagent is active
+    // The across-await state guard — a roll may have started or activity resumed while probing
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return
+    if (chain.idleSince === null || chain.idleHandled) return
+    if (!this.acts(chain)) return
+    const nudged = chain.idleNudgedAt !== null
+    if (nudged) {
+      chain.idleHandled = true
+      this.deps.log(`idle stall persists after nudge → stalled session=${chain.liveId}`)
+      this.pushState(chain, 'stalled')
+      return
+    }
+    chain.idleNudgedAt = now
+    chain.idleSince = now // counts another IDLE_STALL_MS until the next verdict
+    this.deps.log(`idle stall → nudge session=${chain.liveId}`)
+    this.pushState(chain, 'nudged')
+    const liveId = chain.liveId
+    const stateSeq = chain.stateSeq // captures the generation at scheduling time
+    const { prompt } = await this.resumePromptFor(chain, liveId, 'update', true)
+    if (chain.disposed || chain.liveId !== liveId) return // the across-await state guard
+    if (!this.acts(chain)) return
+    this.deps.write(liveId, prompt)
+    setTimeout(() => {
+      if (!chain.disposed && chain.liveId === liveId) {
+        this.deps.write(liveId, '\r')
+        // The same pattern as resetAnchorCheck — 'none' has to be published after Enter for the
+        // scheduler's nudged suppression to lift. If a more recent state was published in between, it is skipped.
+        if (chain.stateSeq === stateSeq) this.pushState(chain, 'none')
+      }
+    }, ENTER_DELAY_MS)
+  }
+
+  private refreshMeta(chain: Chain): Promise<void> {
+    return this.deps.readStatusPayload(chain.liveId).then((payload) => {
+      if (payload) this.applyMeta(chain, payload)
+    })
+  }
+
+  /** parsed: if the caller already has a parseStatusLinePayload result, passing it avoids re-parsing.
+   *  Without it (undefined), parsing happens only on the single-account path. */
+  private applyMeta(chain: Chain, payload: unknown, parsed?: SessionUsage | null): void {
+    const meta = extractStatusLineSession(payload)
+    if (meta.sessionId) {
+      // On first learning claudeSessionId (null→value), save the rolling config once — for restoring it after a disable-and-resume
+      if (!chain.claudeSessionId)
+        this.deps.persistConfig?.(meta.sessionId, { accountIds: chain.accountIds, prompt: chain.prompt })
+      if (chain.claudeSessionId !== meta.sessionId) this.deps.onNativeSession?.(chain.liveId, meta.sessionId)
+      chain.claudeSessionId = meta.sessionId
+    }
+    if (meta.transcriptPath) {
+      // Create one when the path has just been settled or there is no tail yet. since is now — entries
+      // before this point were already there before this chain saw them, and in a copy they include the old limit error.
+      if (chain.transcriptPath !== meta.transcriptPath || chain.limitTail === null) {
+        chain.limitTail = this.newLimitTail(chain, meta.transcriptPath, this.now())
+        chain.limitTailReadFailWarned = false // a failure on the new path is reported again
+      }
+      chain.transcriptPath = meta.transcriptPath
+    }
+    const u = parsed !== undefined ? parsed : parseStatusLinePayload(payload)
+    // Refreshes the observed usage — the input of both the limit-evidence gate and the replay grace.
+    // It is updated here rather than on the 15-second tick because the value has to exist right after a
+    // roll for the replay grace to answer "is the new account already exhausted", and what fetches that
+    // first snapshot is not tick but the ready polling in scheduleAutoPrompt (a few seconds after the
+    // roll). When no window is carried at all it is null — treated as no evidence.
+    const pcts = [u?.session?.usedPercent, u?.weekly?.usedPercent].filter(
+      (p): p is number => typeof p === 'number'
+    )
+    chain.lastUsagePct = pcts.length ? Math.max(...pcts) : null
+    // The single-account blind spot (3-b): schedules a retrospective verdict at the snapshot's resets_at
+    if (chain.accountIds.length === 1 && u) this.armResetCheck(chain, u)
+    this.snap(chain)
+  }
+
+  /** A transcript tail that starts at the file's end, and a snapshot once that end is known. The offset
+   *  is null until the constructor's stat lands; writing again then records the real byte rather than
+   *  leaving the null for the next tick to turn into a number (S6 R4). */
+  private newLimitTail(chain: Chain, filePath: string, since: number): ClaudeTranscriptTail {
+    const tail = new ClaudeTranscriptTail(filePath, since)
+    void tail.positioned.then(() => {
+      if (chain.limitTail === tail) this.snap(chain)
+    })
+    return tail
+  }
+
+  /** What this chain is, for another process to carry on (S6 R4). */
+  private snapshotOf(chain: Chain): RollSnapshot {
+    const now = this.now()
+    const blocks: Record<string, BlockRecord> = {}
+    for (const id of chain.accountIds) {
+      const b = this.deps.blocks.get(id, now)
+      if (b) blocks[id] = { ...b }
+    }
+    return {
+      v: ROLL_SNAPSHOT_VERSION,
+      provider: 'claude',
+      // Copies, not the chain's own arrays: the snapshot is handed to the wiring, and neither side may
+      // change the other's by holding on to it (review M3).
+      accountIds: [...chain.accountIds],
+      currentIndex: chain.cycle.currentIndex,
+      streak: chain.cycle.streakCount,
+      recovery: chain.recovery.map((r) => (r ? { ...r } : null)),
+      blocks,
+      wait: chain.waitPlan ? { ...chain.waitPlan } : null,
+      inPlaceUsed: chain.inPlaceUsed,
+      rolledAt: chain.rolledAt,
+      awaitingPrompt: chain.kind !== 'chat' && chain.awaitingReady,
+      claude: {
+        sessionId: chain.claudeSessionId,
+        transcriptPath: chain.transcriptPath,
+        tailOffset: chain.limitTail?.offset ?? null,
+        tailSince: chain.limitTail?.sinceMs ?? null,
+        ...(chain.kind !== 'chat' && chain.awaitingReady && chain.promptKind === 'briefing'
+          ? chain.briefingPrompt !== null
+            ? briefingNote(chain.briefingPrompt)
+            : { promptKind: 'briefing' as const }
+          : {})
+      },
+      writtenAt: now
+    }
+  }
+
+  /** Writes the snapshot when something a restore reads changed. Never throws: a note that could not be
+   *  written costs a takeover its freshness, never a roll. */
+  private snap(chain: Chain): void {
+    const write = this.deps.snapshot
+    if (!write || chain.disposed) return
+    const s = this.snapshotOf(chain)
+    const key = snapshotKey(s)
+    if (key === chain.snapKey) return
+    chain.snapKey = key
+    try {
+      write(chain.liveId, s)
+    } catch (err) {
+      this.deps.log(`snapshot write failed session=${chain.liveId}: ${String(err)}`)
+    }
+  }
+
+  /** Schedules the verdict timer at the earliest future resets_at (+GRACE). The same time is not
+   *  rescheduled. After the verdict, resets_at is in the past and nothing is scheduled — it is rescheduled
+   *  when the next window's snapshot arrives. */
+  private armResetCheck(chain: Chain, u: SessionUsage): void {
+    const now = this.now()
+    const cands = [u.session?.resetsAt, u.weekly?.resetsAt]
+      .map((s) => (s ? Date.parse(s) : NaN))
+      .filter((t) => Number.isFinite(t) && t > now)
+    if (!cands.length) return
+    const at = Math.min(...cands)
+    if (chain.resetCheckAt === at) return
+    if (chain.resetTimer) clearTimeout(chain.resetTimer)
+    chain.resetCheckAt = at
+    chain.resetTimer = setTimeout(
+      () => {
+        chain.resetTimer = null
+        void this.resetAnchorCheck(chain, at)
+      },
+      at + RESET_GRACE_MS - now
+    )
+  }
+
+  /** The retrospective reset-anchor verdict: ① activity resumed after the reset → self-recovered, no
+   *  intervention. ② nothing pending → simply idle, no intervention. ③ anything else = a limit stall plus a
+   *  failed self-recovery → send only a prompt to the live PTY (no kill, no resume, no transcript copy — non-destructive). */
+  private async resetAnchorCheck(chain: Chain, resetAt: number): Promise<void> {
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return
+    if (!this.acts(chain)) return // quiet (S6 R1)
+    if (!chain.transcriptPath) return
+    if (!this.limitEvidence(chain)) {
+      // This path fires on reaching the reset time and nothing else. With no trace of a limit block that
+      // time means nothing, and all that is left is pushing a prompt into a session whose user stepped
+      // away. The timer is one-shot, so simply returning here is enough — armResetCheck schedules it again
+      // when the next window's snapshot arrives.
+      this.deps.log(
+        `reset-anchor: no limit evidence (usage=${chain.lastUsagePct ?? 'unknown'}) — no action session=${chain.liveId}`
+      )
+      return
+    }
+    const probed = await this.probeActivity(chain.transcriptPath)
+    const lastActivity = Math.max(chain.lastOutputAt, probed ?? 0)
+    if (lastActivity >= resetAt) {
+      this.deps.log(`reset-anchor: activity resumed — no action session=${chain.liveId}`)
+      return
+    }
+    const pending = await this.readPending(chain.transcriptPath)
+    if (!pending || pending < 1) {
+      this.deps.log(`reset-anchor: idle session (pending=${pending}) — no action session=${chain.liveId}`)
+      return
+    }
+    if (chain.disposed || chain.rolling || chain.waitTimer || chain.awaitingReady) return // the across-await state guard
+    if (!this.acts(chain)) return
+    this.deps.log(`reset-anchor: limit stall + no self-recovery → nudge session=${chain.liveId}`)
+    this.pushState(chain, 'nudged') // a momentary event for the Slack notification — the renderer leaves it out of the banner
+    const liveId = chain.liveId
+    const stateSeq = chain.stateSeq // captures the generation at scheduling time — the same place and convention as liveId
+    const { prompt } = await this.resumePromptFor(chain, liveId, 'update', true)
+    if (chain.disposed || chain.liveId !== liveId) return // the across-await state guard
+    if (!this.acts(chain)) return
+    this.deps.write(liveId, prompt)
+    setTimeout(() => {
+      if (!chain.disposed && chain.liveId === liveId) {
+        this.deps.write(liveId, '\r')
+        // The same pattern as sendPrompt — 'none' is published after Enter is sent so that the scheduler's
+        // handleRollState('none') cannot lift its suppression and slip a scheduled command into the same
+        // input line before the prompt is actually submitted. nudged is now suppressed in scheduler.ts as
+        // well, which makes this 'none' the only signal that lifts that suppression — without it the
+        // suppression latches permanently.
+        // As in sendPrompt, if a more recent state ('waiting' or 'switching') was published in between the
+        // generation has advanced — in which case our 'none' is stale and is skipped.
+        if (chain.stateSeq === stateSeq) this.pushState(chain, 'none')
+      }
+    }, ENTER_DELAY_MS)
+  }
+
+  private pushState(
+    chain: Chain,
+    state: RollStateEvent['state'],
+    extra?: Partial<RollStateEvent>
+  ): void {
+    chain.stateSeq++ // the generation advances on every publication — the basis for deciding whether a deferred publication is stale
+    const payload: RollStateEvent = { sessionId: chain.liveId, state, ...extra }
+    // The lasting states are what a late-mounting renderer has to be able to read back; the momentary
+    // ones (nudged/stalled) the renderer never keeps as a banner, so they must not overwrite the last
+    // lasting one either. 'none' clears it.
+    if (state === 'none') chain.lastState = null
+    else if (state !== 'nudged' && state !== 'stalled') chain.lastState = payload
+    this.deps.send('session:rollState', payload)
+  }
+
+  private disposeChain(chain: Chain): void {
+    if (chain.disposed) return
+    chain.disposed = true
+    for (const t of [chain.waitTimer, chain.healthyTimer, chain.promptTimer, chain.trustTimer, chain.resetTimer, chain.heldTimer])
+      if (t) clearTimeout(t)
+    this.chains.delete(chain.liveId)
+    this.pushState(chain, 'none')
+    this.deps.log(`chain disposed session=${chain.liveId}`)
+    if (this.chains.size === 0 && this.ticker) {
+      clearInterval(this.ticker)
+      this.ticker = null
+    }
+  }
+
+  private ensureTicker(): void {
+    if (!this.ticker) this.ticker = setInterval(() => this.tick(), TICK_MS)
+  }
+}

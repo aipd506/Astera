@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { reattachSessions } from './reattach'
+import { PtyRegistry, type RegistryPty } from '../../host/registry'
+import { createHostExits, ptyHeldBy } from '../../host/exits'
+import { EXIT_DEFER_MS } from '../../core/orchestration/exec/exitOwner'
 import type { PtyEntry } from '../../core/host/protocol'
 import type { PtyLike } from '../../core/sessions/pty'
 import type { ProcLike } from '../../core/sessions/proc'
@@ -232,9 +235,179 @@ describe('reattachSessions — line processes', () => {
     const h = deps({ list: async () => [], listProcs: async () => [procEntry({ alive: false })] })
     expect(await reattachSessions(h.d as never)).toEqual({ adopted: 0, refused: 0, sessions: [], chats: [] })
   })
+  // Review Focus 2.
+  it('defers a chat proc the Host is still starting: neither adopted nor killed, and counted as live', async () => {
+    const chat = vi.fn(() => true)
+    const h = deps({
+      list: async () => [],
+      listProcs: async () => [{ id: 'p9', pid: 1, alive: true, meta: { kind: 'chat', id: 'c9', restore: { hostStarting: true } } }],
+      deferProc: (e: PtyEntry) => e.meta?.restore.hostStarting === true
+    })
+    h.d.adopters.chat = chat
+    const r = await reattachSessions(h.d as never)
+    expect(chat).not.toHaveBeenCalled()
+    expect(h.killedProcs).toEqual([])
+    expect(h.attachedProcs).toEqual([]) // no proc-attach: the Host stays the writer through its handshake
+    expect(r.chats).toEqual(['c9'])
+    expect(r.refused).toBe(0)
+  })
+  // Final review I1: the app is a chat proc's writer once its proc-attach is out, so the carry-on the
+  // Host left goes after it, and only for an adopted proc.
+  it('calls afterAttachProc right after the proc-attach of an adopted chat proc, and for no other', async () => {
+    const order: string[] = []
+    const h = deps({
+      list: async () => [],
+      listProcs: async () => [
+        { id: 'p1', pid: 1, alive: true, meta: { kind: 'chat', id: 'c1', restore: {} } },
+        { id: 'p2', pid: 2, alive: true, meta: { kind: 'chat', id: 'c2', restore: { hostStarting: true } } },
+        { id: 'p3', pid: 3, alive: true, meta: { kind: 'chat', id: 'c3', restore: { unreadable: true } } }
+      ],
+      sendAttachProc: (id: string) => { order.push(`attach ${id}`) },
+      deferProc: (e: PtyEntry) => e.meta?.restore.hostStarting === true,
+      afterAttachProc: (e: PtyEntry) => { order.push(`after ${e.meta?.id}`) }
+    })
+    h.d.adopters.chat = (a: { restore: Record<string, unknown> }) => a.restore.unreadable !== true
+    await reattachSessions(h.d as never)
+    expect(order).toEqual(['attach p1', 'after c1'])
+  })
+  it('onlyProc takes back that one line process and lists no pty', async () => {
+    const list = vi.fn(async () => [entry()])
+    const chat = vi.fn((_a: { id: string }) => true)
+    const h = deps({
+      list,
+      listProcs: async () => [
+        { id: 'p1', pid: 1, alive: true, meta: { kind: 'chat', id: 'c1', restore: {} } },
+        { id: 'p2', pid: 2, alive: true, meta: { kind: 'chat', id: 'c2', restore: {} } },
+        { id: 'p3', pid: 3, alive: true, meta: null }
+      ],
+      onlyProc: 'p2'
+    })
+    h.d.adopters.chat = chat
+    const r = await reattachSessions(h.d as never)
+    expect(list).not.toHaveBeenCalled()
+    expect(chat.mock.calls.map((c) => c[0].id)).toEqual(['c2'])
+    expect(h.killedProcs).toEqual([]) // p3 is not this sweep's
+    expect(r).toEqual({ adopted: 1, refused: 0, sessions: [], chats: ['c2'] })
+  })
   it('without listProcs there is no proc sweep', async () => {
     const h = deps({ list: async () => [] })
     delete (h.d as { listProcs?: unknown }).listProcs
     expect((await reattachSessions(h.d as never)).chats).toEqual([])
+  })
+})
+
+// Host S2 design §2.3: a `pty-opened` names one entry, and the sweep it starts takes back that one.
+describe('reattachSessions — only the entry a pty-opened named', () => {
+  const sessionEntry = (id: string, sessionId: string, over: Partial<PtyEntry> = {}): PtyEntry =>
+    entry({ id, meta: { kind: 'session', id: sessionId, restore: { accountId: 'a', cwd: 'D:/p', title: 't' } }, ...over })
+
+  it('with `only`, adopts that one entry and leaves every other entry alone', async () => {
+    const adopted: string[] = []
+    const h = deps({
+      list: async () => [sessionEntry('p1', 'ses_1'), sessionEntry('p2', 'ses_2'), { id: 'p3', pid: 3, meta: null, alive: true }],
+      only: 'p2',
+      adopters: { ...deps().d.adopters, session: (a: { id: string }) => { adopted.push(a.id); return true } }
+    })
+    const r = await reattachSessions(h.d as never)
+    expect(adopted).toEqual(['ses_2'])
+    expect(h.killed).toEqual([]) // p3 has no note and is still not killed: it is not this sweep's
+    expect(h.attached).toEqual(['p2', 'sent:p2'])
+    expect(r).toEqual({ adopted: 1, refused: 0, sessions: ['ses_2'], chats: [] })
+  })
+  // §2.3: a pty-opened arriving while a sweep already adopted the same pty.
+  it('with `only`, does not adopt again an entry the app already holds live', async () => {
+    const adopted: string[] = []
+    const h = deps({
+      list: async () => [sessionEntry('p1', 'ses_1')],
+      only: 'p1',
+      heldLive: () => true,
+      adopters: { ...deps().d.adopters, session: (a: { id: string }) => { adopted.push(a.id); return true } }
+    })
+    await reattachSessions(h.d as never)
+    expect(adopted).toEqual([])
+    expect(h.attached).toEqual([])
+  })
+  it('with `only`, skips an entry that has already exited', async () => {
+    const h = deps({ list: async () => [sessionEntry('p1', 'ses_1', { alive: false })], only: 'p1' })
+    expect(await reattachSessions(h.d as never)).toEqual({ adopted: 0, refused: 0, sessions: [], chats: [] })
+    expect(h.adopted).toEqual([])
+    expect(h.killed).toEqual([])
+  })
+  it('with `only`, does not list line processes', async () => {
+    const listProcs = vi.fn(async () => [procEntry()])
+    const h = deps({ list: async () => [sessionEntry('p1', 'ses_1')], only: 'p1', listProcs })
+    const r = await reattachSessions(h.d as never)
+    expect(listProcs).not.toHaveBeenCalled()
+    expect(r.chats).toEqual([])
+  })
+})
+
+// Task 14, carried from Task 12's rules: after the app adopts a Host-spawned session, exactly one side
+// handles its exit. The Host's exit owner and the app's sweep are wired to each other here the way
+// the socket wires them: every `pty-attach` the sweep sends reaches `heldBy` through `ptyHeldBy`.
+describe('reattachSessions — who handles the exit of a session the Host opened', () => {
+  const hostWithOneSession = () => {
+    let exitPty: (code: number) => void = () => {}
+    const registry = new PtyRegistry({
+      spawn: (): RegistryPty => ({
+        pid: 7, onData: () => {}, onExit: (cb) => { exitPty = (code) => cb({ exitCode: code }) },
+        write: () => {}, resize: () => {}, kill: () => {}, pause: () => {}, resume: () => {}
+      }),
+      log: () => {}
+    })
+    const hostHandled: string[] = []
+    const exits = createHostExits({
+      registry,
+      sessionExited: async (e) => { hostHandled.push(e.sessionId) },
+      orphanedSessions: () => [],
+      log: () => {}
+    })
+    const r = registry.open({ id: 'p_host', file: 'claude', args: [], opts: { cwd: 'D:/p', cols: 80, rows: 24, env: {} }, meta: { kind: 'session', id: 'ses_host', restore: {} } })
+    if (!r.ok) throw new Error(r.error)
+    const APP_SOCKET = 3
+    /** The app's sweep limited to the pty the push named, over the Host's real list. */
+    const adopt = (onAppExit: (code: number) => void) =>
+      reattachSessions({
+        ...deps().d,
+        list: async () => registry.list(),
+        only: 'p_host',
+        attach: () => ({ ...pty(), onExit: (cb: (e: { exitCode: number }) => void) => { const prev = exitPty; exitPty = (code) => { prev(code); cb({ exitCode: code }) } } }),
+        sendAttach: (id: string) => {
+          const held = ptyHeldBy({ t: 'pty-attach', id }, { greeted: true })
+          if (held !== null) exits.heldBy(held, APP_SOCKET)
+        },
+        adopters: { ...deps().d.adopters, session: (a: { pty: PtyLike }) => { a.pty.onExit((e) => onAppExit(e.exitCode)); return true } }
+      })
+    return { exits, hostHandled, adopt, exit: (code: number) => exitPty(code) }
+  }
+
+  it("after adoption the exit is the app's alone: the Host leaves it", async () => {
+    vi.useFakeTimers()
+    try {
+      const h = hostWithOneSession()
+      const appHandled: number[] = []
+      await h.adopt((code) => appHandled.push(code))
+      h.exit(1)
+      await vi.advanceTimersByTimeAsync(EXIT_DEFER_MS)
+      expect(appHandled).toEqual([1])
+      expect(h.hostHandled).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+  it("an exit before adoption is the Host's alone: the sweep then finds it ended and adopts nothing", async () => {
+    vi.useFakeTimers()
+    try {
+      const h = hostWithOneSession()
+      h.exit(1)
+      const appHandled: number[] = []
+      const r = await h.adopt((code) => appHandled.push(code))
+      await vi.advanceTimersByTimeAsync(EXIT_DEFER_MS)
+      expect(r.adopted).toBe(0)
+      expect(appHandled).toEqual([])
+      expect(h.hostHandled).toEqual(['ses_host'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

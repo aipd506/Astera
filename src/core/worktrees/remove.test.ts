@@ -253,3 +253,176 @@ describe('removeWorktree', () => {
     expect(existsSync(info.path)).toBe(true)
   })
 })
+
+// 폴더가 있는지는 비동기로, 시간 제한을 두고 묻는다(presence.ts). 동기 existsSync 는 끊긴 네트워크
+// 공유에서 20~60초 동안 메인 스레드나 Host 스레드를 세웠다. 그리고 **확인하지 못한 것은 없는 것이
+// 아니다** — 시간 초과나 모르는 답으로는 레지스트리 항목도 폴더도 지우지 않는다.
+describe('removeWorktree, 폴더 확인이 답하지 못할 때', () => {
+  const unreachable = async (): Promise<'unreachable'> => 'unreachable'
+  const refused = async (): Promise<'refused'> => 'refused'
+
+  it('원본 저장소를 읽지 못하고 폴더 확인도 시간 초과면 레지스트리 항목을 남기고 거절한다', async () => {
+    const wt = path.join(reg.getRoot(), 'somerepo', 'x')
+    const info = {
+      id: 'dead-share', repoPath: path.join(reg.getRoot(), 'no-such-repo'), path: wt,
+      name: 'x', branch: 'u/x', baseRef: 'main', createdAt: new Date().toISOString()
+    }
+    await reg.add(info)
+    await expect(
+      removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse, presence: unreachable })
+    ).rejects.toThrow(/WORKTREE_UNREACHABLE/)
+    expect(reg.get(info.id)).not.toBeNull()
+  })
+
+  it('원본 저장소를 읽지 못해도 폴더가 없다고 확인되면 레지스트리 항목만 정리한다', async () => {
+    const info = {
+      id: 'gone-both', repoPath: path.join(reg.getRoot(), 'no-such-repo'), path: path.join(reg.getRoot(), 'r', 'y'),
+      name: 'y', branch: 'u/y', baseRef: 'main', createdAt: new Date().toISOString()
+    }
+    await reg.add(info)
+    const r = await removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse, presence: async () => 'missing' })
+    expect(r.removed).toBe(true)
+    expect(reg.get(info.id)).toBeNull()
+  })
+
+  it('git 이 잊은 폴더라도 확인이 거절되면(refused) force 여도 지우지 않는다', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'orphan-dead', registry: reg })
+    await fs.rm(path.join(repo, '.git', 'worktrees', path.basename(info.path)), { recursive: true, force: true })
+    await expect(
+      removeWorktree({ id: info.id, force: true, registry: reg, isPathInUse: noUse, presence: refused })
+    ).rejects.toThrow(/WORKTREE_UNREACHABLE/)
+    expect(existsSync(info.path)).toBe(true)
+    expect(reg.get(info.id)).not.toBeNull()
+  })
+
+  it('git 에 등록된 워크트리라도 폴더 확인이 시간 초과면 청결 검사 없이 지우지 않는다', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'live-dead', registry: reg })
+    await expect(
+      removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse, presence: unreachable })
+    ).rejects.toThrow(/WORKTREE_UNREACHABLE/)
+    expect(existsSync(info.path)).toBe(true)
+    expect(reg.get(info.id)).not.toBeNull()
+    expect(await localBranchExists(repo, info.branch)).toBe(true)
+  })
+
+  it('폴더가 없다고 확인되면 git 에 등록된 워크트리도 청결 검사 없이 정리한다', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'live-gone', registry: reg })
+    await fs.rm(info.path, { recursive: true, force: true })
+    const seen: string[] = []
+    const r = await removeWorktree({
+      id: info.id, registry: reg, isPathInUse: noUse,
+      presence: async (p) => { seen.push(p); return 'missing' }
+    })
+    expect(r.removed).toBe(true)
+    expect(seen).toEqual([info.path])
+    expect(reg.get(info.id)).toBeNull()
+  })
+})
+
+describe('removeWorktree, a refused check', () => {
+  it('is asked again, not taken as unreachable', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'refused-once', registry: reg })
+    let n = 0
+    const r = await removeWorktree({
+      id: info.id, registry: reg, isPathInUse: noUse,
+      presence: async () => (++n === 1 ? 'refused' : 'present')
+    })
+    expect(r.removed).toBe(true)
+    expect(existsSync(info.path)).toBe(false)
+  })
+})
+
+// Stage 2 final review, C1: before git removes the folder its links are taken out (detachLinks.ts). When
+// that walk cannot finish, git is not run on the folder at all and nothing is removed.
+describe('removeWorktree, the links are taken out first', () => {
+  it('a failed link walk removes nothing and says so (LINKS_UNVERIFIED)', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'walkfail', registry: reg })
+    for (const force of [false, true]) {
+      await expect(
+        removeWorktree({
+          id: info.id, force, registry: reg, isPathInUse: noUse,
+          detach: async () => ({ ok: false, reason: 'timeout' })
+        })
+      ).rejects.toThrow(/LINKS_UNVERIFIED/)
+      expect(existsSync(path.join(info.path, 'f.txt'))).toBe(true)
+      expect(reg.get(info.id)).not.toBeNull()
+      expect(await localBranchExists(repo, info.branch)).toBe(true)
+      expect(gitIn(repo, ['worktree', 'list', '--porcelain'])).toContain('walkfail')
+    }
+  })
+
+  it('walks the folder it removes; without force git\'s tracked symlinks are spared, with force nothing is', async () => {
+    const seen: Array<{ root: string; spares: boolean }> = []
+    const detach = async (root: string, opts: { keep?: (rel: string) => boolean }) => {
+      seen.push({ root, spares: opts.keep !== undefined })
+      return { ok: true as const, unlinked: 0 }
+    }
+    const a = await createWorktree({ repoPath: repo, name: 'walk-a', registry: reg })
+    await removeWorktree({ id: a.info.id, registry: reg, isPathInUse: noUse, detach })
+    const b = await createWorktree({ repoPath: repo, name: 'walk-b', registry: reg })
+    await removeWorktree({ id: b.info.id, force: true, registry: reg, isPathInUse: noUse, detach })
+    expect(seen).toEqual([
+      { root: a.info.path, spares: true },
+      { root: b.info.path, spares: false }
+    ])
+  })
+})
+
+describe('removeWorktree without force, with a tracked symlink', () => {
+  it('spares git\'s own symlink, so the clean worktree is still removed', async (ctx) => {
+    gitIn(repo, ['config', 'core.symlinks', 'true'])
+    await fs.mkdir(path.join(repo, 'dir'))
+    await fs.writeFile(path.join(repo, 'dir', 'x.txt'), 'x', 'utf8')
+    try {
+      await fs.symlink('dir', path.join(repo, 'alias'), 'dir')
+    } catch {
+      ctx.skip('symlinks cannot be made here')
+    }
+    gitIn(repo, ['add', 'dir', 'alias'])
+    gitIn(repo, ['commit', '-m', 'tracked link'])
+    const { info } = await createWorktree({ repoPath: repo, name: 'tracked-link', registry: reg })
+    if (!(await fs.lstat(path.join(info.path, 'alias'))).isSymbolicLink()) ctx.skip('git checked the link out as a file')
+    const r = await removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse })
+    expect(r.removed).toBe(true)
+    expect(existsSync(info.path)).toBe(false)
+  })
+})
+
+// Re-review minor: without force, a locked worktree or one with submodules is refused by git anyway.
+// It is refused before the link walk, so its node_modules links are not taken out for nothing.
+describe('removeWorktree without force, refused before the link walk', () => {
+  const walkSpy = () => {
+    const walked: string[] = []
+    const detach = async (root: string) => {
+      walked.push(root)
+      return { ok: true as const, unlinked: 0 }
+    }
+    return { walked, detach }
+  }
+
+  it('a locked worktree: WORKTREE_LOCKED, no walk, nothing removed', async () => {
+    const { info } = await createWorktree({ repoPath: repo, name: 'locked', registry: reg })
+    gitIn(repo, ['worktree', 'lock', info.path])
+    const { walked, detach } = walkSpy()
+    await expect(removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse, detach })).rejects.toThrow(
+      /WORKTREE_LOCKED/
+    )
+    expect(walked).toEqual([])
+    expect(existsSync(path.join(info.path, 'f.txt'))).toBe(true)
+    expect(reg.get(info.id)).not.toBeNull()
+  })
+
+  it('a worktree with a submodule: HAS_SUBMODULES, no walk, nothing removed', async () => {
+    const sub = await makeRepo('astera-wt-rm-sub-')
+    gitIn(repo, ['-c', 'protocol.file.allow=always', 'submodule', 'add', sub, 'sub'])
+    gitIn(repo, ['commit', '-m', 'add submodule'])
+    const { info } = await createWorktree({ repoPath: repo, name: 'withsub', registry: reg })
+    const { walked, detach } = walkSpy()
+    await expect(removeWorktree({ id: info.id, registry: reg, isPathInUse: noUse, detach })).rejects.toThrow(
+      /HAS_SUBMODULES/
+    )
+    expect(walked).toEqual([])
+    expect(existsSync(path.join(info.path, 'f.txt'))).toBe(true)
+    expect(reg.get(info.id)).not.toBeNull()
+  })
+})

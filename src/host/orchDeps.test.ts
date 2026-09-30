@@ -1,0 +1,1357 @@
+import { describe, it, expect, vi } from 'vitest'
+import { hostOrchDeps } from './orchDeps'
+import type { HostLocal } from './spawner'
+import type { HostChecks } from './checks'
+import { RepairNeeded } from '../core/settings/repairNeeded'
+import { HostRetiring } from '../core/host/hostRetiring'
+import { AppUnreachable } from '../core/host/orchProtocol'
+import os from 'node:os'
+import path from 'node:path'
+import { PtyRegistry } from './registry'
+import { ProcRegistry } from './procRegistry'
+import { registrySessions } from './sessions'
+import { encodeUserTurn } from '../core/chat/claudeProtocol'
+import type { ChatPrompt } from '../core/sessions/chatRead'
+import { emptyState } from '../core/orchestration/state'
+
+const base = (over: Partial<Parameters<typeof hostOrchDeps>[0]> = {}): Parameters<typeof hostOrchDeps>[0] => ({
+  getState: () => ({}) as never,
+  setState: async () => {},
+  now: () => 'T',
+  runningSessions: () => 0,
+  appVersion: () => '0.0.0',
+  backup: async () => {},
+  act: vi.fn(),
+  hasApp: () => true,
+  log: () => {},
+  onAppRequired: () => {},
+  readAccounts: vi.fn().mockResolvedValue([]),
+  readRunConfigs: vi.fn().mockResolvedValue([]),
+  sessions: { listSessions: async () => [], readSession: async () => ({ cols: 80, rows: 24, screen: [], scrollback: [] }), sendSession: async () => {}, readChat: async () => [], sendChat: async () => {}, serial: (_id, run) => run() },
+  ...over
+})
+
+describe('hostOrchDeps', () => {
+  // 상태는 Host 안에서 끝나고, 행동은 앱으로 나간다.
+  it('행동 의존은 앱으로 나가는 호출이다', async () => {
+    const act = vi.fn().mockResolvedValue({ sessionId: 's1', cwd: 'D:/p', specPath: 'D:/p/s.md' })
+    const deps = hostOrchDeps(base({ act }))
+    await deps.startWorker({ dispatchId: 'd1' } as never)
+    // 인자는 언제나 배열째 간다 — 받는 쪽은 언제나 펼친다(F21).
+    expect(act).toHaveBeenCalledWith('startWorker', [{ dispatchId: 'd1' }])
+  })
+
+  // 앱이 없으면 그 자리에서 거절해야 한다. 기다리게 두면 워커가 영영 멈춘다.
+  it('앱이 없으면 APP_REQUIRED 로 거절한다', async () => {
+    const deps = hostOrchDeps(base({ hasApp: () => false }))
+    await expect(deps.startWorker({} as never)).rejects.toThrow(/APP_REQUIRED/)
+  })
+
+  // Host 가 스스로 아는 것은 나가지 않는다 — `status` 와 `version` 은 앱이 없어도 답해야 하고,
+  // 그것이 사람이 가장 먼저 해 보는 일이다.
+  it('세션 수와 버전은 앱에 묻지 않는다', async () => {
+    const act = vi.fn()
+    const deps = hostOrchDeps(base({ act, hasApp: () => false, runningSessions: () => 3, appVersion: () => '1.2.3' }))
+    expect(deps.runningSessions?.()).toBe(3)
+    expect(deps.appVersion?.()).toBe('1.2.3')
+    expect(act).not.toHaveBeenCalled()
+  })
+
+  /**
+   * **인자는 하나여도 배열로 간다**(F21). "하나면 그것만" 규칙은 `removeWorktrees(paths)` 처럼
+   * 인자 하나가 그 자체로 배열인 경우를 두 인자짜리 호출과 바이트 단위로 같게 만든다 — 받는 쪽이
+   * 둘을 구별할 방법이 없다. 규칙 하나, 이름별 표 없음.
+   */
+  it('인자 하나가 배열이어도 두 인자와 섞이지 않는다', async () => {
+    const act = vi.fn().mockResolvedValue({ failed: [] })
+    const deps = hostOrchDeps(base({ act }))
+    await deps.removeWorktrees?.(['D:/wt1', 'D:/wt2'])
+    expect(act).toHaveBeenCalledWith('removeWorktrees', [['D:/wt1', 'D:/wt2']])
+    await deps.mergeWorktrees?.('D:/p', ['D:/wt1'])
+    expect(act).toHaveBeenLastCalledWith('mergeWorktrees', ['D:/p', ['D:/wt1']])
+  })
+
+  it('인자가 없는 의존은 빈 배열로 간다', async () => {
+    const act = vi.fn().mockResolvedValue([])
+    const deps = hostOrchDeps(base({ act }))
+    await deps.listAccounts()
+    expect(act).toHaveBeenCalledWith('listAccounts', [])
+  })
+
+  // 파일은 Host 의 것이다. 앱이 대신 복사하면 CLI 가 방금 쓴 것보다 한 커밋 옛 상태가 담길 수 있다.
+  it('reset 의 백업은 앱에 묻지 않는다', async () => {
+    const act = vi.fn()
+    const backup = vi.fn().mockResolvedValue(undefined)
+    const deps = hostOrchDeps(base({ act, backup, hasApp: () => false }))
+    await deps.backup?.()
+    expect(backup).toHaveBeenCalled()
+    expect(act).not.toHaveBeenCalled()
+  })
+
+  /**
+   * **아무도 안 받는 거절을 남기지 않는다.**
+   *
+   * `unregisterRolling` 은 `(sessionId): void` 이고 호출부 둘 다 결과를 버린다(command.ts 의
+   * dispatch-abandon, 그리고 worker_done 두 경로의 dropRollingChain). 이것을 async 로 감싸면 앱이
+   * 없을 때 아무도 붙잡지 않은 거부 약속이 남고, Host 에는 unhandledRejection 처리기가 없어서
+   * Node 의 기본 동작이 프로세스를 — 그 Host 가 들고 있는 모든 터미널과 함께 — 내린다.
+   */
+  it('결과를 안 받는 의존은 앱이 없어도 약속을 남기지 않는다', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (e: unknown): void => {
+      unhandled.push(e)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const logs: string[] = []
+      const deps = hostOrchDeps(base({ hasApp: () => false, log: (m) => logs.push(m) }))
+      // 반환값 자체가 약속이면 이미 틀렸다 — 호출부는 그것을 버린다.
+      expect(deps.unregisterRolling?.('s1')).toBeUndefined()
+      await new Promise((r) => setTimeout(r, 30))
+      expect(unhandled).toEqual([])
+      // 삼키되 말은 남긴다 — 앱이 없으면 걷을 롤링 등록도 없지만, 조용히 넘어가면 안 된다.
+      expect(logs.some((l) => l.includes('unregisterRolling') && l.includes('APP_REQUIRED'))).toBe(true)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  it('결과를 안 받는 의존은 앱이 실패로 답해도 약속을 남기지 않는다', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (e: unknown): void => {
+      unhandled.push(e)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const logs: string[] = []
+      const deps = hostOrchDeps(
+        base({ act: vi.fn().mockRejectedValue(new Error('the app went away')), log: (m) => logs.push(m) })
+      )
+      expect(deps.unregisterRolling?.('s1')).toBeUndefined()
+      await new Promise((r) => setTimeout(r, 30))
+      expect(unhandled).toEqual([])
+      expect(logs.some((l) => l.includes('unregisterRolling') && l.includes('the app went away'))).toBe(true)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  // 앱이 없어 거절한 것과, 앱이 답을 안 해 거절한 것은 같은 사실이다 — 둘 다 "지금은 못 한다".
+  it('앱이 도중에 닿지 않게 되면 그것도 앱 문제로 알린다', async () => {
+    const refused: string[] = []
+    const deps = hostOrchDeps(
+      base({
+        act: vi.fn().mockRejectedValue(new AppUnreachable('did not answer in time')),
+        onAppRequired: (name) => refused.push(name)
+      })
+    )
+    await expect(deps.readWorker({ dispatchId: 'd1' })).rejects.toThrow(/did not answer/)
+    expect(refused).toEqual(['readWorker'])
+  })
+
+  // 앱이 답한 실패는 그 행동의 실패다 — 채널 문제가 아니므로 CONFLICT 로 바뀌면 안 된다.
+  it('앱이 답한 실패는 앱 문제로 세지 않는다', async () => {
+    const refused: string[] = []
+    const deps = hostOrchDeps(
+      base({ act: vi.fn().mockRejectedValue(new Error('no account')), onAppRequired: (name) => refused.push(name) })
+    )
+    await expect(deps.readWorker({ dispatchId: 'd1' })).rejects.toThrow(/no account/)
+    expect(refused).toEqual([])
+  })
+
+  /**
+   * **계정 목록은 앱이 없으면 프로필의 accounts.json 이 답한다**(CLI phase C, 수정 1회차). 앱만이
+   * 그 파일을 쓰므로 앱이 없으면 쓰는 쪽이 없고, 파일이 앱이 마지막으로 남긴 말이다. 앱이 있으면
+   * 앱의 메모리가 정본이다 — 잠깐 디스크보다 앞설 수 있다.
+   */
+  describe('listAccounts — 앱이 없으면 파일', () => {
+    const acc = [{ id: 'acc1', label: '일', provider: 'claude' as const }]
+
+    it('앱이 없으면 파일을 읽고, 앱 문제로 표시하지 않는다', async () => {
+      const refused: string[] = []
+      const act = vi.fn()
+      const readAccounts = vi.fn().mockResolvedValue(acc)
+      const deps = hostOrchDeps(
+        base({ hasApp: () => false, act, readAccounts, onAppRequired: (n) => refused.push(n) })
+      )
+      expect(await deps.listAccounts('claude')).toEqual(acc)
+      expect(readAccounts).toHaveBeenCalledWith('claude')
+      expect(act).not.toHaveBeenCalled()
+      expect(refused).toEqual([])
+    })
+
+    it('앱이 있으면 앱에 묻고 파일은 읽지 않는다', async () => {
+      const act = vi.fn().mockResolvedValue(acc)
+      const readAccounts = vi.fn()
+      const deps = hostOrchDeps(base({ act, readAccounts }))
+      expect(await deps.listAccounts()).toEqual(acc)
+      expect(act).toHaveBeenCalledWith('listAccounts', [])
+      expect(readAccounts).not.toHaveBeenCalled()
+    })
+
+    // 못 묻는 것은 한 조건이다 — 앱이 없는 것과 도중에 답하지 않는 것은 같은 사실이다.
+    it('앱이 도중에 닿지 않으면 파일로 답하고 로그를 남긴다', async () => {
+      const logs: string[] = []
+      const refused: string[] = []
+      const readAccounts = vi.fn().mockResolvedValue(acc)
+      const deps = hostOrchDeps(
+        base({
+          act: vi.fn().mockRejectedValue(new AppUnreachable('did not answer in time')),
+          readAccounts,
+          log: (m) => logs.push(m),
+          onAppRequired: (n) => refused.push(n)
+        })
+      )
+      expect(await deps.listAccounts('codex')).toEqual(acc)
+      expect(readAccounts).toHaveBeenCalledWith('codex')
+      expect(refused).toEqual([])
+      expect(logs.some((l) => l.includes('listAccounts') && l.includes('accounts.json'))).toBe(true)
+    })
+
+    // 앱이 답한 실패는 그 행동의 실패다 — 파일로 덮지 않는다.
+    it('앱이 답한 실패는 파일로 덮지 않는다', async () => {
+      const readAccounts = vi.fn()
+      const deps = hostOrchDeps(base({ act: vi.fn().mockRejectedValue(new Error('boom')), readAccounts }))
+      await expect(deps.listAccounts()).rejects.toThrow(/boom/)
+      expect(readAccounts).not.toHaveBeenCalled()
+    })
+
+    // 파일이 깨졌으면 "지금은 못 한다" 가 참이다 — 6 으로, 고치는 방법을 말하며.
+    it('파일을 못 읽으면 앱 문제로 표시하고 고치는 말을 싣는다', async () => {
+      const refused: string[] = []
+      const deps = hostOrchDeps(
+        base({
+          hasApp: () => false,
+          readAccounts: vi.fn().mockRejectedValue(new Error('accounts.json could not be read; open Astera to repair it')),
+          onAppRequired: (n) => refused.push(n)
+        })
+      )
+      const err = await Promise.resolve(deps.listAccounts()).then(
+        () => null,
+        (e: unknown) => e
+      )
+      expect(err).toBeInstanceOf(AppUnreachable)
+      expect(String(err)).toMatch(/open Astera to repair it/)
+      expect(refused).toEqual(['listAccounts'])
+    })
+  })
+
+  /**
+   * **실행 구성도 앱이 없으면 프로필의 run-configs.json 과 그 폴더가 답한다**(CLI phase D). 계정과
+   * 같은 갈래다: 앱이 있으면 앱이 정본이고, 없으면 파일이 앱이 마지막으로 남긴 말이다.
+   */
+  describe('listRunConfigs — 앱이 없으면 파일', () => {
+    const cfgs = [{ id: 'cfg1', name: 'test', type: 'npm' }]
+
+    it('앱이 없으면 파일을 읽고, 앱 문제로 표시하지 않는다', async () => {
+      const refused: string[] = []
+      const logs: string[] = []
+      const act = vi.fn()
+      const readRunConfigs = vi.fn().mockResolvedValue(cfgs)
+      const deps = hostOrchDeps(
+        base({ hasApp: () => false, act, readRunConfigs, log: (m) => logs.push(m), onAppRequired: (n) => refused.push(n) })
+      )
+      expect(await deps.listRunConfigs?.('D:/p')).toEqual(cfgs)
+      expect(readRunConfigs).toHaveBeenCalledWith('D:/p')
+      expect(act).not.toHaveBeenCalled()
+      expect(refused).toEqual([])
+      expect(logs.some((l) => l.includes('listRunConfigs') && l.includes('run-configs.json'))).toBe(true)
+    })
+
+    it('앱이 있으면 앱에 묻고 파일은 읽지 않는다', async () => {
+      const act = vi.fn().mockResolvedValue(cfgs)
+      const readRunConfigs = vi.fn()
+      const deps = hostOrchDeps(base({ act, readRunConfigs }))
+      expect(await deps.listRunConfigs?.('D:/p')).toEqual(cfgs)
+      expect(act).toHaveBeenCalledWith('listRunConfigs', ['D:/p'])
+      expect(readRunConfigs).not.toHaveBeenCalled()
+    })
+
+    it('파일을 못 읽으면 앱 문제로 표시하고 고치는 말을 싣는다', async () => {
+      const refused: string[] = []
+      const deps = hostOrchDeps(
+        base({
+          hasApp: () => false,
+          readRunConfigs: vi.fn().mockRejectedValue(new Error('run-configs.json is not valid JSON; open Astera to repair it')),
+          onAppRequired: (n) => refused.push(n)
+        })
+      )
+      const err = await Promise.resolve(deps.listRunConfigs?.('D:/p')).then(
+        () => null,
+        (e: unknown) => e
+      )
+      expect(err).toBeInstanceOf(AppUnreachable)
+      expect(String(err)).toMatch(/run-configs\.json .*open Astera to repair it/)
+      expect(refused).toEqual(['listRunConfigs'])
+    })
+  })
+
+  /**
+   * **세션은 Host 가 제 레지스트리로 답한다 — 앱이 붙어 있어도**(CLI phase C, `astera sessions`).
+   * pty 를 쥐고 있는 것이 Host 이므로 앱에 물을 까닭이 없고, 앱이 닫혀 있어도 답해야 한다.
+   * 다만 `sendSession` 은 세션에 글자를 친다 — 두 번 치면 두 번 쳐진다. 그래서 영수증의 "움직였다"
+   * 표시를 남긴다(onEffect), 앱으로 나가는 행동이 act 깔때기에서 남기는 것과 같은 표시다.
+   */
+  describe('sessions — Host 가 스스로 답한다', () => {
+    const fake = () => ({
+      listSessions: vi.fn(async () => [
+        { id: 's1', kind: 'terminal' as const, title: 't', accountId: 'a', cwd: 'D:/p', alive: true, state: 'waiting' as const }
+      ]),
+      readSession: vi.fn(async () => ({ cols: 80, rows: 24, screen: ['screen'], scrollback: [] })),
+      sendSession: vi.fn(async () => {}),
+      readChat: vi.fn(async () => []),
+      sendChat: vi.fn(async () => {}),
+      serial: <T,>(_id: string, run: () => Promise<T>) => run()
+    })
+
+    it('앱이 없어도 앱에 묻지 않고 답하며, 앱 문제로 표시하지 않는다', async () => {
+      const sessions = fake()
+      const act = vi.fn()
+      const refused: string[] = []
+      const deps = hostOrchDeps(base({ sessions, act, hasApp: () => false, onAppRequired: (n) => refused.push(n) }))
+      expect(await deps.listSessions?.()).toEqual([
+        { id: 's1', kind: 'terminal', title: 't', accountId: 'a', cwd: 'D:/p', alive: true, state: 'waiting' }
+      ])
+      expect((await deps.readSession?.('s1', 200))?.screen).toEqual(['screen'])
+      await deps.sendSession?.('s1', 'echo hi', true)
+      expect(sessions.sendSession).toHaveBeenCalledWith('s1', 'echo hi', true)
+      expect(act).not.toHaveBeenCalled()
+      expect(refused).toEqual([])
+    })
+
+    it('앱이 있어도 앱에 묻지 않는다', async () => {
+      const sessions = fake()
+      const act = vi.fn()
+      const deps = hostOrchDeps(base({ sessions, act }))
+      await deps.listSessions?.()
+      await deps.readSession?.('s1', 200)
+      await deps.sendSession?.('s1', 'x', true)
+      expect(act).not.toHaveBeenCalled()
+    })
+
+    it('치는 것만 움직인 것으로 센다 — 읽기와 목록은 아니다', async () => {
+      let n = 0
+      const deps = hostOrchDeps(base({ sessions: fake(), onEffect: () => n++ }))
+      await deps.listSessions?.()
+      await deps.readSession?.('s1', 200)
+      expect(n).toBe(0)
+      await deps.sendSession?.('s1', 'x', true)
+      expect(n).toBe(1)
+    })
+  })
+
+  /**
+   * **대화 세션은 둘로 갈린다**(CLI phase D4). 읽기는 Host 가 파일에서 한다 — 앱이 있어도. 열린 카드는
+   * 앱만 알고, 물을 수 없으면 모른다고(undefined) 답한다. 치기는 앱이 있으면 앱의 세션 드라이버로,
+   * 없으면 Host 가 어댑터의 바이트를 직접 쓴다. 두 길 모두 "움직였다" 이고, 세션마다 한 번에 하나다.
+   *
+   * 진짜 레지스트리 위에서 — 가짜 줄 프로세스가 받은 줄을 센다.
+   */
+  describe('대화 세션 — 읽기는 Host, 카드는 앱, 치기는 앱이 있으면 앱', () => {
+    const chatHost = (restore: Record<string, unknown> = { provider: 'claude', threadId: 'th' }) => {
+      const written: string[] = []
+      const procs = new ProcRegistry({
+        spawn: () => ({
+          pid: 7,
+          onData: () => {},
+          onExit: () => {},
+          write: (d: string) => {
+            written.push(d)
+          },
+          kill: () => {}
+        }),
+        log: () => {}
+      })
+      procs.open({
+        id: 'proc-1',
+        file: 'claude',
+        args: [],
+        opts: { cwd: 'D:/p', env: {} },
+        meta: { kind: 'chat', id: 'chat-1', restore: { accountId: 'acc', cwd: 'D:/p', ...restore } }
+      })
+      const ptys = new PtyRegistry({ spawn: () => { throw new Error('no ptys') }, log: () => {} })
+      const sessions = registrySessions({ ptys, procs, hookEventsDir: path.join(os.tmpdir(), 'astera-orchdeps-no-hooks'), accounts: async () => [] })
+      return { written, sessions }
+    }
+
+    it('카드는 앱이 있으면 앱에 묻고, 없으면 모른다(undefined) — 앱 문제로 표시하지 않는다', async () => {
+      const act = vi.fn().mockResolvedValue({ kind: 'approval', summary: 'Bash: npm test' })
+      const refused: string[] = []
+      const withApp = hostOrchDeps(base({ act, onAppRequired: (n) => refused.push(n) }))
+      expect(await withApp.chatPending?.('chat-1')).toEqual({ kind: 'approval', summary: 'Bash: npm test' })
+      expect(act).toHaveBeenCalledWith('chatPending', ['chat-1'])
+      const act2 = vi.fn()
+      const noApp = hostOrchDeps(base({ act: act2, hasApp: () => false, onAppRequired: (n) => refused.push(n) }))
+      expect(await noApp.chatPending?.('chat-1')).toBeUndefined()
+      expect(act2).not.toHaveBeenCalled()
+      const gone = hostOrchDeps(base({ act: vi.fn().mockRejectedValue(new AppUnreachable('APP_REQUIRED: gone')) }))
+      expect(await gone.chatPending?.('chat-1')).toBeUndefined()
+      expect(refused).toEqual([])
+    })
+
+    it('읽기는 앱이 있어도 Host 가 한다', async () => {
+      const act = vi.fn()
+      const readChat = vi.fn(async () => [{ role: 'user' as const, text: 'hi', tools: [] }])
+      const deps = hostOrchDeps(base({ act, sessions: { ...base().sessions, readChat } }))
+      expect(await deps.readChat?.('chat-1', 20)).toEqual([{ role: 'user', text: 'hi', tools: [] }])
+      expect(readChat).toHaveBeenCalledWith('chat-1', 20)
+      expect(act).not.toHaveBeenCalled()
+    })
+
+    /** 앱의 두 답을 이름으로 가른다: 카드(chatPending)와 치기(chatSend). */
+    const appAnswers = (pending: unknown, sent: unknown = { sent: true }) =>
+      vi.fn(async (name: string) => (name === 'chatPending' ? pending : sent))
+
+    it('앱이 있으면 치기는 앱으로 간다 — 카드를 먼저 묻고, Host 는 아무것도 쓰지 않는다', async () => {
+      const { written, sessions } = chatHost()
+      const act = appAnswers(null)
+      let acted = 0
+      const deps = hostOrchDeps(base({ act, sessions, onEffect: () => acted++ }))
+      expect(await deps.chatSend?.('chat-1', '다음')).toEqual({ sent: true })
+      expect(act.mock.calls).toEqual([
+        ['chatPending', ['chat-1']],
+        ['chatSend', ['chat-1', '다음']]
+      ])
+      expect(written).toEqual([])
+      expect(acted).toBe(1)
+    })
+
+    // **거절은 움직인 것이 아니다**(I1). 카드는 치기 전에 물으므로, 카드 때문에 돌아선 호출은 영수증을
+    // 남기지 않는다 — 카드에 답한 뒤 같은 요청 id 로 다시 치면 이번엔 간다.
+    it('카드가 열려 있으면 치기를 묻지도 않고 돌아선다 — 움직인 것이 아니다', async () => {
+      const { written, sessions } = chatHost()
+      const act = appAnswers({ kind: 'question', summary: '어느 쪽?' })
+      let acted = 0
+      const deps = hostOrchDeps(base({ act, sessions, onEffect: () => acted++ }))
+      expect(await deps.chatSend?.('chat-1', 'x')).toEqual({ sent: false, pending: { kind: 'question', summary: '어느 쪽?' } })
+      expect(act.mock.calls).toEqual([['chatPending', ['chat-1']]])
+      expect(written).toEqual([])
+      expect(acted).toBe(0)
+    })
+
+    // 앱이 붙어 있는데 그 세션을 아직 쥐지 않았다(되찾는 중) — 카드를 모른다(undefined). 치지 않고,
+    // 움직인 것도 아니다(M2). Host 도 쓰지 않는다: 앱이 붙어 있는 동안 쓰는 것은 앱뿐이다.
+    it('앱이 그 세션을 모르면 치지 않고 돌아선다 — 움직인 것도, Host 가 쓰는 것도 아니다', async () => {
+      const { written, sessions } = chatHost()
+      const act = appAnswers(undefined)
+      let acted = 0
+      const deps = hostOrchDeps(base({ act, sessions, onEffect: () => acted++ }))
+      expect(await deps.chatSend?.('chat-1', 'x')).toEqual({ sent: false, reason: 'not-held' })
+      expect(act.mock.calls).toEqual([['chatPending', ['chat-1']]])
+      expect([written, acted]).toEqual([[], 0])
+    })
+
+    // 카드를 묻다 앱이 사라졌다 — 아무것도 보내지 않았으므로 역시 움직인 것이 아니다.
+    it('카드를 묻지 못했으면 치지 않고 돌아선다', async () => {
+      const { written, sessions } = chatHost()
+      let acted = 0
+      const deps = hostOrchDeps(
+        base({ act: vi.fn().mockRejectedValue(new AppUnreachable('APP_REQUIRED: gone')), sessions, onEffect: () => acted++ })
+      )
+      expect(await deps.chatSend?.('chat-1', 'x')).toEqual({ sent: false, reason: 'not-held' })
+      expect([written, acted]).toEqual([[], 0])
+    })
+
+    // 드물게 두 호출 사이에 카드가 열리면 앱의 처리기가 막는다(뒷받침). 그때는 이미 물었으므로 움직인
+    // 것으로 센다 — 검토가 받아들인 경합이다.
+    it('앱이 치기 자리에서 카드로 거절한 답도 그대로 돌아온다', async () => {
+      const { written, sessions } = chatHost()
+      const refusal = { sent: false, pending: { kind: 'question', summary: '어느 쪽?' } }
+      const deps = hostOrchDeps(base({ act: appAnswers(null, refusal), sessions }))
+      expect(await deps.chatSend?.('chat-1', 'x')).toEqual(refusal)
+      expect(written).toEqual([])
+    })
+
+    it('앱이 없으면 Host 가 어댑터의 바이트를 쓴다 — Claude 는 encodeUserTurn 한 줄', async () => {
+      const { written, sessions } = chatHost()
+      const act = vi.fn()
+      let acted = 0
+      const refused: string[] = []
+      const deps = hostOrchDeps(base({ act, sessions, hasApp: () => false, onEffect: () => acted++, onAppRequired: (n) => refused.push(n) }))
+      expect(await deps.chatSend?.('chat-1', '다음')).toEqual({ sent: true })
+      expect(written).toEqual([encodeUserTurn('다음') + '\n'])
+      expect(act).not.toHaveBeenCalled()
+      expect(acted).toBe(1)
+      expect(refused).toEqual([])
+    })
+
+    // 스레드가 아직 없는 Codex 는 Host 가 turn/start 를 쓸 곳이 없다 — 앱이 있어야 한다는 거절이다.
+    it('앱이 없는데 Host 도 쓸 수 없으면 앱이 필요하다는 거절이다', async () => {
+      const { written, sessions } = chatHost({ provider: 'codex' })
+      const refused: string[] = []
+      const deps = hostOrchDeps(base({ sessions, hasApp: () => false, onAppRequired: (n) => refused.push(n) }))
+      const err = await deps.chatSend?.('chat-1', 'x').catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(AppUnreachable)
+      expect(String(err)).toMatch(/no Codex thread yet/)
+      expect(refused).toEqual(['chatSend'])
+      expect(written).toEqual([])
+    })
+
+    // 스레드가 없어 Host 가 쓰지 못한 것은 움직인 것이 아니다(I1) — 스레드가 생긴 뒤 같은 id 로 다시 치면 간다.
+    it('Host 가 쓰지 못한 거절은 움직인 것이 아니다', async () => {
+      const { sessions } = chatHost({ provider: 'codex' })
+      let acted = 0
+      const deps = hostOrchDeps(base({ sessions, hasApp: () => false, onEffect: () => acted++ }))
+      await expect(deps.chatSend?.('chat-1', 'x')).rejects.toThrow(/no Codex thread yet/)
+      expect(acted).toBe(0)
+    })
+
+    // **앱이 도중에 사라진 것은 "앱이 없다" 와 다르다.** 앱이 이미 보냈을 수 있다 — Host 가 이어서 쓰면
+    // 같은 턴이 두 번 간다. 그래서 거절하고, 쓰지 않는다.
+    it('앱이 치기에 답하지 못했으면 Host 가 대신 쓰지 않고 거절한다', async () => {
+      const { written, sessions } = chatHost()
+      const refused: string[] = []
+      let acted = 0
+      const act = vi.fn(async (name: string) => {
+        if (name === 'chatPending') return null
+        throw new AppUnreachable('APP_REQUIRED: gone')
+      })
+      const deps = hostOrchDeps(base({ act, sessions, onEffect: () => acted++, onAppRequired: (n) => refused.push(n) }))
+      await expect(deps.chatSend?.('chat-1', 'x')).rejects.toBeInstanceOf(AppUnreachable)
+      expect(written).toEqual([])
+      expect(refused).toEqual(['chatSend'])
+      expect(acted).toBe(1)
+    })
+
+    // 세션마다 한 번에 하나 — 앱으로 가는 길도. 먼저 친 것이 끝나야 다음 것을 묻는다.
+    it('세션마다 차례대로 — 앞의 것이 끝나야 다음 것이 앱에 간다', async () => {
+      const { sessions } = chatHost()
+      let release: () => void = () => {}
+      let held = false
+      const act = vi.fn(async (name: string) => {
+        if (name === 'chatPending') return null
+        if (!held) {
+          held = true
+          return new Promise((r) => (release = () => r({ sent: true })))
+        }
+        return { sent: true }
+      })
+      const deps = hostOrchDeps(base({ act, sessions }))
+      const a = deps.chatSend?.('chat-1', 'a')
+      const b = deps.chatSend?.('chat-1', 'b')
+      await new Promise((r) => setTimeout(r, 10))
+      expect(act.mock.calls.filter((c) => c[0] === 'chatSend')).toEqual([['chatSend', ['chat-1', 'a']]])
+      release()
+      await Promise.all([a, b])
+      expect(act.mock.calls.filter((c) => c[0] === 'chatSend')).toEqual([
+        ['chatSend', ['chat-1', 'a']],
+        ['chatSend', ['chat-1', 'b']]
+      ])
+    })
+
+    // 앱이 없을 때 카드를 모르는 것은 평소 일이다 — 읽을 때마다 로그에 남기지 않는다(M1). 앱이 붙어 있는데
+    // 답을 못 한 것만 남긴다.
+    it('앱이 없어 카드를 못 묻는 것은 로그에 남기지 않는다 — 앱이 답하지 못한 것만 남긴다', async () => {
+      const logs: string[] = []
+      await hostOrchDeps(base({ hasApp: () => false, log: (m) => logs.push(m) })).chatPending?.('chat-1')
+      expect(logs).toEqual([])
+      await hostOrchDeps(
+        base({ act: vi.fn().mockRejectedValue(new AppUnreachable('APP_REQUIRED: gone')), log: (m) => logs.push(m) })
+      ).chatPending?.('chat-1')
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toMatch(/chatPending could not be asked/)
+    })
+
+    it('앱이 없을 때도 차례대로 쓴다', async () => {
+      const { written, sessions } = chatHost()
+      const deps = hostOrchDeps(base({ sessions, hasApp: () => false }))
+      await Promise.all([deps.chatSend?.('chat-1', 'a'), deps.chatSend?.('chat-1', 'b'), deps.chatSend?.('chat-1', 'c')])
+      expect(written).toEqual(['a', 'b', 'c'].map((t) => encodeUserTurn(t) + '\n'))
+    })
+  })
+
+  // 명령 층이 이미 쓰고 있는 deps.log 가 Host 의 로그로 나간다 — 안 이으면 한도 탐침이 못 돈 것
+  // 같은 성능 저하가 아무 흔적 없이 지나간다.
+  it('명령 층의 로그가 Host 로 이어진다', () => {
+    const logs: string[] = []
+    hostOrchDeps(base({ log: (m) => logs.push(m) })).log?.('무언가')
+    expect(logs).toEqual(['무언가'])
+  })
+
+  /**
+   * **세 갈래가 한 분류다.** 어느 의존이 상태 코드를 정하는지는 그 거절을 명령 층이 어떻게
+   * 다루느냐로 갈린다 — 삼키는 것이 답을 정하면, 그 뒤에 제 이유로 실패한 명령이 "앱이 없다"로
+   * 둔갑한다(F25).
+   */
+  describe('거절이 답을 정하는가', () => {
+    it('전달되는 의존의 거절만 앱 문제로 표시된다', async () => {
+      const refused: string[] = []
+      const deps = hostOrchDeps(base({ hasApp: () => false, onAppRequired: (n) => refused.push(n) }))
+      await expect(deps.startWorker({} as never)).rejects.toThrow(/APP_REQUIRED/)
+      await expect(deps.readWorker({ dispatchId: 'd1' })).rejects.toThrow(/APP_REQUIRED/)
+      expect(refused).toEqual(['startWorker', 'readWorker'])
+    })
+
+    it('명령 층이 삼키는 의존은 거절해도 앱 문제로 표시하지 않는다', async () => {
+      const refused: string[] = []
+      const deps = hostOrchDeps(base({ hasApp: () => false, onAppRequired: (n) => refused.push(n) }))
+      // 셋 다 거절은 한다 — 그 거절을 부르는 쪽이 잡아 로그하고 계속 간다.
+      await expect(deps.probeLimit?.({} as never)).rejects.toThrow(/APP_REQUIRED/)
+      await expect(deps.resolveProjectRoot?.('D:/p')).rejects.toThrow(/APP_REQUIRED/)
+      await expect(deps.readReviewFile?.('D:/p/s.md.review.json')).rejects.toThrow(/APP_REQUIRED/)
+      expect(refused).toEqual([])
+    })
+
+    // 거절하면 검토자의 판정이 아무 데도 안 남는다. null 은 이 의존이 이미 가진 말이고, 그때
+    // 순수 층이 Gate 를 연다는 것도 선언에 적혀 있다(F28).
+    it('물어볼 수 없는 repair 대상은 null 로 내려앉는다 — 던지지 않는다', async () => {
+      const refused: string[] = []
+      const logs: string[] = []
+      const deps = hostOrchDeps(
+        base({ hasApp: () => false, onAppRequired: (n) => refused.push(n), log: (m) => logs.push(m) })
+      )
+      await expect(deps.repairTargetFor?.('t1')).resolves.toBeNull()
+      expect(refused).toEqual([])
+      expect(logs.some((l) => l.includes('repairTargetFor') && l.includes('APP_REQUIRED'))).toBe(true)
+    })
+
+    // gate-resolve 는 Gate 해제를 먼저 커밋한 뒤에 이것을 부른다 — 거절하면 이미 일어난 일이
+    // 실패로 보고된다. 이 의존은 실패를 값으로 말할 줄 알고, 그 값에 이유가 실린다(F29).
+    it('물어볼 수 없는 retry-once 는 이유를 실은 실패 값으로 내려앉는다', async () => {
+      const refused: string[] = []
+      const logs: string[] = []
+      const deps = hostOrchDeps(
+        base({ hasApp: () => false, onAppRequired: (n) => refused.push(n), log: (m) => logs.push(m) })
+      )
+      await expect(deps.repairOnce?.({ taskId: 't1' })).resolves.toEqual({
+        ok: false,
+        error: 'APP_REQUIRED: repairOnce needs the Astera app running'
+      })
+      expect(refused).toEqual([])
+      expect(logs.some((l) => l.includes('repairOnce') && l.includes('APP_REQUIRED'))).toBe(true)
+    })
+
+    // 앱이 없는 것과 앱이 답을 안 하는 것은 부르는 쪽에게 같은 사실이다 — 하나의 조건이다.
+    it('앱이 답하지 못해도 같은 값으로 내려앉는다', async () => {
+      const logs: string[] = []
+      const deps = hostOrchDeps(
+        base({ act: vi.fn().mockRejectedValue(new AppUnreachable('did not answer in time')), log: (m) => logs.push(m) })
+      )
+      await expect(deps.repairTargetFor?.('t1')).resolves.toBeNull()
+      expect(logs.some((l) => l.includes('did not answer in time'))).toBe(true)
+    })
+
+    // 앱이 **답한** 실패는 물어보지 못한 것이 아니다 — 그것까지 삼키면 진짜 고장이 조용해진다.
+    it('앱이 답한 실패는 내려앉지 않고 그대로 던진다', async () => {
+      const deps = hostOrchDeps(base({ act: vi.fn().mockRejectedValue(new Error('repair.ts threw')) }))
+      await expect(deps.repairTargetFor?.('t1')).rejects.toThrow(/repair.ts threw/)
+    })
+
+    it('결과를 안 받는 의존은 던지지도, 앱 문제로 표시하지도 않는다', () => {
+      const refused: string[] = []
+      const logs: string[] = []
+      const deps = hostOrchDeps(
+        base({ hasApp: () => false, onAppRequired: (n) => refused.push(n), log: (m) => logs.push(m) })
+      )
+      expect(deps.startValidation?.({ taskId: 't1', cwd: 'D:/p' })).toBeUndefined()
+      expect(deps.startReview?.({ taskId: 't1' })).toBeUndefined()
+      expect(deps.startRepair?.({ dispatchId: 'd1' })).toBeUndefined()
+      expect(deps.onDispatchLost?.({ dispatchId: 'd1' })).toBeUndefined()
+      expect(refused).toEqual([])
+      expect(logs).toHaveLength(4)
+    })
+
+    // 이 넷이 **있다는 것 자체**가 applyWorkerDone 의 canValidate·canReview 를 참으로 만든다
+    // (command.ts 의 `!!deps.startValidation`). 없으면 Task 는 검증도 검토도 없이 completed 로
+    // 간다 — Host 로 돈 Job 이 수렴하지 않던 이유다.
+    it('검증·검토·수리 의존이 실제로 주입된다', () => {
+      const deps = hostOrchDeps(base())
+      for (const name of ['startValidation', 'startReview', 'startRepair', 'onDispatchLost', 'repairTargetFor'] as const)
+        expect(typeof deps[name]).toBe('function')
+    })
+  })
+
+  /**
+   * === 무엇이 "움직였다" 인가 (요청 영수증 설계 §3) ===
+   *
+   * 영수증은 명령이 커밋했거나, **상태 밖의 무언가를 바꾸는 의존을 불렀을 때** 남는다. 뒤의 절반이
+   * 여기서 정해진다 — 세 래퍼가 모두 하나의 `act` 깔때기로 모이므로, 의존이 전달되면서 이 줄을 지나지
+   * 않을 방법이 없다.
+   */
+  describe('상태 밖을 바꾸는 의존', () => {
+    const marked = (over: Partial<Parameters<typeof hostOrchDeps>[0]> = {}): { deps: ReturnType<typeof hostOrchDeps>; acted: () => number } => {
+      let n = 0
+      return { deps: hostOrchDeps(base({ onEffect: () => n++, ...over })), acted: () => n }
+    }
+
+    it('세션을 띄우는 의존은 움직인 것으로 센다', async () => {
+      const m = marked({ act: vi.fn().mockResolvedValue({ sessionId: 's', cwd: 'c', specPath: 'p' }) })
+      await m.deps.startWorker({ dispatchId: 'd1' } as never)
+      expect(m.acted()).toBe(1)
+    })
+
+    // **명령 이름으로 목록을 짰다면 놓쳤을 자리다.** run-merge 는 git 병합을 돌리고 setState 는 한
+    // 번도 부르지 않는다.
+    it('커밋하지 않고 디스크를 건드리는 의존도 움직인 것으로 센다', async () => {
+      const m = marked({ act: vi.fn().mockResolvedValue({ ok: true, merged: [], uncommitted: 0 }) })
+      await m.deps.mergeWorktrees?.('D:/p', ['D:/wt'])
+      expect(m.acted()).toBe(1)
+    })
+
+    // 읽기와 토글은 두 번 물어도 세상이 달라지지 않는다 — 여기에 영수증을 남기면 그 뒤의 읽기가
+    // 모두 낡은 답을 받는다.
+    it('읽기·탐침·토글은 움직인 것이 아니다', async () => {
+      const m = marked({ act: vi.fn().mockResolvedValue([]) })
+      await m.deps.listAccounts()
+      await m.deps.readWorker({ dispatchId: 'd1' })
+      await m.deps.listRunConfigs?.('D:/p')
+      await m.deps.probeLimit?.({} as never)
+      await m.deps.resolveProjectRoot?.('D:/p')
+      await m.deps.trackingEnabled?.()
+      await m.deps.repairTargetFor?.('t1')
+      expect(m.acted()).toBe(0)
+    })
+
+    // 결과를 아무도 안 받는다고 공짜인 것은 아니다 — 이 넷은 모두 무언가를 시작하거나 끝낸다.
+    it('결과를 안 받는 의존도 움직인 것으로 센다', () => {
+      const m = marked({ act: vi.fn().mockResolvedValue(undefined) })
+      m.deps.startValidation?.({ taskId: 't1', cwd: 'D:/p' })
+      m.deps.unregisterRolling?.('ses1')
+      expect(m.acted()).toBe(2)
+    })
+
+    // 점 찍힌 이름도 같은 깔때기를 지난다 — 그룹 단위로 선언한 것이 실제로 나가는 이름에 닿아야 한다.
+    it('점 찍힌 이름도 같은 깔때기를 지난다', async () => {
+      const m = marked({ act: vi.fn().mockResolvedValue({ ok: true, savedAt: 'T' }) })
+      await m.deps.handoffs?.save('ses1', {} as never)
+      await m.deps.sessionTasks?.start('ses1', '무언가')
+      expect(m.acted()).toBe(2)
+    })
+
+    // **앱이 없으면 깔때기에 닿기도 전에 거절된다** — 물어보지 못한 것은 일어나지 않은 것이고, 그
+    // 호출은 영수증을 남기지 않아야 한다.
+    it('앱이 없어 거절된 전달은 움직인 것이 아니다', async () => {
+      const m = marked({ hasApp: () => false })
+      await expect(m.deps.startWorker({} as never)).rejects.toThrow(/APP_REQUIRED/)
+      expect(m.acted()).toBe(0)
+    })
+
+    // **묻고 답을 못 들은 것은 안 일어난 것이 아니다.** 앱이 도중에 사라지거나 마감을 넘겼을 때,
+    // 그 행동은 이미 일어났을 수 있다 — 일어났을 수 있는 요청은 일어난 것으로 읽어야 한다.
+    it('앱이 답하지 못해도 이미 물어본 것은 움직인 것으로 센다', async () => {
+      const m = marked({ act: vi.fn().mockRejectedValue(new AppUnreachable('APP_REQUIRED: gone')) })
+      await expect(m.deps.startWorker({} as never)).rejects.toThrow()
+      expect(m.acted()).toBe(1)
+    })
+
+    // 영수증을 남기지 않는 호출자는 이 기구를 아예 지나가지 않는다 — 함수가 없으면 아무 일도 없다.
+    it('onEffect 를 주지 않으면 아무것도 달라지지 않는다', async () => {
+      const act = vi.fn().mockResolvedValue({ sessionId: 's', cwd: 'c', specPath: 'p' })
+      const deps = hostOrchDeps(base({ act }))
+      await deps.startWorker({ dispatchId: 'd1' } as never)
+      expect(act).toHaveBeenCalledWith('startWorker', [{ dispatchId: 'd1' }])
+    })
+  })
+})
+
+const fakeLocal = (over: Partial<HostLocal> = {}): HostLocal => ({
+  owns: () => true,
+  startWorker: vi.fn().mockResolvedValue({ sessionId: 'ses_h', cwd: 'D:/p', specPath: 'D:/s.md' }),
+  startCoordinator: vi.fn().mockResolvedValue({ sessionId: 'ses_c' }),
+  releaseWorker: vi.fn().mockResolvedValue(undefined),
+  readWorker: vi.fn().mockResolvedValue('tail'),
+  probeLimit: vi.fn().mockResolvedValue(null),
+  readReviewFile: vi.fn().mockResolvedValue(null),
+  makeRunWorktree: vi.fn().mockResolvedValue('D:/wt-run'),
+  mergeWorktrees: vi.fn().mockResolvedValue({ ok: true, merged: [], uncommitted: 0 }),
+  removeWorktrees: vi.fn().mockResolvedValue({ failed: [] }),
+  ...over
+})
+describe('HOST_LOCAL (S2)', () => {
+  it('is answered by the Host and never asked of the app, with or without one', async () => {
+    for (const hasApp of [true, false]) {
+      const act = vi.fn(); const local = fakeLocal()
+      const deps = hostOrchDeps(base({ act, hasApp: () => hasApp, local }))
+      expect(await deps.startWorker({ dispatchId: 'd1', worktree: 'current' } as never)).toMatchObject({ sessionId: 'ses_h' })
+      await deps.releaseWorker({ dispatchId: 'd1' })
+      expect(await deps.readWorker({ dispatchId: 'd1' })).toBe('tail')
+      expect(await deps.startCoordinator!({ runId: 'r', cwd: 'D:/p', accountId: 'a', brief: 'b' })).toEqual({ sessionId: 'ses_c' })
+      expect(act).not.toHaveBeenCalled()
+    }
+  })
+  it('marks an effectful local call before it runs, and a read not at all', async () => {
+    const order: string[] = []
+    const local = fakeLocal({ startWorker: vi.fn(async () => { order.push('start'); return { sessionId: 's', cwd: 'c', specPath: 'p' } }), readWorker: vi.fn(async () => { order.push('read'); return '' }) })
+    const deps = hostOrchDeps(base({ local, onEffect: () => order.push('effect') }))
+    await deps.startWorker({} as never); await deps.readWorker({ dispatchId: 'd' })
+    expect(order).toEqual(['effect', 'start', 'read'])
+  })
+  // R1: the S2-alone guard.
+  it('sends a call the Host does not own the way it went before — refused with no app', async () => {
+    const onAppRequired = vi.fn()
+    const local = fakeLocal({ owns: (name, args) => !(name === 'startWorker' && (args[0] as { worktree?: string }).worktree === 'new') })
+    const deps = hostOrchDeps(base({ hasApp: () => false, local, onAppRequired }))
+    await expect(deps.startWorker({ worktree: 'new' } as never)).rejects.toThrow(/APP_REQUIRED/)
+    expect(onAppRequired).toHaveBeenCalledWith('startWorker', expect.any(String))
+    expect(local.startWorker).not.toHaveBeenCalled()
+  })
+  it('keeps probeLimit and readReviewFile swallowed when they fall back', async () => {
+    const onAppRequired = vi.fn()
+    const deps = hostOrchDeps(base({ hasApp: () => false, local: fakeLocal({ owns: () => false }), onAppRequired }))
+    await expect(deps.probeLimit!({} as never)).rejects.toThrow(/APP_REQUIRED/)
+    await expect(deps.readReviewFile!('D:/r.md')).rejects.toThrow(/APP_REQUIRED/)
+    expect(onAppRequired).not.toHaveBeenCalled()
+  })
+  it('with no local, every one of the nine travels to the app exactly as before', async () => {
+    const act = vi.fn().mockResolvedValue({})
+    const deps = hostOrchDeps(base({ act, local: null }))
+    await deps.startWorker({ dispatchId: 'd1' } as never)
+    expect(act).toHaveBeenCalledWith('startWorker', [{ dispatchId: 'd1' }])
+  })
+  // A forwarded fallback still goes through the funnel, so a keyed retry of it is not re-run either.
+  it('marks a forwarded fallback as an effect, as it did before S2', async () => {
+    const onEffect = vi.fn()
+    const act = vi.fn().mockResolvedValue(undefined)
+    const deps = hostOrchDeps(base({ act, onEffect, local: fakeLocal({ owns: () => false }) }))
+    await deps.releaseWorker({ dispatchId: 'd1' })
+    expect(act).toHaveBeenCalledWith('releaseWorker', [{ dispatchId: 'd1' }])
+    expect(onEffect).toHaveBeenCalledTimes(1)
+  })
+  // I1/I2: a local refusal only the app can clear (a profile file it must repair) decides the command
+  // the way an absent app does, and names the file. Any other local failure passes straight through.
+  it('flags a local repair refusal with its file, and passes any other local failure straight through', async () => {
+    const onAppRequired = vi.fn()
+    const needsRepair = new RepairNeeded('accounts.json is not valid JSON; open Astera to repair it', 'accounts.json')
+    const deps = hostOrchDeps(base({ onAppRequired, local: fakeLocal({ startWorker: vi.fn().mockRejectedValue(needsRepair), releaseWorker: vi.fn().mockRejectedValue(new Error('boom')) }) }))
+    await expect(deps.startWorker({} as never)).rejects.toBe(needsRepair)
+    expect(onAppRequired).toHaveBeenCalledWith('startWorker', needsRepair.message, { repair: 'accounts.json' })
+    await expect(deps.releaseWorker({ dispatchId: 'd1' })).rejects.toThrow('boom')
+    expect(onAppRequired).toHaveBeenCalledTimes(1)
+  })
+  // Fix round ruling (a): a spawn refused because the Host is leaving is a conflict the caller retries,
+  // flagged the way a repair refusal is, with `retry` instead of a file.
+  it('flags a local refusal from a retiring Host with retry, for the names that propagate', async () => {
+    const onAppRequired = vi.fn()
+    const retiring = new HostRetiring()
+    const deps = hostOrchDeps(base({ onAppRequired, local: fakeLocal({ startWorker: vi.fn().mockRejectedValue(retiring), startCoordinator: vi.fn().mockRejectedValue(retiring) }) }))
+    await expect(deps.startWorker({} as never)).rejects.toBe(retiring)
+    expect(onAppRequired).toHaveBeenCalledWith('startWorker', retiring.message, { retry: 'host-retiring' })
+    await expect(deps.startCoordinator!({} as never)).rejects.toBe(retiring)
+    expect(onAppRequired).toHaveBeenCalledWith('startCoordinator', retiring.message, { retry: 'host-retiring' })
+  })
+  // Host S3 Task 6 fix round 2: the Host refusing on its own because an app it must ask is running
+  // but not attached is a conflict, as an app that could not be reached is.
+  it('flags a local refusal for want of the app, for the names that propagate', async () => {
+    const onAppRequired = vi.fn()
+    const detached = new AppUnreachable('Astera is running but not connected to this Host')
+    const deps = hostOrchDeps(base({ onAppRequired, local: fakeLocal({ startWorker: vi.fn().mockRejectedValue(detached) }) }))
+    await expect(deps.startWorker({} as never)).rejects.toBe(detached)
+    expect(onAppRequired).toHaveBeenCalledWith('startWorker', detached.message, {})
+  })
+  it('flags a file read that needs repair with its file, when the app is absent', async () => {
+    const onAppRequired = vi.fn()
+    const deps = hostOrchDeps(base({ hasApp: () => false, onAppRequired, readAccounts: vi.fn().mockRejectedValue(new RepairNeeded('accounts.json is not valid JSON; open Astera to repair it', 'accounts.json')) }))
+    await expect(deps.listAccounts()).rejects.toThrow(/open Astera to repair it/)
+    expect(onAppRequired).toHaveBeenCalledWith('listAccounts', expect.stringMatching(/open Astera/), { repair: 'accounts.json' })
+  })
+})
+
+describe('HOST_LOCAL worktree names (S3)', () => {
+  it('are answered by the Host with or without an app, and never asked of the app', async () => {
+    for (const hasApp of [true, false]) {
+      const act = vi.fn(); const local = fakeLocal()
+      const deps = hostOrchDeps(base({ act, hasApp: () => hasApp, local }))
+      expect(await deps.makeRunWorktree!({ repoPath: 'D:/p', name: 'n' })).toBe('D:/wt-run')
+      await deps.mergeWorktrees!('D:/p', ['D:/wt']); await deps.removeWorktrees!(['D:/wt'])
+      expect(act).not.toHaveBeenCalled()
+    }
+  })
+  it('mark the effect before they act', async () => {
+    const order: string[] = []
+    const local = fakeLocal({ mergeWorktrees: vi.fn(async () => { order.push('merge'); return { ok: true as const, merged: [], uncommitted: 0 } }) })
+    await hostOrchDeps(base({ local, onEffect: () => order.push('effect') })).mergeWorktrees!('D:/p', ['D:/wt'])
+    expect(order).toEqual(['effect', 'merge'])
+  })
+  // R4: an app that keeps worktrees is asked, as in S2, and none attached is refused, as in S2.
+  it('go to an app that keeps them, the S2 way', async () => {
+    const act = vi.fn().mockResolvedValue('D:/from-app'); const onAppRequired = vi.fn()
+    const local = fakeLocal({ owns: (name) => !['makeRunWorktree', 'mergeWorktrees', 'removeWorktrees'].includes(name) })
+    expect(await hostOrchDeps(base({ act, local })).makeRunWorktree!({ repoPath: 'D:/p', name: 'n' })).toBe('D:/from-app')
+    expect(act).toHaveBeenCalledWith('makeRunWorktree', [{ repoPath: 'D:/p', name: 'n' }])
+    await expect(hostOrchDeps(base({ hasApp: () => false, local, onAppRequired })).makeRunWorktree!({ repoPath: 'D:/p', name: 'n' })).rejects.toThrow(/APP_REQUIRED/)
+    expect(onAppRequired).toHaveBeenCalledWith('makeRunWorktree', expect.any(String))
+  })
+})
+
+describe('HOST_DRIVES (R8)', () => {
+  const build = (over: Partial<Parameters<typeof hostOrchDeps>[0]> = {}): ReturnType<typeof hostOrchDeps> => hostOrchDeps(base(over))
+  const checks = (): HostChecks => ({
+    startValidation: vi.fn(), startReview: vi.fn(), startRepair: vi.fn(),
+    repairTargetFor: vi.fn(() => ({ kind: 'fresh' } as never)),
+    repairOnce: vi.fn(async () => ({ ok: true as const })), lang: vi.fn(async () => 'ko' as const),
+    stopValidation: vi.fn(() => false), stopForeignValidations: vi.fn(async () => 0), checking: vi.fn(() => false), resumeSweep: vi.fn(), langNow: vi.fn(() => 'ko' as const),
+    accounts: vi.fn(async () => []), loginStatus: vi.fn(async () => true)
+  })
+  it('answers all six from the Host while it drives, and forwards nothing', async () => {
+    const c = checks()
+    const act = vi.fn()
+    const d = build({ hasApp: () => true, act, drive: { owns: () => true, checks: c } })
+    d.startValidation!({ taskId: 't', cwd: 'x' })
+    d.startReview!({ taskId: 't' })
+    d.startRepair!({ dispatchId: 'd' })
+    expect(await d.repairTargetFor!('t')).toEqual({ kind: 'fresh' })
+    expect(await d.repairOnce!({ taskId: 't' })).toEqual({ ok: true })
+    expect(await d.lang!()).toBe('ko')
+    expect(c.startValidation).toHaveBeenCalledWith({ taskId: 't', cwd: 'x' })
+    expect(act).not.toHaveBeenCalled()
+  })
+  // N9: record, then assert — an expect inside the mock would be swallowed by the wrapper's catch.
+  it('marks an effect for the ones that act, before they run', () => {
+    const order: string[] = []
+    const c = checks()
+    ;(c.startValidation as ReturnType<typeof vi.fn>).mockImplementation(() => { order.push('call') })
+    const d = build({ onEffect: () => order.push('effect'), drive: { owns: () => true, checks: c } })
+    d.startValidation!({ taskId: 't', cwd: 'x' })
+    expect(order).toEqual(['effect', 'call'])
+  })
+  it('takes exactly today’s routes while an app drives: forwarded, and degraded with no answer', async () => {
+    const act = vi.fn(async () => undefined)
+    const d = build({ hasApp: () => true, act, drive: { owns: () => false, checks: checks() } })
+    d.startValidation!({ taskId: 't', cwd: 'x' })
+    expect(act).toHaveBeenCalledWith('startValidation', [{ taskId: 't', cwd: 'x' }])
+    const none = build({ hasApp: () => false, act, drive: { owns: () => false, checks: checks() } })
+    expect(await none.repairTargetFor!('t')).toBeNull() // F58: no target, so no half-opened repair
+  })
+  it('asks owns() at each call, not once', () => {
+    let mine = false
+    const c = checks()
+    const act = vi.fn(async () => undefined)
+    const d = build({ hasApp: () => true, act, drive: { owns: () => mine, checks: c } })
+    d.startReview!({ taskId: 'a' })
+    mine = true
+    d.startReview!({ taskId: 'b' })
+    expect(act).toHaveBeenCalledTimes(1)
+    expect(c.startReview).toHaveBeenCalledWith({ taskId: 'b' })
+  })
+  // Review I1: the async half asks at each call too. F58 needs repairTargetFor and startRepair on
+  // the same predicate at the call, never one read when the deps were built.
+  it('asks owns() at each call for the async names too: true, then false, then true', async () => {
+    let mine = true
+    const c = checks()
+    const d = build({ hasApp: () => false, drive: { owns: () => mine, checks: c } })
+    expect(await d.repairTargetFor!('a')).toEqual({ kind: 'fresh' })
+    mine = false
+    expect(await d.repairTargetFor!('b')).toBeNull() // the old route: no app, so DEGRADES' null
+    mine = true
+    expect(await d.repairTargetFor!('c')).toEqual({ kind: 'fresh' })
+    expect((c.repairTargetFor as ReturnType<typeof vi.fn>).mock.calls).toEqual([['a'], ['c']])
+  })
+  // The void three are bare statements in handleCommand: a throw from the Host's own body is logged,
+  // never thrown into the command (FIRE_AND_FORGET's reason).
+  it('logs a void check that throws, and does not throw into the command', () => {
+    const logs: string[] = []
+    const c = checks()
+    ;(c.startRepair as ReturnType<typeof vi.fn>).mockImplementation(() => { throw new Error('boom') })
+    const d = build({ log: (m) => logs.push(m), drive: { owns: () => true, checks: c } })
+    expect(() => d.startRepair!({ dispatchId: 'd' })).not.toThrow()
+    expect(logs.some((l) => l.includes('startRepair') && l.includes('boom'))).toBe(true)
+  })
+  // Receipt rules: the reads mark nothing; repairOnce marks once when it opened the repair, and a
+  // refusal it made before opening anything (`{ ok: false }`, which repair.ts returns only before its
+  // commit) leaves no mark, so a keyed retry once the reason clears still has the work to do.
+  it('marks repairOnce only when it acted, and never the reads', async () => {
+    let n = 0
+    const c = checks()
+    const d = build({ onEffect: () => n++, drive: { owns: () => true, checks: c } })
+    await d.repairTargetFor!('t')
+    await d.lang!()
+    expect(n).toBe(0)
+    ;(c.repairOnce as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ok: false, error: 'no implementation dispatch' })
+    expect(await d.repairOnce!({ taskId: 't' })).toEqual({ ok: false, error: 'no implementation dispatch' })
+    expect(n).toBe(0)
+    await d.repairOnce!({ taskId: 't' })
+    expect(n).toBe(1)
+    ;(c.repairOnce as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('half-way'))
+    await expect(d.repairOnce!({ taskId: 't' })).rejects.toThrow(/half-way/)
+    expect(n).toBe(2)
+  })
+  it('takes the old routes with no drive at all', async () => {
+    const act = vi.fn(async () => undefined)
+    const d = build({ hasApp: () => true, act, drive: null })
+    d.startRepair!({ dispatchId: 'd' })
+    expect(act).toHaveBeenCalledWith('startRepair', [{ dispatchId: 'd' }])
+    expect(await build({ hasApp: () => false }).lang!()).toBe('en')
+  })
+})
+
+/**
+ * **`resolveProjectRoot` 는 앱이 없거나 Host 가 몰 때 Host 가 답한다.** 앱이 닫힌 채 하위 폴더에서
+ * 만든 Job 이 어느 프로젝트 목록에도 안 보이던 것이 이것 때문이었다 — 앱에 물어 APP_REQUIRED 를
+ * 받고, 명령 층이 그것을 삼켜 받은 경로를 그대로 저장했다.
+ */
+describe('HOST_RESOLVES', () => {
+  const driving = (owns: boolean) => ({ owns: () => owns, checks: {} as HostChecks })
+
+  it('앱이 없으면 Host 의 해석기가 답하고 앱에 묻지 않는다', async () => {
+    const act = vi.fn()
+    const refused: string[] = []
+    const local = vi.fn().mockResolvedValue('D:/proj')
+    const deps = hostOrchDeps(
+      base({ act, hasApp: () => false, resolveProjectRoot: local, onAppRequired: (n) => refused.push(n) })
+    )
+    expect(await deps.resolveProjectRoot?.('D:/proj/src')).toBe('D:/proj')
+    expect(local).toHaveBeenCalledWith('D:/proj/src')
+    expect(act).not.toHaveBeenCalled()
+    expect(refused).toEqual([])
+  })
+
+  it('Host 가 몰면 앱이 붙어 있어도 Host 가 답한다', async () => {
+    const act = vi.fn()
+    const local = vi.fn().mockResolvedValue('D:/proj')
+    const deps = hostOrchDeps(base({ act, hasApp: () => true, resolveProjectRoot: local, drive: driving(true) }))
+    expect(await deps.resolveProjectRoot?.('D:/proj/src')).toBe('D:/proj')
+    expect(act).not.toHaveBeenCalled()
+  })
+
+  it('양보하지 않는 앱이 붙어 있으면 전처럼 앱에 묻는다', async () => {
+    const act = vi.fn().mockResolvedValue('D:/app-root')
+    const local = vi.fn()
+    const deps = hostOrchDeps(base({ act, hasApp: () => true, resolveProjectRoot: local, drive: driving(false) }))
+    expect(await deps.resolveProjectRoot?.('D:/proj/src')).toBe('D:/app-root')
+    expect(act).toHaveBeenCalledWith('resolveProjectRoot', ['D:/proj/src'])
+    expect(local).not.toHaveBeenCalled()
+  })
+
+  // 앱이 물음 도중 떠나거나 기한을 넘기면 "앱이 없다"와 같은 사실이다 — LOCAL_WHEN_ABSENT 처럼 Host 가 답한다.
+  it('붙어 있던 앱이 답하지 못하면 Host 가 답한다', async () => {
+    const act = vi.fn().mockRejectedValue(new AppUnreachable('APP_REQUIRED: gone'))
+    const local = vi.fn().mockResolvedValue('D:/proj')
+    const refused: string[] = []
+    const deps = hostOrchDeps(
+      base({ act, hasApp: () => true, resolveProjectRoot: local, onAppRequired: (n) => refused.push(n) })
+    )
+    expect(await deps.resolveProjectRoot?.('D:/proj/src')).toBe('D:/proj')
+    expect(refused).toEqual([])
+  })
+
+  // 명령 층이 삼키는 실패다. 답을 정하면 제 이유로 실패한 명령이 "앱이 없다"로 둔갑한다.
+  it('Host 의 해석이 실패해도 앱 문제로 표시하지 않는다', async () => {
+    const refused: string[] = []
+    const deps = hostOrchDeps(
+      base({
+        hasApp: () => false,
+        resolveProjectRoot: vi.fn().mockRejectedValue(new Error('accounts.json is not valid JSON')),
+        onAppRequired: (n) => refused.push(n)
+      })
+    )
+    await expect(deps.resolveProjectRoot?.('D:/p')).rejects.toThrow(/accounts\.json/)
+    expect(refused).toEqual([])
+  })
+
+  it('읽기이므로 영수증을 남기지 않는다', async () => {
+    let effects = 0
+    const deps = hostOrchDeps(
+      base({ hasApp: () => false, resolveProjectRoot: async (c) => c, onEffect: () => effects++ })
+    )
+    await deps.resolveProjectRoot?.('D:/p')
+    expect(effects).toBe(0)
+  })
+})
+
+describe('HOST_ROLLS (S6 R8)', () => {
+  const build = (over: Partial<Parameters<typeof hostOrchDeps>[0]> = {}): ReturnType<typeof hostOrchDeps> => hostOrchDeps(base(over))
+  it('unregisterRolling disposes the Host’s own chain, then forwards to an attached app (S6 R8)', async () => {
+    const unregister = vi.fn()
+    const act = vi.fn().mockResolvedValue(undefined)
+    const deps = build({ hasApp: () => true, act, rolling: { unregister } })
+    deps.unregisterRolling?.('s1')
+    expect(unregister).toHaveBeenCalledWith('s1')
+    await vi.waitFor(() => expect(act).toHaveBeenCalledWith('unregisterRolling', ['s1']))
+  })
+  it('unregisterRolling with no app still disposes the Host’s chain and throws nothing', () => {
+    const unregister = vi.fn()
+    const deps = build({ hasApp: () => false, act: vi.fn(), rolling: { unregister } })
+    expect(() => deps.unregisterRolling?.('s1')).not.toThrow()
+    expect(unregister).toHaveBeenCalledWith('s1')
+  })
+  it('unregisterRolling still forwards, and throws nothing, when the Host’s disposal throws (fix round 1)', async () => {
+    const logs: string[] = []
+    const unregister = vi.fn(() => { throw new Error('boom') })
+    const act = vi.fn().mockResolvedValue(undefined)
+    const deps = build({ hasApp: () => true, act, rolling: { unregister }, log: (m) => logs.push(m) })
+    expect(() => deps.unregisterRolling?.('s1')).not.toThrow()
+    await vi.waitFor(() => expect(act).toHaveBeenCalledWith('unregisterRolling', ['s1']))
+    expect(logs.some((l) => l.includes('unregisterRolling') && l.includes('boom'))).toBe(true)
+  })
+})
+
+// Task 1 fix round 1, I2: the hand-over stops a coordinator it cannot use.
+describe('stopCoordinator', () => {
+  it('kills the Host’s own pty when its registry holds the session, and asks nobody', async () => {
+    const act = vi.fn()
+    const stopSession = vi.fn(() => true)
+    const deps = hostOrchDeps(base({ act, local: fakeLocal({ stopSession }) }))
+    await deps.stopCoordinator!('ses_c')
+    expect(stopSession).toHaveBeenCalledWith('ses_c')
+    expect(act).not.toHaveBeenCalled()
+  })
+  it('asks the attached app for a session the Host does not hold, and only logs a failure', async () => {
+    const act = vi.fn().mockRejectedValue(new Error('gone'))
+    const logs: string[] = []
+    const onAppRequired = vi.fn()
+    const deps = hostOrchDeps(base({ act, onAppRequired, log: (m) => logs.push(m), local: fakeLocal({ stopSession: () => false }) }))
+    await deps.stopCoordinator!('ses_app')
+    expect(act).toHaveBeenCalledWith('stopCoordinator', ['ses_app'])
+    expect(onAppRequired).not.toHaveBeenCalled()
+    expect(logs.join('\n')).toMatch(/ses_app/)
+  })
+  it('with no app and no pty of its own, logs that it could not', async () => {
+    const act = vi.fn()
+    const logs: string[] = []
+    const deps = hostOrchDeps(base({ act, hasApp: () => false, log: (m) => logs.push(m), local: null }))
+    await deps.stopCoordinator!('ses_x')
+    expect(act).not.toHaveBeenCalled()
+    expect(logs.join('\n')).toMatch(/could not be stopped/)
+  })
+})
+
+describe('hostOrchDeps — HOST_CHATS (chat takeover §3.5)', () => {
+  const prompt = (sessionId: string): ChatPrompt => ({ sessionId, id: 'r1', kind: 'approval', tool: 'Bash', summary: 's' })
+  const chats = (writerOf: string[]) => ({
+    prompts: vi.fn(() => writerOf.map(prompt)),
+    isWriter: (id: string) => writerOf.includes(id),
+    answer: vi.fn(async (_s: string, _r: string, _d: string, mark?: () => void) => { mark?.(); return { answered: true } as const }),
+    requests: () => [], send: vi.fn(async (_id: string, _text: string, _mark?: () => void) => {})
+  })
+  it('lists the Host’s own writer sessions with no app, complete', async () => {
+    const deps = hostOrchDeps(base({ hasApp: () => false, chats: chats(['c1']) }))
+    expect(await deps.chatPrompts?.()).toEqual({ prompts: [prompt('c1')], complete: true })
+  })
+  it('asks the app for the rest, and never lists a session twice', async () => {
+    const act = vi.fn().mockResolvedValue({ prompts: [prompt('c1'), prompt('c2')], complete: true })
+    const deps = hostOrchDeps(base({ act, chats: chats(['c1']) }))
+    expect((await deps.chatPrompts?.())?.prompts.map((x) => x.sessionId)).toEqual(['c1', 'c2'])
+    expect(act).toHaveBeenCalledWith('chatPrompts', [undefined])
+  })
+  it('an app that cannot be asked makes the list incomplete, not a failure', async () => {
+    const act = vi.fn().mockRejectedValue(new Error('this app cannot do chatPrompts'))
+    const deps = hostOrchDeps(base({ act, chats: chats(['c1']) }))
+    expect(await deps.chatPrompts?.()).toEqual({ prompts: [prompt('c1')], complete: false })
+  })
+  it('answers by the Host when it is the writer, marking the effect, and forwards otherwise', async () => {
+    const onEffect = vi.fn()
+    const act = vi.fn().mockResolvedValue({ answered: true })
+    const c = chats(['c1'])
+    const deps = hostOrchDeps(base({ act, onEffect, chats: c }))
+    expect(await deps.chatAnswer?.('c1', 'r1', 'deny')).toEqual({ answered: true })
+    expect(onEffect).toHaveBeenCalledTimes(1)
+    expect(act).not.toHaveBeenCalled()
+    await deps.chatAnswer?.('c2', 'r1', 'allow')
+    expect(act).toHaveBeenCalledWith('chatAnswer', ['c2', 'r1', 'allow'])
+  })
+  // Task 8 fix round 1 (Minor 2): an app holding the proc without the chat-takeover yield has no
+  // chatAnswer; it is not asked, nothing is marked, and the answer says to answer in Astera.
+  it('does not forward an answer to an app that cannot give one, and marks nothing', async () => {
+    const onEffect = vi.fn()
+    const act = vi.fn().mockResolvedValue({ answered: true })
+    const deps = hostOrchDeps(base({ act, onEffect, chats: chats([]), chatAppAnswers: (id) => id !== 'old' }))
+    const r = await deps.chatAnswer?.('old', 'r1', 'allow')
+    expect(r).toMatchObject({ answered: false, reason: 'not-held' })
+    expect((r as { detail?: string }).detail).toMatch(/answer it in Astera/)
+    expect(act).not.toHaveBeenCalled()
+    expect(onEffect).not.toHaveBeenCalled()
+    await deps.chatAnswer?.('new', 'r1', 'allow')
+    expect(act).toHaveBeenCalledWith('chatAnswer', ['new', 'r1', 'allow'])
+  })
+  it('answers not-held with no writer anywhere', async () => {
+    const deps = hostOrchDeps(base({ hasApp: () => false, chats: chats([]) }))
+    expect(await deps.chatAnswer?.('c9', 'r1', 'allow')).toEqual({ answered: false, reason: 'not-held' })
+  })
+  it('P10: a Host-writer session answers its card and refuses a send behind it, with no app', async () => {
+    const card = { id: 'r1', kind: 'approval' as const, about: { tool: 'Bash', lines: ['ls'] }, decisions: ['accept' as const] }
+    const c = { ...chats(['c1']), requests: () => [card] }
+    const deps = hostOrchDeps(base({ hasApp: () => false, chats: c }))
+    expect(await deps.chatPending?.('c1')).toEqual({ kind: 'approval', summary: 'Bash: ls' })
+    expect(await deps.chatSend?.('c1', 'x')).toEqual({ sent: false, pending: { kind: 'approval', summary: 'Bash: ls' } })
+    expect(c.send).not.toHaveBeenCalled()
+  })
+  // Final review M5: with an app attached, a session the Host writes to (deferred under P5, or never
+  // adopted by the app) is sent the way chatPending reads it: by the Host adapter, never forwarded.
+  it('M5: with an app attached, a Host-writer session is sent through the Host adapter, and its card refuses', async () => {
+    const act = vi.fn().mockResolvedValue({ sent: false, reason: 'not-held' })
+    const c = chats(['c1'])
+    c.send.mockImplementation(async (_id: string, _text: string, mark?: () => void) => { mark?.() })
+    const deps = hostOrchDeps(base({ act, chats: c }))
+    expect(await deps.chatSend?.('c1', 'hi')).toEqual({ sent: true })
+    expect(c.send).toHaveBeenCalledWith('c1', 'hi', expect.any(Function))
+    expect(act).not.toHaveBeenCalled()
+    const card = { id: 'r1', kind: 'approval' as const, about: { tool: 'Bash', lines: ['ls'] }, decisions: ['accept' as const] }
+    const carded = hostOrchDeps(base({ act, chats: { ...chats(['c1']), requests: () => [card] } }))
+    expect(await carded.chatSend?.('c1', 'x')).toEqual({ sent: false, pending: { kind: 'approval', summary: 'Bash: ls' } })
+    expect(act).not.toHaveBeenCalled()
+  })
+  it('P10: a Host-writer session with no card is sent through the Host adapter, not the raw write', async () => {
+    const onEffect = vi.fn()
+    const sendChat = vi.fn(async () => {})
+    const c = chats(['c1'])
+    c.send.mockImplementation(async (_id: string, _text: string, mark?: () => void) => { mark?.() })
+    const b = base({ hasApp: () => false, onEffect, chats: c })
+    const deps = hostOrchDeps({ ...b, sessions: { ...b.sessions, sendChat } })
+    expect(await deps.chatPending?.('c1')).toBe(null)
+    expect(await deps.chatSend?.('c1', 'hi')).toEqual({ sent: true })
+    expect(c.send).toHaveBeenCalledWith('c1', 'hi', expect.any(Function))
+    expect(sendChat).not.toHaveBeenCalled()
+    expect(onEffect).toHaveBeenCalledTimes(1)
+  })
+})
+
+// `tasks dispatch` (CLI spec §18). The worker is started through `worker-start` under the loop's own
+// caller, so this call's own receipt depends on this mark alone.
+describe('hostOrchDeps — dispatchTask, the Host loop placing one Task', () => {
+  it('is absent when the Host has no loop to ask, so the command answers 409', () => {
+    expect(hostOrchDeps(base()).dispatchTask).toBeUndefined()
+  })
+
+  it('never goes to the app, and marks an effect once a worker was placed', async () => {
+    const act = vi.fn()
+    let acted = 0
+    const deps = hostOrchDeps(
+      base({ act, onEffect: () => acted++, dispatchTask: async (id) => ({ status: 200, body: { taskId: id } }) })
+    )
+    expect(await deps.dispatchTask!('tsk_1')).toEqual({ status: 200, body: { taskId: 'tsk_1' } })
+    expect(acted).toBe(1)
+    expect(act).not.toHaveBeenCalled()
+  })
+
+  it('a refusal placed nothing and marks nothing, so the same request id works later', async () => {
+    let acted = 0
+    const deps = hostOrchDeps(
+      base({ onEffect: () => acted++, dispatchTask: async () => ({ status: 409, body: { error: 'not placed' } }) })
+    )
+    expect((await deps.dispatchTask!('tsk_1')).status).toBe(409)
+    expect(acted).toBe(0)
+  })
+
+  it('a throw is marked, since it may have come after the start', async () => {
+    let acted = 0
+    const deps = hostOrchDeps(
+      base({
+        onEffect: () => acted++,
+        dispatchTask: async () => {
+          throw new Error('disk full')
+        }
+      })
+    )
+    await expect(deps.dispatchTask!('tsk_1')).rejects.toThrow('disk full')
+    expect(acted).toBe(1)
+  })
+})
+
+// `sessions create` (CLI spec §14): the Host's own starter, never the app.
+describe('hostOrchDeps — createSession, the Host starting a session', () => {
+  const req = { kind: 'terminal' as const, accountId: 'acc_c', cwd: '/repo', rollAccountIds: [] }
+  const row = { id: 's1', kind: 'terminal' as const, title: 't', accountId: 'acc_c', cwd: '/repo', alive: true, state: 'unknown' as const }
+
+  it('is absent without a starter, so the command answers 409', () => {
+    expect(hostOrchDeps(base()).createSession).toBeUndefined()
+  })
+
+  it('a started session is an effect, and nothing goes to the app', async () => {
+    const act = vi.fn()
+    let acted = 0
+    const deps = hostOrchDeps(base({ act, onEffect: () => acted++, createSession: async () => row }))
+    expect(await deps.createSession!(req)).toEqual(row)
+    expect(acted).toBe(1)
+    expect(act).not.toHaveBeenCalled()
+  })
+
+  it('a refusal before the spawn is no effect; a failure after it is one', async () => {
+    let acted = 0
+    const { refusedBeforeActing } = await import('../core/host/orchProtocol')
+    const refusing = hostOrchDeps(
+      base({ onEffect: () => acted++, createSession: async () => { throw refusedBeforeActing(new Error('CWD_MISSING: /nope')) } })
+    )
+    await expect(refusing.createSession!(req)).rejects.toThrow('CWD_MISSING')
+    expect(acted).toBe(0)
+    const failing = hostOrchDeps(base({ onEffect: () => acted++, createSession: async () => { throw new Error('did not finish starting') } }))
+    await expect(failing.createSession!(req)).rejects.toThrow('did not finish')
+    expect(acted).toBe(1)
+  })
+
+  it('a damaged settings file is the app being required, carrying the file', async () => {
+    const flagged: Array<{ name: string; repair?: string }> = []
+    const deps = hostOrchDeps(
+      base({
+        onAppRequired: (name, _why, detail) => flagged.push({ name, repair: detail?.repair }),
+        createSession: async () => {
+          throw new RepairNeeded('open Astera to repair it', 'app-settings.json')
+        }
+      })
+    )
+    await expect(deps.createSession!(req)).rejects.toThrow('repair')
+    expect(flagged).toEqual([{ name: 'createSession', repair: 'app-settings.json' }])
+  })
+})
+
+// `sessions send --wait` (CLI spec §15): where a chat turn is, from the adapter that decodes it.
+describe('hostOrchDeps — chatTurn and sessionTurn', () => {
+  const prompt: ChatPrompt = { sessionId: 'c1', id: 'req_1', kind: 'approval', tool: 'Bash', summary: 'npm test' }
+  const chatsWith = (turn: { alive: boolean; status: 'idle' | 'working' | 'waiting'; error: string | null } | null) => ({
+    prompts: () => [prompt],
+    isWriter: () => false,
+    answer: async () => ({ answered: true as const }),
+    requests: () => [],
+    send: async () => {},
+    turnOf: () => turn
+  })
+
+  it("the Host's own adapter answers first, with its open prompt, and the app is not asked", async () => {
+    const act = vi.fn()
+    const writer = { ...chatsWith({ alive: true, status: 'waiting', error: null }), isWriter: () => true }
+    const deps = hostOrchDeps(base({ act, chats: writer }))
+    expect(await deps.chatTurn!('c1')).toEqual({ alive: true, status: 'waiting', error: null, prompt })
+    expect(act).not.toHaveBeenCalled()
+  })
+
+  it('a session the Host holds no adapter for is asked of the app, and nobody to ask is undefined', async () => {
+    const act = vi.fn().mockResolvedValue({ alive: true, status: 'working', error: null, prompt: null })
+    const deps = hostOrchDeps(base({ act, chats: chatsWith(null) }))
+    expect(await deps.chatTurn!('c1')).toEqual({ alive: true, status: 'working', error: null, prompt: null })
+    expect(act).toHaveBeenCalledWith('chatTurn', ['c1'])
+    const alone = hostOrchDeps(base({ hasApp: () => false, chats: chatsWith(null) }))
+    expect(await alone.chatTurn!('c1')).toBeUndefined()
+  })
+
+  // Review 3, I1. Only the writing adapter moves to `working` when a turn is sent; a reader stays `idle`
+  // until output arrives, so reading it would end a wait before the turn started.
+  it('a Host adapter that is only a reader is not asked: the app, which writes, is', async () => {
+    const act = vi.fn().mockResolvedValue({ alive: true, status: 'working', error: null, prompt: null })
+    const reader = { ...chatsWith({ alive: true, status: 'idle', error: null }), isWriter: () => false }
+    const deps = hostOrchDeps(base({ act, chats: reader }))
+    expect(await deps.chatTurn!('c1')).toEqual({ alive: true, status: 'working', error: null, prompt: null })
+    expect(act).toHaveBeenCalledWith('chatTurn', ['c1'])
+  })
+
+  it('an older app that cannot answer chatTurn reads as nobody able to say, not as a failure', async () => {
+    const logs: string[] = []
+    const act = vi.fn().mockRejectedValue(new Error('this app cannot do chatTurn'))
+    const deps = hostOrchDeps(base({ act, log: (m) => logs.push(m), chats: chatsWith(null) }))
+    expect(await deps.chatTurn!('c1')).toBeUndefined()
+    expect(logs.some((l) => l.includes('chatTurn'))).toBe(true)
+  })
+
+  it("sessionTurn is the Host's own registry, a read that marks nothing", async () => {
+    let acted = 0
+    const sessionTurn = vi.fn(async () => ({ alive: true, state: 'waiting' as const, prompt: null }))
+    const deps = hostOrchDeps(
+      base({
+        onEffect: () => acted++,
+        sessions: { ...base().sessions, sessionTurn }
+      })
+    )
+    expect(await deps.sessionTurn!('t1', 5)).toEqual({ alive: true, state: 'waiting', prompt: null })
+    expect(sessionTurn).toHaveBeenCalledWith('t1', 5)
+    expect(acted).toBe(0)
+  })
+})
+
+describe('hostOrchDeps and the Host journal (J7)', () => {
+  it('journalTimeline is the Host’s own, never forwarded, and absent without a journal', () => {
+    const act = vi.fn()
+    const rows = [{ at: 'x', kind: 'runtime-lost' as const, sourceId: 'e', summary: '' }]
+    const deps = hostOrchDeps({ ...base(), act, journalTimeline: () => rows })
+    expect(deps.journalTimeline?.('run_1', emptyState())).toBe(rows)
+    expect(act).not.toHaveBeenCalled()
+    expect(hostOrchDeps({ ...base(), act }).journalTimeline).toBeUndefined()
+  })
+})

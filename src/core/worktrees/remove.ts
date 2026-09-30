@@ -1,13 +1,66 @@
-import { promises as fs, existsSync } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { WorktreeRemoveResult } from '../types'
-import { isPathWithin } from '../files/tree'
-import { git, gitVersionAtLeast, isCleanWorktree, listGitWorktrees } from './git'
-import type { WorktreeRegistry } from './registry'
+import { isPathWithin, isSamePath } from '../files/tree'
+import { git, gitVersionAtLeast, isCleanWorktree, listGitWorktrees, GIT_WRITE_TIMEOUT_MS } from './git'
 
-const samePath = (a: string, b: string): boolean =>
-  path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase()
+/** Options for a call that changes the repository — see GIT_WRITE_TIMEOUT_MS. A `worktree remove`
+ *  killed part-way leaves the folder half deleted with git's record of it still in place, so writes
+ *  are never cut short at the read default. */
+const write = (cwd: string): { cwd: string; timeoutMs: number } => ({ cwd, timeoutMs: GIT_WRITE_TIMEOUT_MS })
+import type { WorktreeStore } from './registry'
+import { askUntilAnswered, defaultActionPresenceCheck, type PresenceCheck } from './presence'
+import { detachLinks, type DetachResult } from './detachLinks'
+
+/** What the index says about this worktree: the paths git tracks as symlinks (mode 120000), relative
+ *  with `/`, case folded where the file system folds it, and whether it has any submodule (a 160000
+ *  entry). null when git could not say. */
+async function trackedIndex(worktreePath: string): Promise<{ links: Set<string>; submodules: boolean } | null> {
+  const r = await git(['ls-files', '-s', '-z'], { cwd: worktreePath, trim: false })
+  if (!r.ok) return null
+  const fold = process.platform === 'win32' || process.platform === 'darwin'
+  const links = new Set<string>()
+  let submodules = false
+  for (const rec of r.stdout.split('\0')) {
+    const tab = rec.indexOf('\t')
+    if (tab < 0) continue
+    if (rec.startsWith('160000 ')) submodules = true
+    if (!rec.startsWith('120000 ')) continue
+    const p = rec.slice(tab + 1)
+    links.add(fold ? p.toLowerCase() : p)
+  }
+  return { links, submodules }
+}
+
+/** Takes the links out of a worktree before `git worktree remove` runs on it (detachLinks.ts): Git for
+ *  Windows' remove deletes through a junction, into the folder outside it points at. Without force,
+ *  git's own tracked symlinks are spared: git never follows them, and removing one would make the
+ *  worktree dirty and the removal refused, leaving it damaged. Also without force, a worktree with
+ *  submodules is refused first (HAS_SUBMODULES): git refuses to remove one without force, and taking
+ *  its links out beforehand would only have cost its node_modules links. Throws LINKS_UNVERIFIED when
+ *  the walk could not finish; nothing is removed then. */
+async function detachBeforeRemove(
+  worktreePath: string,
+  force: boolean,
+  detach: (root: string, opts: { keep?: (rel: string) => boolean }) => Promise<DetachResult>
+): Promise<void> {
+  let keep: ((rel: string) => boolean) | undefined
+  if (!force) {
+    const tracked = await trackedIndex(worktreePath)
+    if (!tracked)
+      throw new Error(`LINKS_UNVERIFIED: git could not list the tracked files, nothing was removed (${worktreePath})`)
+    if (tracked.submodules)
+      throw new Error(`HAS_SUBMODULES: the worktree has submodules, remove it with force (${worktreePath})`)
+    const fold = process.platform === 'win32' || process.platform === 'darwin'
+    keep = (rel) => tracked.links.has(fold ? rel.toLowerCase() : rel)
+  }
+  const r = await detach(worktreePath, keep ? { keep } : {})
+  if (!r.ok)
+    throw new Error(
+      `LINKS_UNVERIFIED: the links in the folder could not all be checked and taken out, nothing was removed (${worktreePath}): ${r.reason}`
+    )
+}
 
 /** Dangerous paths: the repo itself, a parent that contains the repo, home, a parent that contains home, the filesystem root */
 export function isDangerousRemovalPath(
@@ -16,9 +69,9 @@ export function isDangerousRemovalPath(
   homeDir: string
 ): boolean {
   const p = path.resolve(worktreePath)
-  if (samePath(p, repoPath) || samePath(p, homeDir)) return true
+  if (isSamePath(p, repoPath) || isSamePath(p, homeDir)) return true
   if (isPathWithin(p, repoPath) || isPathWithin(p, homeDir)) return true // p is an ancestor of them
-  if (samePath(p, path.parse(p).root)) return true
+  if (isSamePath(p, path.parse(p).root)) return true
   return false
 }
 
@@ -51,7 +104,7 @@ async function countOrphanEntries(
     const entries = await fs.readdir(worktreePath)
     return opts?.countGitDir ? entries.length : entries.filter((e) => e !== '.git').length
   } catch (err) {
-    // ENOENT (a TOCTOU race after existsSync) and EACCES/EPERM (permission denied) both converge on "unverifiable"
+    // ENOENT (a TOCTOU race after the presence check) and EACCES/EPERM (permission denied) both converge on "unverifiable"
     throw new Error(
       `ORPHAN_UNVERIFIABLE: ${worktreePath} (${err instanceof Error ? err.message : String(err)})`
     )
@@ -64,7 +117,7 @@ async function countOrphanEntries(
  *  since it can be a path the user chose for other things too. */
 async function pruneEmptyRepoDir(worktreePath: string, root: string): Promise<void> {
   const parent = path.dirname(path.resolve(worktreePath))
-  if (samePath(parent, root) || !isPathWithin(root, parent)) return
+  if (isSamePath(parent, root) || !isPathWithin(root, parent)) return
   await fs.rmdir(parent).catch(() => {}) // ENOTEMPTY / ENOENT / EACCES all mean "leave it"
 }
 
@@ -103,14 +156,36 @@ async function isBranchMerged(repo: string, branch: string): Promise<boolean> {
   return false
 }
 
+/** Whether the worktree's folder is there, asked asynchronously and with a time limit, on the
+ *  per-root action lane (presence.ts: a check stuck on another drive never refuses this one). A sync
+ *  existsSync on a folder on a dead network share froze the calling thread (the Electron main thread,
+ *  or the Host's) for 20 to 60 s. **Only `missing` counts as gone**: a timeout or any other error is
+ *  "not known", and nothing is deleted on it (the registry entry least of all). A refusal (no call was
+ *  made) is asked again a few times (askUntilAnswered); one that lasts is "could not check", which
+ *  deletes nothing either. */
+async function folderState(p: string, check: PresenceCheck): Promise<'present' | 'missing'> {
+  const r = await askUntilAnswered(check, p)
+  if (r === 'present' || r === 'missing') return r
+  throw new Error(
+    r === 'refused'
+      ? `WORKTREE_UNREACHABLE: the folder could not be checked just now, nothing was removed (${p})`
+      : `WORKTREE_UNREACHABLE: folder not reachable, nothing was removed (${p})`
+  )
+}
+
 export async function removeWorktree(args: {
   id: string
   force?: boolean
-  registry: WorktreeRegistry
+  registry: WorktreeStore
   isPathInUse: (worktreePath: string) => string | null
+  /** Test seam; defaults to the process-wide action-lane check (presence.ts). */
+  presence?: PresenceCheck
+  /** Test seam: the link walk before git removes the folder (detachLinks.ts). */
+  detach?: (root: string, opts: { keep?: (rel: string) => boolean }) => Promise<DetachResult>
 }): Promise<WorktreeRemoveResult> {
   const info = args.registry.get(args.id)
   if (!info) throw new Error(`NOT_MANAGED: not a worktree created by this app (${args.id})`)
+  const presence = args.presence ?? defaultActionPresenceCheck
 
   const inUse = args.isPathInUse(info.path)
   if (inUse) throw new Error(`IN_USE: ${inUse}`)
@@ -122,22 +197,22 @@ export async function removeWorktree(args: {
   try {
     rows = await listGitWorktrees(info.repoPath)
   } catch {
-    if (!existsSync(info.path)) {
+    if ((await folderState(info.path, presence)) === 'missing') {
       await pruneEmptyRepoDir(info.path, args.registry.getRoot())
       await args.registry.removeEntry(args.id)
       return { removed: true, branchDeleted: false }
     }
     throw new Error(`ORPHAN_UNPROVEN: cannot inspect the original repo (${info.repoPath})`)
   }
-  const row = rows.find((r) => samePath(r.path, info.path))
+  const row = rows.find((r) => isSamePath(r.path, info.path))
 
   let branchDeleted = false
   let branchPreserved: { branch: string; head: string } | undefined
 
   if (!row) {
     // git has forgotten it
-    await git(['worktree', 'prune'], { cwd: info.repoPath })
-    if (existsSync(info.path)) {
+    await git(['worktree', 'prune'], write(info.repoPath))
+    if ((await folderState(info.path, presence)) === 'present') {
       if (!(await isProvenOrphanDir(info.path, info.repoPath))) {
         // Without proof there is no telling our worktree from an unrelated directory — but an empty one
         // has nothing to lose, and demanding proof there left the row undeletable forever
@@ -154,26 +229,36 @@ export async function removeWorktree(args: {
       }
     }
   } else {
-    // If the directory is already gone, git status itself is impossible and there is nothing to inspect — skip the cleanliness check
-    if (!args.force && existsSync(info.path)) {
-      const { clean, changedCount } = await isCleanWorktree(info.path)
-      if (!clean) throw new Error(`DIRTY: ${changedCount}`)
+    // If the directory is already gone, git status itself is impossible and there is nothing to inspect — skip the cleanliness check.
+    // Force or not, the folder is asked about first: before git removes it, its links are taken out
+    // (detachBeforeRemove — git would delete through a junction into the folder it points at), and
+    // that walk is not run on a folder that did not answer. Unreachable throws; nothing is removed.
+    // A locked worktree is refused by git without force; refused here first, before the link walk
+    // would have taken its node_modules links out for nothing.
+    if (!args.force && row.locked)
+      throw new Error(`WORKTREE_LOCKED: the worktree is locked (git worktree lock), nothing was removed (${info.path})`)
+    if ((await folderState(info.path, presence)) === 'present') {
+      if (!args.force) {
+        const { clean, changedCount } = await isCleanWorktree(info.path)
+        if (!clean) throw new Error(`DIRTY: ${changedCount}`)
+      }
+      await detachBeforeRemove(info.path, args.force === true, args.detach ?? detachLinks)
     }
     const rm = await git(
       args.force
         ? ['worktree', 'remove', '--force', info.path]
         : ['worktree', 'remove', info.path],
-      { cwd: info.repoPath }
+      write(info.repoPath)
     )
     if (!rm.ok) throw new Error(`GIT_REMOVE_FAILED: ${rm.stderr || rm.stdout}`)
-    await git(['worktree', 'prune'], { cwd: info.repoPath })
+    await git(['worktree', 'prune'], write(info.repoPath))
   }
 
   // Branch deletion: -d → squash detection → -D; on failure the branch is preserved
-  const del = await git(['branch', '-d', '--', info.branch], { cwd: info.repoPath })
+  const del = await git(['branch', '-d', '--', info.branch], write(info.repoPath))
   if (del.ok) branchDeleted = true
   else if (await isBranchMerged(info.repoPath, info.branch)) {
-    branchDeleted = (await git(['branch', '-D', '--', info.branch], { cwd: info.repoPath })).ok
+    branchDeleted = (await git(['branch', '-D', '--', info.branch], write(info.repoPath))).ok
   }
   if (!branchDeleted) {
     const head = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${info.branch}`], {

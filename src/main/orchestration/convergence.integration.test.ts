@@ -7,18 +7,21 @@
 // **rig() 는 src/main/ipc.ts 의 실제 배선(bootOrch)을 그대로 흉내 낸다** — task-14-brief.md 의 초안이
 // 아니라, 그 초안이 쓰인 뒤 아홉 개의 Task 가 인터페이스를 바꾼 지금의 ipc.ts 를 읽고 다시 짰다:
 //   - onSettled: repairTargetFor → applyValidationResult → **커밋** → (reviewing 이면 startReview,
-//     아니면 새 repair Dispatch 를 찾아 performRepair) — 커밋이 부수 효과보다 먼저다(ipc.ts 의 onSettled).
+//     아니면 새 repair Dispatch 를 찾아 performRepair) — 커밋이 부수 효과보다 먼저다(onSettled, 지금은
+//     core/orchestration/exec/validation.ts 에 있고 앱과 Host 가 같이 짓는다).
 //   - startReview: 검토 Dispatch 를 **커밋한 뒤에만** startWorker 를 부르고, 그 뒤에 sessionId·cwd·
-//     specPath 를 되읽어 patch 한다(ipc.ts 의 startReview) — performRepair 와 같은 규율. spec 본문은
+//     specPath 를 되읽어 patch 한다(createReviewStarter, 지금은 core/orchestration/exec/review.ts 에
+//     있다 — 아래의 사본은 그 함수를 부르지 않는다) — performRepair 와 같은 규율. spec 본문은
 //     production 의 buildReviewSpecFile·specFileName 을 그대로 불러 쓴다(review.json 경로가 앞뒤로
 //     일치하는지 확인하려면 손으로 흉내 낸 문자열이 아니라 진짜 조립기가 필요하다).
 //   - readReviewFile: 완성된 경로(`${specPath}.review.json`)를 받는다. suffix 를 붙이는 자리는
 //     server.ts 의 send worker_done(검토 분기) 하나뿐이다 — 여기서 또 붙이면 조용히 죽는다.
-//   - startWorker: ipc.ts 의 진짜 래퍼가 하는 일 중 이 테스트가 붙잡는 하나 — Task.accountIds 에서
-//     rollAccountIds(그 워커의 롤링 체인)를 계산해 붙인다(ipc.ts 의 startWorker 래퍼, core/accounts 의
-//     rollChainFor). 검토 Dispatch 는 구현자와 다른 provider 이므로 이 계산을 건너뛰고 요청된 계정
-//     하나로 저하한다 — ipc.ts 의 그 가드 그대로. **이 재구현이 ipc.ts 자신의 코드를 실행하는 것은
-//     아니다** — 그 격차는 옆의 ipcConvergenceWiring.test.ts(텍스트 가드)가 메운다.
+//   - startWorker: 진짜 래퍼(startWorkerWithChain, core/orchestration/exec/workerStart.ts)가 하는 일 중
+//     이 테스트가 붙잡는 하나 — Task.accountIds 에서 rollAccountIds(그 워커의 롤링 체인)를 계산해
+//     붙인다(core/accounts 의 rollChainFor). 검토 Dispatch 는 구현자와 다른 provider 이므로 이 계산을
+//     건너뛰고 요청된 계정 하나로 저하한다 — startWorkerWithChain 의 그 가드 그대로. **이 재구현이
+//     startWorkerWithChain 자신의 코드를 실행하는 것은 아니다** — 그 함수의 동작은
+//     workerStart.test.ts 가 증명하고, ipcConvergenceWiring.test.ts 는 ipc.ts 가 그 함수를 부르는지만 본다.
 //   - store.load 가 낸 revalidate·rereview 목록은 이 배선이 스스로 소비한다(부팅 로직은 ipc.ts 에
 //     있고 store.load 자신은 아무것도 시작하지 않는다).
 //
@@ -31,11 +34,13 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { handleCommand, type OrchServerDeps } from './server'
-import { TaskValidator, type ValidatorRunner } from './validator'
-import { performRepair, repairOnce, repairTargetFor, type RepairDeps } from './repair'
-import { OrchestrationStore } from './store'
-import { buildReviewSpecFile, specFileName } from './coordinator'
+import { handleCommand, type OrchServerDeps } from '../../core/orchestration/command'
+import { TaskValidator, type ValidatorRunner } from '../../core/orchestration/exec/validator'
+import { performRepair, repairOnce, repairTargetFor, type RepairDeps } from '../../core/orchestration/exec/repair'
+import { createReviewGate } from '../../core/orchestration/exec/reviewGate'
+import { pauseWorkParkedByTheToggle } from '../../core/orchestration/alwaysOn'
+import { OrchestrationStore } from '../../core/orchestration/store'
+import { buildReviewSpecFile, specFileName } from '../../core/orchestration/exec/coordinator'
 import {
   applyValidationResult,
   blockForValidation,
@@ -51,7 +56,7 @@ import type { Account } from '../../core/types'
 import type { Provider } from '../../core/providers/meta'
 
 // 세 계정, 두 provider. accA·accA2 는 구현자의 롤링 체인(계정을 갈아탈 순서, property 4) 이고,
-// accC 는 유일한 codex 계정이라 검토자로 뽑힌다 — ipc.ts 의 startReview 가 구현자와 다른 provider
+// accC 는 유일한 codex 계정이라 검토자로 뽑힌다 — exec/review.ts 의 createReviewStarter 가 구현자와 다른 provider
 // 에서만 검토자를 고르는 것과 같은 모양이다.
 const fullAccounts: Account[] = [
   { id: 'accA', label: 'A', provider: 'claude', configDir: 'C:/accA', color: '#111111', createdAt: '2026-01-01T00:00:00.000Z' },
@@ -103,12 +108,12 @@ function rig(initial: OrchState = emptyState()) {
   const readReviewFileCalls: string[] = []
   const suspiciousFilesFor = new Map<string, string[]>()
 
-  // ipc.ts 의 startWorker 래퍼 — 워커를 띄우는 모든 길(worker-start, repair 의 같은 세션 재사용·새
-  // 워커, 검토 Dispatch)이 이 한 곳을 지나고, 여기서 Task.accountIds 로부터 rollAccountIds 를 계산해
-  // 붙인다(property 4). 띄우려는 provider 가 이 Task 의 provider 와 다르면(검토 Dispatch) 그 계산을
-  // 건너뛰고 요청된 계정 하나로 저하한다 — ipc.ts 의 그 가드 그대로. **이것은 그 계약을 이 층에서
-  // 재구현한 것이지 ipc.ts 자신의 코드가 아니다** — ipc.ts 가 실제로 그 계약을 지키는지는
-  // ipcConvergenceWiring.test.ts(텍스트 가드)가 별도로 확인한다.
+  // startWorkerWithChain(ipc.ts 의 startWorker 래퍼가 부른다) — 워커를 띄우는 모든 길(worker-start,
+  // repair 의 같은 세션 재사용·새 워커, 검토 Dispatch)이 이 한 곳을 지나고, 여기서 Task.accountIds
+  // 로부터 rollAccountIds 를 계산해 붙인다(property 4). 띄우려는 provider 가 이 Task 의 provider 와
+  // 다르면(검토 Dispatch) 그 계산을 건너뛰고 요청된 계정 하나로 저하한다 — 그 함수의 가드 그대로.
+  // **이것은 그 계약을 이 층에서 재구현한 것이지 그 함수 자신의 코드가 아니다** — 그 함수의 동작은
+  // workerStart.test.ts 가 증명하고, ipcConvergenceWiring.test.ts 는 ipc.ts 가 그것을 부르는지만 본다.
   const startWorker: OrchServerDeps['startWorker'] = async (a) => {
     const task = box.state.tasks.find((t) => t.id === a.taskId)
     const taskAccountIds = task?.accountIds
@@ -133,6 +138,15 @@ function rig(initial: OrchState = emptyState()) {
     return { sessionId, cwd: 'D:/wt', specPath }
   }
 
+  // ruling F63 의 회차 게이트와 그 거절 — production 코드 그대로다(createReviewGate). ipc.ts 가
+  // 같은 네 값으로 같은 것을 만든다.
+  const reviewGate = createReviewGate({
+    getState: () => box.state,
+    setState,
+    now: () => new Date().toISOString(),
+    log: (m) => logs.push(m)
+  })
+
   // repair.ts 가 그대로 받는 의존 묶음 — performRepair/repairOnce 는 production 코드다.
   const repairDeps: RepairDeps = {
     getState: () => box.state,
@@ -145,7 +159,7 @@ function rig(initial: OrchState = emptyState()) {
     now: () => new Date().toISOString()
   }
 
-  // ipc.ts 의 startReview — 검토 Dispatch 를 **커밋한 뒤에만** startWorker 를 부르고, 그 뒤에
+  // exec/review.ts 의 createReviewStarter 를 본뜬 사본 — 검토 Dispatch 를 **커밋한 뒤에만** startWorker 를 부르고, 그 뒤에
   // sessionId·cwd·specPath 를 되읽어 patch 한다(property 1). spec 본문은 production 의
   // buildReviewSpecFile 을 그대로 부른다 — resultPath 를 그 함수가 실제로 문서에 박아 넣는 문자열
   // 그대로 얻어야, "그 문서가 말하는 자리" 와 "server.ts 가 실제로 읽는 자리" 가 같은지(property 2,
@@ -153,6 +167,9 @@ function rig(initial: OrchState = emptyState()) {
   const startReview = async ({ taskId }: { taskId: string }): Promise<void> => {
     const task = box.state.tasks.find((t) => t.id === taskId)
     if (task?.status !== 'reviewing') return
+    // ruling F63 — 회차 게이트. **여기는 production 코드 그대로다**(createReviewGate 를 실제로 부른다):
+    // 판정도 거절도 그 파일이 들고 있고, exec/review.ts 의 createReviewStarter 가 부르는 것과 같은 한 줄이다.
+    if (await reviewGate.refuseIfRunGated({ taskId })) return
     const impl = box.state.dispatches
       .filter((d) => d.taskId === taskId && !d.review)
       .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
@@ -174,7 +191,7 @@ function rig(initial: OrchState = emptyState()) {
     )
     if (!opened.ok) return
     await setState(opened.state)
-    // ipc.ts 는 `<specsDir>/<specFileName(taskId, dispatchId)>.review.json` 을 짓는다 — 아래
+    // exec/review.ts 는 `<specsDir>/<specFileName(taskId, dispatchId)>.review.json` 을 짓는다 — 아래
     // startWorker 가 이 Dispatch 의 specPath 로 내는 값과 같은 함수·같은 인자를 쓴다.
     const resultPath = `${SPECS_DIR}/${specFileName(taskId, opened.value.id)}.review.json`
     const specFileContent = buildReviewSpecFile({
@@ -284,7 +301,6 @@ function rig(initial: OrchState = emptyState()) {
     releaseWorker: async () => {},
     listAccounts: (provider) => (provider ? accounts.filter((a) => a.provider === provider) : accounts),
     readWorker: async () => '',
-    enabled: () => true,
     startValidation,
     startReview: startReviewHook,
     readReviewFile,
@@ -743,5 +759,48 @@ describe('convergence — §51', () => {
     ])
     expect(r.box.state.tasks[0].checkHistory).toEqual({ tests: ['failed'] })
     expect(r.logs).toEqual([])
+  })
+
+  // ruling F63 — 순서로 확인한다. 업그레이드가 세워 둔 회차에 큐로 들어온 보고가 적용되는 그 장면
+  // 이고, 그때 검토자가 뜨면 사람이 세워 둔 것 위에서 계정이 쓰인다. 여기서 도는 것은 전부
+  // production 코드다: 마이그레이션의 판정(pauseWorkParkedByTheToggle), handleCommand 의 send
+  // worker_done, applyWorkerDone, 그리고 createReviewGate.
+  it('F63: 세워 둔 회차에 큐 보고가 적용돼도 검토자는 뜨지 않고, Task 는 사람이 볼 자리에 남는다', async () => {
+    const r = rig()
+    const { taskId, dispatchId, sessionId } = await r.setup({ review: true })
+
+    // 업그레이드가 하는 일 그대로 — 칸만 세우고 열린 Dispatch 는 그대로 둔다. 큐에 남아 있던 보고는
+    // 바로 그 Dispatch 의 것이다.
+    const paused = pauseWorkParkedByTheToggle(r.box.state)
+    expect(paused.runs).toHaveLength(1)
+    r.box.state = paused.state
+
+    const startedBefore = r.started.length
+    await r.done(taskId, dispatchId, sessionId)
+
+    // **먼저 끝 상태를 기다린다.** startReview 는 fire-and-forget 이라, 곧바로 재면 "아직 안 떴다"
+    // 를 "안 뜬다" 로 잘못 읽는다 — 아래 대조 테스트가 같은 자리에서 검토자가 실제로 뜨는 것을
+    // 보이므로, 그 착각은 이 테스트를 조용히 통과시켰을 것이다.
+    await vi.waitFor(() => expect(r.box.state.tasks[0].status).toBe('blocked'))
+
+    // 그러고 나서: 검토자를 띄운 적이 없다. startWorker 가 불린 적 없다는 것이 그 증거다.
+    expect(r.started.slice(startedBefore)).toHaveLength(0)
+    expect(r.box.state.dispatches.filter((d) => d.review)).toHaveLength(0)
+
+    // Task 는 reviewing 에 버려지지 않았다 — 이유가 Gate 에 적혀 있다.
+    expect(r.box.state.gates).toHaveLength(1)
+    expect(r.box.state.gates[0].question).toMatch(/paused/)
+    expect(r.box.state.gates[0].taskId).toBe(taskId)
+  })
+
+  // 같은 순서에서 회차를 세우지 않으면 검토자가 뜬다 — 위 테스트가 "아무것도 안 뜬다" 를 다른
+  // 이유로 통과하고 있지 않다는 것을 이 한 줄이 말한다.
+  it('F63 대조: 세우지 않은 회차에서는 같은 보고가 검토자를 띄운다', async () => {
+    const r = rig()
+    const { taskId, dispatchId, sessionId } = await r.setup({ review: true })
+    await r.done(taskId, dispatchId, sessionId)
+    const rev = await r.awaitOpenReview(taskId)
+    expect(rev.review).toBe(true)
+    expect(r.box.state.gates).toHaveLength(0)
   })
 })

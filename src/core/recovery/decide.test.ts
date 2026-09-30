@@ -57,6 +57,27 @@ describe('decideRecovery', () => {
     expect(d.class).toBe('review')
   })
 
+  // Stage 4 T1: a marker file or a folder that did not answer is "cannot say" — never "none in
+  // progress" (which would restart a worker on top of a merge) and never "the worktree is gone".
+  it('an in-progress state that could not be checked stops recovery as unreadable, not as nothing in progress', () => {
+    for (const smartResume of [false, true]) {
+      const d = decideRecovery({ attempt: attempt({ nativeSessionId: 'uuid-a' }), git: git({ inProgress: 'unknown' }), smartResume })
+      expect(d.strategy).toBe('review')
+      expect(d.class).toBe('review')
+      expect(d.reasonMessage.key).toBe('jobs.recovery.reason.treeUnreadable')
+    }
+  })
+
+  it('a folder that did not answer is unreadable, not gone', () => {
+    const d = decideRecovery({
+      attempt: attempt(),
+      git: git({ exists: null, head: null, dirty: null, inProgress: 'unknown', conflicts: null, branch: null }),
+      smartResume: true
+    })
+    expect(d.strategy).toBe('review')
+    expect(d.reasonMessage.key).toBe('jobs.recovery.reason.treeUnreadable')
+  })
+
   it('an unreadable journal stops recovery, even with a native session', () => {
     for (const over of [{}, { nativeSessionId: 'uuid-a' }]) {
       const d = decideRecovery({

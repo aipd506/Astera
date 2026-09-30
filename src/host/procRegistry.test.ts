@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { ProcRegistry, PROC_BUFFER_CHARS, type RegistryProc } from './procRegistry'
+import { ProcRegistry, PROC_BUFFER_CHARS, DEAD_ENTRIES_KEPT, type RegistryProc } from './procRegistry'
 import type { PtyMeta } from '../core/host/protocol'
 
 const meta = (over: Partial<PtyMeta> = {}): PtyMeta => ({ kind: 'chat', id: 'chat_1', restore: { accountId: 'a1' }, ...over })
@@ -136,6 +136,17 @@ describe('ProcRegistry — exit', () => {
     expect(h.registry.liveCount()).toBe(0)
     expect(h.logs.some((l) => l.includes('proc p1 exited 3'))).toBe(true)
   })
+
+  // The exit can come from the grace timer while a grandchild still holds stdout (nodeProc.ts), so
+  // lines can keep arriving for an ended entry, and an ended chat is kept for good.
+  it('keeps no line that arrives after the exit, and still reports it', () => {
+    const h = harness()
+    h.open()
+    h.procs[0].exit(0)
+    h.procs[0].emit(['late', 'later', ''].join(String.fromCharCode(10)))
+    expect(h.registry.buffer('p1')).toEqual([])
+    expect(h.lines).toEqual([['p1', 1, 'late'], ['p1', 2, 'later']])
+  })
 })
 
 describe('ProcRegistry — notes, kill, killAll', () => {
@@ -166,5 +177,127 @@ describe('ProcRegistry — notes, kill, killAll', () => {
     h.registry.killAll()
     expect(h.procs[1].killed).toBe(true)
     expect(h.logs.some((l) => l.includes('proc p1 could not be killed'))).toBe(true)
+  })
+})
+
+// Host S3 R8 and the M4 carry, for line processes: the same two questions PtyRegistry answers.
+describe('ProcRegistry — what each live process runs in, and how many ended ones are kept', () => {
+  /** A registry whose processes the test ends by id. */
+  const rig = (): { reg: ProcRegistry; exit(id: string, code: number): void } => {
+    const procs = new Map<string, ReturnType<typeof fakeProc>>()
+    let opening = ''
+    const reg = new ProcRegistry({
+      spawn: () => {
+        const p = fakeProc()
+        procs.set(opening, p)
+        return p
+      },
+      log: () => {}
+    })
+    const open = reg.open.bind(reg)
+    reg.open = (a) => {
+      opening = a.id
+      return open(a)
+    }
+    return { reg, exit: (id, code) => procs.get(id)!.exit(code) }
+  }
+
+  it('names the folder each live process was opened in, and forgets it once it ends', () => {
+    const { reg, exit } = rig()
+    reg.open({ id: 'p1', file: 'x', args: [], opts: { cwd: 'D:/wt/a', env: {} }, meta: { kind: 'chat', id: 'c1', restore: { title: 't' } } })
+    reg.open({ id: 'p2', file: 'x', args: [], opts: { cwd: 'D:/p', env: {} } })
+    expect(reg.liveEntries()).toEqual([
+      { id: 'p1', cwd: 'D:/wt/a', meta: { kind: 'chat', id: 'c1', restore: { title: 't' } } },
+      { id: 'p2', cwd: 'D:/p', meta: null }
+    ])
+    exit('p1', 0)
+    expect(reg.liveEntries().map((e) => e.id)).toEqual(['p2'])
+  })
+
+  // An ended chat is read by its session id: `sessions list` shows it, and `sessions read` finds its
+  // transcript through its note (host/sessions.ts `chatOf`). So a chat is kept the way a pty session
+  // is, and only the other ended entries are capped.
+  it('keeps only the newest ended entries that are not sessions, and every ended chat', () => {
+    const { reg, exit } = rig()
+    const open = (id: string, m: PtyMeta | undefined): void => {
+      reg.open({ id, file: 'x', args: [], opts: { cwd: 'D:/p', env: {} }, meta: m })
+    }
+    open('c0', { kind: 'chat', id: 'm_c0', restore: {} })
+    exit('c0', 1)
+    open('first', undefined)
+    for (let i = 0; i < DEAD_ENTRIES_KEPT + 6; i++) {
+      open(`r${i}`, i % 2 === 0 ? undefined : { kind: 'run', id: `m_r${i}`, restore: {} })
+      exit(`r${i}`, 0)
+    }
+    open('live', undefined)
+    const ids = reg.list().map((e) => e.id)
+    expect(ids).toContain('c0')
+    expect(ids).toContain('first')
+    expect(ids).toContain('live')
+    expect(ids.filter((id) => /^r\d+$/.test(id))).toHaveLength(DEAD_ENTRIES_KEPT)
+    expect(ids).not.toContain('r0')
+    expect(ids).not.toContain('r5')
+    expect(ids).toContain('r6')
+  })
+
+  it('drops the entry that ended longest ago, not the one opened first', () => {
+    const { reg, exit } = rig()
+    const open = (id: string): void => {
+      reg.open({ id, file: 'x', args: [], opts: { cwd: 'D:/p', env: {} } })
+    }
+    open('long')
+    for (let i = 0; i < DEAD_ENTRIES_KEPT; i++) {
+      open(`r${i}`)
+      exit(`r${i}`, 0)
+    }
+    exit('long', 1)
+    const ids = reg.list().map((e) => e.id)
+    expect(ids).toContain('long')
+    expect(ids).not.toContain('r0')
+    expect(ids).toHaveLength(DEAD_ENTRIES_KEPT)
+  })
+})
+
+describe('ProcRegistry — listeners (chat takeover P13)', () => {
+  it('every onLine and onExit listener hears, and one that throws costs the others nothing', () => {
+    const h = harness()
+    const seen: string[] = []
+    h.registry.onLine(() => { throw new Error('boom') })
+    const off = h.registry.onLine((id, _s, line) => seen.push(`${id} ${line}`))
+    h.registry.onExit((id, code) => seen.push(`exit ${id} ${code}`))
+    h.open()
+    h.procs[0].emit('a\n')
+    off()
+    h.procs[0].emit('b\n')
+    h.procs[0].exit(0)
+    expect(seen).toEqual(['p1 a', 'exit p1 0'])
+    expect(h.lines.map((l) => l[2])).toEqual(['a', 'b'])
+    expect(h.logs.some((l) => l.includes('boom'))).toBe(true)
+  })
+})
+
+describe('ProcRegistry.onMeta (Slack in the Host, P7)', () => {
+  it('tells a note at open and after each merge, and nothing for a proc with no note', () => {
+    const h = harness()
+    const heard: Array<[string, string, unknown]> = []
+    h.registry.onMeta((id, m, why) => heard.push([id, why, m.restore.title]))
+    h.open('p1', meta({ restore: { title: 'a' } }))
+    h.open('p2', null)
+    h.registry.note('p1', { title: 'b' })
+    h.registry.note('p2', { title: 'c' })
+    expect(heard).toEqual([['p1', 'open', 'a'], ['p1', 'note', 'b']])
+  })
+  it('isolates a listener that throws, logs it once, and unsubscribes', () => {
+    const h = harness()
+    const heard: string[] = []
+    h.registry.onMeta(() => { throw new Error('boom') })
+    const off = h.registry.onMeta((id) => heard.push(id))
+    h.open('p1')
+    h.registry.note('p1', { x: 1 })
+    expect(heard).toEqual(['p1', 'p1'])
+    expect(h.logs.filter((l) => /a meta listener threw/.test(l))).toHaveLength(1)
+    off()
+    h.registry.note('p1', { x: 2 })
+    expect(heard).toEqual(['p1', 'p1'])
   })
 })

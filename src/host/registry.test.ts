@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { PtyRegistry, SCROLLBACK_CHARS, type RegistryPty } from './registry'
+import { PtyRegistry, SCROLLBACK_CHARS, DEAD_ENTRIES_KEPT, type RegistryPty } from './registry'
 import type { PtyMeta } from '../core/host/protocol'
 
 const meta = (over: Partial<PtyMeta> = {}): PtyMeta => ({ kind: 'terminal', id: 'trm_1', restore: { projectPath: 'D:/p' }, ...over })
@@ -80,6 +80,56 @@ describe('PtyRegistry', () => {
     expect(p.sizes).toEqual([[100, 40]])
     expect(p.paused).toBe(0)
     expect(p.killed).toBe(true)
+  })
+
+  // `sessions read` renders the scrollback at the size the tab has — spawn says it, resize changes it.
+  it('remembers the size a pty was opened at and the last size it was resized to', () => {
+    const h = registry()
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta() })
+    expect(h.r.size('p1')).toEqual({ cols: 80, rows: 24 })
+    h.r.resize('p1', 100, 40)
+    expect(h.r.size('p1')).toEqual({ cols: 100, rows: 40 })
+    expect(h.r.size('nope')).toBe(null)
+  })
+
+  // `sessions list` judges a hook event against it (host/sessions.ts): input written after the event
+  // is something the event cannot account for. Resizing is not input.
+  it('remembers when a pty was last written to, and only for a write that reached it', () => {
+    let clock = 1000
+    const r = new PtyRegistry({ spawn: () => fakePty(), log: () => {}, now: () => clock })
+    r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta() })
+    expect(r.lastWrite('p1')).toBe(null)
+    r.write('p1', 'x')
+    expect(r.lastWrite('p1')).toBe(1000)
+    clock = 2000
+    r.resize('p1', 100, 40)
+    expect(r.lastWrite('p1')).toBe(1000)
+    r.write('p1', '\r')
+    expect(r.lastWrite('p1')).toBe(2000)
+    r.write('nope', 'x')
+    expect(r.lastWrite('nope')).toBe(null)
+  })
+
+  // The app's xterm writes its own reports into the pty — a focus change, the answer to a query the
+  // agent's TUI sent. They reach the pty (the TUI asked for them), but nobody typed them.
+  it('a write of only terminal reports reaches the pty but is not input; a keystroke is', () => {
+    const esc = String.fromCharCode(27)
+    let clock = 1000
+    const p = fakePty()
+    const r = new PtyRegistry({ spawn: () => p, log: () => {}, now: () => clock })
+    r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta() })
+    r.write('p1', `${esc}[O`)
+    r.write('p1', `${esc}[?12;40R`)
+    expect(p.sent).toEqual([`${esc}[O`, `${esc}[?12;40R`])
+    expect(r.lastWrite('p1')).toBe(null)
+    r.write('p1', `${esc}[A`)
+    expect(r.lastWrite('p1')).toBe(1000)
+    clock = 2000
+    r.write('p1', esc)
+    expect(r.lastWrite('p1')).toBe(2000)
+    clock = 3000
+    r.write('p1', `${esc}[I`)
+    expect(r.lastWrite('p1')).toBe(2000)
   })
 
   // A message for a session that has gone is ordinary, not exceptional: the app may have sent it
@@ -194,6 +244,21 @@ describe('PtyRegistry', () => {
     p.exit(0)
     expect(h.r.buffer('p1')).toBe('')
     expect(h.r.list()).toEqual([{ id: 'p1', pid: p.pid, meta: meta(), alive: false }])
+  })
+
+  // ConPTY can deliver output after the exit. An ended entry is kept (a session for good), so output
+  // that landed in its buffer then would be kept for the rest of the Host's life, with no reader.
+  it('keeps no output that arrives after the exit, and still hands it to the listeners', () => {
+    const p = fakePty()
+    const h = registry({ pty: p })
+    const heard: string[] = []
+    h.r.onData((_, d) => heard.push(d))
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta({ kind: 'session', id: 'ses_1', restore: {} }) })
+    p.emit('before')
+    p.exit(0)
+    p.emit('after')
+    expect(h.r.buffer('p1')).toBe('')
+    expect(heard).toEqual(['before', 'after'])
   })
 
   // Measured on win32: node-pty's ConPTY kill runs a helper process to enumerate the console's
@@ -316,5 +381,198 @@ describe('the last screen of a session that ended badly', () => {
     r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta() })
     p.exit(1)
     expect(logs.some((l) => l.includes('last screen: (nothing)'))).toBe(true)
+  })
+
+  // F4: the Host's spawner subscribes beside attachPtyHost, and the second subscriber must not
+  // silently disconnect the first.
+  it('tells every subscriber, not only the last one', () => {
+    const p = fakePty()
+    const h = registry({ pty: p })
+    const a: string[] = []; const b: string[] = []
+    h.r.onData((_id, d) => a.push(d)); h.r.onData((_id, d) => b.push(d))
+    const ea: number[] = []; const eb: number[] = []
+    h.r.onExit((_id, c) => ea.push(c)); h.r.onExit((_id, c) => eb.push(c))
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta() })
+    p.emit('x'); p.exit(2)
+    expect([a, b, ea, eb]).toEqual([['x'], ['x'], [2], [2]])
+  })
+  it('finds a live session pty by the app id in its note', () => {
+    const p = fakePty()
+    const h = registry({ pty: p })
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta({ kind: 'session', id: 'ses_1', restore: {} }) })
+    expect(h.r.sessionPty('ses_1')).toBe('p1')
+    expect(h.r.sessionPty('ses_2')).toBeNull()
+    expect(h.r.metaOf('p1')?.id).toBe('ses_1')
+    p.exit(7)
+    expect(h.r.sessionPty('ses_1')).toBeNull()
+    expect(h.r.sessionExitCode('ses_1')).toEqual({ code: 7 })
+  })
+  it('does not answer a session lookup with a pty of another kind', () => {
+    const h = registry()
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta({ kind: 'terminal', id: 'ses_1' }) })
+    expect(h.r.sessionPty('ses_1')).toBeNull()
+  })
+  it('has no exit code for a session that is alive or was never here', () => {
+    const h = registry()
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta({ kind: 'session', id: 'ses_1', restore: {} }) })
+    expect(h.r.sessionExitCode('ses_1')).toBeNull()
+    expect(h.r.sessionExitCode('nope')).toBeNull()
+  })
+
+  // I1: a listener that throws must not starve the ones after it, and must not escape into node-pty's
+  // own event handler, where nothing catches it and the Host would exit with every pty it holds.
+  it('keeps calling the other listeners when one throws, and lets nothing escape', () => {
+    const p = fakePty()
+    const h = registry({ pty: p })
+    h.r.onData(() => { throw new Error('tap broke') })
+    h.r.onExit(() => { throw new Error('exit tap broke') })
+    const data: string[] = []; const exits: number[] = []
+    h.r.onData((_id, d) => data.push(d))
+    h.r.onExit((_id, c) => exits.push(c))
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta() })
+    expect(() => { p.emit('x'); p.emit('y'); p.exit(2) }).not.toThrow()
+    expect([data, exits]).toEqual([['x', 'y'], [2]])
+    // Once per listener per kind: a tap that throws on every chunk must not flood the log.
+    const dataLogs = h.logs.filter((l) => l.includes('tap broke') && !l.includes('exit tap'))
+    const exitLogs = h.logs.filter((l) => l.includes('exit tap broke'))
+    expect(dataLogs).toHaveLength(1)
+    expect(exitLogs).toHaveLength(1)
+    expect(dataLogs[0]).toContain('p1')
+  })
+
+  // I3: during a roll that keeps the session id the old pty can still be alive (a slow ConPTY kill)
+  // when the new one opens. A command for the session belongs to the new one.
+  it('answers a session lookup with the last-opened live pty', () => {
+    const made = [fakePty(1), fakePty(2)]
+    let i = 0
+    const r = new PtyRegistry({ spawn: () => made[i++], log: () => {} })
+    r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta({ kind: 'session', id: 'ses_1', restore: {} }) })
+    r.open({ id: 'p2', file: 'cmd.exe', args: [], opts, meta: meta({ kind: 'session', id: 'ses_1', restore: {} }) })
+    expect(r.sessionPty('ses_1')).toBe('p2')
+    made[1].exit(0)
+    expect(r.sessionPty('ses_1')).toBe('p1')
+  })
+  // M1: node-pty can deliver an exit with no code (the `exited undefined` lines). That session has
+  // ended, and the answer must say so: the Host's handover closes an ended session and skips one it
+  // never held (R3), so "ended with no code" cannot read like "never here".
+  it('answers an ended session with no code as ended, not as never here', () => {
+    const p = fakePty()
+    const h = registry({ pty: p })
+    h.r.open({ id: 'p1', file: 'cmd.exe', args: [], opts, meta: meta({ kind: 'session', id: 'ses_1', restore: {} }) })
+    p.exit(undefined as unknown as number)
+    expect(h.r.sessionExitCode('ses_1')).toEqual({ code: null })
+    expect(h.r.sessionExitCode('nope')).toBeNull()
+  })
+})
+
+// Host S3 R8 and the M4 carry: the Host judges "is this folder in use" from what its live ptys were
+// opened in, and a Host that outlives many builds must not keep every one of them.
+describe('what each live pty runs in, and how many ended ones are kept', () => {
+  /** A registry whose ptys the test ends by id. */
+  const rig = (): { reg: PtyRegistry; exit(id: string, code: number): void } => {
+    const ptys = new Map<string, ReturnType<typeof fakePty>>()
+    let opening = ''
+    const reg = new PtyRegistry({
+      spawn: () => {
+        const p = fakePty()
+        ptys.set(opening, p)
+        return p
+      },
+      log: () => {}
+    })
+    const open = reg.open.bind(reg)
+    reg.open = (a) => {
+      opening = a.id
+      return open(a)
+    }
+    return { reg, exit: (id, code) => ptys.get(id)!.exit(code) }
+  }
+
+  it('names the folder each live pty was opened in, and forgets it once it ends', () => {
+    const { reg, exit } = rig()
+    reg.open({ id: 'p1', file: 'x', args: [], opts: { cwd: 'D:/wt/a', cols: 80, rows: 24, env: {} }, meta: { kind: 'run', id: 'r1', restore: { configName: 'dev' } } })
+    reg.open({ id: 'p2', file: 'x', args: [], opts: { cwd: 'D:/p', cols: 80, rows: 24, env: {} } })
+    expect(reg.liveEntries()).toEqual([
+      { id: 'p1', cwd: 'D:/wt/a', meta: { kind: 'run', id: 'r1', restore: { configName: 'dev' } } },
+      { id: 'p2', cwd: 'D:/p', meta: null }
+    ])
+    exit('p1', 0)
+    expect(reg.liveEntries().map((e) => e.id)).toEqual(['p2'])
+  })
+
+  // M4: a project that runs a build every minute must not grow the Host for the rest of its life.
+  it('keeps only the newest ended entries that are not sessions, and every ended session', () => {
+    const { reg, exit } = rig()
+    const open = (id: string, kind: 'run' | 'session'): void => {
+      reg.open({ id, file: 'x', args: [], opts: { cwd: 'D:/p', cols: 80, rows: 24, env: {} }, meta: { kind, id: `m_${id}`, restore: {} } })
+    }
+    open('s0', 'session')
+    exit('s0', 1)
+    // Live and older than every ended one: age alone never evicts.
+    open('first', 'run')
+    for (let i = 0; i < DEAD_ENTRIES_KEPT + 6; i++) {
+      open(`r${i}`, 'run')
+      exit(`r${i}`, 0)
+    }
+    open('live', 'run')
+    const ids = reg.list().map((e) => e.id)
+    expect(ids).toContain('s0')
+    expect(ids).toContain('first')
+    expect(ids).toContain('live')
+    expect(ids.filter((id) => /^r\d+$/.test(id))).toHaveLength(DEAD_ENTRIES_KEPT)
+    expect(ids).not.toContain('r0')
+    expect(ids).not.toContain('r5')
+    expect(ids).toContain('r6')
+    expect(reg.sessionExitCode('m_s0')).toEqual({ code: 1 })
+    // The pty that just ended is the newest ended one, so a late attach still hears its exit.
+    expect(reg.exitCodeOf(`r${DEAD_ENTRIES_KEPT + 5}`)).toEqual({ code: 0 })
+  })
+
+  // Opening order is not ending order: a dev server opened at the Host's start that ends after a day
+  // of builds is the newest ended entry, and a late pty-attach for it must still hear its exit.
+  it('drops the entry that ended longest ago, not the one opened first', () => {
+    const { reg, exit } = rig()
+    const open = (id: string): void => {
+      reg.open({ id, file: 'x', args: [], opts: { cwd: 'D:/p', cols: 80, rows: 24, env: {} }, meta: { kind: 'run', id: `m_${id}`, restore: {} } })
+    }
+    open('server')
+    for (let i = 0; i < DEAD_ENTRIES_KEPT; i++) {
+      open(`r${i}`)
+      exit(`r${i}`, 0)
+    }
+    exit('server', 1)
+    expect(reg.exitCodeOf('server')).toEqual({ code: 1 })
+    expect(reg.exitCodeOf('r0')).toBeNull()
+    expect(reg.list()).toHaveLength(DEAD_ENTRIES_KEPT)
+  })
+
+  it('keeps the cap the design fixed', () => {
+    expect(DEAD_ENTRIES_KEPT).toBe(64)
+  })
+})
+
+describe('PtyRegistry.onMeta (Slack in the Host, P7)', () => {
+  it('tells a note at open and after each merge, and nothing for a pty with no note', () => {
+    const { r } = registry()
+    const heard: Array<[string, string, unknown]> = []
+    r.onMeta((id, m, why) => heard.push([id, why, m.restore.title]))
+    r.open({ id: 'p1', file: 'x', args: [], opts, meta: meta({ kind: 'session', id: 's1', restore: { title: 'a' } }) })
+    r.open({ id: 'p2', file: 'x', args: [], opts })
+    r.note('p1', { title: 'b' })
+    r.note('p2', { title: 'c' })
+    expect(heard).toEqual([['p1', 'open', 'a'], ['p1', 'note', 'b']])
+  })
+  it('isolates a listener that throws, logs it once, and unsubscribes', () => {
+    const { r, logs } = registry()
+    const heard: string[] = []
+    r.onMeta(() => { throw new Error('boom') })
+    const off = r.onMeta((id) => heard.push(id))
+    r.open({ id: 'p1', file: 'x', args: [], opts, meta: meta() })
+    r.note('p1', { x: 1 })
+    expect(heard).toEqual(['p1', 'p1'])
+    expect(logs.filter((l) => /a meta listener threw/.test(l))).toHaveLength(1)
+    off()
+    r.note('p1', { x: 2 })
+    expect(heard).toEqual(['p1', 'p1'])
   })
 })

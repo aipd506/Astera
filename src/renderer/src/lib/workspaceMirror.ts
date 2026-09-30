@@ -1,0 +1,85 @@
+// The mirror tabs' state: one entry per session the Host has shown a workspace for. Pure, so it is
+// tested without a window. A closed workspace keeps its entry (and last frame) until its tab closes:
+// the person sees "closed" rather than a tab that vanished (agent workspace plan ruling P7).
+import type { WorkspaceEvent, WorkspaceFrame, WorkspaceSummary } from '../../../core/host/protocol'
+import { placeTab } from '../../../core/panes/place'
+import { appTab } from '../../../core/panes/tabId'
+import { groupOfTab, removeTab, type PaneNode } from '../../../core/panes/tree'
+
+export interface MirrorEntry {
+  sessionId: string
+  open: boolean
+  running: boolean
+  helper: string | null
+  frame: WorkspaceFrame | null
+  /** Seconds the running script's launch has waited for the app so far; absent when it is not waiting. */
+  launching?: number
+}
+
+export type Mirrors = Record<string, MirrorEntry>
+
+export function applyWorkspaceEvent(prev: Mirrors, e: WorkspaceEvent): Mirrors {
+  const was = prev[e.sessionId]
+  if (e.kind === 'frame') {
+    const launching = was?.launching !== undefined ? { launching: was.launching } : {}
+    return { ...prev, [e.sessionId]: { sessionId: e.sessionId, open: true, running: was?.running ?? false, helper: was?.helper ?? null, frame: e.frame, ...launching } }
+  }
+  const running = e.open && e.running
+  const launching = running && e.launching !== undefined ? { launching: e.launching } : {}
+  return {
+    ...prev,
+    [e.sessionId]: { sessionId: e.sessionId, open: e.open, running, helper: e.open ? e.helper : null, frame: was?.frame ?? null, ...launching }
+  }
+}
+
+/** The mirror bar's status line, as a message key and its parameters: the app starting (with the
+ *  seconds the Host counts), a helper running, idle, or closed. */
+export function mirrorStatus(
+  m: MirrorEntry | null
+):
+  | { key: 'workspace.pane.launching'; params: { seconds: number } }
+  | { key: 'workspace.pane.running'; params: { helper: string } }
+  | { key: 'workspace.pane.idle' | 'workspace.pane.closed' } {
+  if (m?.running && m.launching !== undefined) return { key: 'workspace.pane.launching', params: { seconds: m.launching } }
+  if (m?.running) return { key: 'workspace.pane.running', params: { helper: m.helper ?? '...' } }
+  return { key: m?.open === true ? 'workspace.pane.idle' : 'workspace.pane.closed' }
+}
+
+export function mirrorsFromList(list: WorkspaceSummary[]): Mirrors {
+  const out: Mirrors = {}
+  for (const w of list) out[w.sessionId] = { sessionId: w.sessionId, open: true, running: w.running, helper: w.helper, frame: w.frame }
+  return out
+}
+
+/** Sessions that are open in `next` and were not open in `prev`: each gets its tab placed once. */
+export function newlyOpened(prev: Mirrors, next: Mirrors): string[] {
+  return Object.values(next)
+    .filter((m) => m.open && prev[m.sessionId]?.open !== true)
+    .map((m) => m.sessionId)
+}
+
+/** Sessions whose workspace is open now: the mirror tabs a freshly built tree must carry. */
+export function openSessionIds(m: Mirrors): string[] {
+  return Object.values(m)
+    .filter((e) => e.open)
+    .map((e) => e.sessionId)
+}
+
+/** Places each session's mirror tab in the background (the openAgentTab rule: the agent's work must not
+ *  take the tab the person is on), each placement building on the previous one's tree, so two
+ *  workspaces that open before a render both keep their tab. A tab already in the tree is left alone. */
+export function placeAppTabs(root: PaneNode | null, sessionIds: string[], activePaneId: string | null): PaneNode | null {
+  let next = root
+  for (const sid of sessionIds) {
+    const id = appTab(sid)
+    if (next && groupOfTab(next, id)) continue
+    next = placeTab(next, id, { activePaneId, background: true }).root
+  }
+  return next
+}
+
+/** The tree without the session's mirror tab: a closed session leaves no mirror behind. */
+export function removeAppTab(root: PaneNode | null, sessionId: string): PaneNode | null {
+  const id = appTab(sessionId)
+  return root && groupOfTab(root, id) ? removeTab(root, id) : root
+}

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -6,6 +6,7 @@ import { makeDescriptors, descriptorOf, isAmbientDir } from './descriptor'
 import type { KeychainHas } from '../accounts/keychain'
 import { claudeLoginProbe } from '../accounts/loginStatus'
 import { PROVIDERS } from './meta'
+import { foldsCaseHere } from '../testPaths'
 
 describe('provider descriptor', () => {
   it('모든 provider에 대해 값 필드가 채워진다', () => {
@@ -38,10 +39,15 @@ describe('provider descriptor', () => {
   })
 
   it('buildCommand가 플랫폼을 반영한다 (팩토리인 이유)', () => {
-    expect(makeDescriptors('win32').claude.buildCommand({})).toEqual({
-      file: 'cmd.exe',
-      args: ['/c', 'claude']
-    })
+    // win32 는 PATH 가 아는 절대 경로로 띄운다. PATH 를 비워 claude 를 모르게 하면 cmd.exe 없이 이름
+    // 그대로다 — cmd.exe 에 이름을 넘기면 작업 폴더에서 먼저 찾는다 (windowsExecutable.ts). 비우지 않으면
+    // claude 가 설치된 Windows 에서는 그 절대 경로가 나와 이 기대가 기계에 따라 갈린다.
+    vi.stubEnv('PATH', '')
+    try {
+      expect(makeDescriptors('win32').claude.buildCommand({})).toEqual({ file: 'claude', args: [] })
+    } finally {
+      vi.unstubAllEnvs()
+    }
     expect(makeDescriptors('darwin').claude.buildCommand({})).toEqual({ file: 'claude', args: [] })
     expect(makeDescriptors('darwin').codex.buildCommand({})).toEqual({ file: 'codex', args: [] })
   })
@@ -52,11 +58,11 @@ describe('provider descriptor', () => {
     expect(descriptorOf(t, { provider: 'codex' }).cliFile).toBe('codex')
   })
 
-  it('isAmbientDir는 홈 기본 디렉토리만 참이고 대소문자·구분자 차이를 무시한다', () => {
+  it('isAmbientDir는 홈 기본 디렉토리만 참이고 대소문자 차이는 접는 플랫폼에서만 무시한다', () => {
     const t = makeDescriptors('win32')
     const home = path.join('C:', 'Users', 'tester')
     expect(isAmbientDir(t.claude, home, path.join(home, '.claude'))).toBe(true)
-    expect(isAmbientDir(t.claude, home, path.join(home, '.CLAUDE'))).toBe(true)
+    expect(isAmbientDir(t.claude, home, path.join(home, '.CLAUDE'))).toBe(foldsCaseHere)
     expect(isAmbientDir(t.claude, home, path.join(home, '.claude-accounts', 'a'))).toBe(false)
     expect(isAmbientDir(t.codex, home, path.join(home, '.codex'))).toBe(true)
     // provider가 다르면 서로의 ambient를 인정하지 않는다

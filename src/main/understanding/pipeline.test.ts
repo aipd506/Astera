@@ -77,7 +77,10 @@ const explanation = (over: Record<string, unknown> = {}): Record<string, unknown
   ...over
 })
 
-async function make(generator: { accountId?: string } = { accountId: 'a1' }): Promise<{
+async function make(
+  generator: { accountId?: string } = { accountId: 'a1' },
+  extra: Partial<ConstructorParameters<typeof UnderstandingPipeline>[0]> = {}
+): Promise<{
   store: UnderstandingStore
   pipeline: UnderstandingPipeline
   /** 화면으로 나간 알림. 여기가 비면 배경 재생성의 결과는 화면에 닿지 않는다 */
@@ -93,7 +96,8 @@ async function make(generator: { accountId?: string } = { accountId: 'a1' }): Pr
     generator: () => generator,
     lang: () => 'ko' as const,
     now: () => '2026-08-30T12:00:00.000Z',
-    onChanged: (root) => changed.push(root)
+    onChanged: (root) => changed.push(root),
+    ...extra
   })
   return { store, pipeline, changed }
 }
@@ -188,6 +192,33 @@ describe('onUnitClosed — 닫힌 작업이 기록이 된다', () => {
     const r = store.get(projectRoot)!.records[0]
     expect(r.status).toBe('failed')
     expect(r.reason).toContain('src/auth')
+  })
+
+  // Stage 4 T1: 근거 파일은 비동기로, 예산 안의 probe 로 묻는다. 동기 statSync 는 끊긴 공유 위의
+  // 프로젝트에서 main 을 20~60초 세웠다. 답이 없는 것은 "없다" 가 아니라 "확인할 수 없다" 다.
+  it('근거 파일을 probe 로 묻고, 답이 없으면 유령 경로가 아니라 EVIDENCE_UNREACHABLE 로 실패한다', async () => {
+    const asked: string[] = []
+    const { store, pipeline } = await make(undefined, {
+      fileProbe: async (p) => {
+        asked.push(p)
+        return 'timeout'
+      }
+    })
+    agentReply.value = explanation()
+    await pipeline.onUnitClosed(projectRoot, unit())
+    const r = store.get(projectRoot)!.records[0]
+    expect(asked).toEqual([path.resolve(projectRoot, 'src/auth/login.ts')])
+    expect(r.status).toBe('failed')
+    expect(r.reason).toBe('EVIDENCE_UNREACHABLE')
+  })
+
+  it('probe 가 파일이 아니라고 하면 그 경로를 대며 거부한다', async () => {
+    const { store, pipeline } = await make(undefined, { fileProbe: async () => 'absent' })
+    agentReply.value = explanation()
+    await pipeline.onUnitClosed(projectRoot, unit())
+    const r = store.get(projectRoot)!.records[0]
+    expect(r.status).toBe('failed')
+    expect(r.reason).toContain('src/auth/login.ts')
   })
 
   it('새 기록이 앞에 온다 — 목록의 축은 시간이다', async () => {

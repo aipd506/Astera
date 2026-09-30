@@ -1,8 +1,37 @@
-import { createReadStream } from 'node:fs'
-import { open } from 'node:fs/promises'
-import { createInterface } from 'node:readline'
 import type { TranscriptMessage } from '../types'
 import { lastTurns, PREVIEW_TURNS, READ_BUFFER_MAX, toTitle, type TranscriptResumeMaterial } from './parser'
+import {
+  openTranscriptSource,
+  parseTranscriptLine,
+  readHeadLines,
+  readTailLines,
+  TRANSCRIPT_HEAD_BYTES,
+  TRANSCRIPT_HEAD_BYTES_MAX,
+  TRANSCRIPT_TAIL_BYTES,
+  TRANSCRIPT_TAIL_BYTES_MAX,
+  type OpenTranscriptSource,
+  type TranscriptWindowOptions
+} from './transcriptWindow'
+
+// **Every reader here goes through byte windows (transcriptWindow.ts), as the claude parser does.**
+// Preview and resume used to stream the whole rollout and JSON.parse every line; a rollout with pasted
+// screenshots carries each as a data URL of a megabyte or more, and a long session grows past 100 MB
+// the same way a claude transcript does. The windows, their caps and the heavy-line handling are the
+// claude parser's, so the two providers cost the same and differ in the same few places.
+//
+// **The answer is the old readers' answer (fixtures/codexParserReference.ts) on every file, except:**
+// 1. parseCodexMeta — the head window stops at TRANSCRIPT_HEAD_BYTES_MAX (4 MB). If the first
+//    `maxLines` lines are longer than that together, a field that only appears past it (a title after
+//    a 4 MB run of screenshots) is not seen and stays null.
+// 2. parseCodexPreview / parseCodexForResume — the tail window stops at TRANSCRIPT_TAIL_BYTES_MAX
+//    (64 MB). A file whose last 64 MB do not hold what the reader needs answers from what they do
+//    hold: the preview says truncated and keeps the turns it has (the same rule as
+//    parseTranscriptPreview), the resume returns fewer than READ_BUFFER_MAX requests and messages.
+// 3. Any reader — a line over HEAVY_LINE_CHARS (256K characters) has every JSON string that is wholly
+//    a base64 run of 4096+ characters, or a data URL of one, emptied before it is parsed. A message
+//    whose whole text was such a token is then empty and is no message; text beside an image is kept.
+// 4. Any reader — a line still over PARSE_LINE_CHARS_MAX (4M characters) after that is skipped.
+// 1 and 2 happen only past the caps; 3 and 4 only on such lines. codexParserWindow.test.ts shows each.
 
 /** Extracts the session uuid from a codex rollout filename (rollout-<ts>-<uuid>.jsonl) */
 export const ROLLOUT_UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
@@ -105,15 +134,9 @@ function isRealCodexUserText(text: string): boolean {
   return !CODEX_WRAPPER_PREFIXES.some((p) => t.startsWith(p))
 }
 
-function parseLine(raw: string): Record<string, unknown> | null {
-  try {
-    const obj: unknown = JSON.parse(raw)
-    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return null
-    return obj as Record<string, unknown>
-  } catch {
-    return null // defensive parsing — ignore a broken line
-  }
-}
+/** One rollout line, parsed the way the claude parser parses one: a heavy line has its base64 values
+ *  (a screenshot's data URL) emptied first, and a line past the hard cap is not parsed at all. */
+const parseLine = parseTranscriptLine
 
 /** Extracts session_meta (sessionId, cwd) and the first user title within the leading maxLines
  *  (mirrors parseTranscriptMeta in parser.ts) */
@@ -133,36 +156,49 @@ export function isExecRollout(meta: CodexMeta): boolean {
   return meta.source === 'exec'
 }
 
-export async function parseCodexMeta(filePath: string, maxLines = 40): Promise<CodexMeta> {
+export async function parseCodexMeta(
+  filePath: string,
+  maxLines = 40,
+  opts?: Pick<TranscriptWindowOptions, 'headBytes' | 'maxHeadBytes' | 'open'>
+): Promise<CodexMeta> {
   const meta: CodexMeta = { sessionId: null, cwd: null, title: null, source: null }
-  const stream = createReadStream(filePath, { encoding: 'utf8' })
-  const rl = createInterface({ input: stream })
+  const src = await (opts?.open ?? openTranscriptSource)(filePath)
   let n = 0
   try {
-    for await (const raw of rl) {
-      if (++n > maxLines) break
-      const obj = parseLine(raw)
-      if (!obj) continue
-      if (obj.type === 'session_meta') {
-        const p = obj.payload
-        if (p !== null && typeof p === 'object' && !Array.isArray(p)) {
-          const pr = p as Record<string, unknown>
-          if (meta.sessionId === null && typeof pr.session_id === 'string') meta.sessionId = pr.session_id
-          if (meta.sessionId === null && typeof pr.id === 'string') meta.sessionId = pr.id
-          if (meta.cwd === null && typeof pr.cwd === 'string') meta.cwd = pr.cwd
-          if (meta.source === null && typeof pr.source === 'string') meta.source = pr.source
+    await readHeadLines(
+      src,
+      src.size,
+      { initial: opts?.headBytes ?? TRANSCRIPT_HEAD_BYTES, max: opts?.maxHeadBytes ?? TRANSCRIPT_HEAD_BYTES_MAX },
+      (lines) => {
+        // A window ends on a line break, so its split ends in one empty string that is no line — a
+        // stream would not have reported it, and `maxLines` counts what a stream reports.
+        const count = lines.length > 0 && lines[lines.length - 1] === '' ? lines.length - 1 : lines.length
+        for (let i = 0; i < count; i++) {
+          if (++n > maxLines) return true
+          const obj = parseLine(lines[i])
+          if (!obj) continue
+          if (obj.type === 'session_meta') {
+            const p = obj.payload
+            if (p !== null && typeof p === 'object' && !Array.isArray(p)) {
+              const pr = p as Record<string, unknown>
+              if (meta.sessionId === null && typeof pr.session_id === 'string') meta.sessionId = pr.session_id
+              if (meta.sessionId === null && typeof pr.id === 'string') meta.sessionId = pr.id
+              if (meta.cwd === null && typeof pr.cwd === 'string') meta.cwd = pr.cwd
+              if (meta.source === null && typeof pr.source === 'string') meta.source = pr.source
+            }
+            continue
+          }
+          if (meta.title === null) {
+            const msg = eventMessage(obj)
+            if (msg && msg.kind === 'user' && isRealCodexUserText(msg.text)) meta.title = toTitle(msg.text)
+          }
+          if (meta.sessionId && meta.cwd && meta.title) return true
         }
-        continue
+        return false
       }
-      if (meta.title === null) {
-        const msg = eventMessage(obj)
-        if (msg && msg.kind === 'user' && isRealCodexUserText(msg.text)) meta.title = toTitle(msg.text)
-      }
-      if (meta.sessionId && meta.cwd && meta.title) break
-    }
+    )
   } finally {
-    rl.close()
-    stream.destroy()
+    await src.close().catch(() => undefined)
   }
   return meta
 }
@@ -171,26 +207,24 @@ export async function parseCodexMeta(filePath: string, maxLines = 40): Promise<C
  *  (mirrors parseTranscriptTail in parser.ts) */
 export async function parseCodexTail(
   filePath: string,
-  tailBytes = 256 * 1024
+  tailBytes = 256 * 1024,
+  opts?: { open?: OpenTranscriptSource }
 ): Promise<{ lastUserTitle: string | null; awaitingReply: boolean }> {
   const empty = { lastUserTitle: null, awaitingReply: false }
-  let handle: Awaited<ReturnType<typeof open>> | undefined
   try {
-    handle = await open(filePath, 'r')
-    const stat = await handle.stat()
-    const start = Math.max(0, stat.size - tailBytes)
-    const length = stat.size - start
-    if (length <= 0) return empty
-    const buffer = Buffer.alloc(length)
-    await handle.read(buffer, 0, length, start)
-    let text = buffer.toString('utf8')
-    if (start > 0) {
-      // Reading started mid-file, so everything before the first newline (an incomplete line) is
-      // discarded — a newline is 1 byte, so a multibyte boundary is safe too
-      const nl = text.indexOf('\n')
-      text = nl === -1 ? '' : text.slice(nl + 1)
+    const src = await (opts?.open ?? openTranscriptSource)(filePath)
+    let lines: string[] = []
+    try {
+      // One fixed window, never widened: this runs for every row of an expansion (as the claude list's
+      // parseTranscriptTail does), and a row whose last 256 KB say nothing just shows the head title.
+      await readTailLines(src, { initial: tailBytes, max: tailBytes }, (raw) => {
+        lines = raw
+        return true
+      })
+    } finally {
+      await src.close().catch(() => undefined)
     }
-    const lines = text.split('\n').filter((l) => l.trim().length > 0)
+    lines = lines.filter((l) => l.trim().length > 0)
 
     let lastUserTitle: string | null = null
     let awaitingReply = false
@@ -221,13 +255,6 @@ export async function parseCodexTail(
     return { lastUserTitle, awaitingReply }
   } catch {
     return empty
-  } finally {
-    // Honours the no-throw contract even if close itself rejects (a double close, for instance)
-    try {
-      await handle?.close()
-    } catch {
-      /* an fd cleanup failure is ignored — it does not affect the result */
-    }
   }
 }
 
@@ -236,29 +263,55 @@ export async function parseCodexTail(
  *  일은 lastTurns 하나가 하고 여기서 되풀이하지 않는다. */
 export async function parseCodexPreview(
   filePath: string,
-  maxTurns = PREVIEW_TURNS
+  maxTurns = PREVIEW_TURNS,
+  opts?: TranscriptWindowOptions
 ): Promise<{ messages: TranscriptMessage[]; truncated: boolean }> {
-  const messages: TranscriptMessage[] = []
-  const stream = createReadStream(filePath, { encoding: 'utf8' })
-  const rl = createInterface({ input: stream })
+  const src = await (opts?.open ?? openTranscriptSource)(filePath)
+  let messages: TranscriptMessage[] = []
+  let from: number
   try {
-    for await (const raw of rl) {
-      const obj = parseLine(raw)
-      if (!obj) continue
-      const msg = eventMessage(obj)
-      if (!msg) continue
-      if (msg.kind === 'user' && !isRealCodexUserText(msg.text)) continue
-      messages.push({
-        role: msg.kind === 'user' ? 'user' : 'assistant',
-        text: msg.text,
-        timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined
-      })
-    }
+    // The claude preview's rule (parseTranscriptPreview): widen until maxTurns + 1 user messages are
+    // in — then the last maxTurns turns are whole and "truncated" is certain — or the start, or the cap.
+    ;({ from } = await readTailLines(
+      src,
+      { initial: opts?.tailBytes ?? TRANSCRIPT_TAIL_BYTES, max: opts?.maxTailBytes ?? TRANSCRIPT_TAIL_BYTES_MAX },
+      (raw) => {
+        messages = previewMessagesOf(raw).concat(messages)
+        return userCount(messages) > maxTurns
+      }
+    ))
   } finally {
-    rl.close()
-    stream.destroy()
+    await src.close().catch(() => undefined)
   }
-  return lastTurns(messages, maxTurns)
+  if (from === 0 || userCount(messages) > maxTurns) return lastTurns(messages, maxTurns)
+  if (userCount(messages) === maxTurns) {
+    const first = messages.findIndex((m) => m.role === 'user')
+    return { messages: first === -1 ? [] : messages.slice(first), truncated: true }
+  }
+  return { messages, truncated: true }
+}
+
+function previewMessagesOf(raw: readonly string[]): TranscriptMessage[] {
+  const out: TranscriptMessage[] = []
+  for (const r of raw) {
+    const obj = parseLine(r)
+    if (!obj) continue
+    const msg = eventMessage(obj)
+    if (!msg) continue
+    if (msg.kind === 'user' && !isRealCodexUserText(msg.text)) continue
+    out.push({
+      role: msg.kind === 'user' ? 'user' : 'assistant',
+      text: msg.text,
+      timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined
+    })
+  }
+  return out
+}
+
+function userCount(messages: readonly TranscriptMessage[]): number {
+  let n = 0
+  for (const m of messages) if (m.role === 'user') n++
+  return n
 }
 
 /** 탭 세션용 재개 브리핑의 재료 — parseTranscriptForResume(parser.ts)의 codex 대응.
@@ -267,14 +320,34 @@ export async function parseCodexPreview(
  *  제목 레코드)나 `file-history-snapshot`(손댄 파일 스냅숏)에 해당하는 레코드가 없다 — 있지도 않은
  *  것을 첫 사용자 메시지 등으로 대신 채우면 "어느 메시지가 작업인지 판정하지 않는다"는 계획의
  *  규칙을 이 provider 에서만 깨는 것이 된다. 그래서 `title` 은 항상 `null`, `editedFiles` 는 항상
- *  빈 배열이다 — 후자는 buildTabResumeText(main/orchestration/resumePacket.ts)가 이미 git 변경
+ *  빈 배열이다 — 후자는 buildTabResumeText(core/orchestration/exec/resumePacket.ts)가 이미 git 변경
  *  목록으로 내려가는 경로를 갖고 있어 손실이 없다. `lastCommand` 도 같은 이유로 항상 `null` 이다 —
  *  codex 의 실행 기록(`function_call`/`function_call_output`, 도구 이름 `exec_command`)은 claude 의
  *  `tool_use`(Bash)/`tool_result`(`is_error`) 와 필드 모양이 다르고 그쪽은 측정한 적이 없다. 있지도
  *  않은 모양을 추측해 채우는 것은 이 필드가 지키려는 것("모르는 것을 지어내지 않는다")과 정반대다.
  *  나머지 둘(`requests`·`tail`)은 claude 와 같은 재료(event_msg 의 user_message/agent_message)에서
  *  뽑는다 — parseCodexPreview 와 같은 판정(isRealCodexUserText)을 쓴다. */
-export async function parseCodexForResume(filePath: string): Promise<TranscriptResumeMaterial> {
+export async function parseCodexForResume(
+  filePath: string,
+  opts?: TranscriptWindowOptions
+): Promise<TranscriptResumeMaterial> {
+  const src = await (opts?.open ?? openTranscriptSource)(filePath)
+  let messages: TranscriptMessage[] = []
+  try {
+    // Every message here is either a request (a real user text) or an answer, and both land in the
+    // tail — so once READ_BUFFER_MAX of each are in the window, nothing before it can change the last
+    // READ_BUFFER_MAX of either. No head window: codex has no title record to look for.
+    await readTailLines(
+      src,
+      { initial: opts?.tailBytes ?? TRANSCRIPT_TAIL_BYTES, max: opts?.maxTailBytes ?? TRANSCRIPT_TAIL_BYTES_MAX },
+      (raw) => {
+        messages = previewMessagesOf(raw).concat(messages)
+        return userCount(messages) >= READ_BUFFER_MAX && messages.length >= READ_BUFFER_MAX
+      }
+    )
+  } finally {
+    await src.close().catch(() => undefined)
+  }
   const result: TranscriptResumeMaterial = {
     title: null,
     requests: [],
@@ -282,29 +355,13 @@ export async function parseCodexForResume(filePath: string): Promise<TranscriptR
     tail: [],
     lastCommand: null
   }
-  const stream = createReadStream(filePath, { encoding: 'utf8' })
-  const rl = createInterface({ input: stream })
-  try {
-    for await (const raw of rl) {
-      const obj = parseLine(raw)
-      if (!obj) continue
-      const msg = eventMessage(obj)
-      if (!msg) continue
-      if (msg.kind === 'user') {
-        if (!isRealCodexUserText(msg.text)) continue // 기계가 남긴 wrapper — 요청도 꼬리도 아니다
-        result.requests.push(msg.text)
-        if (result.requests.length > READ_BUFFER_MAX) result.requests.shift()
-      }
-      result.tail.push({
-        role: msg.kind === 'user' ? 'user' : 'assistant',
-        text: msg.text,
-        timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined
-      })
-      if (result.tail.length > READ_BUFFER_MAX) result.tail.shift()
+  for (const m of messages) {
+    if (m.role === 'user') {
+      result.requests.push(m.text)
+      if (result.requests.length > READ_BUFFER_MAX) result.requests.shift()
     }
-  } finally {
-    rl.close()
-    stream.destroy()
+    result.tail.push(m)
+    if (result.tail.length > READ_BUFFER_MAX) result.tail.shift()
   }
   return result
 }

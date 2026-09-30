@@ -8,10 +8,44 @@ import {
   parseCodexTail,
   ROLLOUT_UUID_RE
 } from '../codexParser'
-import type { HistoryStrategy } from './types'
+import type { HistoryIo, HistoryStrategy, MemoFile } from './types'
 
 /** Scan root for codex session files — this file is the only place that knows about `sessions` */
 const root = (configDir: string): string => path.join(configDir, 'sessions')
+
+/** Every rollout of the account with its (mtimeMs, size) — the listing the index is keyed on.
+ *  `complete` is false when some folder or file could not be read (EBUSY, EPERM…): such a listing is
+ *  still good for showing, but not for saying which files are gone. */
+async function rolloutFiles(account: Account, io: HistoryIo): Promise<{ files: MemoFile[]; complete: boolean }> {
+  const status = { complete: true }
+  const files: MemoFile[] = []
+  for (const y of await io.subdirs(root(account.configDir), status))
+    for (const m of await io.subdirs(y, status))
+      for (const dir of await io.subdirs(m, status))
+        for (const f of await io.jsonlByMtimeDesc(dir, status)) {
+          files.push({ path: path.join(dir, f.name), mtimeMs: f.mtimeMs, size: f.size })
+        }
+  return { files, complete: status.complete }
+}
+
+/** The cwd the index keeps for one rollout. An exec rollout reports none, which is the same thing the
+ *  list already says about a file it does not recognise — "no cwd = not a project", the rule
+ *  buildEntry applies too. That keeps the exclusion in one shape rather than adding a second kind of
+ *  skip. */
+async function headCwd(filePath: string): Promise<string | null> {
+  const m = await parseCodexMeta(filePath)
+  return isExecRollout(m) ? null : m.cwd
+}
+
+/** Every rollout with the cwd the index knows for it — parsing only the heads it does not know, and
+ *  pruning the entries of files that are gone, but only after a listing that read everything: a
+ *  transient failure answers an empty folder, and pruning on that would throw the root's entries away
+ *  and rescan them all on the next pass. */
+async function rolloutCwds(account: Account, io: HistoryIo): Promise<{ files: MemoFile[]; cwds: (string | null)[] }> {
+  const { files, complete } = await rolloutFiles(account, io)
+  const cwds = await io.cwdMemo(files, headCwd, complete ? root(account.configDir) : undefined)
+  return { files, cwds }
+}
 
 /** codex history: <configDir>/sessions/<y>/<m>/<d>/rollout-<ts>-<uuid>.jsonl — directory↔date 1:1 */
 export const codexHistoryStrategy: HistoryStrategy = {
@@ -38,19 +72,8 @@ export const codexHistoryStrategy: HistoryStrategy = {
    *
    *  The exclusion rule stays "no cwd = not a project", the same one buildEntry applies. */
   projectSummaries: async (account, io): Promise<ProjectSummary[]> => {
-    const files: { path: string; mtimeMs: number; size: number }[] = []
-    for (const dir of await codexHistoryStrategy.allDirs(account, io)) {
-      for (const f of await io.jsonlByMtimeDesc(dir)) {
-        files.push({ path: path.join(dir, f.name), mtimeMs: f.mtimeMs, size: f.size })
-      }
-    }
-    // An exec rollout reports no cwd here, which is the same thing this list already says about a
-    // file it does not recognise — "no cwd = not a project", the rule buildEntry applies too. That
-    // keeps the exclusion in one shape rather than adding a second kind of skip.
-    const cwds = await io.cwdMemo(files, async (p) => {
-      const m = await parseCodexMeta(p)
-      return isExecRollout(m) ? null : m.cwd
-    })
+    const { files, cwds } = await rolloutCwds(account, io)
+    io.flushIndex()
     const byPath = new Map<string, ProjectSummary>()
     files.forEach((f, i) => {
       const cwd = cwds[i]
@@ -68,6 +91,41 @@ export const codexHistoryStrategy: HistoryStrategy = {
       }
     })
     return [...byPath.values()]
+  },
+  /** One project's sessions. Its directories are dates, so the old path parsed every rollout of every
+   *  date (head + 256 KB tail) to keep the few of this project — the first expansion on a machine with
+   *  thousands of rollouts was slow and said nothing. Now the index (sessionCwdCache.ts) names the
+   *  project's files by their cwd; only a file it does not know is opened to learn its cwd, and only
+   *  the project's own files are built into rows, which the index keeps too, so an unchanged file is
+   *  not opened again. */
+  entriesForProject: async (account, projectPath, io) => {
+    const { files, cwds } = await rolloutCwds(account, io)
+    const key = io.pathKey(projectPath)
+    const mine = files.filter((_, i) => {
+      const cwd = cwds[i]
+      return cwd !== null && io.pathKey(cwd) === key
+    })
+    const rows = await io.rowMemo(mine, async (f) => {
+      const e = await codexHistoryStrategy.buildEntry(account, f.path, f.mtimeMs, io)
+      return e && { cwd: e.projectPath, sessionId: e.sessionId, title: e.title, awaitingReply: e.awaitingReply }
+    })
+    io.flushIndex() // once for the pass: the cwds and the rows together
+    const out: HistoryEntry[] = []
+    rows.forEach((row, i) => {
+      if (!row || io.pathKey(row.cwd) !== key) return
+      out.push({
+        id: `${account.id}:${row.sessionId}`,
+        accountId: account.id,
+        sessionId: row.sessionId,
+        projectPath: row.cwd,
+        title: row.title,
+        updatedAt: new Date(mine[i].mtimeMs).toISOString(),
+        filePath: mine[i].path,
+        awaitingReply: row.awaitingReply,
+        rootUuid: null
+      })
+    })
+    return out
   },
   /** One codex rollout file → HistoryEntry. Treated as noise and null when cwd or sessionId is missing. */
   buildEntry: async (account, filePath, mtimeMs): Promise<HistoryEntry | null> => {

@@ -23,3 +23,22 @@ export function resolveShell(
   }
   return { file: envShell || '/bin/sh', args: [] }
 }
+
+/**
+ * resolveShell over an async lookup that says **where** a candidate is: on win32 every candidate is
+ * looked for at once — each lookup walks PATH, and one PATH entry on an offline drive must not be paid
+ * for three times in a row — and then the same order decides. The answer is the absolute path the
+ * lookup found, or `fallback` when none was found: a bare name would make node-pty walk PATH again
+ * itself, synchronously, on the spawning thread (conpty.cc). Off win32 nothing is looked for, exactly
+ * as resolveShell does.
+ */
+export async function resolveShellAsync(
+  platform: NodeJS.Platform,
+  locate: (file: string) => Promise<string | null>,
+  envShell?: string,
+  fallback = 'cmd.exe'
+): Promise<ShellSpawn> {
+  if (platform !== 'win32') return resolveShell(platform, () => false, envShell)
+  const found = await Promise.all(WIN_CANDIDATES.map((f) => locate(f)))
+  return { file: found.find((f): f is string => typeof f === 'string' && f !== '') ?? fallback, args: [] }
+}

@@ -11,6 +11,7 @@
 import { spawn } from 'node:child_process'
 import type { ModelListResult } from '../../core/models/types'
 import { parseClaudeModels, parseCodexModels } from '../../core/models/parse'
+import { windowsSpawn } from '../../core/sessions/windowsExecutable'
 
 /** 이 왕복은 사용자가 설정 화면에서 기다리는 시간이다. 실측이 2초 안쪽이라 넉넉히 잡되,
  *  응답이 없는 CLI 에 무한히 매달리지 않는다. */
@@ -24,7 +25,8 @@ const TIMEOUT_MS = 20_000
  *  cmd 에 넘기는 경우인데, 이 함수가 넘기는 인자는 전부 이 파일 안의 상수다. 사용자 입력은
  *  stdin 의 JSON 으로만 들어가고 그것은 cmd 가 보지 않는다. */
 function wrapForPlatform(file: string, args: string[]): { file: string; args: string[] } {
-  return process.platform === 'win32' ? { file: 'cmd.exe', args: ['/c', file, ...args] } : { file, args }
+  // By where PATH says the CLI is, never by name (core/sessions/windowsExecutable.ts)
+  return process.platform === 'win32' ? windowsSpawn(file, args) : { file, args }
 }
 
 interface RunOpts {

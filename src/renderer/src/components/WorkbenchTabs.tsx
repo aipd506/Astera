@@ -3,7 +3,7 @@ import type { SessionKind } from '../../../core/types'
 import { resolveFileIcon } from '../../../core/files/icons'
 import { useI18n } from '../i18n/I18nProvider'
 import { FileIcon } from './FileIcon'
-import { Globe, MessageSquare, Repeat, Terminal } from 'lucide-react'
+import { Globe, MessageSquare, Monitor, Repeat, Terminal } from 'lucide-react'
 
 /** File viewer tab. Renderer-only — unlike sessions, main is not involved. id = `file:${path}`.
  *  (FileTabs.tsx가 이 탭 줄로 대체되면서 타입만 여기로 옮겨 왔다) */
@@ -89,6 +89,17 @@ export type WorkbenchTab =
       agentRunning: boolean
       /** Set when this tab is a session's agent browser — draws the "agent" tag. */
       agentSessionId?: string
+    }
+  | {
+      tabId: string
+      kind: 'app'
+      sessionId: string
+      /** The session's title: the mirror belongs to that session. */
+      title: string
+      /** A script is running in the workspace: the chip spins. */
+      running: boolean
+      /** The desktop still exists. */
+      open: boolean
     }
   | {
       tabId: string
@@ -254,6 +265,14 @@ export function WorkbenchTabs({
                 <Globe size={11} />
               </span>
             )
+          ) : tab.kind === 'app' ? (
+            tab.running ? (
+              <span className="tab-dot busy bp-tab-busy" title={t('workspace.tab.running')} />
+            ) : (
+              <span className="tab-glyph" aria-hidden="true">
+                <Monitor size={11} />
+              </span>
+            )
           ) : tab.kind === 'record' ? (
             // Same glyph as the sidebar row's .hiw-g — the same record must not wear two different
             // labels in two places. When the status is unknown, no span is left either — an empty
@@ -305,6 +324,7 @@ export function WorkbenchTabs({
           {tab.kind === 'browser' && tab.agentSessionId !== undefined && (
             <span className="run-tag" title={t('preview.agent.tab')}>{t('preview.agent.tab')}</span>
           )}
+          {tab.kind === 'app' && <span className="run-tag" title={t('workspace.tab.tag')}>{t('workspace.tab.tag')}</span>}
           {tab.kind === 'file' && tab.hint && <span className="tab-hint">{tab.hint}</span>}
           {tab.kind === 'file' && tab.dirty && (
             <span className="tab-dirty" title={t('explorer.tab.unsaved')} />

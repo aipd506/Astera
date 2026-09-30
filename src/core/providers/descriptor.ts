@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { comparablePath } from '../files/tree'
 import os from 'node:os'
 import { execFile } from 'node:child_process'
 import type { DetectCandidate } from '../types'
@@ -24,18 +25,7 @@ import { claudeLoginProbe, fileMarkerProbe, type LoginProbe } from '../accounts/
  * (buildClaudeCommand(platform)). As a global constant, tests could not pin win32/darwin.
  */
 
-// win32 first: ignores differences in path case and separator.
-// (There used to be 4 copies of this rule — in manager.ts, settingsSync.ts, detectCodex.ts and core.ts.
-// The consolidation merged only 2 of them: the private method in manager.ts and the inline normalizeDir in
-// core.ts.)
-// normalizePath in settingsSync.ts and normalize in detectCodex.ts are still alive and really
-// used, by isHomeClaudeDir and isAmbientCodexDir respectively — today they are exactly identical to this
-// rule (all of them path.resolve(p).toLowerCase()) but they are separate definitions. toLowerCase is the
-// wrong rule on Linux, and it is wrong on macOS too if the volume was formatted case-sensitive — but it
-// is right for the two platforms we actually support, since APFS is case-insensitive by default.
-// Changing the semantics was out of scope; whoever fixes that later has to look at all three places
-// together (here, normalizePath in settingsSync.ts, normalize in detectCodex.ts).
-const normalizePath = (p: string): string => path.resolve(p).toLowerCase()
+// Paths compare through comparablePath (core/files/tree.ts): case folded on win32 and darwin, exact on linux.
 
 export interface ProviderDescriptor extends ProviderMeta {
   /** The executable used for spawn and logout */
@@ -85,8 +75,8 @@ export interface ProviderDescriptor extends ProviderMeta {
    *  is actually in progress can be misread as idle (a child process title matched by coincidence).
    *
    *  Why it lives on ProviderDescriptor (Node only): the only place that reads this value is the coordinator
-   *  wiring in main/orchestration — this flag is the reason
-   *  CoordinatorDeps.isBusy(sessionId): boolean | null (main/orchestration/coordinator.ts) is tri-state
+   *  wiring in core/orchestration/exec — this flag is the reason
+   *  CoordinatorDeps.isBusy(sessionId): boolean | null (core/orchestration/exec/coordinator.ts) is tri-state
    *  (null = it cannot be decided for this provider). The renderer's session:busy display (App.tsx) does not
    *  consult this flag and uses the raw BusyScanner value (existing behaviour) — since the renderer has no
    *  use for it, it goes here rather than in meta.ts (which the renderer shares). */
@@ -164,5 +154,5 @@ export function isAmbientDir(
   homeDir: string,
   configDir: string
 ): boolean {
-  return normalizePath(configDir) === normalizePath(path.join(homeDir, d.ambientDirName))
+  return comparablePath(configDir) === comparablePath(path.join(homeDir, d.ambientDirName))
 }

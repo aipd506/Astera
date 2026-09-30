@@ -64,3 +64,50 @@ describe('listWithStatus', () => {
     expect(reg.list().map((w) => w.id)).toEqual([a.id])
   })
 })
+
+// 폴더 확인이 확답을 주지 못한 항목(멈춘 네트워크 드라이브, 권한 오류)은 잊지 않는다 — 폴더가
+// 사라졌다고 확인된 것(ENOENT)만 걷는다
+describe('listWithStatus — 확인이 불확실할 때', () => {
+  it('멈춘 폴더는 unreachable 로 남고 레지스트리에서 지워지지 않는다', async () => {
+    const repo = await makeRepo('astera-wt-ls4-')
+    const root = await tempDir('astera-wt-ls4root-')
+    const regDir = await tempDir('astera-wt-ls4reg-')
+    const reg = new WorktreeRegistry(path.join(regDir, 'worktrees.json'), root)
+    await reg.load()
+    const a = (await createWorktree({ repoPath: repo, name: 'hung', registry: reg })).info
+    const b = (await createWorktree({ repoPath: repo, name: 'fine', registry: reg })).info
+    const items = await listWithStatus(reg, async (p) => (p === a.path ? 'unreachable' : 'present'))
+    const byId = new Map(items.map((w) => [w.id, w.status]))
+    expect(byId.get(a.id)).toBe('unreachable')
+    expect(byId.get(b.id)).toBe('ok')
+    expect(reg.list().map((w) => w.id).sort()).toEqual([a.id, b.id].sort())
+  })
+
+  // git 이 worktree 목록을 주지 못한 것은 "git 이 이 폴더를 모른다"가 아니다. orphan-dir("git 등록
+  // 소실")는 사람이 지워도 되는 잔해로 읽히므로, 모를 때는 그 이름을 붙이지 않고 따로 말한다.
+  it('저장소의 git 이 목록을 주지 못하면 git-unchecked 이고, orphan-dir 이 아니며, 레지스트리에 남는다', async () => {
+    const repo = await makeRepo('astera-wt-ls6-')
+    const root = await tempDir('astera-wt-ls6root-')
+    const regDir = await tempDir('astera-wt-ls6reg-')
+    const reg = new WorktreeRegistry(path.join(regDir, 'worktrees.json'), root)
+    await reg.load()
+    const a = (await createWorktree({ repoPath: repo, name: 'kept', registry: reg })).info
+    // 원본 저장소의 .git 을 치운다 — `git worktree list` 가 실패한다
+    await fs.rename(path.join(repo, '.git'), path.join(repo, '.git-away'))
+    const items = await listWithStatus(reg, async () => 'present')
+    expect(items.map((w) => [w.id, w.status])).toEqual([[a.id, 'git-unchecked']])
+    expect(reg.list().map((w) => w.id)).toEqual([a.id])
+  })
+
+  it('ENOENT 로 확인된(missing) 항목은 여전히 걷힌다', async () => {
+    const repo = await makeRepo('astera-wt-ls5-')
+    const root = await tempDir('astera-wt-ls5root-')
+    const regDir = await tempDir('astera-wt-ls5reg-')
+    const reg = new WorktreeRegistry(path.join(regDir, 'worktrees.json'), root)
+    await reg.load()
+    const a = (await createWorktree({ repoPath: repo, name: 'gone', registry: reg })).info
+    const items = await listWithStatus(reg, async () => 'missing')
+    expect(items.some((w) => w.id === a.id)).toBe(false)
+    expect(reg.list()).toHaveLength(0)
+  })
+})

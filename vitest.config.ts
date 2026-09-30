@@ -20,7 +20,9 @@ export default defineConfig({
       'src/host/**/*.test.ts',
       'src/main/**/*.test.ts',
       'src/renderer/**/*.test.ts',
-      'src/cli/**/*.test.ts'
+      'src/cli/**/*.test.ts',
+      'scripts/**/*.test.mjs',
+      'vitest.globalSetup.test.ts'
     ],
     environment: 'node',
     testTimeout: 10_000,

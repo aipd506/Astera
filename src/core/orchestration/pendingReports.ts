@@ -7,20 +7,23 @@
 // app applies it at the next start.
 //
 // This module holds the decisions and the file format, with no filesystem in it: `src/cli/run.ts`
-// writes, `src/main/orchestration/pendingDrain.ts` reads and applies.
+// writes, `core/orchestration/pendingDrain.ts` reads, and the app applies.
 import path from 'node:path'
 import { workerDoneFieldError } from './sendArgs'
 import type { Dispatch } from './types'
 
-/** Folder beside the info file the CLI already reads (orch-info.json). One file per report rather
- *  than one appended log: two workers can finish at the same moment with the app gone, and two
+/** Folder under the profile's `orch` directory, beside the shuttle the app writes there. One file
+ *  per report rather than one appended log: two workers can finish at the same moment with the app gone, and two
  *  processes appending to one file can interleave into a line neither of them wrote. */
 export const PENDING_REPORTS_DIR = 'pending-reports'
 
-/** The queue lives beside `ASTERA_INFO`, which is the only path the CLI is given. The app reaches
- *  the same folder through `<userData>/orch`, where it writes that info file. */
-export function pendingReportsDirFrom(infoPath: string): string {
-  return path.join(path.dirname(infoPath), PENDING_REPORTS_DIR)
+/** The queue lives under the profile's `orch` folder — the one folder all three readers can name
+ *  without being told. **It used to be derived from `ASTERA_INFO`**, which was the only path the CLI
+ *  was given; that variable and the file it named are both gone (host control plane design §7), and
+ *  the CLI now derives the Host's address from this same profile directory — so the rule is written
+ *  once here instead of once per process. */
+export function pendingReportsDirIn(profileDir: string): string {
+  return path.join(profileDir, 'orch', PENDING_REPORTS_DIR)
 }
 
 /** Message types a worker may leave behind in a file.
@@ -275,9 +278,16 @@ export function dispatchesHeldOnlyByReport(a: {
  *  is on is not something the worker can see. And the reason not to re-send is that the app
  *  already has the report, not that a re-send would fail — once the app is back a re-send works
  *  perfectly well, and an agent that tries it and finds the notice wrong has no reason to believe
- *  the rest of it. */
-export function undeliveredReportNotice(a: { path: string }): string {
-  return JSON.stringify({
+ *
+ *  **객체를 돌려준다, 글자가 아니라.** 부르는 쪽이 다른 모든 응답과 같은 봉투에 담아야 하기
+ *  때문이다(공개 CLI 설계 §7). 이것만 봉투 밖으로 나가면 `jq .ok` 가 이 한 경우에만 null 이 된다. */
+export function undeliveredReportNotice(a: { path: string }): {
+  queued: true
+  applied: false
+  path: string
+  note: string
+} {
+  return {
     queued: true,
     applied: false,
     path: a.path,
@@ -286,5 +296,5 @@ export function undeliveredReportNotice(a: { path: string }): string {
       'named above, and the app applies it at the next start that has orchestration on. Nothing in ' +
       'the job has changed yet, so do not act as if this report had taken effect. Do not send it ' +
       'again either: the app already has it, and a second copy is only a second copy.'
-  })
+  }
 }

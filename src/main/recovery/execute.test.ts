@@ -2,10 +2,12 @@ import { describe, it, expect } from 'vitest'
 import { executeRecovery } from './execute'
 import { emptyState, type OrchState } from '../../core/orchestration/state'
 import type { LostAttempt, RecoveryDecision } from '../../core/recovery/types'
-import type { Dispatch, Run, Task } from '../../core/orchestration/types'
+import type { Dispatch, Task } from '../../core/orchestration/types'
+import { stateFromLegacy } from '../../core/orchestration/legacyState'
+import type { LegacyRun } from '../../core/orchestration/legacy'
 
 const NOW = '2026-09-09T10:00:00.000Z'
-const run = (over: Partial<Run> = {}): Run => ({ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: NOW, autoDispatch: true, ...over })
+const run = (over: Partial<LegacyRun> = {}): LegacyRun => ({ id: 'run_1', objective: 'o', cwd: 'D:/p', createdAt: NOW, autoDispatch: true, ...over })
 const task = (over: Partial<Task> = {}): Task => ({
   id: 'tsk_1', runId: 'run_1', title: 't', spec: 'do the thing', deps: [], status: 'dispatched',
   accountIds: ['acc_1'], consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW, ...over
@@ -15,7 +17,8 @@ const lost = (over: Partial<Dispatch> = {}): Dispatch => ({
   cwd: 'D:/wt', specPath: 'D:/spec.md', startedAt: NOW, workerState: 'outcome_unknown',
   endedAt: NOW, retained: false, ...over
 })
-const stateWith = (d: Dispatch, t: Task = task()): OrchState => ({ ...emptyState(), runs: [run()], tasks: [t], dispatches: [d] })
+const stateWith = (d: Dispatch, t: Task = task()): OrchState =>
+  stateFromLegacy({ runs: [run()], tasks: [t], dispatches: [d] })
 const attempt = (over: Partial<LostAttempt> = {}): LostAttempt => ({
   runId: 'run_1', taskId: 'tsk_1', dispatchId: 'dsp_1', provider: 'claude', accountId: 'acc_1',
   cwd: 'D:/wt', promptConfirmed: true, baseHead: 'aaa', hasValidateConfig: false, appDriven: true, ...over
@@ -147,7 +150,7 @@ describe('executeRecovery', () => {
   })
 
   // Important 2 — 재조립된 repair spec 도 원래 repair·평범한 redispatch 와 똑같이 지식 절을 실어야
-  // 한다(main/orchestration/repair.ts 의 repairSpec, main/orchestration/coordinator.ts 의
+  // 한다(main/orchestration/repair.ts 의 repairSpec, core/orchestration/exec/coordinator.ts 의
   // startWorker 기본 경로). specFileContent 를 통째로 넘기면 코디네이터 자신의 스캔을 건너뛰므로,
   // 여기서 주입된 knowledge 의존으로 대신 실어야 한다.
   it('knowledge 의존이 있으면 재조립된 repair spec 에도 지식 절이 실린다', async () => {

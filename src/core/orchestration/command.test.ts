@@ -1,0 +1,7736 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { promises as fs } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { handleCommand, handleExit, PENDING_START_WINDOW_MS, type HostSession, type OrchServerDeps, type SessionScreen } from './command'
+import { SPAWN_DEADLINE_MS } from '../host/unresponsive'
+import { APP_CALLER, HOST_CALLER } from '../host/driver'
+import { ensureProject } from './projects'
+import { absPath } from '../testPaths'
+import { PTY_LOST_SIGHT_EXIT_CODE } from '../sessions/pty'
+import { DEFAULT_IDLE_WAIT_TIMEOUT_MS, OrchCoordinator, type CoordinatorDeps } from './exec/coordinator'
+import { OrchestrationStore } from './store'
+import {
+  applyValidationResult,
+  attachCoordinator,
+  blockForValidation,
+  createGate,
+  emptyState,
+  openReviewDispatch,
+  rekeyDispatch,
+  type OrchState
+} from './state'
+import { TaskValidator } from './exec/validator'
+import { FAILURE_LIMIT, type CheckResult, type JobRun, type Project } from './types'
+import { parseArgs } from './cliArgs'
+import { runningRunCount } from './running'
+import { isQueueableReport } from './pendingReports'
+import { checkConfigIdsOf } from './convergence'
+import { createCheckWaits } from './checkWaits'
+import { coordinatorReleaseOf } from './exec/releaseDefer'
+import type { ChatAnswerResult, ChatPrompt, ChatPromptList } from '../sessions/chatRead'
+
+const NOW = '2026-08-04T00:00:00.000Z'
+
+// 실제 파일시스템을 쓰는 통합 테스트(아래 'worker-start × OrchCoordinator' 블록)를 위한
+// 임시 디렉토리 — RunConfigStore.test.ts 선례와 같은 패턴. 다른 describe들은 이 dir을 쓰지
+// 않고 기존처럼 하드코딩된 'D:/p' 문자열을 그대로 쓴다(실제 fs를 건드리지 않는 mock이라 안전).
+let dir: string
+/** 배선이 주입하는 spec 디렉토리 — **워커 cwd 밖**이다 */
+let specsDir: string
+beforeEach(async () => {
+  dir = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-orchsrv-'))
+  specsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'astera-orchsrvspec-'))
+})
+afterEach(async () => {
+  await fs.rm(dir, { recursive: true, force: true })
+  await fs.rm(specsDir, { recursive: true, force: true })
+})
+
+const makeDeps = (initial: OrchState = emptyState()): OrchServerDeps & { state: OrchState } => {
+  const box = { state: initial }
+  return {
+    state: box.state,
+    getState: () => box.state,
+    setState: async (next) => {
+      box.state = next
+    },
+    startWorker: async () => ({ sessionId: 'sess1', cwd: 'D:/p', specPath: 'D:/p/orch/specs/a.md' }),
+    releaseWorker: async () => {},
+    listAccounts: () => [{ id: 'acc1', label: '계정1', provider: 'codex' }],
+    readWorker: async () => 'output',
+    now: () => NOW
+  } as OrchServerDeps & { state: OrchState }
+}
+
+const call = (
+  deps: OrchServerDeps,
+  cmd: string,
+  args: Record<string, unknown> = {},
+  sessionId = 'coordinator'
+): Promise<{ status: number; body: unknown }> => handleCommand(deps, { sessionId }, cmd, args)
+
+describe('handleCommand — 기본', () => {
+  // **오케스트레이션에는 켜고 끄는 값이 없다.** Astera 가 늘 갖고 있는 기능이므로, 이 층에는
+  // 그것을 묻는 dep 자체가 없다 — makeDeps 에도 없고, 그래서 이 호출은 거절되지 않는다.
+  it('꺼져 있음을 물어볼 자리가 없다 — 명령은 그냥 돈다', async () => {
+    const r = await call(makeDeps(), 'run-create', { objective: 'o', cwd: 'D:/p' })
+    expect(r.status).toBe(200)
+  })
+  // **없는 명령과 없는 id 는 다른 일이다**(공개 CLI 설계 §8). 501 은 CLI 쪽에서
+  // VERSION_MISMATCH(9) 로 떨어지고, 404 는 NOT_FOUND(4) 로 떨어진다.
+  it('알 수 없는 명령은 501 이다 — 없는 id 의 404 와 가른다', async () => {
+    const r = await call(makeDeps(), 'no-such-command')
+    expect(r.status).toBe(501)
+    expect((await call(makeDeps(), 'jobs-get', { id: 'nope' })).status).toBe(404)
+  })
+  it('run-create가 Run을 만들고 id를 돌려준다', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+  it('필수 인자가 없으면 400을 낸다', async () => {
+    const r = await call(makeDeps(), 'run-create', {})
+    expect(r.status).toBe(400)
+  })
+  it('run-create 가 등록된 프로젝트에 Run 을 매단다', async () => {
+    const reg = ensureProject(emptyState(), { path: absPath('proj'), now: NOW })
+    const deps = makeDeps(reg.state)
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: absPath('proj') })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].projectId).toBe(reg.project.id)
+  })
+  // **등록은 여기서 하지 않는다.** 이 명령은 CLI 로도 불리고, 코디네이터가 워크트리 안에서 부른
+  // run-create 가 그 워크트리를 프로젝트로 등록해 버리면 목록이 작업 폴더로 오염된다
+  it('run-create 는 모르는 경로를 프로젝트로 등록하지 않는다', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: absPath('nowhere') })
+    expect(r.status).toBe(200)
+    expect(deps.getState().projects).toEqual([])
+    expect(deps.getState().jobs[0].projectId).toBeUndefined()
+  })
+  it('run-create 가 concurrency·auto 를 Run 에 싣는다', async () => {
+    const r = await call(makeDeps(), 'run-create', {
+      objective: '무언가',
+      cwd: '/p',
+      concurrency: 5,
+      auto: true
+    })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ concurrency: 5, autoDispatch: true })
+    // provider 는 이제 Run 의 것이 아니다 — Task 의 계정이 정한다(Task.accountIds)
+    expect(r.body).not.toHaveProperty('provider')
+  })
+  it('run-create 에 셋이 없으면 Run 에도 없다 — 옛 동작이 그대로다', async () => {
+    const r = await call(makeDeps(), 'run-create', { objective: '무언가', cwd: '/p' })
+    expect(r.body).not.toHaveProperty('provider')
+    expect(r.body).not.toHaveProperty('concurrency')
+    expect(r.body).not.toHaveProperty('autoDispatch')
+  })
+  it('concurrency 가 1 미만이거나 정수가 아니면 거절한다', async () => {
+    const r = await call(makeDeps(), 'run-create', { objective: 'x', cwd: '/p', concurrency: 0 })
+    expect(r.status).toBe(400)
+  })
+  // 조용히 무시하지 않는 이유: 이 플래그를 보내는 호출자는 "이 Run 은 이 CLI 로 돈다"고 믿고
+  // 있고, 무시하면 그 믿음이 틀렸다는 것을 알 방법이 없다. 값이 맞는 provider 여도 거절한다 —
+  // 옮길 자리가 없기 때문이다(한 Run 에 두 provider 의 Task 가 섞일 수 있다).
+  it('run-create 는 provider 를 더 받지 않는다 — 값이 맞아도 거절한다', async () => {
+    for (const provider of ['claude', 'codex', 'gpt']) {
+      const r = await call(makeDeps(), 'run-create', { objective: 'x', cwd: '/p', provider })
+      expect(r.status).toBe(400)
+      expect(String((r.body as { error?: string }).error)).toContain('--provider is no longer accepted')
+    }
+  })
+  it('run-create 가 schedule 을 담아 템플릿을 만든다', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', {
+      objective: '매일 점검',
+      cwd: 'D:/p',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].schedule).toEqual({ kind: 'daily', time: '09:00' })
+  })
+
+  // 예약은 자신이 돌지 않는다. auto 를 함께 받았더라도 템플릿에는 켜지 않는다 — 켜면
+  // slotsToFill 의 방어에 기대게 되고, 그 방어는 손으로 고친 파일을 위한 것이다
+  it('예약 Run 에는 autoDispatch 를 켜지 않는다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    expect(deps.getState().jobs[0].autoDispatch).toBeUndefined()
+  })
+
+  it('잘못된 schedule 은 400 으로 거절한다', async () => {
+    const r = await call(makeDeps(), 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      schedule: { kind: 'daily', time: '25:00' }
+    })
+    expect(r.status).toBe(400)
+  })
+
+  it('schedule 이 없으면 평범한 Run 이다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    expect(deps.getState().jobs[0].schedule).toBeUndefined()
+    expect(deps.getState().jobs[0].autoDispatch).toBe(true)
+  })
+})
+
+describe('handleCommand — 역할 인가', () => {
+  /** worker-start까지 진행해 sess1이 워커인 상태를 만든다 */
+  const seedWorker = async (): Promise<OrchServerDeps> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    return deps
+  }
+
+  it('워커 세션은 worker-start를 부를 수 없다 — 중첩 오케스트레이션 차단', async () => {
+    const deps = await seedWorker()
+    const r = await call(deps, 'worker-start', { taskId: 'x' }, 'sess1')
+    expect(r.status).toBe(403)
+  })
+  it('워커 세션은 task-create·run-create·reset·gate-create를 부를 수 없다', async () => {
+    const deps = await seedWorker()
+    for (const cmd of ['task-create', 'run-create', 'reset', 'gate-create']) {
+      expect((await call(deps, cmd, {}, 'sess1')).status).toBe(403)
+    }
+  })
+  it('워커 세션은 자기 send·ask를 부를 수 있다', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    const r = await call(
+      deps,
+      'send',
+      {
+        type: 'worker_done',
+        taskId: d.taskId,
+        dispatchId: d.id,
+        outcome: 'succeeded',
+        subject: 'a',
+        body: 'b'
+      },
+      'sess1'
+    )
+    expect(r.status).toBe(200)
+  })
+  it('워커 세션은 다른 dispatch로 보고할 수 없다', async () => {
+    const deps = await seedWorker()
+    const r = await call(
+      deps,
+      'send',
+      {
+        type: 'worker_done',
+        taskId: 'tsk_other',
+        dispatchId: 'dsp_other',
+        outcome: 'succeeded',
+        subject: 'a',
+        body: 'b'
+      },
+      'sess1'
+    )
+    expect(r.status).toBe(403)
+  })
+  it('오케스트레이터 세션은 모든 명령을 부를 수 있다', async () => {
+    const deps = await seedWorker()
+    expect((await call(deps, 'tasks-list', {})).status).toBe(200)
+    expect((await call(deps, 'accounts', {})).status).toBe(200)
+  })
+})
+
+describe('handleCommand — 롤링이 세션을 rekey 한 뒤 (worker-rolling-phase-1a)', () => {
+  /** worker-start까지 진행해 sess1이 워커인 상태를 만든다 (위 seedWorker와 동일한 절차) */
+  const seedWorker = async (): Promise<OrchServerDeps> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    return deps
+  }
+
+  it('rekey 된 세션의 worker_done 이 Task 를 정상적으로 마무리한다 — 이 브랜치의 존재 이유', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    // sess1 -> sess2 로 롤 — OrchRollTap.onRolled 가 실제로 하는 일을 여기서는 직접 부른다
+    // (rollTap.test.ts 가 그 함수 자체를 이미 pin 한다. 여기서는 그 결과가 handleCommand 의
+    // send/worker_done 경로와 맞물리는지를 본다).
+    const rekeyed = rekeyDispatch(
+      deps.getState(),
+      { oldSessionId: 'sess1', newSessionId: 'sess2', accountId: 'acc2' },
+      NOW
+    )
+    if (!rekeyed.ok) throw new Error(`expected ok, got ${rekeyed.error}`)
+    await deps.setState(rekeyed.state)
+
+    const r = await call(
+      deps,
+      'send',
+      {
+        type: 'worker_done',
+        taskId: d.taskId,
+        dispatchId: d.id,
+        outcome: 'succeeded',
+        subject: 'a',
+        body: 'b'
+      },
+      'sess2' // 옛 sessionId(sess1)가 아니라 rekey 된 새 세션으로 보고한다
+    )
+    expect(r.status).toBe(200)
+    const closed = deps.getState().dispatches.find((x) => x.id === d.id)
+    expect(closed?.outcome).toBe('succeeded')
+    expect(closed?.endedAt).toBeDefined()
+    const task = deps.getState().tasks.find((t) => t.id === d.taskId)
+    expect(task?.status).toBe('completed')
+  })
+
+  it('rekey 되지 않은 새 세션 id는 워커로 인식되지 않는다 — COORDINATOR_ONLY 를 부를 수 있다(해저드)', async () => {
+    const deps = await seedWorker()
+    // handleCommand 는 caller.sessionId 가 dispatches.find(d => d.sessionId === caller.sessionId) 로
+    // 걸리는지로 워커 여부를 정한다. 'sess2'는 롤이 만든 새 세션 id 라고 해도, rekeyDispatch 가 아직
+    // 부르지 않았으면 어떤 Dispatch 도 그 값을 sessionId 로 갖지 않는다 — 즉 워커로 인식되지 않고
+    // COORDINATOR_ONLY 가드가 적용되지 않는다.
+    const before = await call(deps, 'run-create', { objective: 'o2', cwd: 'D:/p' }, 'sess2')
+    expect(before.status).toBe(200) // 거부되지 않는다 — 이것이 이 브랜치가 막으려는 결함이다
+
+    const rekeyed = rekeyDispatch(
+      deps.getState(),
+      { oldSessionId: 'sess1', newSessionId: 'sess2', accountId: 'acc2' },
+      NOW
+    )
+    if (!rekeyed.ok) throw new Error(`expected ok, got ${rekeyed.error}`)
+    await deps.setState(rekeyed.state)
+
+    // rekey 된 뒤에는 'sess2'가 그 Dispatch의 sessionId이므로 워커로 인식되어 같은 명령이 막힌다
+    const after = await call(deps, 'run-create', { objective: 'o3', cwd: 'D:/p' }, 'sess2')
+    expect(after.status).toBe(403)
+  })
+})
+
+describe('handleCommand — 역할 인가 (완료 후에도 워커)', () => {
+  /** worker-start까지 진행해 sess1이 워커인 상태를 만든다 (위 seedWorker와 동일한 절차) */
+  const seedWorker = async (): Promise<OrchServerDeps> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    return deps
+  }
+
+  it('worker_done을 보낸 직후에도 같은 세션은 계속 워커다 — 코디네이터 명령이 거부된다', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    const done = await call(
+      deps,
+      'send',
+      {
+        type: 'worker_done',
+        taskId: d.taskId,
+        dispatchId: d.id,
+        outcome: 'succeeded',
+        subject: 'a',
+        body: 'b'
+      },
+      'sess1'
+    )
+    expect(done.status).toBe(200)
+    for (const cmd of ['task-create', 'run-create', 'worker-start', 'gate-create', 'reset']) {
+      expect((await call(deps, cmd, {}, 'sess1')).status).toBe(403)
+    }
+  })
+})
+
+describe('session-task-*', () => {
+  type SessionTasks = NonNullable<OrchServerDeps['sessionTasks']>
+
+  // A stand-in for WorkUnitCollector.startTask/completeTask/cancelTask — records nothing on its
+  // own, just answers whatever the test asks it to.
+  const makeSessionTasks = (overrides: Partial<SessionTasks> = {}): SessionTasks => ({
+    start: overrides.start ?? (async () => ({ ok: true, id: 'wu_1' })),
+    complete: overrides.complete ?? (async () => ({ ok: true, id: 'wu_1' })),
+    cancel: overrides.cancel ?? (async () => ({ ok: true, id: 'wu_1' }))
+  })
+
+  /** Runs through worker-start so sess1 becomes a worker (same procedure as seedWorker above) */
+  const seedWorker = async (deps: OrchServerDeps): Promise<void> => {
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+  }
+
+  it('추적이 켜져 있으면 받는다', async () => {
+    const deps = {
+      ...makeDeps(),
+      trackingEnabled: () => true,
+      sessionTasks: makeSessionTasks()
+    }
+    const r = await call(deps, 'session-task-start', { objective: '인증 리팩터' })
+    expect(r.status).toBe(200)
+  })
+
+  it('추적이 꺼져 있으면 거절한다', async () => {
+    const deps = { ...makeDeps(), trackingEnabled: () => false }
+    const r = await call(deps, 'session-task-start', { objective: '인증 리팩터' })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('tracking')
+  })
+
+  it('워커 세션은 세 명령을 다 못 부른다 — Run 이 이미 그 일을 기록한다', async () => {
+    const deps = { ...makeDeps(), trackingEnabled: () => true, sessionTasks: makeSessionTasks() }
+    await seedWorker(deps)
+    for (const cmd of ['session-task-start', 'session-task-complete', 'session-task-cancel']) {
+      const r = await call(deps, cmd, { objective: 'x' }, 'sess1')
+      expect(r.status).toBe(403)
+    }
+  })
+
+  // isWorker alone misses this: a Run's coordinator session never holds a dispatch, so it passed
+  // the worker check and could declare a session task on top of the record its own Run already
+  // writes when it finishes (onRunFinished) — the same double-recording the worker check exists to
+  // block, one level up. trackingEnabled and sessionTasks are both truthy here on purpose: a missing
+  // isRunCoordinator check must be the only way this test can fail, not some unrelated 409/409.
+  it('Run 코디네이터 세션도 세 명령을 다 못 부른다 — 그 Run 이 이미 그 일을 기록한다', async () => {
+    const deps = { ...makeDeps(), trackingEnabled: () => true, sessionTasks: makeSessionTasks() }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const attached = attachCoordinator(deps.getState(), { runId, sessionId: 'sess1' })
+    if (!attached.ok) throw new Error(attached.error)
+    await deps.setState(attached.state)
+    for (const cmd of ['session-task-start', 'session-task-complete', 'session-task-cancel']) {
+      const r = await call(deps, cmd, { objective: 'x' }, 'sess1')
+      expect(r.status).toBe(403)
+    }
+  })
+
+  // v1.3.10 denied a session its own /astera-task for as long as it lived, once it had coordinated a
+  // single Run: coordinatorSessionId is cleared only when the session itself disappears, never when
+  // its Run finishes. The rule is meant to stop one piece of work being recorded twice while a Run is
+  // in flight — after it lands, whatever that session does next is different work.
+  it('Run 이 끝난 뒤에는 같은 세션이 자기 작업을 다시 선언할 수 있다', async () => {
+    const deps = { ...makeDeps(), trackingEnabled: () => true, sessionTasks: makeSessionTasks() }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    const attached = attachCoordinator(deps.getState(), { runId, sessionId: 'sess1' })
+    if (!attached.ok) throw new Error(attached.error)
+    await deps.setState(attached.state)
+
+    // While the Run is running, denied — the Run will record this work itself
+    expect((await call(deps, 'session-task-start', { objective: 'x' }, 'sess1')).status).toBe(403)
+
+    // The Run lands. coordinatorSessionId still points at sess1, and that must stop mattering
+    await call(deps, 'task-update', { id: taskId, status: 'completed' })
+    expect(deps.getState().runs.find((r) => r.id === runId)!.coordinatorSessionId).toBe('sess1')
+    for (const cmd of ['session-task-start', 'session-task-complete', 'session-task-cancel']) {
+      expect((await call(deps, cmd, { objective: 'x' }, 'sess1')).status).toBe(200)
+    }
+  })
+
+  it('session-task-start 가 목표를 넘기고 중단된 앞 작업의 id 를 돌려준다', async () => {
+    const start = vi.fn<SessionTasks['start']>(async () => ({
+      ok: true,
+      id: 'wu_new',
+      interruptedId: 'wu_old'
+    }))
+    const deps = {
+      ...makeDeps(),
+      trackingEnabled: () => true,
+      sessionTasks: makeSessionTasks({ start })
+    }
+    const r = await call(deps, 'session-task-start', { objective: '인증 리팩터' }, 'sess9')
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ id: 'wu_new', interruptedId: 'wu_old' })
+    expect(start).toHaveBeenCalledWith('sess9', '인증 리팩터')
+  })
+
+  it('목표가 비면 거절한다', async () => {
+    const deps = { ...makeDeps(), trackingEnabled: () => true, sessionTasks: makeSessionTasks() }
+    expect((await call(deps, 'session-task-start', {})).status).toBe(400)
+    expect((await call(deps, 'session-task-start', { objective: '   ' })).status).toBe(400)
+  })
+
+  it('session-task-complete 가 --check 를 구조화된 값으로 넘긴다', async () => {
+    const complete = vi.fn<SessionTasks['complete']>(async () => ({ ok: true, id: 'wu_1' }))
+    const deps = {
+      ...makeDeps(),
+      trackingEnabled: () => true,
+      sessionTasks: makeSessionTasks({ complete })
+    }
+    const r = await call(
+      deps,
+      'session-task-complete',
+      { check: ['tests=passed', 'build=skipped'], summary: '요약' },
+      'sess9'
+    )
+    expect(r.status).toBe(200)
+    expect(complete).toHaveBeenCalledWith('sess9', {
+      source: 'agent',
+      checks: [
+        { name: 'tests', status: 'passed' },
+        { name: 'build', status: 'skipped' }
+      ],
+      summary: '요약'
+    })
+  })
+
+  it('닫힌 집합 밖의 검사 상태는 거절한다', async () => {
+    const complete = vi.fn<SessionTasks['complete']>(async () => ({ ok: true, id: 'wu_1' }))
+    const deps = {
+      ...makeDeps(),
+      trackingEnabled: () => true,
+      sessionTasks: makeSessionTasks({ complete })
+    }
+    const r = await call(deps, 'session-task-complete', { check: ['tests=maybe'] })
+    expect(r.status).toBe(400)
+    expect(complete).not.toHaveBeenCalled()
+  })
+
+  it('열린 작업이 없으면 session-task-complete 는 아무것도 만들지 않는다', async () => {
+    const complete = vi.fn<SessionTasks['complete']>(async () => ({
+      ok: false,
+      reason: 'NO_ACTIVE_TASK'
+    }))
+    const deps = {
+      ...makeDeps(),
+      trackingEnabled: () => true,
+      sessionTasks: makeSessionTasks({ complete })
+    }
+    const before = deps.getState()
+    const r = await call(deps, 'session-task-complete', {})
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('/astera-task')
+    expect(deps.getState()).toBe(before)
+  })
+
+  it('session-task-cancel 이 사유를 넘긴다', async () => {
+    const cancel = vi.fn<SessionTasks['cancel']>(async () => ({ ok: true, id: 'wu_1' }))
+    const deps = {
+      ...makeDeps(),
+      trackingEnabled: () => true,
+      sessionTasks: makeSessionTasks({ cancel })
+    }
+    const r = await call(deps, 'session-task-cancel', { reason: '더 이상 필요 없음' }, 'sess9')
+    expect(r.status).toBe(200)
+    expect(cancel).toHaveBeenCalledWith('sess9', '더 이상 필요 없음')
+  })
+})
+
+describe('handleCommand — worker_done 재전송 멱등성 (§8) — 소유권과 유효성 분리', () => {
+  /** worker-start까지 진행해 sess1이 워커인 상태를 만든다 */
+  const seedWorker = async (): Promise<OrchServerDeps> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    return deps
+  }
+
+  it('자기 dispatchId로 worker_done을 두 번 보내면 두 번째는 alreadyReported다(403이 아니다)', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    const resend = {
+      type: 'worker_done',
+      taskId: d.taskId,
+      dispatchId: d.id,
+      outcome: 'succeeded',
+      subject: 'a',
+      body: 'b'
+    }
+    const first = await call(deps, 'send', resend, 'sess1')
+    expect(first.status).toBe(200)
+    expect(first.body).toBe('accepted')
+    const second = await call(deps, 'send', resend, 'sess1')
+    expect(second.status).toBe(200)
+    expect(second.body).toBe('alreadyReported')
+  })
+
+  it('dispatch가 닫힌 워커 세션의 send --type worker_done 재전송은 크래시 없이 응답한다', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    const resend = {
+      type: 'worker_done',
+      taskId: d.taskId,
+      dispatchId: d.id,
+      outcome: 'succeeded',
+      subject: 'a',
+      body: 'b'
+    }
+    await call(deps, 'send', resend, 'sess1') // 첫 번째 — 이 dispatch를 닫는다
+    let thrown: unknown = null
+    let r: { status: number; body: unknown } | undefined
+    try {
+      r = await call(deps, 'send', resend, 'sess1') // 두 번째 — 이미 닫힌 자기 dispatch로 재전송
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeNull()
+    expect(r?.status).toBe(200)
+  })
+
+  it('dispatch가 닫힌 워커 세션이 ask를 불러도 크래시 없이 거부 응답한다', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      {
+        type: 'worker_done',
+        taskId: d.taskId,
+        dispatchId: d.id,
+        outcome: 'succeeded',
+        subject: 'a',
+        body: 'b'
+      },
+      'sess1'
+    )
+    let thrown: unknown = null
+    let r: { status: number; body: unknown } | undefined
+    try {
+      r = await call(deps, 'ask', { taskId: d.taskId, dispatchId: d.id, question: 'q?' }, 'sess1')
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeNull()
+    // 서버가 미리 403을 내지 않는다 — createQuestion까지 보내 'dispatch already settled'로
+    // 거부되는 것이 더 정확한 에러다(닫힌 자기 dispatch이므로 소유권은 있다).
+    expect(r?.status).toBe(400)
+    expect(JSON.stringify(r?.body)).toContain('settled')
+  })
+})
+
+describe('handleCommand — send 소유권 (워커)', () => {
+  const seedWorker = async (): Promise<OrchServerDeps> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    return deps
+  }
+
+  it('워커가 dispatchId 없이 남의 taskId로 escalation을 보내면 거부된다', async () => {
+    const deps = await seedWorker()
+    const r = await call(
+      deps,
+      'send',
+      { type: 'escalation', taskId: 'tsk_other', subject: 's', body: 'b' },
+      'sess1'
+    )
+    expect(r.status).toBe(403)
+  })
+  it('워커의 send는 dispatchId 생략 시 자기 열린 dispatch로 채운다', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    const r = await call(deps, 'send', { type: 'status', subject: 's', body: 'b' }, 'sess1')
+    expect(r.status).toBe(200)
+    const msg = deps.getState().messages[deps.getState().messages.length - 1]
+    expect(msg.dispatchId).toBe(d.id)
+  })
+  it('워커가 명시적으로 다른(남의) dispatchId를 주면 거부된다', async () => {
+    const deps = await seedWorker()
+    const run2 = await call(deps, 'run-create', { objective: 'o2', cwd: 'D:/p' })
+    const task2 = await call(deps, 'task-create', {
+      account: 'acc1',
+      runId: (run2.body as { id: string }).id,
+      title: 't2',
+      spec: 's2'
+    })
+    // sess1이 아닌 다른 세션(sess2)이 소유한 dispatch를 직접 주입한다 —
+    // makeDeps의 startWorker mock은 항상 sess1을 돌려주므로 worker-start로는 두 번째
+    // 세션을 만들 수 없다.
+    const otherDispatch = {
+      id: 'dsp_other',
+      taskId: (task2.body as { id: string }).id,
+      provider: 'codex' as const,
+      accountId: 'acc1',
+      sessionId: 'sess2',
+      cwd: 'D:/p2',
+      specPath: 'D:/p2/orch/specs/a.md',
+      startedAt: NOW,
+      workerState: 'ready' as const,
+      retained: false
+    }
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [...deps.getState().dispatches, otherDispatch]
+    })
+    const r = await call(
+      deps,
+      'send',
+      { type: 'status', dispatchId: otherDispatch.id, subject: 's', body: 'b' },
+      'sess1'
+    )
+    expect(r.status).toBe(403)
+  })
+})
+
+describe('handleCommand — worker-start 사전 검증 (고아 세션 방지)', () => {
+  it('서킷 브레이크된 Task로 worker-start를 부르면 startWorker를 부르지 않고 거부한다', async () => {
+    let startWorkerCalls = 0
+    const deps = {
+      ...makeDeps(),
+      startWorker: async () => {
+        startWorkerCalls++
+        return { sessionId: 'sessX', cwd: 'D:/p', specPath: 'D:/p/orch/specs/a.md' }
+      }
+    }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await deps.setState({
+      ...deps.getState(),
+      tasks: deps
+        .getState()
+        .tasks.map((t) => (t.id === taskId ? { ...t, consecutiveFailures: FAILURE_LIMIT } : t))
+    })
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(r.status).toBe(400)
+    expect(startWorkerCalls).toBe(0)
+  })
+
+  it('존재하지 않는 task로 worker-start를 부르면 startWorker를 부르지 않고 거부한다', async () => {
+    let startWorkerCalls = 0
+    const deps = {
+      ...makeDeps(),
+      startWorker: async () => {
+        startWorkerCalls++
+        return { sessionId: 'sessX', cwd: 'D:/p', specPath: 'D:/p/orch/specs/a.md' }
+      }
+    }
+    const r = await call(deps, 'worker-start', {
+      taskId: 'tsk_missing',
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(r.status).toBe(404)
+    expect(startWorkerCalls).toBe(0)
+  })
+
+  it('blocked 상태인 task로 worker-start를 부르면 startWorker를 부르지 않고 거부한다', async () => {
+    let startWorkerCalls = 0
+    const deps = {
+      ...makeDeps(),
+      startWorker: async () => {
+        startWorkerCalls++
+        return { sessionId: 'sessX', cwd: 'D:/p', specPath: 'D:/p/orch/specs/a.md' }
+      }
+    }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    const gate = await call(deps, 'gate-create', { task: taskId, question: 'q?' })
+    expect(gate.status).toBe(200) // 사전조건: task가 blocked로 전이됐다
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(r.status).toBe(400)
+    expect(startWorkerCalls).toBe(0)
+  })
+
+  it('같은 task에 이미 열린 dispatch가 있으면 두 번째 worker-start는 startWorker를 부르지 않고 거부한다', async () => {
+    let startWorkerCalls = 0
+    const deps = {
+      ...makeDeps(),
+      startWorker: async () => {
+        startWorkerCalls++
+        return { sessionId: `sess${startWorkerCalls}`, cwd: 'D:/p', specPath: 'D:/p/orch/specs/a.md' }
+      }
+    }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    const first = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(first.status).toBe(200)
+    expect(startWorkerCalls).toBe(1)
+    const second = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(second.status).toBe(400)
+    expect(startWorkerCalls).toBe(1) // 두 번째 시도에서 startWorker가 불리지 않았다
+  })
+
+  // 템플릿의 Task 를 배치하면 그것이 terminal 이 되고, 그러면 store.ts 의 TTL 조건이 템플릿에서
+  // 참이 되어 30일 뒤 예약과 모든 회차가 조용히 사라진다. slotsToFill 은 자동 배치만 막는다 —
+  // 이 명령이 사람과 코디네이터가 쓰는 두 번째 문이다.
+  it('예약 템플릿의 Task 로 worker-start 를 부르면 startWorker 를 부르지 않고 거부한다', async () => {
+    let startWorkerCalls = 0
+    const deps = {
+      ...makeDeps(),
+      startWorker: async () => {
+        startWorkerCalls++
+        return { sessionId: 'sessX', cwd: 'D:/p', specPath: 'D:/p/orch/specs/a.md' }
+      }
+    }
+    const run = await call(deps, 'run-create', {
+      objective: '매일 점검',
+      cwd: 'D:/p',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    expect(task.status).toBe(200)
+    // 계획에 붙인 Task 는 **정의**다 — 회차가 없으므로 배치할 자리가 없다
+    expect(deps.getState().tasks[0].jobId).toBe(runId)
+    expect(deps.getState().tasks[0].runId).toBeUndefined()
+    const taskId = (task.body as { id: string }).id
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    // 400, not 404: the Task named is there, only its Run is not (the same answer `send` gives)
+    expect(r.status).toBe(400)
+    expect(JSON.stringify(r.body)).toContain('unknown run')
+    expect(startWorkerCalls).toBe(0)
+  })
+
+  // The Task is there, the Run it points at is not (orchestration.json is edited by hand). `send`
+  // answers this with 400 (applyWorkerDone's refusal is not marked missing); worker-start answered 404
+  // until 2026-09-25, so the same fact exited 4 from one command and 2 from the other.
+  it('Task 가 가리키는 회차가 없으면 worker-start 는 400 으로 거절하고 startWorker 를 부르지 않는다', async () => {
+    let startWorkerCalls = 0
+    const deps = {
+      ...makeDeps(),
+      startWorker: async () => {
+        startWorkerCalls++
+        return { sessionId: 'sessX', cwd: 'D:/p', specPath: 'D:/p/orch/specs/a.md' }
+      }
+    }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await deps.setState({
+      ...deps.getState(),
+      tasks: deps.getState().tasks.map((t) => (t.id === taskId ? { ...t, runId: 'run_gone' } : t))
+    })
+    const before = deps.getState()
+    const r = await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    expect(r).toEqual({ status: 400, body: { error: `unknown run for task: ${taskId}` } })
+    expect(startWorkerCalls).toBe(0)
+    expect(deps.getState()).toBe(before)
+  })
+
+  // 회차는 운영이 되어야 한다(설계 2절) — 위의 거절이 회차까지 막으면 예약은 아무것도 돌리지 못한다
+  it('예약 회차의 Task 는 그대로 배치된다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', {
+      objective: '매일 점검',
+      cwd: 'D:/p',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const templateId = (run.body as { id: string }).id
+    await call(deps, 'task-create', { account: 'acc1', runId: templateId, title: 't', spec: 's' })
+    const child = (await call(deps, 'run-spawn', { run: templateId })).body as { id: string }
+    const copy = deps.getState().tasks.find((t) => t.runId === child.id)!
+    const r = await call(deps, 'worker-start', {
+      taskId: copy.id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(r.status).toBe(200)
+  })
+
+  // 설계 2절: 프로젝트 폴더에서는 워커가 돌지 않는다. app-managed Run(autoDispatch)이 아직
+  // 워크트리를 갖지 못한 동안 --worktree 없이 worker-start 가 들어오면 기본값이 'current' 로
+  // 떨어져 그 금지를 어겼다 — 그래서 이 조합만 거절한다(server.ts 의 새 조건).
+  it('워크트리가 없는 app-managed Run 에 --worktree 없이 worker-start 를 부르면 거부한다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true
+    })
+    const jobId = (run.body as { id: string }).id
+    // `--auto` 인 Job 은 '실행' 을 눌러야 회차가 생긴다 — Task 를 배치하려면 그 회차가 있어야 한다
+    await call(deps, 'run-start', { run: jobId })
+    const runId = deps.getState().runs.find((r) => r.jobId === jobId)!.id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    const r = await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1' })
+    expect(r.status).toBe(409)
+  })
+
+  // 위 거절이 이 조합에만 닿는다는 증거 — --worktree 를 명시하면(사람이 자리를 골랐다는 뜻) 같은
+  // Run·같은 Task 로도 그대로 된다.
+  it('같은 Run 이라도 --worktree 를 명시하면 그대로 된다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true
+    })
+    const jobId = (run.body as { id: string }).id
+    await call(deps, 'run-start', { run: jobId })
+    const runId = deps.getState().runs.find((r) => r.jobId === jobId)!.id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'D:/wt'
+    })
+    expect(r.status).toBe(200)
+  })
+})
+
+describe('handleCommand — check', () => {
+  it('워커 세션은 check를 부를 수 없다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    await call(deps, 'worker-start', {
+      taskId: (task.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const r = await call(deps, 'check', {}, 'sess1')
+    expect(r.status).toBe(403)
+  })
+})
+
+describe('handleCommand — reset', () => {
+  it('열린 Dispatch가 있으면 거부한다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    await call(deps, 'worker-start', {
+      taskId: (task.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const r = await call(deps, 'reset', { all: true })
+    expect(r.status).toBe(409)
+  })
+  it('열린 Dispatch가 없으면 상태를 비운다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const r = await call(deps, 'reset', { all: true })
+    expect(r.status).toBe(200)
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+  // task-13a: args.all을 서버가 아예 읽지 않던 결함 — else 분기가 우연히 같은 전체 리셋을
+  // 해서 결과는 맞았지만 플래그가 무시되고 있었다. 지금은 --all을 명시적으로 읽고, 세 플래그
+  // 중 아무것도 안 주면(파괴적 연산 기본값을 "전부 지움"으로 두지 않는다) 거부한다.
+  it('플래그를 하나도 주지 않으면 거부하고 상태를 건드리지 않는다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const r = await call(deps, 'reset', {})
+    expect(r.status).toBe(400)
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+
+  // 세 곳이 다 요구하는데 미구현이었다 — 파괴적 연산의 문서화된
+  // 유일한 안전망이다. 실제 스토어를 붙여 파일이 남는 것까지 확인한다.
+  describe('.bak', () => {
+    const withStore = async (): Promise<{ deps: OrchServerDeps; file: string }> => {
+      const file = path.join(dir, 'orchestration.json')
+      const store = new OrchestrationStore(file)
+      await store.load()
+      const deps: OrchServerDeps = {
+        ...makeDeps(),
+        getState: () => store.get(),
+        setState: (next) => store.save(next),
+        backup: () => store.backup()
+      }
+      return { deps, file }
+    }
+
+    it('reset --all 뒤 .bak이 존재하고 그 내용이 리셋 전 상태다', async () => {
+      const { deps, file } = await withStore()
+      await call(deps, 'run-create', { objective: '지워질 Run', cwd: 'D:/p' })
+      expect((await call(deps, 'reset', { all: true })).status).toBe(200)
+      const bak = JSON.parse(await fs.readFile(file + '.bak', 'utf8')) as OrchState
+      expect(bak.runs).toHaveLength(1)
+      expect(bak.jobs[0].objective).toBe('지워질 Run')
+      expect((JSON.parse(await fs.readFile(file, 'utf8')) as OrchState).runs).toHaveLength(0)
+    })
+
+    it('reset --tasks도 백업한다', async () => {
+      const { deps, file } = await withStore()
+      const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+      await call(deps, 'task-create', { account: 'acc1', runId: (run.body as { id: string }).id, spec: 's' })
+      expect((await call(deps, 'reset', { tasks: true })).status).toBe(200)
+      const bak = JSON.parse(await fs.readFile(file + '.bak', 'utf8')) as OrchState
+      expect(bak.tasks).toHaveLength(1)
+      expect(deps.getState().tasks).toHaveLength(0)
+      expect(deps.getState().runs).toHaveLength(1) // --tasks는 Run을 남긴다
+    })
+
+    it('플래그가 없어 거부되는 호출은 .bak을 만들지 않는다 — 직전 백업을 갈아치우지 않는다', async () => {
+      const { deps, file } = await withStore()
+      await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+      expect((await call(deps, 'reset', {})).status).toBe(400)
+      await expect(fs.stat(file + '.bak')).rejects.toThrow()
+    })
+
+    it('backup의 await 동안 착륙한 변경을 덮지 않는다 — 쓰기 역전 회귀', async () => {
+      // backup(쓰기 큐 + copyFile)이 새 양보 지점이다. wipe가 진입 스냅샷 s를 캡처하면 그 사이
+      // 착륙한 변경이 옛 배열로 되돌려진다 — 워커의 send가 그렇게 사라지면 미ack Delivery가
+      // 참조하는 메시지가 없어져 이 브랜치가 두 번 못박은 Delivery 무결성이 깨진다.
+      const deps = makeDeps()
+      const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+      const runId = (run.body as { id: string }).id
+      await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+      deps.backup = async (): Promise<void> => {
+        const before = deps.getState()
+        await deps.setState({
+          ...before,
+          messages: [
+            ...before.messages,
+            {
+              id: 'msg_concurrent',
+              runId,
+              type: 'status',
+              subject: 'backup await 동안 도착한 워커 메시지',
+              body: 'b',
+              answered: false,
+              createdAt: NOW
+            }
+          ]
+        })
+      }
+      const r = await call(deps, 'reset', { tasks: true })
+      expect(r.status).toBe(200)
+      expect(deps.getState().messages.some((m) => m.id === 'msg_concurrent')).toBe(true)
+      expect(deps.getState().tasks).toHaveLength(0) // 지울 것은 지웠다
+    })
+
+    it('backup 미주입이면 백업을 건너뛰고 reset은 그대로 동작한다', async () => {
+      const deps = makeDeps() // backup을 주입하지 않는다
+      await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+      expect((await call(deps, 'reset', { all: true })).status).toBe(200)
+      expect(deps.getState().runs).toHaveLength(0)
+    })
+  })
+})
+
+describe('handleCommand — inbox는 코디네이터 전용', () => {
+  const seedTwoWorkers = async (): Promise<OrchServerDeps & { state: OrchState }> => {
+    const deps = makeDeps()
+    let n = 0
+    deps.startWorker = async () => {
+      n++
+      return { sessionId: `sess${n}`, cwd: 'D:/p', specPath: `D:/p/orch/specs/${n}.md` }
+    }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    for (const title of ['A', 'B']) {
+      const task = await call(deps, 'task-create', { account: 'acc1', runId, title, spec: `spec ${title}` })
+      await call(deps, 'worker-start', {
+        taskId: (task.body as { id: string }).id,
+        agent: 'codex',
+        account: 'acc1',
+        worktree: 'current'
+      })
+    }
+    return deps
+  }
+
+  it('워커 세션의 inbox는 403이다 — ask --resume의 소유권 가드를 우회하는 구멍이었다', async () => {
+    const deps = await seedTwoWorkers()
+    expect((await call(deps, 'inbox', { limit: 200 }, 'sess1')).status).toBe(403)
+  })
+
+  it('코디네이터의 inbox는 여전히 200이다', async () => {
+    const deps = await seedTwoWorkers()
+    const r = await call(deps, 'inbox', {})
+    expect(r.status).toBe(200)
+    expect(Array.isArray(r.body)).toBe(true)
+  })
+
+  it('워커는 자기 dispatch의 send·ask는 계속 쓸 수 있다 — 막은 것은 inbox뿐이다', async () => {
+    const deps = await seedTwoWorkers()
+    const d = deps.getState().dispatches.find((x) => x.sessionId === 'sess1')!
+    const r = await call(
+      deps,
+      'send',
+      { type: 'status', taskId: d.taskId, dispatchId: d.id, subject: 's', body: 'b' },
+      'sess1'
+    )
+    expect(r.status).toBe(200)
+  })
+})
+
+describe('handleCommand — retained dispatch', () => {
+  const seedRetained = async (
+    retain: boolean
+  ): Promise<{ deps: OrchServerDeps & { state: OrchState }; released: string[]; dispatchId: string }> => {
+    const released: string[] = []
+    const deps = makeDeps()
+    deps.releaseWorker = async ({ dispatchId }): Promise<void> => {
+      released.push(dispatchId)
+    }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const task = await call(deps, 'task-create', { account: 'acc1', runId: (run.body as { id: string }).id,
+      title: 't',
+      spec: 's' })
+    const started = await call(deps, 'worker-start', {
+      taskId: (task.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const dispatchId = (started.body as { dispatchId: string }).dispatchId
+    if (retain) await call(deps, 'worker-retain', { dispatch: dispatchId })
+    return { deps, released, dispatchId }
+  }
+
+  it('retained에 worker-stop은 409이고 상태가 불변이다', async () => {
+    // 예전에는 releaseWorker 결과를 보지 않고 stopped+endedAt을 세웠다 — 세션은 살아 있는데
+    // 오케스트레이터는 죽은 줄 알고 --retry-of로 같은 cwd에 새 워커를 띄웠다.
+    const { deps, released, dispatchId } = await seedRetained(true)
+    const r = await call(deps, 'worker-stop', { dispatch: dispatchId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('retained')
+    const d = deps.getState().dispatches[0]
+    expect(d.workerState).toBe('ready')
+    expect(d.endedAt).toBeUndefined()
+    expect(released).toEqual([]) // 세션을 닫으려는 시도조차 하지 않는다
+  })
+
+  it('retained가 아니면 worker-stop은 그대로 stopped로 닫는다', async () => {
+    const { deps, released, dispatchId } = await seedRetained(false)
+    const r = await call(deps, 'worker-stop', { dispatch: dispatchId })
+    expect(r.status).toBe(200)
+    const d = deps.getState().dispatches[0]
+    expect(d.workerState).toBe('stopped')
+    expect(d.endedAt).toBeDefined()
+    expect(released).toEqual([dispatchId])
+  })
+
+  // Recovery reads this to tell a deliberate close from a crash (Dispatch.closedBy)
+  it('worker-stop and worker-abandon record who closed the dispatch', async () => {
+    const stop = await seedRetained(false)
+    const stopped = await call(stop.deps, 'worker-stop', { dispatch: stop.dispatchId })
+    expect(stopped.status).toBe(200)
+    expect(stop.deps.getState().dispatches.find((d) => d.id === stop.dispatchId)?.closedBy).toBe('stop')
+
+    const abandon = await seedRetained(false)
+    await call(abandon.deps, 'worker-abandon', { dispatch: abandon.dispatchId })
+    expect(abandon.deps.getState().dispatches.find((d) => d.id === abandon.dispatchId)?.closedBy).toBe('abandon')
+  })
+
+  it('retained에 worker-release는 200이지만 skipped를 싣는다 — 조용히 건너뛰지 않는다', async () => {
+    const { deps, dispatchId } = await seedRetained(true)
+    const r = await call(deps, 'worker-release', { dispatch: dispatchId })
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ released: dispatchId, skipped: 'retained' })
+  })
+
+  it('retained가 아니면 worker-release 응답에 skipped가 없다', async () => {
+    const { deps, dispatchId } = await seedRetained(false)
+    const r = await call(deps, 'worker-release', { dispatch: dispatchId })
+    expect(r.body).toEqual({ released: dispatchId })
+  })
+
+  it('알 수 없는 dispatch의 worker-release는 종전처럼 통과한다 — 존재를 검증하지 않는다', async () => {
+    const { deps } = await seedRetained(false)
+    const r = await call(deps, 'worker-release', { dispatch: 'dsp_nope' })
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ released: 'dsp_nope' })
+  })
+})
+
+// task-13a: COORDINATOR_ONLY에는 'task-update'가 있었는데 handleCommand의 switch에 케이스가
+// 없어 인가는 통과하고 라우팅에서 404로 죽던 공백. task-update는 canTransition을 우회해
+// 코디네이터가 좌초한 Task를 수동으로 정정하는 유일한 경로다.
+describe('handleCommand — task-update (전이 표 우회, task-13a)', () => {
+  const seedTask = async (deps: OrchServerDeps): Promise<string> => {
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    return (task.body as { id: string }).id
+  }
+
+  /** taskId를 completed까지 실제로 진행시킨다(worker-start → send worker_done) —
+   *  completed는 ALLOWED 표에서 전이가 전혀 없는 종단이라 이후 --status ready는
+   *  canTransition으로는 절대 금지되는 전이다(우회 검증에 쓴다) */
+  const seedCompletedTask = async (deps: OrchServerDeps): Promise<string> => {
+    const taskId = await seedTask(deps)
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const d = deps.getState().dispatches[0]
+    await call(deps, 'send', {
+      type: 'worker_done',
+      taskId,
+      dispatchId: d.id,
+      outcome: 'succeeded',
+      subject: 'a',
+      body: 'b'
+    })
+    return taskId
+  }
+
+  // 설계 G4(명세 §30). 완료 강제는 그 사실과 이유가 남아야 한다 — 이 앱은 버튼을 따로 두지 않고
+  // task-update 가 그 자리를 겸하므로, 요구도 기록도 여기 붙는다.
+  const seedConvergingTask = async (deps: OrchServerDeps): Promise<string> => {
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', {
+      account: 'acc1',
+      runId,
+      title: 't',
+      spec: 's',
+      validate: 'cfg1'
+    })
+    return (task.body as { id: string }).id
+  }
+
+  it('--max-total-minutes 가 정책에 실린다', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true, maxTotalMinutes: 45 })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].convergence).toEqual({ maxTotalMinutes: 45 })
+  })
+
+  it('--max-total-minutes 는 --convergence 없이는 거절된다 — 나머지 셋과 같은 규칙', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', maxTotalMinutes: 45 })
+    expect(r.status).toBe(400)
+    expect(String((r.body as { error: string }).error)).toContain('--max-total-minutes')
+  })
+
+  it('수렴하지 않은 Task 를 완료로 옮기려면 --reason 이 필요하다', async () => {
+    const deps = makeDeps()
+    const taskId = await seedConvergingTask(deps)
+    const r = await call(deps, 'task-update', { id: taskId, status: 'completed' })
+    expect(r.status).toBe(400)
+    expect(String((r.body as { error: string }).error)).toContain('--reason')
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.status).not.toBe('completed')
+  })
+
+  it('--reason 을 주면 완료되고 그 이유가 Task 에 남는다', async () => {
+    const deps = makeDeps()
+    const taskId = await seedConvergingTask(deps)
+    const r = await call(deps, 'task-update', {
+      id: taskId,
+      status: 'completed',
+      reason: '검사 환경이 이 기계에 없어 손으로 확인했다'
+    })
+    expect(r.status).toBe(200)
+    const t = deps.getState().tasks.find((x) => x.id === taskId)!
+    expect(t.status).toBe('completed')
+    expect(t.completionOverride?.reason).toBe('검사 환경이 이 기계에 없어 손으로 확인했다')
+  })
+
+  // 요구는 강제인 경우에만 — 평범한 손보기까지 막으면 이 명령을 쓰던 구조 경로가 한 번에 막힌다
+  it('자동 수정 없는 Run 의 완료는 이유를 묻지 않는다', async () => {
+    const deps = makeDeps()
+    const taskId = await seedTask(deps)
+    const r = await call(deps, 'task-update', { id: taskId, status: 'completed' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.completionOverride).toBeUndefined()
+  })
+
+  it('200이고 Task 상태가 바뀐다', async () => {
+    const deps = makeDeps()
+    const taskId = await seedTask(deps)
+    const r = await call(deps, 'task-update', { id: taskId, status: 'blocked' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.status).toBe('blocked')
+  })
+
+  // 사용자 판정: 가이드 8절이 "서킷 브레이크로 갇힌 Task를 task-update로
+  // 구제한다"고 광고하는데 카운터가 남아 있으면 재디스패치가 여전히 막혀 그 구제가 성립하지
+  // 않는다. D5로 세션 종료도 카운트하게 되면서 "워커 탭을 3번 닫으면 Task가 영구 불가"가
+  // 실제 경로가 됐다.
+  describe('서킷 카운터를 되돌린다', () => {
+    /** 세션 종료로 닫힌 Dispatch를 FAILURE_LIMIT회 만들어 서킷을 연다 */
+    const openCircuit = async (deps: OrchServerDeps, taskId: string): Promise<string> => {
+      let dispatchId = ''
+      for (let i = 1; i <= FAILURE_LIMIT; i++) {
+        deps.startWorker = async () => ({
+          sessionId: `sess${i}`,
+          cwd: 'D:/p',
+          specPath: 'D:/p/orch/specs/a.md'
+        })
+        const started = await call(deps, 'worker-start', {
+          taskId,
+          agent: 'codex',
+          account: 'acc1',
+          worktree: 'current',
+          ...(dispatchId ? { retryOf: dispatchId } : {})
+        })
+        dispatchId = (started.body as { dispatchId: string }).dispatchId
+        await handleExit(deps, { sessionId: `sess${i}`, exitCode: 1 })
+      }
+      return dispatchId
+    }
+
+    it('서킷이 열린 Task에 task-update 후 worker-start --retry-of가 통과한다', async () => {
+      const deps = makeDeps()
+      const taskId = await seedTask(deps)
+      const dispatchId = await openCircuit(deps, taskId)
+      expect(deps.getState().tasks.find((t) => t.id === taskId)!.consecutiveFailures).toBe(
+        FAILURE_LIMIT
+      )
+      // 카운터가 남아 있으면 상태만 바뀌고 이 재시도가 circuit break로 거부된다
+      const blocked = await call(deps, 'worker-start', {
+        taskId,
+        agent: 'codex',
+        account: 'acc1',
+        worktree: 'current',
+        retryOf: dispatchId
+      })
+      expect(blocked.status).toBe(400)
+      expect(JSON.stringify(blocked.body)).toContain('circuit break')
+
+      const updated = await call(deps, 'task-update', { id: taskId, status: 'ready' })
+      expect(updated.status).toBe(200)
+      expect(deps.getState().tasks.find((t) => t.id === taskId)!.consecutiveFailures).toBe(0)
+
+      deps.startWorker = async () => ({
+        sessionId: 'sess-after',
+        cwd: 'D:/p',
+        specPath: 'D:/p/orch/specs/a.md'
+      })
+      const retried = await call(deps, 'worker-start', {
+        taskId,
+        agent: 'codex',
+        account: 'acc1',
+        worktree: 'current',
+        retryOf: dispatchId
+      })
+      expect(retried.status).toBe(200)
+    })
+
+    it('실패가 없던 Task의 카운터도 0으로 유지된다 — 다른 필드는 그대로다', async () => {
+      const deps = makeDeps()
+      const taskId = await seedTask(deps)
+      const before = deps.getState().tasks.find((t) => t.id === taskId)!
+      await call(deps, 'task-update', { id: taskId, status: 'blocked' })
+      const after = deps.getState().tasks.find((t) => t.id === taskId)!
+      expect(after.consecutiveFailures).toBe(0)
+      expect(after.spec).toBe(before.spec)
+      expect(after.deps).toBe(before.deps)
+    })
+  })
+
+  it('전이 표가 금지하는 전이도 통과한다 — completed에서 ready로(우회 확인)', async () => {
+    const deps = makeDeps()
+    const taskId = await seedCompletedTask(deps)
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.status).toBe('completed')
+    const r = await call(deps, 'task-update', { id: taskId, status: 'ready' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.status).toBe('ready')
+  })
+
+  it('우회 여부를 로그에 남긴다 — task id·이전 상태·새 상태·table-allowed=false', async () => {
+    const logs: string[] = []
+    const deps = { ...makeDeps(), log: (m: string) => logs.push(m) }
+    const taskId = await seedCompletedTask(deps)
+    await call(deps, 'task-update', { id: taskId, status: 'ready' })
+    expect(
+      logs.some(
+        (l) =>
+          l.includes(taskId) &&
+          l.includes('completed') &&
+          l.includes('ready') &&
+          l.includes('table-allowed=false')
+      )
+    ).toBe(true)
+  })
+
+  it('허용되는 전이는 table-allowed=true로 로그에 남는다', async () => {
+    const logs: string[] = []
+    const deps = { ...makeDeps(), log: (m: string) => logs.push(m) }
+    const taskId = await seedTask(deps)
+    await call(deps, 'task-update', { id: taskId, status: 'blocked' })
+    expect(logs.some((l) => l.includes('table-allowed=true'))).toBe(true)
+  })
+
+  it('--result를 주면 Task.result에 반영한다', async () => {
+    const deps = makeDeps()
+    const taskId = await seedTask(deps)
+    const r = await call(deps, 'task-update', {
+      id: taskId,
+      status: 'failed',
+      result: '수동 정정: 세션이 죽어 강제로 failed 처리'
+    })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.result).toBe(
+      '수동 정정: 세션이 죽어 강제로 failed 처리'
+    )
+  })
+
+  it('A를 completed로 정정하면 A에 의존하던 pending Task B가 ready로 승격된다(recomputeReady)', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const a = await call(deps, 'task-create', { account: 'acc1', runId, title: 'a', spec: 's' })
+    const aId = (a.body as { id: string }).id
+    const b = await call(deps, 'task-create', { account: 'acc1', runId, title: 'b', spec: 's', deps: [aId] })
+    const bId = (b.body as { id: string }).id
+    expect(deps.getState().tasks.find((t) => t.id === bId)!.status).toBe('pending')
+    const r = await call(deps, 'task-update', { id: aId, status: 'completed' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.find((t) => t.id === bId)!.status).toBe('ready')
+  })
+
+  it('B가 blocked(Gate)면 A를 완료시켜도 B는 blocked에 머문다 — recomputeReady는 blocked를 건드리지 않는다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const a = await call(deps, 'task-create', { account: 'acc1', runId, title: 'a', spec: 's' })
+    const aId = (a.body as { id: string }).id
+    const b = await call(deps, 'task-create', { account: 'acc1', runId, title: 'b', spec: 's', deps: [aId] })
+    const bId = (b.body as { id: string }).id
+    const gate = await call(deps, 'gate-create', { task: bId, question: 'q?' })
+    expect(gate.status).toBe(200) // 사전조건: B가 blocked로 전이됐다
+    expect(deps.getState().tasks.find((t) => t.id === bId)!.status).toBe('blocked')
+    const r = await call(deps, 'task-update', { id: aId, status: 'completed' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.find((t) => t.id === bId)!.status).toBe('blocked')
+  })
+
+  it('유효하지 않은 --status는 400을 낸다', async () => {
+    const deps = makeDeps()
+    const taskId = await seedTask(deps)
+    const before = deps.getState().tasks.find((t) => t.id === taskId)!.status
+    const r = await call(deps, 'task-update', { id: taskId, status: 'bogus' })
+    expect(r.status).toBe(400)
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.status).toBe(before)
+  })
+
+  it('존재하지 않는 --id는 400을 낸다', async () => {
+    const r = await call(makeDeps(), 'task-update', { id: 'tsk_missing', status: 'ready' })
+    expect(r.status).toBe(404)
+  })
+
+  it('워커 세션이 부르면 403이다', async () => {
+    const deps = makeDeps()
+    const taskId = await seedTask(deps)
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const r = await call(deps, 'task-update', { id: taskId, status: 'ready' }, 'sess1')
+    expect(r.status).toBe(403)
+  })
+})
+
+describe('handleCommand — tasks list --ready', () => {
+  it('ready 상태만 걸러 준다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const a = await call(deps, 'task-create', { account: 'acc1', runId, title: 'a', spec: 's' })
+    await call(deps, 'task-create', {
+      account: 'acc1',
+      runId,
+      title: 'b',
+      spec: 's',
+      deps: [(a.body as { id: string }).id]
+    })
+    const r = await call(deps, 'tasks-list', { ready: true })
+    const list = r.body as { id: string; title: string }[]
+    expect(list.map((t) => t.title)).toEqual(['a'])
+  })
+  it('brief는 spec을 160자에서 자르고 표시를 남긴다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', runId: (run.body as { id: string }).id,
+      title: 't',
+      spec: 'x'.repeat(300) })
+    const r = await call(deps, 'tasks-list', { brief: true })
+    const list = r.body as { spec: string; spec_truncated: boolean }[]
+    expect(list[0].spec.length).toBe(160)
+    expect(list[0].spec_truncated).toBe(true)
+  })
+})
+
+// 그 결함들의 뿌리는 server.ts와 coordinator.ts가 각각 openDispatch를 부르는
+// 이중 호출이었다 — 한쪽만(Mock startWorker로) 테스트하면 이 회귀를 잡을 수 없다. 그래서
+// 이 블록은 실제 OrchCoordinator를 OrchServerDeps.startWorker/releaseWorker의 구현으로
+// 배선해 둘을 함께 검증한다(리뷰가 명시적으로 요구한 유일한 방법).
+describe('handleCommand — worker-start × OrchCoordinator 통합 배선', () => {
+  const makeWiredDeps = (
+    coordOverrides: Partial<CoordinatorDeps> = {}
+  ): OrchServerDeps & { state: OrchState } => {
+    const box = { state: emptyState() as OrchState }
+    const coordDeps: CoordinatorDeps = {
+      spawnSession: async () => ({ id: 'sess1' }),
+      writeToSession: () => {},
+      isBusy: () => null,
+      isAlive: () => true,
+      killSession: () => {},
+      createWorktree: async (a) => ({ path: path.join(dir, 'wt-' + a.name) }),
+      accountProvider: () => 'codex',
+      specsDir,
+      log: () => {},
+      ...coordOverrides
+    }
+    const coordinator = new OrchCoordinator(coordDeps)
+    return {
+      state: box.state,
+      getState: () => box.state,
+      setState: async (next) => {
+        box.state = next
+      },
+      // 실제 배선은 여기서 Task.accountIds 를 읽어 롤링 체인을 만든다(ipc.ts의 deps.startWorker) —
+      // 이 테스트 배선은 그 계정 하나짜리 체인으로 충분하다(서버는 체인을 보지 않는다).
+      startWorker: (a) => coordinator.startWorker({ ...a, rollAccountIds: [a.accountId] }),
+      releaseWorker: async () => {},
+      listAccounts: () => [{ id: 'acc1', label: '계정1', provider: 'codex' }],
+      readWorker: async () => 'output',
+      now: () => NOW
+    } as OrchServerDeps & { state: OrchState }
+  }
+
+  const seedTask = async (deps: OrchServerDeps): Promise<string> => {
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: dir })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    return (task.body as { id: string }).id
+  }
+  /** taskId 와 같은 회차에 Task 하나를 더 만든다 — --terminal 재사용 후보 Dispatch 의 주인이다. */
+  const seedSibling = async (deps: OrchServerDeps, taskId: string): Promise<string> => {
+    const runId = deps.getState().tasks.find((t) => t.id === taskId)!.runId
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 'o', spec: 's' })
+    return (task.body as { id: string }).id
+  }
+
+  it('worker-start 왕복이 200이고 dispatchId를 돌려준다 — openDispatch 이중 호출 회귀 방지', async () => {
+    const deps = makeWiredDeps()
+    const taskId = await seedTask(deps)
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(r.status).toBe(200)
+    const body = r.body as { dispatchId: string; sessionId: string }
+    expect(body.dispatchId).toBeTruthy()
+    expect(body.sessionId).toBe('sess1')
+    // 이중으로 openDispatch가 불렸다면 두 번째 호출이 'dispatch already open'으로 400을
+    // 내거나 dispatch가 2개 생겼을 것이다 — 회귀 방지의 핵심 단정.
+    expect(deps.getState().dispatches).toHaveLength(1)
+    expect(deps.getState().dispatches[0].id).toBe(body.dispatchId)
+    expect(deps.getState().dispatches[0].sessionId).toBe('sess1')
+  })
+
+  it('스폰 실패 후 상태가 무결하다 — dispatch 0개·Task 원상태·거짓 status 없음, 같은 Task로 재시도하면 성공한다', async () => {
+    let fail = true
+    const deps = makeWiredDeps({
+      spawnSession: async () => {
+        if (fail) throw new Error('spawn failed')
+        return { id: 'sess1' }
+      }
+    })
+    const taskId = await seedTask(deps)
+    const before = deps.getState().tasks.find((t) => t.id === taskId)!.status
+
+    const r1 = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(r1.status).toBe(400)
+    expect(deps.getState().dispatches).toHaveLength(0)
+    expect(deps.getState().tasks.find((t) => t.id === taskId)!.status).toBe(before)
+    expect(deps.getState().messages.some((m) => m.type === 'status')).toBe(false)
+
+    fail = false
+    const r2 = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect(r2.status).toBe(200)
+    expect(deps.getState().dispatches).toHaveLength(1)
+  })
+
+  it('스폰 대기 중 다른 워커의 worker_done이 착륙해도 patch가 그 결과를 덮어쓰지 않는다 (C3)', async () => {
+    let releaseSpawn: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      releaseSpawn = resolve
+    })
+    const deps = makeWiredDeps({
+      spawnSession: async () => {
+        await gate
+        return { id: 'sess1' }
+      }
+    })
+    const taskId = await seedTask(deps)
+    const startPromise = call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    // handleCommand는 openDispatch를 커밋(await deps.setState)한 뒤에야 코디네이터의
+    // startWorker(스폰 대기)로 들어간다 — setState mock에 내부 await가 없어 그 커밋은
+    // call()이 반환을 완료한 시점에 이미 동기적으로 반영돼 있다.
+    const dispatchId = deps.getState().dispatches[0].id
+    const done = await call(deps, 'send', {
+      type: 'worker_done',
+      taskId,
+      dispatchId,
+      outcome: 'succeeded',
+      subject: 's',
+      body: 'b'
+    })
+    expect(done.status).toBe(200)
+    releaseSpawn()
+    const r = await startPromise
+    expect(r.status).toBe(200)
+    const d = deps.getState().dispatches.find((x) => x.id === dispatchId)!
+    expect(d.outcome).toBe('succeeded') // patch가 이 값을 덮어쓰지 않았다
+    expect(d.sessionId).toBe('sess1') // 그런데도 sessionId는 patch됐다
+  })
+
+  it('죽은 --terminal로 재사용을 시도하면 거부되고 dispatch가 남지 않는다', async () => {
+    const deps = makeWiredDeps({ isAlive: () => false })
+    const taskId = await seedTask(deps)
+    const other = await seedSibling(deps, taskId)
+    // 재사용 후보 dispatch를 직접 심는다(이미 종단된, 재사용 가능한 것처럼 보이는 상태) —
+    // 실제로 살아 있는지는 isAlive만이 판정한다.
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [
+        {
+          id: 'dsp_prev',
+          taskId: other,
+          provider: 'codex',
+          accountId: 'acc1',
+          sessionId: 'sessDead',
+          cwd: dir,
+          specPath: path.join(specsDir, 'x.md'),
+          startedAt: NOW,
+          workerState: 'stopped',
+          outcome: 'succeeded',
+          endedAt: NOW,
+          retained: false
+        }
+      ]
+    })
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current',
+      terminal: 'sessDead'
+    })
+    expect(r.status).toBe(400)
+    expect(JSON.stringify(r.body)).toContain('not alive')
+    expect(deps.getState().dispatches.filter((x) => x.taskId === taskId)).toHaveLength(0)
+  })
+
+  it('아직 열린 dispatch가 쓰고 있는 세션은 --terminal로 재사용할 수 없다', async () => {
+    // worker-start의 사전 검증(server.ts)은 "같은 taskId에 열린 dispatch"만 본다 — 다른 Task의
+    // 열린 dispatch가 그 세션을 쓰고 있는 경우는 openDispatch의 sessionId 가드(state.ts)가
+    // 잡는다. 이 조합이 통과하면 한 세션에 열린 dispatch가 둘이 되어, closeDispatch(첫 번째
+    // 열린 것을 닫는다)와 releaseArgsFor(마지막에 열린 것이 소유자다)가 서로 다른 dispatch를
+    // 가리킨다. 그 두 규칙이 만나는 경우 자체를 없애는 것이 이 거부다.
+    const deps = makeWiredDeps({ isAlive: () => true })
+    const taskId = await seedTask(deps)
+    const other = await seedSibling(deps, taskId)
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [
+        {
+          id: 'dsp_live',
+          taskId: other,
+          provider: 'codex',
+          accountId: 'acc1',
+          sessionId: 'sessLive',
+          cwd: dir,
+          specPath: path.join(specsDir, 'x.md'),
+          startedAt: NOW,
+          workerState: 'ready', // 열려 있다 — endedAt·outcome이 없다
+          retained: false
+        }
+      ]
+    })
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current',
+      terminal: 'sessLive'
+    })
+    expect(r.status).toBe(400)
+    expect(JSON.stringify(r.body)).toContain('sessionId already in use')
+    expect(deps.getState().dispatches.filter((x) => x.taskId === taskId)).toHaveLength(0)
+  })
+
+  // **--terminal 은 같은 회차의 세션만 다시 쓴다.** 이전에는 "그 sessionId 를 가진 Dispatch 가
+  // 어딘가 있다" 만 봤으므로, 다른 회차 워커의 세션 id 를 아는 코디네이터가 그 세션에 타이핑할 수
+  // 있었다.
+  /** taskId 를 한 번 돌려 끝낸다(worker-start → worker_done). 그 세션(sess1)은 살아 있고 열린
+   *  Dispatch 가 없으니 --terminal 로 다시 쓸 수 있는 상태다. */
+  const finishOnce = async (deps: OrchServerDeps, taskId: string): Promise<string> => {
+    const r = await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    const { dispatchId, sessionId } = r.body as { dispatchId: string; sessionId: string }
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' })
+    return sessionId
+  }
+  const runOf = (deps: OrchServerDeps, taskId: string): string =>
+    deps.getState().tasks.find((t) => t.id === taskId)!.runId!
+
+  it('같은 회차의 끝난 세션은 --terminal 로 다시 쓸 수 있다', async () => {
+    const writes: string[] = []
+    const deps = makeWiredDeps({ writeToSession: (id) => void writes.push(id) })
+    const first = await seedTask(deps)
+    const sessionId = await finishOnce(deps, first)
+    const next = await call(deps, 'task-create', { account: 'acc1', runId: runOf(deps, first), title: 'n', spec: 's' })
+    const nextId = (next.body as { id: string }).id
+    writes.length = 0
+    const r = await call(deps, 'worker-start', {
+      taskId: nextId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current',
+      terminal: sessionId
+    })
+    expect(r.status).toBe(200)
+    expect((r.body as { sessionId: string }).sessionId).toBe(sessionId)
+    expect(writes).toContain(sessionId)
+  })
+
+  it('다른 회차의 세션은 --terminal 로 다시 쓸 수 없다 — 403, 아무것도 타이핑하지 않는다', async () => {
+    const writes: string[] = []
+    const deps = makeWiredDeps({ writeToSession: (id) => void writes.push(id) })
+    const other = await seedTask(deps)
+    const sessionId = await finishOnce(deps, other)
+    const mine = await seedTask(deps) // 새 run-create 이므로 다른 회차다
+    expect(runOf(deps, mine)).not.toBe(runOf(deps, other))
+    writes.length = 0
+    const before = deps.getState().tasks.find((t) => t.id === mine)!.status
+    const r = await call(deps, 'worker-start', {
+      taskId: mine,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current',
+      terminal: sessionId
+    })
+    expect(r.status).toBe(403)
+    const msg = JSON.stringify(r.body)
+    expect(msg).toContain(runOf(deps, other))
+    expect(msg).toContain(runOf(deps, mine))
+    expect(writes).toHaveLength(0)
+    expect(deps.getState().dispatches.filter((x) => x.taskId === mine)).toHaveLength(0)
+    expect(deps.getState().tasks.find((t) => t.id === mine)!.status).toBe(before)
+  })
+
+  it('어느 Dispatch 도 쓰지 않은 세션은 지금처럼 404 다', async () => {
+    const deps = makeWiredDeps()
+    const taskId = await seedTask(deps)
+    const r = await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current',
+      terminal: 'sessNobody'
+    })
+    expect(r.status).toBe(404)
+    expect(JSON.stringify(r.body)).toContain('unknown terminal: sessNobody')
+  })
+})
+
+describe('handleExit — probeLimit 배선과 쓰기 역전 회귀', () => {
+  /** run + task + 열린 dispatch(sessionId='sess1')를 만든다. makeDeps().startWorker가 항상
+   *  sess1을 돌려주는 스텁이라 'handleCommand — 역할 인가'의 seedWorker와 같은 모양이다. */
+  const seedOpenDispatch = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    runId: string
+  }> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    return { deps, runId }
+  }
+
+  it('probeLimit이 값을 주면 Dispatch에 실린다', async () => {
+    const { deps } = await seedOpenDispatch()
+    deps.probeLimit = async () => 1_700_000_000_000
+    await handleExit(deps, { sessionId: 'sess1', exitCode: 1 })
+    const d = deps.getState().dispatches[0]
+    expect(d.limitResetsAt).toBe(1_700_000_000_000)
+    expect(d.endedAt).toBeDefined()
+  })
+
+  it('probeLimit이 null이면 필드가 없다', async () => {
+    const { deps } = await seedOpenDispatch()
+    deps.probeLimit = async () => null
+    await handleExit(deps, { sessionId: 'sess1', exitCode: 1 })
+    const d = deps.getState().dispatches[0]
+    expect('limitResetsAt' in d).toBe(false)
+  })
+
+  it('probeLimit이 던지면 handleExit은 던지지 않고 세션은 그대로 닫히며 log가 한 번 불린다', async () => {
+    const { deps } = await seedOpenDispatch()
+    const logs: string[] = []
+    deps.probeLimit = async () => {
+      throw new Error('probe boom')
+    }
+    deps.log = (m: string): void => {
+      logs.push(m)
+    }
+    await expect(handleExit(deps, { sessionId: 'sess1', exitCode: 1 })).resolves.toBeUndefined()
+    const d = deps.getState().dispatches[0]
+    expect(d.endedAt).toBeDefined()
+    expect(d.workerState).toBe('failed')
+    expect('limitResetsAt' in d).toBe(false)
+    expect(logs).toHaveLength(1)
+  })
+
+  it('probeLimit이 미주입이면 부르지 않고 기존 동작 그대로다', async () => {
+    const { deps } = await seedOpenDispatch()
+    await handleExit(deps, { sessionId: 'sess1', exitCode: 0 })
+    const d = deps.getState().dispatches[0]
+    expect(d.workerState).toBe('stopped')
+    expect('limitResetsAt' in d).toBe(false)
+    const msg = deps.getState().messages.find((m) => m.type === 'status')!
+    expect(msg.subject).toBe('session ended without reporting')
+  })
+
+  it('무관한 세션의 exit은 상태를 한 글자도 바꾸지 않는다 (과거에 소실된 회귀)', async () => {
+    // server.ts의 `r.value === null` 조기 반환이 그 가드다. 없으면 앱의 **모든** 세션 종료가
+    // orchestration.json을 재기록한다 — 오케스트레이션과 무관한 사용자 탭을 닫을 때마다.
+    const { deps } = await seedOpenDispatch()
+    const before = deps.getState()
+    let writes = 0
+    const inner = deps.setState.bind(deps)
+    deps.setState = async (next): Promise<void> => {
+      writes++
+      await inner(next)
+    }
+    await handleExit(deps, { sessionId: 'sess-of-a-user-tab', exitCode: 0 })
+    expect(writes).toBe(0)
+    expect(deps.getState()).toBe(before) // 같은 객체다 — 새 상태를 만들지도 않았다
+    expect(deps.getState().dispatches[0].endedAt).toBeUndefined()
+  })
+
+  it('probeLimit의 await 동안 다른 상태 변경이 일어나도 잃지 않는다 — 쓰기 역전 회귀', async () => {
+    const { deps, runId } = await seedOpenDispatch()
+    // probeLimit 안에서 직접 deps.setState를 불러 상태를 바꾼다 — Run에 무관한 메시지 하나를
+    // 추가한다. handleExit이 await 이전 스냅샷으로 closeDispatch를 부르면 이 변경이
+    // setState(r.state)에 덮여 사라진다 (T7에서 실증된 것과 같은 쓰기 역전).
+    deps.probeLimit = async () => {
+      const before = deps.getState()
+      await deps.setState({
+        ...before,
+        messages: [
+          ...before.messages,
+          {
+            id: 'msg_concurrent',
+            runId,
+            type: 'status',
+            subject: 'concurrent write',
+            body: 'probeLimit await 동안의 다른 변경',
+            answered: false,
+            createdAt: NOW
+          }
+        ]
+      })
+      return null
+    }
+    await handleExit(deps, { sessionId: 'sess1', exitCode: 1 })
+    expect(deps.getState().messages.some((m) => m.id === 'msg_concurrent')).toBe(true)
+  })
+})
+
+describe("send --type worker_done --outcome failed: 한도 탐침", () => {
+  /** run + task + 열린 dispatch(sessionId='sess1')를 만든다 — handleExit 블록의 seedOpenDispatch와
+   *  같은 모양이다. */
+  const seedOpenDispatch = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    runId: string
+    taskId: string
+    dispatchId: string
+  }> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', {
+      taskId,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const dispatchId = deps.getState().dispatches[0].id
+    return { deps, runId, taskId, dispatchId }
+  }
+
+  it('worker_done --outcome failed에서 탐침이 불리고 값이 Dispatch에 실린다', async () => {
+    const { deps, taskId, dispatchId } = await seedOpenDispatch()
+    let probeCalls = 0
+    deps.probeLimit = async () => {
+      probeCalls++
+      return 1_700_000_000_000
+    }
+    const r = await call(deps, 'send', {
+      type: 'worker_done',
+      taskId,
+      dispatchId,
+      outcome: 'failed',
+      subject: 'a',
+      body: 'b'
+    })
+    expect(r.status).toBe(200)
+    expect(probeCalls).toBe(1)
+    const d = deps.getState().dispatches.find((x) => x.id === dispatchId)!
+    expect(d.limitResetsAt).toBe(1_700_000_000_000)
+    expect(d.outcome).toBe('failed')
+  })
+
+  it("outcome: 'completed'(succeeded)에서는 탐침을 부르지 않는다", async () => {
+    const { deps, taskId, dispatchId } = await seedOpenDispatch()
+    let probeCalls = 0
+    deps.probeLimit = async () => {
+      probeCalls++
+      return 1_700_000_000_000
+    }
+    const r = await call(deps, 'send', {
+      type: 'worker_done',
+      taskId,
+      dispatchId,
+      outcome: 'succeeded',
+      subject: 'a',
+      body: 'b'
+    })
+    expect(r.status).toBe(200)
+    expect(probeCalls).toBe(0)
+    const d = deps.getState().dispatches.find((x) => x.id === dispatchId)!
+    expect('limitResetsAt' in d).toBe(false)
+  })
+
+  it('탐침이 던져도 worker_done은 200을 반환한다', async () => {
+    const { deps, taskId, dispatchId } = await seedOpenDispatch()
+    const logs: string[] = []
+    deps.probeLimit = async () => {
+      throw new Error('probe boom')
+    }
+    deps.log = (m: string): void => {
+      logs.push(m)
+    }
+    const r = await call(deps, 'send', {
+      type: 'worker_done',
+      taskId,
+      dispatchId,
+      outcome: 'failed',
+      subject: 'a',
+      body: 'b'
+    })
+    expect(r.status).toBe(200)
+    const d = deps.getState().dispatches.find((x) => x.id === dispatchId)!
+    expect(d.outcome).toBe('failed')
+    expect('limitResetsAt' in d).toBe(false)
+    expect(logs).toHaveLength(1)
+  })
+
+  it('한도로 실패한 worker_done도 inbox에 status 메시지를 남긴다 (오케스트레이터 가이드 §7, 리뷰 I3)', async () => {
+    const { deps, taskId, dispatchId } = await seedOpenDispatch()
+    deps.probeLimit = async () => 1_700_000_000_000
+    const r = await call(deps, 'send', {
+      type: 'worker_done',
+      taskId,
+      dispatchId,
+      outcome: 'failed',
+      subject: '워커 자체 보고',
+      body: '문구가 나오고 멈췄다'
+    })
+    expect(r.status).toBe(200)
+    const messages = deps.getState().messages
+    // 워커가 직접 보낸 worker_done 메시지(subject·body)는 그대로 남는다 — 탐침이 덮어쓰지 않는다.
+    expect(
+      messages.some((m) => m.type === 'worker_done' && m.subject === '워커 자체 보고')
+    ).toBe(true)
+    // closeDispatch(handleExit 경로, state.ts)와 같은 형식의 별도 status 메시지가 추가된다.
+    const status = messages.find((m) => m.type === 'status' && m.dispatchId === dispatchId)
+    expect(status?.subject).toBe('session ended at a usage limit')
+    expect(status?.body).toContain(new Date(1_700_000_000_000).toISOString())
+    expect(status?.body).toContain('--retry-of')
+  })
+
+  it('probeLimit의 await 동안 다른 상태 변경이 일어나도 잃지 않는다 — 쓰기 역전 회귀 (리뷰 I4)', async () => {
+    const { deps, runId, taskId, dispatchId } = await seedOpenDispatch()
+    // probeLimit 안에서 직접 deps.setState를 불러 상태를 바꾼다 — handleExit 블록의 "쓰기 역전
+    // 회귀" 테스트와 같은 형태다. server.ts가 probeLimit의 await 이후 deps.getState()를 다시
+    // 읽지 않고 진입 시점 스냅샷(s)으로 applyWorkerDone을 부르면 이 변경이 setState(nextState)에
+    // 덮여 사라진다 — 이 테스트를 그 되돌린 코드로 실제로 돌려 실패를 확인했다(리뷰 I4, 보고서
+    // 참고).
+    deps.probeLimit = async () => {
+      const before = deps.getState()
+      await deps.setState({
+        ...before,
+        messages: [
+          ...before.messages,
+          {
+            id: 'msg_concurrent',
+            runId,
+            type: 'status',
+            subject: 'concurrent write',
+            body: 'probeLimit await 동안의 다른 변경',
+            answered: false,
+            createdAt: NOW
+          }
+        ]
+      })
+      return null
+    }
+    await call(deps, 'send', {
+      type: 'worker_done',
+      taskId,
+      dispatchId,
+      outcome: 'failed',
+      subject: 'a',
+      body: 'b'
+    })
+    expect(deps.getState().messages.some((m) => m.id === 'msg_concurrent')).toBe(true)
+  })
+})
+
+describe('unregisterRolling — Dispatch 가 닫히는데 세션은 살아 있는 자리', () => {
+  /** run + task + 열린 dispatch(sessionId='sess1') + unregisterRolling 기록 */
+  const seed = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    taskId: string
+    dispatchId: string
+    dropped: string[]
+  }> => {
+    const deps = makeDeps()
+    const dropped: string[] = []
+    deps.unregisterRolling = (sessionId) => dropped.push(sessionId)
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    return { deps, taskId, dispatchId: deps.getState().dispatches[0].id, dropped }
+  }
+
+  it('worker_done 이 그 세션의 롤링 체인을 걷는다', async () => {
+    const { deps, taskId, dispatchId, dropped } = await seed()
+    const r = await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' },
+      'sess1'
+    )
+    expect(r.status).toBe(200)
+    expect(dropped).toEqual(['sess1'])
+  })
+
+  // 재전송은 아무것도 닫지 않는다(alreadyReported) — 그때 걷는 것은 이미 걷힌 것을 또 부르는 일이다
+  it('worker_done 재전송에서는 다시 걷지 않는다', async () => {
+    const { deps, taskId, dispatchId, dropped } = await seed()
+    const done = { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' }
+    await call(deps, 'send', done, 'sess1')
+    const again = await call(deps, 'send', done, 'sess1')
+    expect(again.body).toBe('alreadyReported')
+    expect(dropped).toEqual(['sess1'])
+  })
+
+  // 이 명령은 어떤 프로세스도 건드리지 않는다 — Dispatch 만 닫히고 세션은 살아 있을 수 있다
+  it('worker-abandon 도 걷는다', async () => {
+    const { deps, dispatchId, dropped } = await seed()
+    const r = await call(deps, 'worker-abandon', { dispatch: dispatchId })
+    expect(r.status).toBe(200)
+    expect(dropped).toEqual(['sess1'])
+  })
+
+  // 세션을 죽이는 경로에서는 부르지 않는다 — 종료가 스스로 체인을 버린다(handleExit → disposeChain)
+  it('worker-stop 은 걷지 않는다 — 세션을 죽이는 경로다', async () => {
+    const { deps, dispatchId, dropped } = await seed()
+    const r = await call(deps, 'worker-stop', { dispatch: dispatchId })
+    expect(r.status).toBe(200)
+    expect(dropped).toEqual([])
+  })
+
+  it('세션 종료(handleExit)도 걷지 않는다 — 롤링이 이미 버렸다', async () => {
+    const { deps, dropped } = await seed()
+    await handleExit(deps, { sessionId: 'sess1', exitCode: 0 })
+    expect(deps.getState().dispatches[0].endedAt).toBeDefined()
+    expect(dropped).toEqual([])
+  })
+
+  // 주입되지 않은 배선(기존 테스트 포함)에서 보고 경로가 그대로 도는지 — 선택적 dep 관례
+  it('주입되지 않아도 worker_done 은 그대로 200 이다', async () => {
+    const { deps, taskId, dispatchId } = await seed()
+    deps.unregisterRolling = undefined
+    const r = await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' },
+      'sess1'
+    )
+    expect(r.status).toBe(200)
+  })
+})
+
+describe('run-create — cwd 정규화', () => {
+  it('해석기가 주입되면 그것이 돌려준 값을 cwd로 저장한다', async () => {
+    const deps = makeDeps()
+    deps.resolveProjectRoot = async () => 'D:/proj'
+    const r = await call(deps, 'run-create', { objective: '목표', cwd: 'D:/proj/src/main' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].cwd).toBe('D:/proj')
+  })
+
+  it('해석기에 주어진 --cwd 를 그대로 넘긴다', async () => {
+    const deps = makeDeps()
+    const seen: string[] = []
+    deps.resolveProjectRoot = async (cwd) => {
+      seen.push(cwd)
+      return 'D:/proj'
+    }
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/proj/src/main' })
+    expect(seen).toEqual(['D:/proj/src/main'])
+  })
+
+  // 선택적 의존성 관례 — 주입하지 않는 기존 호출자(테스트 포함)는 그대로 동작해야 한다
+  it('해석기가 없으면 주어진 --cwd 를 그대로 저장한다', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', { objective: '목표', cwd: 'D:/proj/src/main' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].cwd).toBe('D:/proj/src/main')
+  })
+
+  // 배선(ipc.ts)은 계정마다 파일시스템을 훑고 git 까지 부른다. 거기서 난 실패가 Run 생성을
+  // 막으면 코디네이터가 아무 작업도 시작하지 못한다 — handleExit 이 probeLimit 을 감싼 것과 같다
+  it('해석기가 실패하면 주어진 --cwd 를 그대로 저장한다', async () => {
+    const deps = makeDeps()
+    const logged: string[] = []
+    deps.log = (m) => logged.push(m)
+    deps.resolveProjectRoot = async () => {
+      throw new Error('EACCES')
+    }
+    const r = await call(deps, 'run-create', { objective: '목표', cwd: 'D:/proj/src/main' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].cwd).toBe('D:/proj/src/main')
+    expect(logged.some((m) => m.includes('EACCES'))).toBe(true)
+  })
+
+  it('objective 가 비면 정규화 이전에 거절한다', async () => {
+    const deps = makeDeps()
+    let called = false
+    deps.resolveProjectRoot = async (cwd) => {
+      called = true
+      return cwd
+    }
+    const r = await call(deps, 'run-create', { objective: '  ', cwd: 'D:/proj' })
+    expect(r.status).toBe(400)
+    expect(called).toBe(false)
+  })
+})
+
+describe('task-create --validate 와 run-configs', () => {
+  it('--validate 를 Task 에 저장한다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    const r = await call(deps, 'task-create', { account: 'acc1', spec: '작업', validate: 'cfg1' })
+    expect(r.status).toBe(200)
+    // validateConfigId(단수)는 더 쓰지 않는다 — 옛 단일 값도 한 칸짜리 목록으로 저장한다
+    // (server.ts task-create, 설계 D8).
+    expect(deps.getState().tasks[0].validateConfigIds).toEqual(['cfg1'])
+    expect(deps.getState().tasks[0]).not.toHaveProperty('validateConfigId')
+  })
+
+  it('--validate 없이 만든 Task 에는 그 필드가 없다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업' })
+    expect(deps.getState().tasks[0].validateConfigIds).toBeUndefined()
+  })
+
+  it('run-configs 는 주입된 목록을 그대로 돌려준다', async () => {
+    const deps = makeDeps()
+    deps.listRunConfigs = async () => [{ id: 'cfg1', name: '테스트', type: 'npm' }]
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    const r = await call(deps, 'run-configs', {})
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual([{ id: 'cfg1', name: '테스트', type: 'npm' }])
+  })
+
+  // 주입되지 않는 기존 호출자(테스트 포함)가 깨지면 안 된다 — now?/log?/backup? 와 같은 관례다
+  it('listRunConfigs 가 주입되지 않으면 빈 목록이다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    const r = await call(deps, 'run-configs', {})
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual([])
+  })
+
+  // 워커도 자기가 무엇으로 검증될지 볼 수 있어야 한다 — 상태를 바꾸지 않는 읽기 명령이다
+  it('워커 세션도 run-configs 를 부를 수 있다', async () => {
+    const deps = makeDeps()
+    deps.listRunConfigs = async () => [{ id: 'cfg1', name: '테스트', type: 'npm' }]
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const workerSession = deps.getState().dispatches[0].sessionId
+    const r = await call(deps, 'run-configs', {}, workerSession)
+    expect(r.status).toBe(200)
+  })
+})
+
+describe('task-create --account', () => {
+  // 기본 makeDeps 는 계정을 하나만 준다 — 목록 문법을 보려면 같은 provider 의 계정이 둘 있어야 한다
+  const accountDeps = () => ({
+    ...makeDeps(),
+    listAccounts: () => [
+      { id: 'acc1', label: '계정1', provider: 'codex' as const },
+      { id: 'acc2', label: '계정2', provider: 'codex' as const }
+    ]
+  })
+
+  /** claude 와 codex 를 함께 가진 목록 — 섞인 지정을 거절하는지 보려면 두 provider 가 필요하다 */
+  const mixedDeps = (): OrchServerDeps & { state: OrchState } =>
+    Object.assign(makeDeps(), {
+      listAccounts: () => [
+        { id: 'cl1', label: 'claude1', provider: 'claude' as const },
+        { id: 'cl2', label: 'claude2', provider: 'claude' as const },
+        { id: 'cx1', label: 'codex1', provider: 'codex' as const }
+      ]
+    })
+
+  // 이 목록이 provider 의 유일한 출처이므로(Task.accountIds), 없으면 어느 CLI 로 띄울지 알 방법이
+  // 없다. 예전에는 Run 이 provider 를 들고 있어 비워 두면 그 provider 의 기본 계정으로 갔다.
+  it('--account 가 없으면 거절한다 — provider 의 출처가 이 목록뿐이다', async () => {
+    const deps = accountDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const r = await call(deps, 'task-create', { runId, spec: 's' })
+    expect(r.status).toBe(400)
+    expect(String((r.body as { error?: string }).error)).toContain('--account is required')
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  // 섞이면 첫 계정으로 띄운 CLI 가 한도에 걸렸을 때 다른 CLI 의 계정으로 갈아타려 한다 — 그것은
+  // 갈아타기가 아니라 다른 프로그램을 띄우는 일이다
+  it('서로 다른 provider 가 섞인 목록을 거절한다', async () => {
+    const deps = mixedDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const r = await call(deps, 'task-create', { runId, spec: 's', account: 'cl1,cx1' })
+    expect(r.status).toBe(400)
+    const err = String((r.body as { error?: string }).error)
+    // 어느 칸이 어긋났는지 말한다 — 목록이 셋 넷이면 "섞였다"만으로는 어디를 고칠지 알 수 없다
+    expect(err).toContain('must not mix providers')
+    expect(err).toContain('cl1 is claude')
+    expect(err).toContain('cx1 is codex')
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  it('같은 provider 끼리면 그대로 받는다 — 순서도 그대로다', async () => {
+    const deps = mixedDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const r = await call(deps, 'task-create', { runId, spec: 's', account: 'cl2,cl1' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.at(-1)?.accountIds).toEqual(['cl2', 'cl1'])
+  })
+
+  // 한 Run 에 두 provider 의 Task 가 섞이는 것은 **막지 않는다** — provider 를 Run 에서 Task 로
+  // 내린 이유가 그것이다. 거절은 한 Task 안의 목록에만 적용된다.
+  it('같은 Run 에 claude Task 와 codex Task 가 함께 있을 수 있다', async () => {
+    const deps = mixedDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    expect((await call(deps, 'task-create', { runId, spec: 'a', account: 'cl1' })).status).toBe(200)
+    expect((await call(deps, 'task-create', { runId, spec: 'b', account: 'cx1' })).status).toBe(200)
+    expect(deps.getState().tasks.map((t) => t.accountIds)).toEqual([['cl1'], ['cx1']])
+  })
+
+  it('--account 는 쉼표로 순서 있는 목록을 받는다', async () => {
+    const deps = accountDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const r = await call(deps, 'task-create', { runId, spec: 's', account: 'acc2,acc1' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.at(-1)?.accountIds).toEqual(['acc2', 'acc1'])
+  })
+
+  it('--account 하나는 원소 하나인 목록이다 (기존 호출)', async () => {
+    const deps = accountDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const r = await call(deps, 'task-create', { runId, spec: 's', account: 'acc1' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks.at(-1)?.accountIds).toEqual(['acc1'])
+  })
+
+  // **없는 계정은 404 다** — 적은 id 가 없다는 것이고, `run-create --coordinator-account` 가
+  // 같은 사실을 이미 404 로 말한다. 빈 칸·중복·provider 섞임은 인자가 틀린 것이라 400 그대로다.
+  it('목록의 어느 한 칸이라도 모르는 계정이면 404 로 거절한다', async () => {
+    const deps = accountDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const r = await call(deps, 'task-create', { runId, spec: 's', account: 'acc1,nope' })
+    expect(r.status).toBe(404)
+    expect((r.body as { error: string }).error).toBe('unknown account: nope')
+  })
+
+  it('같은 계정을 두 번 적으면 거절한다', async () => {
+    const deps = accountDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const r = await call(deps, 'task-create', { runId, spec: 's', account: 'acc1,acc1' })
+    expect(r.status).toBe(400)
+    expect((r.body as { error: string }).error).toMatch(/acc1/)
+  })
+
+  it('쉼표만 있거나 빈 칸이 섞이면 거절한다', async () => {
+    const deps = accountDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    // 상태 코드만으로는 이 검사를 못 박지 못한다 — 빈 칸은 언제나 동시에 "모르는 계정"이거나
+    // (트림하면 빈 문자열은 목록에 없다) 중복(빈 문자열끼리는 서로 같다)이기도 해서, 이 검사를
+    // 지워도 다른 두 검사 중 하나가 대신 400 을 낸다. 메시지까지 맞춰야 이 검사 자체를 본다.
+    const commaOnly = await call(deps, 'task-create', { runId, spec: 's', account: ',' })
+    expect(commaOnly.status).toBe(400)
+    expect((commaOnly.body as { error: string }).error).toBe(
+      '--account must not contain an empty entry'
+    )
+    const mixedEmpty = await call(deps, 'task-create', { runId, spec: 's', account: 'acc1,,acc2' })
+    expect(mixedEmpty.status).toBe(400)
+    expect((mixedEmpty.body as { error: string }).error).toBe(
+      '--account must not contain an empty entry'
+    )
+  })
+})
+
+describe('worker_done 이 검증을 시작한다', () => {
+  it('검증이 걸린 Task 가 끝나면 startValidation 을 부른다', async () => {
+    const deps = makeDeps()
+    const started: { taskId: string; cwd: string }[] = []
+    deps.startValidation = (a) => void started.push(a)
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', validate: 'cfg1' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    expect(deps.getState().tasks[0].status).toBe('validating')
+    expect(started).toEqual([{ taskId, cwd: d.cwd }])
+  })
+
+  it('검증이 없는 Task 는 startValidation 을 부르지 않는다', async () => {
+    const deps = makeDeps()
+    const started: { taskId: string; cwd: string }[] = []
+    deps.startValidation = (a) => void started.push(a)
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    expect(deps.getState().tasks[0].status).toBe('completed')
+    expect(started).toEqual([])
+  })
+
+  // **주입되지 않으면 검증이 없는 것으로 동작한다**(스펙 5절). validating 으로 보내면 결과를
+  // 가져다줄 것이 아무것도 없어 Task 가 영원히 그 상태이고, recomputeReady 는 completed 만
+  // 승격시키므로 의존 Task 는 전부 pending 에 멈춘다 — 선택적 의존성이 저하하는 대신 Task 를
+  // 고립시키는 것이다. 같은 자루의 listRunConfigs 는 빈 목록으로 올바르게 저하한다.
+  it('startValidation 이 주입되지 않으면 검증 없이 completed 로 간다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', validate: 'cfg1' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    const r = await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks[0].status).toBe('completed')
+  })
+
+  // 재전송(재시도 네트워크 요청 등)은 applyWorkerDone 이 상태를 바꾸지 않고 'alreadyReported' 를
+  // 돌려주는 문서화된 idempotent 경로다 — 이 경우 startValidation 을 다시 부르면 같은 cwd 에
+  // 검증이 중복으로 큐잉되고, 그 사이 Task 가 재시도돼 validating 으로 다시 들어왔다면 낡은
+  // 검증의 종료 코드가 새 시도를 정산해 버린다.
+  it('재전송된 worker_done 은 startValidation 을 다시 부르지 않는다', async () => {
+    const deps = makeDeps()
+    const started: { taskId: string; cwd: string }[] = []
+    deps.startValidation = (a) => void started.push(a)
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', validate: 'cfg1' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    const args = {
+      type: 'worker_done',
+      taskId,
+      dispatchId: d.id,
+      outcome: 'succeeded',
+      subject: 's',
+      body: 'b'
+    }
+    await call(deps, 'send', args, d.sessionId)
+    expect(started).toHaveLength(1)
+    const r2 = await call(deps, 'send', args, d.sessionId)
+    expect(r2.body).toBe('alreadyReported')
+    expect(started).toHaveLength(1) // 재전송으로 다시 큐잉되지 않는다
+  })
+})
+
+describe('task-create --review 와 검토 라우팅', () => {
+  it('task-create --review 가 reviewRequested 를 켠다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', review: true })
+    expect(deps.getState().tasks[0].reviewRequested).toBe(true)
+  })
+
+  it('--review 없이 만든 Task 는 reviewRequested 가 없다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업' })
+    expect(deps.getState().tasks[0].reviewRequested).toBeUndefined()
+  })
+
+  // 이것이 이 Task 의 핵심이다 — 검토 Dispatch 의 보고가 구현 보고로 처리되면 Task 가 두 번 끝난다
+  it('검토 Dispatch 로 온 worker_done 은 applyReviewResult 로 간다', async () => {
+    // review: true 인 Dispatch, reviewing 인 Task → worker_done succeeded → completed
+    // 그리고 'review passed' status 메시지가 남는다
+    const deps = makeDeps()
+    deps.startReview = () => {}
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', review: true })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const impl = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      {
+        type: 'worker_done',
+        taskId,
+        dispatchId: impl.id,
+        outcome: 'succeeded',
+        subject: 's',
+        body: 'b'
+      },
+      impl.sessionId
+    )
+    expect(deps.getState().tasks[0].status).toBe('reviewing')
+    // 검토 Dispatch를 직접 주입한다 — 그것을 여는 배선(startReview 구현)은 이 Task의 몫이 아니다.
+    // 다른 provider(codex)를 쓴다 — 구현은 claude였다.
+    const reviewDispatch = {
+      id: 'dsp_review',
+      taskId,
+      provider: 'codex' as const,
+      accountId: 'acc1',
+      sessionId: 'sess_review',
+      cwd: 'D:/p',
+      specPath: 'D:/p/orch/specs/review.md',
+      review: true,
+      startedAt: NOW,
+      workerState: 'ready' as const,
+      retained: false
+    }
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [...deps.getState().dispatches, reviewDispatch]
+    })
+    const r = await call(
+      deps,
+      'send',
+      {
+        type: 'worker_done',
+        taskId,
+        dispatchId: reviewDispatch.id,
+        outcome: 'succeeded',
+        subject: 's',
+        body: '리뷰 통과'
+      },
+      reviewDispatch.sessionId
+    )
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks[0].status).toBe('completed')
+    expect(
+      deps.getState().messages.some((m) => m.subject === 'review passed')
+    ).toBe(true)
+  })
+
+  it('구현 Dispatch 로 온 worker_done 은 지금과 똑같이 처리된다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    const r = await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    expect(r.status).toBe(200)
+    expect(r.body).toBe('accepted')
+    expect(deps.getState().tasks[0].status).toBe('completed')
+  })
+
+  it('startReview 가 주입되지 않으면 canReview: false 가 넘어간다', async () => {
+    // reviewRequested 가 걸린 Task 도 성공 보고에 곧바로 completed 로 간다
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', review: true })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    const r = await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks[0].status).toBe('completed')
+  })
+
+  it('Task 가 reviewing 이 되면 startReview 를 taskId 로 부른다', async () => {
+    // cwd 는 넘기지 않는다 — 배선이 구현 Dispatch 에서 얻는다(그 Dispatch 를 어차피 찾아야 한다)
+    const deps = makeDeps()
+    const started: { taskId: string }[] = []
+    deps.startReview = (a) => void started.push(a)
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', review: true })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    expect(deps.getState().tasks[0].status).toBe('reviewing')
+    expect(started).toEqual([{ taskId }])
+  })
+
+  it('재전송(alreadyReported)에는 startReview 를 부르지 않는다', async () => {
+    // startValidation 이 같은 이유로 result.value === 'accepted' 를 본다
+    const deps = makeDeps()
+    const started: { taskId: string }[] = []
+    deps.startReview = (a) => void started.push(a)
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', review: true })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    const args = {
+      type: 'worker_done',
+      taskId,
+      dispatchId: d.id,
+      outcome: 'succeeded',
+      subject: 's',
+      body: 'b'
+    }
+    await call(deps, 'send', args, d.sessionId)
+    expect(started).toHaveLength(1)
+    const r2 = await call(deps, 'send', args, d.sessionId)
+    expect(r2.body).toBe('alreadyReported')
+    expect(started).toHaveLength(1)
+  })
+
+  // TASK_STATUSES 는 손수 쓴 목록이라 빠뜨려도 컴파일은 통과한다 — task-update가 그 목록으로
+  // --status 를 검증하는 실제 지점이다(task-list는 필터일 뿐 검증하지 않는다).
+  it('task-update --status reviewing 이 거절되지 않는다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    const task = await call(deps, 'task-create', { account: 'acc1', spec: '작업' })
+    const taskId = (task.body as { id: string }).id
+    const r = await call(deps, 'task-update', { id: taskId, status: 'reviewing' })
+    expect(r.status).toBe(200)
+  })
+})
+
+// 검토 Dispatch 는 앱이 띄운 것이고, 코디네이터에게는 그것을 다시 띄우는 명령이 없다 — 그래서 그것이
+// 스스로 끝나지 못한 두 경우(세션이 죽는다 / 한도에 걸려 실패를 보고한다)를 서버가 각각 받아 준다.
+describe('검토 Dispatch 가 스스로 끝나지 못했을 때 — handleExit 의 Gate 와 한도 탐침', () => {
+  /** Task 를 reviewing 까지 보내고 열린 검토 Dispatch(sessionId='sess_review')를 넣는다 — '검토
+   *  라우팅' 블록과 같은 주입 방식이다(검토 Dispatch 를 여는 배선은 ipc.ts 의 몫이라 서버에 없다).
+   *  consecutiveFailures 는 2 로 둔다: FAILURE_LIMIT 이 3 이므로, 여기서 한 번 더 오르면 회로가
+   *  끊긴다 — 검토자가 죽은 것만으로 그렇게 되어서는 안 된다는 것이 이 블록의 요점이다. */
+  const seedReviewing = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    taskId: string
+    reviewId: string
+  }> => {
+    const deps = makeDeps()
+    deps.startReview = () => {}
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', review: true })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const impl = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: impl.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      impl.sessionId
+    )
+    const reviewId = 'dsp_review'
+    await deps.setState({
+      ...deps.getState(),
+      tasks: deps.getState().tasks.map((t) => (t.id === taskId ? { ...t, consecutiveFailures: 2 } : t)),
+      dispatches: [
+        ...deps.getState().dispatches,
+        {
+          id: reviewId,
+          taskId,
+          provider: 'codex' as const,
+          accountId: 'acc1',
+          sessionId: 'sess_review',
+          cwd: 'D:/p',
+          specPath: 'D:/p/orch/specs/review.md',
+          review: true,
+          startedAt: NOW,
+          workerState: 'ready' as const,
+          retained: false
+        }
+      ]
+    })
+    return { deps, taskId, reviewId }
+  }
+
+  it('검토자 세션이 보고 없이 죽으면 Gate 가 열리고 Task 가 blocked 로 간다', async () => {
+    const { deps, taskId, reviewId } = await seedReviewing()
+    await handleExit(deps, { sessionId: 'sess_review', exitCode: 1 })
+    const st = deps.getState()
+    expect(st.dispatches.find((d) => d.id === reviewId)!.endedAt).toBeDefined()
+    expect(st.tasks[0].status).toBe('blocked')
+    expect(st.gates).toHaveLength(1)
+    expect(st.gates[0].taskId).toBe(taskId)
+    // 끝난 일을 버리지 않는 탈출구가 질문에 실린다(blockForReview)
+    expect(st.gates[0].question).toContain('task-update --status completed')
+    // 코디네이터를 깨우는 수단은 메시지뿐이다 — Gate 만 만들고 알리지 않으면 아무도 오지 않는다
+    expect(st.messages.some((m) => m.type === 'decision_gate' && m.taskId === taskId)).toBe(true)
+  })
+
+  // closeDispatch 가 올린 값을 되돌린다. 남겨 두면 검토자가 세 번 죽는 것만으로 멀쩡한 작업의 회로가
+  // 끊기고, 그것은 이 Gate 가 막으려는 바로 그 일이다.
+  it('검토자가 죽어 열린 Gate 는 consecutiveFailures 를 올리지 않는다', async () => {
+    const { deps } = await seedReviewing()
+    await handleExit(deps, { sessionId: 'sess_review', exitCode: 1 })
+    expect(deps.getState().tasks[0].consecutiveFailures).toBe(2)
+    expect(deps.getState().tasks[0].consecutiveFailures).toBeLessThan(FAILURE_LIMIT)
+  })
+
+  // 구현 Dispatch 의 종료는 한 글자도 달라지지 않는다 — Task 는 dispatched 에 남고(--retry-of 가
+  // 집어 간다) 카운터는 올라간다.
+  it('구현 Dispatch 가 죽으면 Gate 를 열지 않고 기존 동작 그대로다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'codex', account: 'acc1' })
+    await handleExit(deps, { sessionId: 'sess1', exitCode: 1 })
+    expect(deps.getState().gates).toHaveLength(0)
+    expect(deps.getState().tasks[0].status).toBe('dispatched')
+    expect(deps.getState().tasks[0].consecutiveFailures).toBe(1)
+  })
+
+  // 탐침이 검토 분기보다 위에 있어야 한다. 아래에 있으면 이 보고는 탐침을 지나지 못하고 코디네이터는
+  // "검토자가 반려했다"만 읽는다 — 멀쩡한 작업에 구현자를 다시 띄우고, 계정이 언제 풀리는지는 아무도
+  // 모른다. 가이드 7절의 "limitResetsAt 이 붙으면 받은편지함에도 status 메시지로 온다"가 이 경로에도
+  // 적용된다.
+  it('한도에 걸린 검토자의 failed 보고도 limitResetsAt 과 status 메시지를 남긴다', async () => {
+    const { deps, taskId, reviewId } = await seedReviewing()
+    const probed: string[] = []
+    deps.probeLimit = async (d) => {
+      probed.push(d.id)
+      return 1_700_000_000_000
+    }
+    const r = await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: reviewId, outcome: 'failed', subject: '반려', body: '부족하다' },
+      'sess_review'
+    )
+    expect(r.status).toBe(200)
+    expect(probed).toEqual([reviewId])
+    const st = deps.getState()
+    expect(st.dispatches.find((d) => d.id === reviewId)!.limitResetsAt).toBe(1_700_000_000_000)
+    const status = st.messages.find(
+      (m) => m.dispatchId === reviewId && m.subject === 'session ended at a usage limit'
+    )
+    expect(status?.body).toContain(new Date(1_700_000_000_000).toISOString())
+    // 검토 판정 자체는 그대로 반영된다 — 탐침이 그것을 덮지 않는다
+    expect(st.tasks[0].status).toBe('failed')
+    expect(st.messages.some((m) => m.subject === 'review failed')).toBe(true)
+  })
+
+  it('검토자가 succeeded 로 보고하면 탐침을 부르지 않는다', async () => {
+    const { deps, taskId, reviewId } = await seedReviewing()
+    let calls = 0
+    deps.probeLimit = async () => {
+      calls++
+      return 1_700_000_000_000
+    }
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: reviewId, outcome: 'succeeded', subject: 's', body: 'b' },
+      'sess_review'
+    )
+    expect(calls).toBe(0)
+    expect(deps.getState().tasks[0].status).toBe('completed')
+    expect('limitResetsAt' in deps.getState().dispatches.find((d) => d.id === reviewId)!).toBe(false)
+  })
+})
+
+// Job Continuity P1: a worker Dispatch that closes on its own, with no reported outcome, is a
+// stranded Task. handleExit is the only place that observes that moment, so it is also the only
+// place that can hand the dispatch id to recovery.
+describe('handleExit — onDispatchLost hands a stranded implementer to recovery', () => {
+  /** run + task + open implementer dispatch (sessionId='sess1') — same shape as the probeLimit
+   *  block's seedOpenDispatch, plus the dispatchId onDispatchLost is expected to report. */
+  const seedOpenDispatch = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    dispatchId: string
+  }> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    const dispatchId = deps.getState().dispatches[0].id
+    return { deps, dispatchId }
+  }
+
+  /** Task in `reviewing` with an open review Dispatch (sessionId='sess_review') — same injection
+   *  shape as the 'task-create --review 와 검토 라우팅' and '검토 Dispatch 가 스스로 끝나지 못했을 때'
+   *  blocks build: the review Dispatch is appended straight onto state (the wiring that opens it is
+   *  not the server's job), not routed through worker-start. */
+  const seedReviewing = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    reviewDispatchId: string
+  }> => {
+    const deps = makeDeps()
+    deps.startReview = () => {}
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', review: true })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const impl = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: impl.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      impl.sessionId
+    )
+    const reviewDispatchId = 'dsp_review'
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [
+        ...deps.getState().dispatches,
+        {
+          id: reviewDispatchId,
+          taskId,
+          provider: 'codex' as const,
+          accountId: 'acc1',
+          sessionId: 'sess_review',
+          cwd: 'D:/p',
+          specPath: 'D:/p/orch/specs/review.md',
+          review: true,
+          startedAt: NOW,
+          workerState: 'ready' as const,
+          retained: false
+        }
+      ]
+    })
+    return { deps, reviewDispatchId }
+  }
+
+  it('an implementer dispatch that ends without reporting reaches onDispatchLost with its own dispatch id', async () => {
+    const lost: string[] = []
+    const { deps, dispatchId } = await seedOpenDispatch()
+    deps.onDispatchLost = (a) => lost.push(a.dispatchId)
+    await handleExit(deps, { sessionId: 'sess1', exitCode: 1 })
+    expect(lost).toEqual([dispatchId])
+  })
+
+  // The failure this whole slice exists to prevent, arriving through the one path nobody traced. The
+  // socket to the Host drops while the Host is alive and still running the ptys; every handle ends
+  // with PTY_LOST_SIGHT_EXIT_CODE, SessionManager records the session exited, and if that reached
+  // closeDispatch the reconciler would read the worker as lost and start a second agent in the same
+  // worktree as the one still running.
+  it('an exit that only says the app lost sight of the pty leaves the Dispatch open and writes nothing', async () => {
+    const { deps } = await seedOpenDispatch()
+    const before = deps.getState()
+    let writes = 0
+    const inner = deps.setState.bind(deps)
+    deps.setState = async (next): Promise<void> => {
+      writes++
+      await inner(next)
+    }
+    await handleExit(deps, { sessionId: 'sess1', exitCode: PTY_LOST_SIGHT_EXIT_CODE })
+    expect(writes).toBe(0)
+    expect(deps.getState()).toBe(before) // the same object — no new state was even built
+    expect(deps.getState().dispatches[0].endedAt).toBeUndefined()
+    expect(deps.getState().dispatches[0].workerState).toBe('ready')
+  })
+
+  it('a lost-sight exit is not reported to recovery either', async () => {
+    const lost: string[] = []
+    const { deps } = await seedOpenDispatch()
+    deps.onDispatchLost = (a) => lost.push(a.dispatchId)
+    await handleExit(deps, { sessionId: 'sess1', exitCode: PTY_LOST_SIGHT_EXIT_CODE })
+    expect(lost).toEqual([])
+  })
+
+  it("a reviewer's exit does not reach onDispatchLost — its Gate is the recovery path", async () => {
+    const lost: string[] = []
+    const { deps } = await seedReviewing()
+    deps.onDispatchLost = (a) => lost.push(a.dispatchId)
+    await handleExit(deps, { sessionId: 'sess_review', exitCode: 1 })
+    expect(lost).toEqual([])
+    // Proof the reviewer branch was actually taken, not that the fixture failed to open a review
+    // dispatch: the Gate is the recovery path for a reviewer that ends without reporting.
+    const st = deps.getState()
+    expect(st.tasks[0].status).toBe('blocked')
+    expect(st.gates).toHaveLength(1)
+  })
+})
+
+// ── 이음매를 통과하는 통합 테스트 ──────────────────────────────────────────────
+// 층마다 테스트가 있었는데 리뷰가 낸 Critical 은 그 사이에 살아 있었다: 검증 결과가 Message 를
+// 만들지 않아 코디네이터가 영원히 알지 못한다는 것. handleCommand('send', worker_done) 에서
+// 시작해 가짜 ValidatorRunner 와 TaskValidator 를 지나, **Task 상태와 결과 받은편지함(check)을
+// 함께** 단언한다 — 코디네이터를 깨우는 수단은 메시지뿐이므로 상태만 보는 단언으로는 이 결함이
+// 잡히지 않는다.
+describe('worker_done → 검증 실행 → 결과 (배선 통합)', () => {
+  /** ipc.ts 가 하는 배선과 같은 모양으로 서버·검증기·순수 계층을 잇는다 */
+  const wire = async (): Promise<{
+    deps: OrchServerDeps
+    validator: TaskValidator
+    started: { cwd: string; taskId: string; configId: string; runId: string }[]
+    taskId: string
+    cwd: string
+  }> => {
+    const deps = makeDeps()
+    const started: { cwd: string; taskId: string; configId: string; runId: string }[] = []
+    const validator = new TaskValidator({
+      runner: {
+        start: async (a) => {
+          const runId = `run_${started.length + 1}`
+          started.push({ ...a, runId })
+          return { runId, name: a.configId }
+        },
+        output: () => '빌드 로그 꼬리',
+        stop: () => {}
+      },
+      onSettled: async ({ taskId, results }) => {
+        const r = applyValidationResult(deps.getState(), { taskId, results }, NOW)
+        if (r.ok) await deps.setState(r.state)
+      },
+      onCannotRun: async ({ taskId, reason }) => {
+        const r = blockForValidation(deps.getState(), { taskId, reason }, NOW)
+        if (r.ok) await deps.setState(r.state)
+      }
+    })
+    deps.startValidation = ({ taskId, cwd }) => {
+      // ipc.ts 의 실제 배선과 같은 모양 — checkConfigIdsOf 가 옛 단일 값(validateConfigId)과 새
+      // 목록(validateConfigIds)을 함께 본다(convergence.ts). 이 shim 이 단수만 읽던 채로 남아 있으면
+      // task-create 가 목록만 싣는 지금 배선과 갈라진 채 계속 통과한다.
+      const task = deps.getState().tasks.find((t) => t.id === taskId)
+      validator.enqueue({ taskId, cwd, configIds: task ? checkConfigIdsOf(task) : [] })
+    }
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', validate: 'cfg1' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    // 코디네이터가 실제로 하는 일: worker_done 배치를 받아 ack 한다. 이 ack 뒤에는 새 메시지가
+    // 붙지 않는 한 check 가 아무것도 돌려주지 않는다 — 그것이 이 결함의 증상이었다.
+    const first = (await call(deps, 'check', {})).body as { deliveryId: string }
+    await call(deps, 'check', { ack: first.deliveryId })
+    await vi.waitFor(() => expect(started).toHaveLength(1))
+    return { deps, validator, started, taskId, cwd: d.cwd }
+  }
+
+  it('worker_done 성공은 Task 를 validating 으로 보내고 그 cwd 에서 검증을 시작한다', async () => {
+    const { deps, started, taskId, cwd } = await wire()
+    expect(deps.getState().tasks[0].status).toBe('validating')
+    expect(started).toEqual([{ taskId, cwd, configId: 'cfg1', runId: 'run_1' }])
+  })
+
+  it('검증 실패는 Task 를 failed 로 보내고 status 메시지를 코디네이터에게 배달한다', async () => {
+    const { deps, validator, started, taskId } = await wire()
+    validator.onRunExit({ runId: started[0].runId, exitCode: 2 })
+    await vi.waitFor(() => expect(deps.getState().tasks[0].status).toBe('failed'))
+    const r = await call(deps, 'check', {})
+    const body = r.body as { count: number; messages: { type: string; subject: string; body: string; taskId?: string }[] }
+    expect(body.count).toBe(1)
+    expect(body.messages[0].type).toBe('status')
+    expect(body.messages[0].subject).toBe('validation failed')
+    expect(body.messages[0].taskId).toBe(taskId)
+    expect(body.messages[0].body).toContain('exitCode=2')
+    expect(body.messages[0].body).toContain('빌드 로그 꼬리')
+  })
+
+  // 통과도 배달돼야 한다 — 의존 Task 가 풀린 것을 모르면 코디네이터는 다음 Task 를 띄우지 않는다
+  it('검증 통과는 Task 를 completed 로 보내고 그것도 배달된다', async () => {
+    const { deps, validator, started } = await wire()
+    validator.onRunExit({ runId: started[0].runId, exitCode: 0 })
+    await vi.waitFor(() => expect(deps.getState().tasks[0].status).toBe('completed'))
+    const r = await call(deps, 'check', {})
+    const body = r.body as { messages: { subject: string }[] }
+    expect(body.messages.map((m) => m.subject)).toEqual(['validation passed'])
+  })
+
+  // 검증을 아예 돌릴 수 없으면 Gate 다. 이쪽은 createGate 가 decision_gate 메시지를 붙여 원래부터
+  // 통보되고 있었다 — 그 비대칭이 위의 두 경로에 메시지가 없다는 것을 확정해 준 근거다.
+  it('검증을 돌릴 수 없으면 Gate 가 열리고 decision_gate 가 배달된다', async () => {
+    const deps = makeDeps()
+    const validator = new TaskValidator({
+      runner: {
+        start: async () => {
+          throw new Error('NO_CONFIG: cfg1')
+        },
+        output: () => '',
+        stop: () => {}
+      },
+      onSettled: async () => {},
+      onCannotRun: async ({ taskId, reason }) => {
+        const r = blockForValidation(deps.getState(), { taskId, reason }, NOW)
+        if (r.ok) await deps.setState(r.state)
+      }
+    })
+    deps.startValidation = ({ taskId, cwd }) => {
+      // ipc.ts 의 실제 배선과 같은 모양 — checkConfigIdsOf 가 옛 단일 값(validateConfigId)과 새
+      // 목록(validateConfigIds)을 함께 본다(convergence.ts). 이 shim 이 단수만 읽던 채로 남아 있으면
+      // task-create 가 목록만 싣는 지금 배선과 갈라진 채 계속 통과한다.
+      const task = deps.getState().tasks.find((t) => t.id === taskId)
+      validator.enqueue({ taskId, cwd, configIds: task ? checkConfigIdsOf(task) : [] })
+    }
+    await call(deps, 'run-create', { objective: '목표', cwd: 'D:/p' })
+    await call(deps, 'task-create', { account: 'acc1', spec: '작업', validate: 'cfg1' })
+    const taskId = deps.getState().tasks[0].id
+    await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'acc1' })
+    const d = deps.getState().dispatches[0]
+    await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId, dispatchId: d.id, outcome: 'succeeded', subject: 's', body: 'b' },
+      d.sessionId
+    )
+    await vi.waitFor(() => expect(deps.getState().tasks[0].status).toBe('blocked'))
+    const r = await call(deps, 'check', { types: 'decision_gate' })
+    const body = r.body as { messages: { type: string; body: string }[] }
+    expect(body.messages.some((m) => m.type === 'decision_gate' && m.body.includes('NO_CONFIG'))).toBe(true)
+  })
+})
+
+// 자동 정리(store.ts 의 TTL)는 **끝난** Run 만, 그것도 30일 뒤에 버린다. 끝나지 않은 Run 은 영원히
+// 남으므로 사람이 물러나게 할 길이 있어야 한다 — 이 명령이 그 자리다.
+describe('run-delete', () => {
+  it('없는 Run 은 거절한다', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-delete', { id: 'run_nope' })
+    expect(r.status).toBe(404)
+  })
+
+  it('--id 가 없으면 거절한다', async () => {
+    const deps = makeDeps()
+    expect((await call(deps, 'run-delete', {})).status).toBe(400)
+  })
+
+  // reset 과 같은 판정이고 같은 이유다: 삭제는 되돌릴 수 없으므로 도는 상태에서 다룰 것을 하나 더
+  // 만들지 않는다. 세션까지 죽이게 하면 커밋 안 된 작업이 조용히 사라진다
+  it('그 Run 에 열린 Dispatch 가 있으면 409 로 거절한다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    await call(deps, 'worker-start', {
+      taskId: (task.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const r = await call(deps, 'run-delete', { id: runId })
+    expect(r.status).toBe(409)
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+
+  it('도는 워커가 없으면 그 Run 과 딸린 것을 지운다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const r = await call(deps, 'run-delete', { id: runId })
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ deleted: runId, tasks: 1 })
+    expect(deps.getState().runs).toHaveLength(0)
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  // 다른 Run 의 열린 Dispatch 는 이 Run 의 삭제를 막지 않는다 — 판정이 폴더나 앱 전체가 아니라
+  // **그 Run** 을 봐야 한다. reset 과 다른 점이 이것이다
+  it('다른 Run 이 돌고 있어도 이 Run 은 지운다', async () => {
+    const deps = makeDeps()
+    const busy = await call(deps, 'run-create', { objective: 'busy', cwd: 'D:/p' })
+    const busyId = (busy.body as { id: string }).id
+    const bt = await call(deps, 'task-create', { account: 'acc1', runId: busyId, title: 'bt', spec: 's' })
+    await call(deps, 'worker-start', {
+      taskId: (bt.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const idle = await call(deps, 'run-create', { objective: 'idle', cwd: 'D:/p' })
+    const idleId = (idle.body as { id: string }).id
+    expect((await call(deps, 'run-delete', { id: idleId })).status).toBe(200)
+    expect(deps.getState().runs.map((r) => r.id)).toEqual([busyId])
+  })
+
+  // 되돌릴 수 없는 삭제이므로 지우기 전에 .bak 을 남긴다 — reset 과 같은 관례다
+  it('지우기 전에 백업을 부른다', async () => {
+    let backups = 0
+    const deps = { ...makeDeps(), backup: async () => void backups++ }
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    await call(deps, 'run-delete', { id: (run.body as { id: string }).id })
+    expect(backups).toBe(1)
+  })
+
+  // 워커는 Run 을 지울 이유가 없다 — COORDINATOR_ONLY 에 들어 있어야 한다
+  it('워커 세션은 부를 수 없다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    await call(deps, 'worker-start', {
+      taskId: (task.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    // 그 워커의 세션 id 로 부른다 — handleCommand 가 Dispatch 를 가진 세션을 워커로 본다
+    const r = await call(deps, 'run-delete', { id: runId }, 'sess1')
+    expect(r.status).toBe(403)
+  })
+})
+
+describe('run-spawn — 예약 회차', () => {
+  const withTemplate = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    templateId: string
+  }> => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', {
+      objective: '매일 점검',
+      cwd: 'D:/p',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    return { deps, templateId: (r.body as { id: string }).id }
+  }
+
+  it('예약의 회차를 만들고 그 회차를 돌려준다', async () => {
+    const { deps, templateId } = await withTemplate()
+    const r = await call(deps, 'run-spawn', { run: templateId })
+    expect(r.status).toBe(200)
+    const child = r.body as { id: string; jobId?: string; ordinal?: number }
+    expect(child.jobId).toBe(templateId)
+    expect(child.ordinal).toBe(1)
+    // 계획은 jobs 에 있으므로 이 배열에는 회차 하나뿐이다
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+
+  it('--run 이 없으면 400', async () => {
+    const { deps } = await withTemplate()
+    expect((await call(deps, 'run-spawn', {})).status).toBe(400)
+  })
+
+  // run-spawn 은 **계획**을 받는다 — 회차 id 를 주면 그런 Job 이 없다(404). 계획을 주면 회차가
+  // 하나 더 생기는 것이 이제 정상이다(다시 돌리기).
+  it('회차 id 를 주면 404 다 — run-spawn 은 계획을 받는다', async () => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const plain = (r.body as { id: string }).id
+    expect((await call(deps, 'run-spawn', { run: plain })).status).toBe(404)
+  })
+
+  // 워커가 회차를 만들 수 있으면 워커가 자기 일을 무한히 복제할 수 있다
+  it('워커 세션은 부를 수 없다', async () => {
+    const { deps, templateId } = await withTemplate()
+    const withDispatch: OrchState = {
+      ...deps.getState(),
+      dispatches: [
+        {
+          id: 'dsp1',
+          taskId: 'tsk1',
+          provider: 'claude',
+          accountId: 'acc1',
+          sessionId: 'worker1',
+          cwd: 'D:/p',
+          specPath: 'D:/p/spec.md',
+          startedAt: NOW,
+          workerState: 'ready',
+          retained: false
+        }
+      ]
+    }
+    await deps.setState(withDispatch)
+    const r = await call(deps, 'run-spawn', { run: templateId }, 'worker1')
+    expect(r.status).toBe(403)
+  })
+
+  it('템플릿을 지우면 그 회차도 함께 지운다', async () => {
+    const { deps, templateId } = await withTemplate()
+    await call(deps, 'run-spawn', { run: templateId })
+    await call(deps, 'run-spawn', { run: templateId })
+    expect(deps.getState().runs).toHaveLength(2)
+    const r = await call(deps, 'run-delete', { id: templateId })
+    expect(r.status).toBe(200)
+    expect(deps.getState().runs).toHaveLength(0)
+    expect(deps.getState().jobs).toHaveLength(0)
+  })
+
+  // 정의는 템플릿에 있으므로 회차 하나를 버리는 것은 기록 하나를 버리는 일이다
+  it('회차 하나만 지우면 템플릿과 다른 회차는 남는다', async () => {
+    const { deps, templateId } = await withTemplate()
+    const child = (await call(deps, 'run-spawn', { run: templateId })).body as { id: string }
+    await call(deps, 'run-spawn', { run: templateId })
+    await call(deps, 'run-delete', { id: child.id })
+    const ids = deps.getState().runs.map((x) => x.id)
+    expect(deps.getState().jobs.map((j) => j.id)).toContain(templateId)
+    expect(ids).not.toContain(child.id)
+    expect(ids).toHaveLength(1)
+  })
+
+  /** 회차 하나에 열린 Dispatch 를 심는다. retained 를 바꿔 붙잡아 둔 세션도 만든다 */
+  const withRunningChild = async (
+    retained = false
+  ): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    templateId: string
+    childId: string
+    released: string[]
+  }> => {
+    const released: string[] = []
+    const base = await withTemplate()
+    const deps = Object.assign(base.deps, {
+      releaseWorker: async ({ dispatchId }: { dispatchId: string }) => {
+        released.push(dispatchId)
+      }
+    })
+    const child = (await call(deps, 'run-spawn', { run: base.templateId })).body as { id: string }
+    await deps.setState({
+      ...deps.getState(),
+      tasks: [
+        ...deps.getState().tasks,
+        {
+          id: 'tsk_live',
+          runId: child.id,
+          title: 't',
+          spec: 's',
+          deps: [],
+          status: 'dispatched',
+          consecutiveFailures: 0,
+          createdAt: NOW,
+          updatedAt: NOW
+        }
+      ],
+      dispatches: [
+        {
+          id: 'dsp_live',
+          taskId: 'tsk_live',
+          provider: 'claude',
+          accountId: 'acc1',
+          sessionId: 'worker1',
+          cwd: 'D:/p',
+          specPath: 'D:/p/spec.md',
+          startedAt: NOW,
+          workerState: 'ready',
+          retained
+        }
+      ]
+    })
+    return { deps, templateId: base.templateId, childId: child.id, released }
+  }
+
+  // **예약에서는 "먼저 워커를 멈춰라"가 충족될 수 없다** — 템플릿이 계속 새 회차를 띄우므로 멈춘
+  // 자리에 다음 발화가 또 띄운다. 그래서 템플릿 삭제만은 도는 워커를 스스로 정리한다.
+  it('템플릿 삭제는 도는 워커를 정지시키고 전부 지운다', async () => {
+    const { deps, templateId, released } = await withRunningChild()
+    const r = await call(deps, 'run-delete', { id: templateId })
+    expect(r.status).toBe(200)
+    expect(released).toEqual(['dsp_live'])
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+
+  // 붙잡아 둔 세션은 죽이지 않는다 — 사람이 일부러 살려 둔 것이고, 기록만 지우면 그 세션이 고아가
+  // 된다(coordinator.releaseWorker 가 retained 를 건너뛴다). 이것은 풀 수 있는 거절이다
+  it('붙잡아 둔(retained) 워커가 있으면 거절하고 아무것도 지우지 않는다', async () => {
+    const { deps, templateId, released } = await withRunningChild(true)
+    const r = await call(deps, 'run-delete', { id: templateId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('retain')
+    expect(released).toEqual([])
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+
+  it('회차 하나를 지우는 것은 여전히 거절한다 — 그쪽은 멈추면 다시 뜨지 않는다', async () => {
+    const { deps, childId, released } = await withRunningChild()
+    const r = await call(deps, 'run-delete', { id: childId })
+    expect(r.status).toBe(409)
+    expect(released).toEqual([])
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+
+})
+
+describe('worker-start — 인계된 Run 의 워크트리', () => {
+  // 사이드바 Run 을 넘기는 방식이 autoDispatch 를 끄는 것이라, `autoDispatch` 만 보면 넘긴 Run 이
+  // 이 거절에서 빠져나가고 워커가 조용히 프로젝트 폴더에서 돈다 — 설계가 금지하는 조합이다
+  it('코디네이터에게 넘긴 Run 도 워크트리 없이 --worktree 생략을 거절한다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      coordinatorAccount: 'acc1'
+    })
+    const jobId = (run.body as { id: string }).id
+    await call(deps, 'run-start', { run: jobId })
+    const runId = deps.getState().runs.find((r) => r.jobId === jobId)!.id
+    const t = await call(deps, 'task-create', { account: 'acc1', runId, spec: 's' })
+    const taskId = (t.body as { id: string }).id
+    // 넘긴 상태를 흉내 낸다 — run-start 가 하는 그대로(autoDispatch 를 지운다)
+    await deps.setState({
+      ...deps.getState(),
+      jobs: deps.getState().jobs.map((j) => {
+        const { autoDispatch: _drop, pendingStart: _drop2, ...rest } = j
+        return rest
+      }),
+      runs: deps.getState().runs.map((r) =>
+        r.id === runId ? { ...r, coordinatorSessionId: 'coord1' } : r
+      )
+    })
+    const r = await call(deps, 'worker-start', { task: taskId, agent: 'codex', account: 'acc1' })
+    expect(r.status).toBe(409)
+    expect(String((r.body as { error?: string }).error)).toContain('no worktree yet')
+  })
+
+  it('--worktree 를 명시하면 지나간다 — 사람이 자리를 골랐다는 뜻이다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      coordinatorAccount: 'acc1'
+    })
+    const runId = (run.body as { id: string }).id
+    const t = await call(deps, 'task-create', { account: 'acc1', runId, spec: 's' })
+    const r = await call(deps, 'worker-start', {
+      task: (t.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'new',
+      name: 'w1'
+    })
+    expect(r.status).toBe(200)
+  })
+})
+
+describe('worker-start — 동시 실행 한도', () => {
+  const twoTasks = async (
+    concurrency?: number
+  ): Promise<{ deps: OrchServerDeps & { state: OrchState }; ids: string[] }> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      ...(concurrency === undefined ? {} : { concurrency })
+    })
+    const runId = (run.body as { id: string }).id
+    const ids: string[] = []
+    for (const spec of ['a', 'b', 'c', 'd']) {
+      const t = await call(deps, 'task-create', { account: 'acc1', runId, spec })
+      ids.push((t.body as { id: string }).id)
+    }
+    return { deps, ids }
+  }
+
+  // 이 값을 지키는 곳은 앱의 스케줄러뿐이었다(slotsToFill) — 앱이 유일한 배치자였으므로 충분했다.
+  // 코디네이터에게 넘기는 순간 LLM 이 어길 수 있는 규칙이 되므로 서버가 같이 지킨다.
+  it('한도에 닿으면 다음 worker-start 를 거절한다', async () => {
+    const { deps, ids } = await twoTasks(2)
+    expect((await call(deps, 'worker-start', { task: ids[0], agent: 'codex', account: 'acc1', worktree: 'current' })).status).toBe(200)
+    expect((await call(deps, 'worker-start', { task: ids[1], agent: 'codex', account: 'acc1', worktree: 'current' })).status).toBe(200)
+    const third = await call(deps, 'worker-start', { task: ids[2], agent: 'codex', account: 'acc1', worktree: 'current' })
+    expect(third.status).toBe(409)
+    // 지금 열린 수와 한도를 함께 말한다 — 코디네이터가 시행착오로 규칙을 알아내며 턴을 쓰지 않게
+    const err = String((third.body as { error?: string }).error)
+    expect(err).toContain('concurrency limit')
+    expect(err).toContain('2 of 2')
+  })
+
+  it('한도 안이면 그대로 통과한다', async () => {
+    const { deps, ids } = await twoTasks(3)
+    for (const id of ids.slice(0, 3))
+      expect((await call(deps, 'worker-start', { task: id, agent: 'codex', account: 'acc1', worktree: 'current' })).status).toBe(200)
+  })
+
+  it('한도를 정하지 않은 Run 은 기본값을 쓴다', async () => {
+    const { deps, ids } = await twoTasks()
+    for (const id of ids.slice(0, 3))
+      expect((await call(deps, 'worker-start', { task: id, agent: 'codex', account: 'acc1', worktree: 'current' })).status).toBe(200)
+    expect(
+      (await call(deps, 'worker-start', { task: ids[3], agent: 'codex', account: 'acc1', worktree: 'current' })).status
+    ).toBe(409)
+  })
+
+  // 끝난 Dispatch 는 자리를 비운다 — 아니면 Run 이 한 번 한도에 닿은 뒤로 영원히 막힌다
+  it('끝난 Dispatch 는 세지 않는다', async () => {
+    const { deps, ids } = await twoTasks(1)
+    const first = await call(deps, 'worker-start', { task: ids[0], agent: 'codex', account: 'acc1', worktree: 'current' })
+    expect(first.status).toBe(200)
+    expect(
+      (await call(deps, 'worker-start', { task: ids[1], agent: 'codex', account: 'acc1', worktree: 'current' })).status
+    ).toBe(409)
+    const dispatchId = (first.body as { dispatchId?: string; id?: string }).dispatchId
+      ?? deps.getState().dispatches[0].id
+    await call(deps, 'worker-stop', { dispatch: dispatchId })
+    expect(
+      (await call(deps, 'worker-start', { task: ids[1], agent: 'codex', account: 'acc1', worktree: 'current' })).status
+    ).toBe(200)
+  })
+})
+
+describe('run-start — 코디네이터 인계', () => {
+  /** startCoordinator 를 기록하는 deps. 계정은 claude 둘 + codex 하나. */
+  const coordDeps = (
+    over: Partial<OrchServerDeps> = {}
+  ): OrchServerDeps & {
+    state: OrchState
+    spawned: { runId: string; brief: string }[]
+    made: string[]
+  } => {
+    const spawned: { runId: string; brief: string }[] = []
+    const made: string[] = []
+    const base = Object.assign(makeDeps(), {
+      makeRunWorktree: async (a: { repoPath: string; name: string }) => {
+        made.push(a.name)
+        return `D:/wt/${a.name}`
+      },
+      listAccounts: () => [
+        { id: 'cl1', label: 'claude1', provider: 'claude' as const },
+        { id: 'cl2', label: 'claude2', provider: 'claude' as const },
+        { id: 'cx1', label: 'codex1', provider: 'codex' as const }
+      ],
+      startCoordinator: async (a: { runId: string; brief: string }) => {
+        spawned.push({ runId: a.runId, brief: a.brief })
+        return { sessionId: 'coord-sess' }
+      },
+      ...over
+    })
+    return Object.assign(base, { spawned, made }) as never
+  }
+
+  const mkRun = async (
+    deps: OrchServerDeps,
+    args: Record<string, unknown> = {}
+  ): Promise<string> => {
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, ...args })
+    return (r.body as { id: string }).id
+  }
+  /** '실행' 이 만든 회차. 계획의 id 로 만들고, 코디네이터는 그 회차에 붙는다. */
+  const runOf = (deps: OrchServerDeps, jobId: string) =>
+    deps.getState().runs.find((r) => r.jobId === jobId)!
+
+  it('코디네이터 계정이 있으면 실행이 코디네이터를 띄우고 운전자를 넘긴다', async () => {
+    const deps = coordDeps()
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    const r = await call(deps, 'run-start', { run: runId })
+    expect(r.status).toBe(200)
+    const run = runOf(deps, runId)
+    // 코디네이터는 **회차**에 붙는다 — 운전할 것이 계획이 아니라 그 실행이다
+    expect(deps.spawned.map((x) => x.runId)).toEqual([run.id])
+    expect(run.coordinatorSessionId).toBe('coord-sess')
+    // **운전자를 넘기는 방식이 autoDispatch 를 지우는 것이다** — 켜 둔 채로 코디네이터를 붙이면
+    // 둘이 같은 ready Task 를 두고 경합한다(Job.autoDispatch 의 주석). 계획의 칸이므로 계획에서 빠진다
+    const job = deps.getState().jobs.find((j) => j.id === runId)!
+    expect(job).not.toHaveProperty('autoDispatch')
+    expect(job).not.toHaveProperty('pendingStart')
+  })
+
+  it('인수 프롬프트에 그 Run 의 한도와 Task 수가 실린다', async () => {
+    const deps = coordDeps()
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1', concurrency: 2 })
+    await call(deps, 'task-create', { account: 'cl1', runId, spec: 'a' })
+    await call(deps, 'run-start', { run: runId })
+    const brief = deps.spawned[0].brief
+    // 브리핑이 가리키는 것은 회차다 — 코디네이터가 `--run` 에 넣을 값이 그것이다
+    expect(brief).toContain(runOf(deps, runId).id)
+    expect(brief).toContain('CONCURRENCY IS 2')
+    expect(brief).toContain('tasks already defined: 1')
+  })
+
+  // 전체 브랜치 리뷰, Finding 2 — target.convergence !== undefined 는 손으로 고친 "convergence": null
+  // 을 "정책이 있다" 로 잘못 읽는다. 이 자리는 이 브랜치가 reconciler.ts·ipc.ts 에서 이미 고친 것과
+  // 똑같은 실수였다 — policyOf 로 판정해야 손으로 고친 orchestration.json 에도 다른 모든 관문과 같은
+  // 답을 낸다.
+  it('run.convergence 를 손으로 null 로 고쳐도 인계문에 수렴 절이 붙지 않는다 — policyOf 로 판정한다', async () => {
+    const deps = coordDeps()
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    const s = deps.getState()
+    await deps.setState({
+      ...s,
+      jobs: s.jobs.map((j) => (j.id === runId ? { ...j, convergence: null as never } : j))
+    })
+    const r = await call(deps, 'run-start', { run: runId })
+    expect(r.status).toBe(200)
+    expect(deps.spawned[0].brief).not.toContain('COMPLETION CONVERGENCE IS ON')
+  })
+
+  it('실제로 정책이 걸린 Run 은 인계문에 수렴 절이 붙는다', async () => {
+    const deps = coordDeps()
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1', convergence: true })
+    const r = await call(deps, 'run-start', { run: runId })
+    expect(r.status).toBe(200)
+    expect(deps.spawned[0].brief).toContain('COMPLETION CONVERGENCE IS ON')
+  })
+
+  // 인계하면 앱이 그 Run 의 슬롯을 더 채우지 않으므로, 게으르게 만들던 워크트리를 만들어 줄
+  // 사람이 없어진다 — 한도 1 인 Run 의 코디네이터는 "생략하라"는 배치 규칙을 따를 자리가 없다
+  it('인계 시점에 Run 워크트리를 만들어 기록한다', async () => {
+    const deps = coordDeps()
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    expect((await call(deps, 'run-start', { run: runId })).status).toBe(200)
+    expect(deps.made).toHaveLength(1)
+    expect(runOf(deps, runId).worktree).toBe(`D:/wt/${deps.made[0]}`)
+  })
+
+  it('이미 워크트리가 있으면 다시 만들지 않는다', async () => {
+    const deps = coordDeps()
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    // 회차가 있어야 워크트리를 기록할 자리가 있다 — '실행' 이 그것을 만든다
+    await call(deps, 'run-start', { run: runId })
+    const made = deps.made.length
+    await call(deps, 'run-worktree-set', { run: runOf(deps, runId).id, worktree: 'D:/existing' })
+    await call(deps, 'run-start', { run: runId })
+    expect(deps.made).toHaveLength(made)
+    expect(runOf(deps, runId).worktree).toBe(`D:/wt/${deps.made[0]}`)
+  })
+
+  // 코디네이터를 띄운 뒤에 만들면 그 세션이 첫 명령을 부르는 사이 워크트리 없는 Run 을 본다
+  it('워크트리 만들기가 실패하면 코디네이터를 띄우지 않고 아무것도 바뀌지 않는다', async () => {
+    const deps = coordDeps({
+      makeRunWorktree: async () => {
+        throw new Error('disk full')
+      }
+    })
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    const r = await call(deps, 'run-start', { run: runId })
+    expect(r.status).toBe(400)
+    expect(deps.spawned).toEqual([])
+    const job = deps.getState().jobs[0]
+    expect(job.pendingStart).toBe(true)
+    // 회차도 만들어지지 않았다 — 실패는 아무것도 바꾸지 않는다
+    expect(deps.getState().runs).toEqual([])
+  })
+
+  // Host S3 risk 6 — 워크트리는 만들었는데 코디네이터가 못 뜨면, 상태는 위 테스트처럼 하나도 안
+  // 바뀐다. 그러면 이 회차는 그 폴더를 다시 볼 길이 없고, 아무도 지우지 않는 고아 워크트리로 남는다.
+  it('코디네이터 기동이 실패하면 방금 만든 워크트리를 고아로 남기지 않고 지운다', async () => {
+    const removed: string[][] = []
+    const deps = coordDeps({
+      startCoordinator: async () => {
+        throw new Error('spawn failed')
+      },
+      removeWorktrees: async (paths: string[]) => {
+        removed.push(paths)
+        return { failed: [] }
+      }
+    })
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    const r = await call(deps, 'run-start', { run: runId })
+    expect(r.status).toBe(400)
+    expect(deps.made).toHaveLength(1)
+    expect(removed).toEqual([[`D:/wt/${deps.made[0]}`]])
+    // 코디네이터 실패는 여전히 상태를 하나도 바꾸지 않는다 — 지우는 것은 디스크 쪽 뒷정리일 뿐이다.
+    expect(deps.getState().runs).toEqual([])
+  })
+
+  it('배선이 그 기능을 주입하지 않으면 워크트리 없이 넘긴다 — worker-start 가 소리 내어 거절한다', async () => {
+    const deps = coordDeps({ makeRunWorktree: undefined })
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    expect((await call(deps, 'run-start', { run: runId })).status).toBe(200)
+    expect(runOf(deps, runId)).not.toHaveProperty('worktree')
+    expect(deps.spawned).toHaveLength(1)
+  })
+
+  // 템플릿은 자신이 돌지 않는다 — 붙이면 Task 없는 Run 을 관리하는 세션이 할당량만 쓴다
+  it('예약 템플릿에는 코디네이터를 붙이지 않는다', async () => {
+    const deps = coordDeps()
+    const r = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      coordinatorAccount: 'cl1',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const runId = (r.body as { id: string }).id
+    expect((await call(deps, 'run-start', { run: runId })).status).toBe(200)
+    expect(deps.spawned).toEqual([])
+    expect(deps.made).toEqual([])
+  })
+
+  it('코디네이터 계정이 없으면 띄우지 않고 앱이 계속 돌린다 — 옛 동작', async () => {
+    const deps = coordDeps()
+    const runId = await mkRun(deps)
+    expect((await call(deps, 'run-start', { run: runId })).status).toBe(200)
+    expect(deps.spawned).toEqual([])
+    expect(deps.getState().jobs[0].autoDispatch).toBe(true)
+    expect(runOf(deps, runId)).not.toHaveProperty('coordinatorSessionId')
+  })
+
+  it('배선이 그 기능을 주입하지 않으면 띄우지 않는다', async () => {
+    const deps = coordDeps({ startCoordinator: undefined })
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    expect((await call(deps, 'run-start', { run: runId })).status).toBe(200)
+    expect(deps.getState().jobs[0].autoDispatch).toBe(true)
+  })
+
+  // 걷어 버리면 실행 버튼이 사라져 사람이 다시 누를 수 없고, 운전자도 없는 Run 이 남는다
+  it('코디네이터 띄우기가 실패하면 아무것도 바뀌지 않는다 — pendingStart 가 남는다', async () => {
+    const deps = coordDeps({
+      startCoordinator: async () => {
+        throw new Error('no session')
+      }
+    })
+    const runId = await mkRun(deps, { coordinatorAccount: 'cl1' })
+    const r = await call(deps, 'run-start', { run: runId })
+    expect(r.status).toBe(400)
+    const job = deps.getState().jobs[0]
+    const run = deps.getState().runs.find((x) => x.id === runId)
+    expect(job.pendingStart).toBe(true)
+    expect(job.autoDispatch).toBe(true)
+    expect(run).toBeUndefined()
+  })
+
+  // 조용히 첫 칸만 쓰면 사람이 적은 것과 도는 것이 달라지고, 그 사실을 알 방법이 화면에 없다
+  it('--coordinator-account 는 목록을 거절한다 — 계정은 하나다', async () => {
+    const deps = coordDeps()
+    const r = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      coordinatorAccount: 'cl1,cl2'
+    })
+    expect(r.status).toBe(400)
+    expect(String((r.body as { error?: string }).error)).toContain('takes one account')
+  })
+
+  it('--coordinator-account 는 모르는 계정을 거절한다', async () => {
+    const deps = coordDeps()
+    const r = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      coordinatorAccount: 'nope'
+    })
+    expect(r.status).toBe(404)
+  })
+})
+
+describe('run-start — 사람이 실행을 누를 때까지 기다린다', () => {
+  it('run-create --auto 는 pendingStart 를 함께 켠다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    const job = deps.getState().jobs[0]
+    expect(job.autoDispatch).toBe(true)
+    expect(job.pendingStart).toBe(true)
+    // 회차는 '실행' 을 누를 때 생긴다
+    expect(deps.getState().runs).toEqual([])
+  })
+
+  // **예약도 이 게이트를 쓴다.** 템플릿 자신은 돌지 않지만 발화는 시작이고, Task 를 다 짜기 전에
+  // 첫 회차가 도는 것은 보통 Run 에서 없앤 바로 그 문제다. 게이트가 걷히는 순간부터 무장한다
+  // (firesDue) — 그래서 '실행' 뒤의 첫 예약 시각이 첫 회차가 된다.
+  it('예약 Run 에도 pendingStart 를 켠다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    expect(deps.getState().jobs[0].pendingStart).toBe(true)
+  })
+
+  // autoDispatch 는 여전히 켜지 않는다 — 템플릿이 스스로 배치되면 자기 Task 를 자기가 돌린다.
+  // 두 칸은 다른 질문에 답한다: autoDispatch 는 "누가 돌리는가", pendingStart 는 "시작했는가"
+  it('예약 Run 에는 autoDispatch 를 켜지 않는다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    expect(deps.getState().jobs[0].autoDispatch).toBeUndefined()
+  })
+
+  // 게이트를 걷는 명령은 템플릿에도 그대로 듣는다 — startRun 은 Run 종류를 가리지 않는다
+  it('run-start 가 예약 템플릿의 게이트도 걷는다', async () => {
+    const deps = makeDeps()
+    const c = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const id = (c.body as { id: string }).id
+    expect((await call(deps, 'run-start', { run: id })).status).toBe(200)
+    expect(deps.getState().jobs[0].pendingStart).toBeUndefined()
+  })
+
+  it('run-spawn 이 만든 회차에는 pendingStart 가 없다', async () => {
+    const deps = makeDeps()
+    const t = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const r = await call(deps, 'run-spawn', { run: (t.body as { id: string }).id })
+    expect((r.body as { pendingStart?: boolean }).pendingStart).toBeUndefined()
+  })
+
+  it('run-start 가 pendingStart 를 걷는다', async () => {
+    const deps = makeDeps()
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    const id = (c.body as { id: string }).id
+    const r = await call(deps, 'run-start', { run: id })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].pendingStart).toBeUndefined()
+  })
+
+  // 두 번 눌리는 것을 오류로 만들지 않는다 — 버튼이 사라지기 전에 두 번 눌릴 수 있고, 그때
+  // 사람이 손쓸 수 없는 실패 문구를 띄우는 것은 이 명령이 하려는 일과 무관하다
+  it('이미 시작한 Run 에 다시 불러도 200 이다', async () => {
+    const deps = makeDeps()
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    const id = (c.body as { id: string }).id
+    await call(deps, 'run-start', { run: id })
+    expect((await call(deps, 'run-start', { run: id })).status).toBe(200)
+  })
+
+  it('없는 Run 은 400, --run 이 없으면 400', async () => {
+    const deps = makeDeps()
+    // 없는 id 는 404, 인자를 안 준 것은 400 — 스크립트가 둘을 가를 수 있어야 한다(설계 §8)
+    expect((await call(deps, 'run-start', { run: 'run_nope' })).status).toBe(404)
+    expect((await call(deps, 'run-start', {})).status).toBe(400)
+  })
+
+  it('워커 세션은 부를 수 없다', async () => {
+    const deps = makeDeps()
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    const id = (c.body as { id: string }).id
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [
+        {
+          id: 'dsp1',
+          taskId: 'tsk1',
+          provider: 'claude',
+          accountId: 'acc1',
+          sessionId: 'worker1',
+          cwd: 'D:/p',
+          specPath: 'D:/p/spec.md',
+          startedAt: NOW,
+          workerState: 'ready',
+          retained: false
+        }
+      ]
+    })
+    expect((await call(deps, 'run-start', { run: id }, 'worker1')).status).toBe(403)
+  })
+})
+
+/** 워크트리에서 끝난 Dispatch 하나를 가진 평범한 Run. 지우기가 거절되지 않도록 Dispatch 는 끝난
+ *  상태로 둔다(열려 있으면 409 다 — 그 규칙은 다른 테스트가 지킨다) */
+const withFinishedWorktree = async (): Promise<{
+  deps: OrchServerDeps & { state: OrchState }
+  runId: string
+  merged: string[][]
+  removed: string[][]
+  mergeOk: { value: boolean }
+}> => {
+  const merged: string[][] = []
+  const removed: string[][] = []
+  const mergeOk = { value: true }
+  const base = makeDeps()
+  const deps = Object.assign(base, {
+    mergeWorktrees: async (_cwd: string, paths: string[]) => {
+      merged.push(paths)
+      return mergeOk.value
+        ? { ok: true as const, merged: paths }
+        : { ok: false as const, reason: '프로젝트 폴더가 지저분합니다' }
+    },
+    removeWorktrees: async (paths: string[]) => {
+      removed.push(paths)
+      return { failed: [] as string[] }
+    }
+  })
+  const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+  const runId = (c.body as { id: string }).id
+  await deps.setState({
+    ...deps.getState(),
+    tasks: [
+      {
+        id: 'tsk_w',
+        runId,
+        title: 't',
+        spec: 's',
+        deps: [],
+        status: 'completed',
+        consecutiveFailures: 0,
+        createdAt: NOW,
+        updatedAt: NOW
+      }
+    ],
+    dispatches: [
+      {
+        id: 'dsp_w',
+        taskId: 'tsk_w',
+        provider: 'claude',
+        accountId: 'acc1',
+        sessionId: 'sess_w',
+        cwd: 'D:/wt/a',
+        specPath: 'D:/wt/a/spec.md',
+        startedAt: NOW,
+        endedAt: NOW,
+        outcome: 'succeeded',
+        workerState: 'ready',
+        retained: false
+      }
+    ]
+  })
+  return { deps, runId, merged, removed, mergeOk }
+}
+
+describe('run-delete — 병합·워크트리 선택', () => {
+  it('아무것도 고르지 않으면 오늘과 같다 — 병합도 폴더 삭제도 없다', async () => {
+    const { deps, runId, merged, removed } = await withFinishedWorktree()
+    expect((await call(deps, 'run-delete', { id: runId })).status).toBe(200)
+    expect(merged).toEqual([])
+    expect(removed).toEqual([])
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+
+  it('merge 를 고르면 그 Run 의 워크트리를 합친 뒤 지운다', async () => {
+    const { deps, runId, merged } = await withFinishedWorktree()
+    expect((await call(deps, 'run-delete', { id: runId, merge: true })).status).toBe(200)
+    expect(merged).toEqual([['D:/wt/a']])
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+
+  // 이 테스트가 이 기능의 급소다. 병합을 원했는데 실패한 뒤 지우면 워커의 일이 브랜치째 사라진다
+  it('병합이 실패하면 아무것도 지우지 않고 이유를 돌려준다', async () => {
+    const { deps, runId, mergeOk, removed } = await withFinishedWorktree()
+    mergeOk.value = false
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('지저분')
+    expect(removed).toEqual([])
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+
+  it('removeWorktrees 를 고르면 폴더를 지운다', async () => {
+    const { deps, runId, removed } = await withFinishedWorktree()
+    expect((await call(deps, 'run-delete', { id: runId, removeWorktrees: true })).status).toBe(200)
+    expect(removed).toEqual([['D:/wt/a']])
+  })
+
+  it('폴더 삭제가 실패한 경로는 응답에 실어 보낸다 — 삭제 자체는 막지 않는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    const withFailure = Object.assign(deps, {
+      removeWorktrees: async () => ({ failed: ['D:/wt/a'] })
+    })
+    const r = await call(withFailure, 'run-delete', { id: runId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect((r.body as { worktreesFailed?: string[] }).worktreesFailed).toEqual(['D:/wt/a'])
+    expect(withFailure.getState().runs).toHaveLength(0)
+  })
+
+  // 병합은 커밋만 옮긴다. 커밋되지 않은 변경은 그 폴더에만 있으므로 폴더를 지우면 사라진다 —
+  // 그런 폴더는 지우지 않고 남기며, 응답에 수와 경로를 싣는다.
+  it('merge 와 removeWorktrees 를 함께 골라도 커밋되지 않은 변경이 남은 폴더는 지우지 않고 알린다', async () => {
+    const { deps, runId, removed } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async (_cwd: string, paths: string[]) => ({ ok: true as const, merged: paths, uncommitted: 2, dirty: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(removed).toEqual([])
+    expect(r.body).toMatchObject({ uncommitted: 2, worktreesKept: ['D:/wt/a'] })
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+
+  it('merge 와 removeWorktrees 를 함께 골라도 상태를 확인하지 못한 폴더는 지우지 않고 알린다', async () => {
+    const { deps, runId, removed } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async (_cwd: string, paths: string[]) => ({ ok: true as const, merged: paths, uncommitted: 0, unchecked: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(removed).toEqual([])
+    expect(r.body).toMatchObject({ uncommitted: 0, uncommittedUnchecked: ['D:/wt/a'], worktreesKept: ['D:/wt/a'] })
+  })
+
+  it('merge 와 removeWorktrees 를 함께 골랐고 깨끗하면 폴더를 지우고, 남긴 것이 없으면 worktreesKept 를 싣지 않는다', async () => {
+    const { deps, runId, removed } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async (_cwd: string, paths: string[]) => ({ ok: true as const, merged: paths, uncommitted: 0 })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(removed).toEqual([['D:/wt/a']])
+    expect(r.body).toMatchObject({ uncommitted: 0 })
+    expect(r.body).not.toHaveProperty('worktreesKept')
+    expect(r.body).not.toHaveProperty('uncommittedUnchecked')
+  })
+
+  // --merge 없이도 같은 규칙이다. 폴더를 지우는 쪽(removeWorktrees)이 폴더마다 status 를 읽고,
+  // 커밋되지 않은 변경이 있거나 확인하지 못한 폴더는 남긴다. 응답은 --merge 때와 같은 이름으로 싣는다.
+  it('merge 없이 removeWorktrees 만 골라도 커밋되지 않은 변경이나 확인하지 못한 폴더는 남긴 것으로 알린다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      removeWorktrees: async () => ({
+        failed: ['D:/wt/a'],
+        uncommitted: 3,
+        dirty: ['D:/wt/a']
+      })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 3, worktreesKept: ['D:/wt/a'] })
+    // 남긴 폴더는 실패가 아니다 — 이유가 있어 남긴 것이다
+    expect(r.body).not.toHaveProperty('worktreesFailed')
+    expect(r.body).not.toHaveProperty('uncommittedUnchecked')
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+
+  it('merge 없이 removeWorktrees 만 골랐고 상태를 확인하지 못한 폴더는 uncommittedUnchecked 와 worktreesKept 에 싣는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      removeWorktrees: async () => ({ failed: ['D:/wt/a'], uncommitted: 0, unchecked: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 0, uncommittedUnchecked: ['D:/wt/a'], worktreesKept: ['D:/wt/a'] })
+    expect(r.body).not.toHaveProperty('worktreesFailed')
+  })
+
+  it('merge 없이 removeWorktrees 만 골랐고 모두 지웠으면 센 수만 싣고 worktreesKept 는 싣지 않는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, { removeWorktrees: async () => ({ failed: [] as string[], uncommitted: 0 }) })
+    const r = await call(deps, 'run-delete', { id: runId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 0 })
+    expect(r.body).not.toHaveProperty('worktreesKept')
+  })
+
+  it('merge 와 함께일 때 지우는 쪽이 새로 남긴 폴더도 worktreesKept 에 더한다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async (_cwd: string, paths: string[]) => ({ ok: true as const, merged: paths, uncommitted: 0 }),
+      removeWorktrees: async () => ({ failed: ['D:/wt/a'], uncommitted: 1, dirty: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ uncommitted: 1, worktreesKept: ['D:/wt/a'] })
+    expect(r.body).not.toHaveProperty('worktreesFailed')
+  })
+
+  it('merge 가 닿지 못해 합치지 않은 폴더는 지우지 않고 worktreesKept 와 notMerged 로 알린다', async () => {
+    const { deps, runId, removed } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async () => ({ ok: true as const, merged: [] as string[], uncommitted: 0, notMerged: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-delete', { id: runId, merge: true, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(removed).toEqual([])
+    expect(r.body).toMatchObject({ notMerged: ['D:/wt/a'], worktreesKept: ['D:/wt/a'] })
+  })
+
+  it('워크트리를 쓰지 않은 Run 은 merge 를 골라도 병합을 부르지 않는다', async () => {
+    const merged: string[][] = []
+    const deps = Object.assign(makeDeps(), {
+      mergeWorktrees: async (_c: string, p: string[]) => {
+        merged.push(p)
+        return { ok: true as const, merged: p }
+      }
+    })
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const id = (c.body as { id: string }).id
+    expect((await call(deps, 'run-delete', { id, merge: true })).status).toBe(200)
+    expect(merged).toEqual([])
+  })
+})
+
+// **예약 템플릿을 지울 때 회차들의 워크트리가 대상이다.** 템플릿 자신은 한 번도 돌지 않아 폴더가
+// 없고, id 하나만 보면 그 목록이 비어서 병합도 폴더 삭제도 조용히 건너뛰어진다
+describe('run-delete — 예약 템플릿의 회차 워크트리', () => {
+  /** 템플릿 + 회차 하나. 그 회차만 워크트리에서 끝난 Dispatch 를 갖는다 */
+  const templateWithRound = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    templateId: string
+    merged: string[][]
+    removed: string[][]
+  }> => {
+    const merged: string[][] = []
+    const removed: string[][] = []
+    const deps = Object.assign(makeDeps(), {
+      mergeWorktrees: async (_c: string, paths: string[]) => {
+        merged.push(paths)
+        return { ok: true as const, merged: paths, uncommitted: 0 }
+      },
+      removeWorktrees: async (paths: string[]) => {
+        removed.push(paths)
+        return { failed: [] as string[] }
+      }
+    })
+    const c = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const templateId = (c.body as { id: string }).id
+    // 회차와 그 회차의 Task·Dispatch 를 직접 얹는다 — run-spawn 은 템플릿의 Task 를 복사하므로
+    // 여기서는 Task 를 템플릿에 두지 않고 회차에만 둔다(그것이 이 테스트가 보는 모양이다)
+    await deps.setState({
+      ...deps.getState(),
+      runs: [
+        ...deps.getState().runs,
+        {
+          id: 'run_kid',
+          jobId: templateId,
+          ordinal: 1,
+          createdAt: NOW
+        }
+      ],
+      tasks: [
+        {
+          id: 'tsk_kid',
+          runId: 'run_kid',
+          title: 't',
+          spec: 's',
+          deps: [],
+          status: 'completed',
+          consecutiveFailures: 0,
+          createdAt: NOW,
+          updatedAt: NOW
+        }
+      ],
+      dispatches: [
+        {
+          id: 'dsp_kid',
+          taskId: 'tsk_kid',
+          provider: 'claude',
+          accountId: 'acc1',
+          sessionId: 'sess_kid',
+          cwd: 'D:/wt/kid',
+          specPath: 'D:/wt/kid/spec.md',
+          startedAt: NOW,
+          endedAt: NOW,
+          outcome: 'succeeded',
+          workerState: 'ready',
+          retained: false
+        }
+      ]
+    })
+    return { deps, templateId, merged, removed }
+  }
+
+  it('회차의 폴더를 지운다 — 템플릿 자신에는 폴더가 없다', async () => {
+    const { deps, templateId, removed } = await templateWithRound()
+    const r = await call(deps, 'run-delete', { id: templateId, removeWorktrees: true })
+    expect(r.status).toBe(200)
+    expect(removed).toEqual([['D:/wt/kid']])
+  })
+
+  it('회차의 일을 합친다', async () => {
+    const { deps, templateId, merged } = await templateWithRound()
+    expect((await call(deps, 'run-delete', { id: templateId, merge: true })).status).toBe(200)
+    expect(merged).toEqual([['D:/wt/kid']])
+  })
+
+  it('템플릿과 회차가 함께 사라진다', async () => {
+    const { deps, templateId } = await templateWithRound()
+    await call(deps, 'run-delete', { id: templateId, removeWorktrees: true })
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+})
+
+describe('run-pause', () => {
+  /** 예약 템플릿 + 회차 하나. 그 회차에 열린 Dispatch 가 하나 있다 */
+  const runningSchedule = async (
+    over: Record<string, unknown> = {}
+  ): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    templateId: string
+    released: string[]
+  }> => {
+    const released: string[] = []
+    const deps = Object.assign(makeDeps(), {
+      releaseWorker: async (a: { dispatchId: string }) => {
+        released.push(a.dispatchId)
+      }
+    })
+    const c = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const templateId = (c.body as { id: string }).id
+    // 템플릿의 게이트는 걷어 둔다 — 도는 예약을 멈추는 것이 이 명령의 자리다
+    await call(deps, 'run-start', { run: templateId })
+    await deps.setState({
+      ...deps.getState(),
+      runs: [
+        ...deps.getState().runs,
+        {
+          id: 'run_kid',
+          jobId: templateId,
+          ordinal: 1,
+          createdAt: NOW
+        }
+      ],
+      tasks: [
+        {
+          id: 'tsk_running',
+          runId: 'run_kid',
+          title: 't',
+          spec: 's',
+          deps: [],
+          status: 'dispatched',
+          consecutiveFailures: 0,
+          createdAt: NOW,
+          updatedAt: NOW
+        }
+      ],
+      dispatches: [
+        {
+          id: 'dsp_running',
+          taskId: 'tsk_running',
+          provider: 'claude',
+          accountId: 'acc1',
+          sessionId: 'sess_running',
+          cwd: 'D:/wt/kid',
+          specPath: 'D:/wt/kid/spec.md',
+          startedAt: NOW,
+          workerState: 'ready',
+          retained: false,
+          ...over
+        }
+      ]
+    })
+    return { deps, templateId, released }
+  }
+
+  it('도는 세션을 닫고 Dispatch 를 stopped 로 남긴다', async () => {
+    const { deps, templateId, released } = await runningSchedule()
+    expect((await call(deps, 'run-pause', { run: templateId })).status).toBe(200)
+    expect(released).toEqual(['dsp_running'])
+    const d = deps.getState().dispatches[0]
+    expect(d.workerState).toBe('stopped')
+    expect(d.endedAt).toBe(NOW)
+    // 보고하지 않은 워커에 결과를 적지 않는다 — 그래프가 거짓말을 하게 된다
+    expect(d.outcome).toBeUndefined()
+  })
+
+  // **회차까지 세우는 것이 요점이다.** Dispatch 만 닫으면 그 회차의 다음 ready Task 가 곧바로 뜬다
+  it('템플릿과 회차 모두에 paused 를 세운다', async () => {
+    const { deps, templateId } = await runningSchedule()
+    await call(deps, 'run-pause', { run: templateId })
+    // 계획이 세워지고, 그 회차도 함께 멈춘다
+    expect(deps.getState().jobs.find((j) => j.id === templateId)!.paused).toBe(true)
+    expect(deps.getState().runs.find((r) => r.id === 'run_kid')!.paused).toBe(true)
+  })
+
+  // **pendingStart 를 건드리지 않는다.** 그 칸은 '실행' 의 것이다 — 일시 중지가 그것을 다시 세우면
+  // 세운 뒤에 '실행' 버튼과 '▶' 가 같은 일을 하는 둘로 나란히 뜬다
+  it('pendingStart 는 건드리지 않는다', async () => {
+    const { deps, templateId } = await runningSchedule()
+    await call(deps, 'run-pause', { run: templateId })
+    expect(deps.getState().jobs.find((j) => j.id === templateId)!.pendingStart).toBeUndefined()
+  })
+
+  // 재개는 템플릿의 것만 걷는다 — 멈춘 회차는 이어지지 않는다
+  it('run-resume 이 템플릿만 재개하고 멈춘 회차는 그대로 둔다', async () => {
+    const { deps, templateId } = await runningSchedule()
+    await call(deps, 'run-pause', { run: templateId })
+    expect((await call(deps, 'run-resume', { run: templateId })).status).toBe(200)
+    expect(deps.getState().jobs.find((j) => j.id === templateId)!.paused).toBeUndefined()
+    expect(deps.getState().runs.find((r) => r.id === 'run_kid')!.paused).toBe(true)
+  })
+
+  // 버튼이 사라지기 전에 두 번 눌릴 수 있다 — 요청한 끝 상태는 이미 그것이다
+  it('세워 두지 않은 예약에 run-resume 을 불러도 성공이다', async () => {
+    const { deps, templateId } = await runningSchedule()
+    expect((await call(deps, 'run-resume', { run: templateId })).status).toBe(200)
+  })
+
+  it('예약이 아닌 Run 은 run-resume 도 거절한다', async () => {
+    const deps = makeDeps()
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    expect((await call(deps, 'run-resume', { run: (c.body as { id: string }).id })).status).toBe(400)
+  })
+
+  it('붙잡아 둔 세션이 있으면 409 다 — 아무것도 멈추지 않는다', async () => {
+    const { deps, templateId, released } = await runningSchedule({ retained: true })
+    const r = await call(deps, 'run-pause', { run: templateId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('worker-retain')
+    expect(released).toEqual([])
+    expect(deps.getState().jobs.find((x) => x.id === templateId)!.pendingStart).toBeUndefined()
+  })
+
+  it('예약이 아닌 Run 은 409 다', async () => {
+    const deps = makeDeps()
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    const r = await call(deps, 'run-pause', { run: (c.body as { id: string }).id })
+    expect(r.status).toBe(409)
+  })
+
+  it('없는 Run 은 400, --run 이 없으면 400', async () => {
+    const deps = makeDeps()
+    expect((await call(deps, 'run-pause', { run: 'run_nope' })).status).toBe(404)
+    expect((await call(deps, 'run-pause', {})).status).toBe(400)
+  })
+
+  it('워커 세션은 부를 수 없다', async () => {
+    const { deps, templateId } = await runningSchedule()
+    const r = await call(deps, 'run-pause', { run: templateId }, 'sess_running')
+    expect(r.status).toBe(403)
+  })
+})
+
+describe('run-merge', () => {
+  it('워크트리들을 프로젝트 폴더로 합친다', async () => {
+    const { deps, runId, merged } = await withFinishedWorktree()
+    const r = await call(deps, 'run-merge', { run: runId })
+    expect(r.status).toBe(200)
+    expect(merged).toEqual([['D:/wt/a']])
+    expect((r.body as { merged: string[] }).merged).toEqual(['D:/wt/a'])
+  })
+
+  // 커밋되지 않은 변경의 수는 배선이 세고 이 명령은 그대로 올린다 — 그 수가 렌더러까지 닿아야
+  // "합쳤습니다" 를 "일이 다 옮겨졌다" 로 읽고 폴더를 지우는 경로가 막힌다
+  it('커밋되지 않은 변경의 수를 그대로 올린다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    const withDirty = Object.assign(deps, {
+      mergeWorktrees: async (_c: string, p: string[]) => ({
+        ok: true as const,
+        merged: p,
+        uncommitted: 3
+      })
+    })
+    const r = await call(withDirty, 'run-merge', { run: runId })
+    expect(r.status).toBe(200)
+    expect((r.body as { uncommitted?: number }).uncommitted).toBe(3)
+  })
+
+  // 상태를 읽지 못한 워크트리는 "0개"가 아니다 — 경로를 그대로 올려 화면이 "확인하지 못했다"고 말하게 한다
+  it('커밋되지 않은 변경을 확인하지 못한 워크트리를 그대로 올린다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    const blind = Object.assign(deps, {
+      mergeWorktrees: async (_c: string, p: string[]) => ({
+        ok: true as const,
+        merged: p,
+        uncommitted: 0,
+        unchecked: p
+      })
+    })
+    const r = await call(blind, 'run-merge', { run: runId })
+    expect(r.status).toBe(200)
+    expect((r.body as { uncommittedUnchecked?: string[] }).uncommittedUnchecked).toEqual(['D:/wt/a'])
+  })
+
+  // 폴더에 닿지 못해 합치지 않은 워크트리는 "확인하지 못한 변경"이 아니라 "합치지 않았다"다 — 따로 싣는다
+  it('닿지 못해 합치지 않은 워크트리는 notMerged 로 싣는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    Object.assign(deps, {
+      mergeWorktrees: async () => ({ ok: true as const, merged: [] as string[], uncommitted: 0, notMerged: ['D:/wt/a'] })
+    })
+    const r = await call(deps, 'run-merge', { run: runId })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ merged: [], notMerged: ['D:/wt/a'] })
+    expect(r.body).not.toHaveProperty('uncommittedUnchecked')
+  })
+
+  it('모두 확인했으면 uncommittedUnchecked 는 없다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    const r = await call(deps, 'run-merge', { run: runId })
+    expect((r.body as { uncommittedUnchecked?: string[] }).uncommittedUnchecked).toBeUndefined()
+  })
+
+  it('합쳐도 Run 은 남는다 — 이 명령은 지우지 않는다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    await call(deps, 'run-merge', { run: runId })
+    expect(deps.getState().runs).toHaveLength(1)
+  })
+
+  // **합친 뒤에도 그 Run 은 계속 돌 수 있어야 한다.** 성공한 병합이 워크트리를 걷어 가면
+  // `run.worktree` 는 사라진 폴더를 가리킨 채 남고(run-worktree-set 은 두 번째 쓰기를 거절한다)
+  // 배치는 그 경로를 fs.stat 하므로, 그 Run 은 다시는 Task 를 띄울 수 없게 된다.
+  //
+  // **이 층이 볼 수 있는 것까지만 본다.** 실제 폴더 삭제는 배선의 integrateWorktrees 안에 있고
+  // (src/main/ipc.ts, 사람이 누른 병합에는 reap 을 끈다) 여기서 mergeWorktrees 는 스텁이므로, 그
+  // 삭제 자체는 이 테스트가 볼 수 없다. 이 자리에서 정직하게 물을 수 있는 것은 둘이다: run-merge 가
+  // 폴더 삭제를 **요청하지 않는다**, 그리고 병합 뒤에도 기록된 Run 워크트리가 그대로 남아 다음
+  // 워커가 거기서 뜬다.
+  it('폴더 삭제를 요청하지 않고, 합친 뒤에도 Run 워크트리가 그대로 쓰인다', async () => {
+    const { deps, runId, removed } = await withFinishedWorktree()
+    const set = await call(deps, 'run-worktree-set', { run: runId, worktree: 'D:/wt/run' })
+    expect(set.status).toBe(200)
+    const placements: string[] = []
+    deps.startWorker = async (a) => {
+      placements.push(a.worktree)
+      return { sessionId: 'sess_after', cwd: a.worktree, specPath: 'D:/wt/run/spec.md' }
+    }
+
+    expect((await call(deps, 'run-merge', { run: runId })).status).toBe(200)
+
+    expect(removed).toEqual([])
+    expect(deps.getState().runs.find((r) => r.id === runId)?.worktree).toBe('D:/wt/run')
+    const t = await call(deps, 'task-create', { account: 'acc1', runId, title: '다음', spec: 's' })
+    const r = await call(deps, 'worker-start', {
+      taskId: (t.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1'
+    })
+    expect(r.status).toBe(200)
+    expect(placements).toEqual(['D:/wt/run'])
+  })
+
+  it('합칠 것이 없으면 병합을 부르지 않는다', async () => {
+    const merged: string[][] = []
+    const deps = Object.assign(makeDeps(), {
+      mergeWorktrees: async (_c: string, p: string[]) => {
+        merged.push(p)
+        return { ok: true as const, merged: p }
+      }
+    })
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const r = await call(deps, 'run-merge', { run: (c.body as { id: string }).id })
+    expect(r.status).toBe(200)
+    expect(merged).toEqual([])
+  })
+
+  it('병합이 실패하면 409 와 그 이유다', async () => {
+    const { deps, runId, mergeOk } = await withFinishedWorktree()
+    mergeOk.value = false
+    const r = await call(deps, 'run-merge', { run: runId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('지저분')
+  })
+
+  it('없는 Run 은 400 이다', async () => {
+    expect((await call(makeDeps(), 'run-merge', { run: 'run_nope' })).status).toBe(404)
+  })
+
+  it('병합이 이 빌드에 없으면 400 이다', async () => {
+    const { deps, runId } = await withFinishedWorktree()
+    const noMerge = { ...deps, mergeWorktrees: undefined }
+    expect((await call(noMerge, 'run-merge', { run: runId })).status).toBe(400)
+  })
+})
+
+describe('run-worktree-set', () => {
+  const withRun = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    runId: string
+  }> => {
+    const deps = makeDeps()
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    return { deps, runId: (c.body as { id: string }).id }
+  }
+
+  it('워크트리를 기록한다', async () => {
+    const { deps, runId } = await withRun()
+    const r = await call(deps, 'run-worktree-set', { run: runId, worktree: 'D:/wt/a' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().runs.find((x) => x.id === runId)?.worktree).toBe('D:/wt/a')
+  })
+
+  it('이미 있으면 409 다 — 배선이 워크트리를 두 개 만들었다는 뜻이다', async () => {
+    const { deps, runId } = await withRun()
+    await call(deps, 'run-worktree-set', { run: runId, worktree: 'D:/wt/a' })
+    const again = await call(deps, 'run-worktree-set', { run: runId, worktree: 'D:/wt/b' })
+    expect(again.status).toBe(409)
+    // 첫 값이 그대로여야 한다 — 거절이 곧 덮어쓰지 않았다는 뜻이다
+    expect(deps.getState().runs.find((x) => x.id === runId)?.worktree).toBe('D:/wt/a')
+  })
+
+  it('없는 Run 은 400 이다 — commit 이 err 를 그렇게 낸다(run-start 와 같다)', async () => {
+    const r = await call(makeDeps(), 'run-worktree-set', {
+      run: 'run_nope',
+      worktree: 'D:/wt/a'
+    })
+    expect(r.status).toBe(404)
+  })
+
+  it('--worktree 가 없으면 400 이다', async () => {
+    const { deps, runId } = await withRun()
+    expect((await call(deps, 'run-worktree-set', { run: runId })).status).toBe(400)
+  })
+
+  it('워커 세션은 부를 수 없다 — Run 수준 변경은 워커의 것이 아니다', async () => {
+    const { deps, runId } = await withRun()
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [
+        {
+          id: 'dsp1',
+          taskId: 'tsk1',
+          provider: 'claude',
+          accountId: 'acc1',
+          sessionId: 'worker1',
+          cwd: 'D:/p',
+          specPath: 'D:/p/spec.md',
+          startedAt: NOW,
+          workerState: 'ready',
+          retained: false
+        }
+      ]
+    })
+    const r = await call(deps, 'run-worktree-set', { run: runId, worktree: 'D:/wt/a' }, 'worker1')
+    expect(r.status).toBe(403)
+  })
+})
+
+// CLI 로 들어오는 길을 **파서를 거쳐** 확인한다. 여기가 비어 있던 것이 이 결함의 원인이었다 —
+// 앱은 IPC 로 객체를 직접 보내고(NewTaskModal), 다른 테스트도 서버를 직접 부르므로, 파서가 만드는
+// 키와 서버가 읽는 키가 어긋나도 아무 데서도 드러나지 않았다.
+describe('handleCommand — CLI 인자 경로', () => {
+  /** astera <cmd> ... 한 줄을 파서에 통과시켜 서버가 실제로 받는 args 로 만든다 */
+  const cliArgs = (argv: string[]): Record<string, unknown> => {
+    const parsed = parseArgs(argv)
+    if ('error' in parsed) throw new Error(parsed.error)
+    return parsed.args
+  }
+
+  const twoRuns = async (): Promise<{ deps: OrchServerDeps; older: string; newer: string }> => {
+    const deps = makeDeps()
+    const a = await call(deps, 'run-create', { objective: 'first', cwd: 'D:/p' })
+    const b = await call(deps, 'run-create', { objective: 'second', cwd: 'D:/p' })
+    return { deps, older: (a.body as { id: string }).id, newer: (b.body as { id: string }).id }
+  }
+
+  /**
+   * **listAccounts 의 await 동안 착륙한 변경을 덮지 않는다 — 쓰기 역전 회귀.**
+   *
+   * 이 의존은 이제 배열이거나 그 약속이다(Host 에서는 소켓을 건넌다). 약속이면 그것이 이 명령의
+   * 첫 양보 지점이고, 진입 스냅숏으로 커밋하면 그 사이 착륙한 것이 옛 배열로 되돌려진다 —
+   * run-create 가 resolveProjectRoot 뒤에 다시 읽는 것과 같은 자리, 같은 이유다. 그때 사라지는 것이
+   * 도는 Dispatch 라면 세션은 계속 도는데 기록만 없어진다.
+   */
+  it('listAccounts 의 await 동안 착륙한 변경을 덮지 않는다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    deps.listAccounts = async () => {
+      const before = deps.getState()
+      await deps.setState({
+        ...before,
+        messages: [
+          ...before.messages,
+          {
+            id: 'msg_concurrent',
+            runId,
+            type: 'status',
+            subject: 'listAccounts await 동안 도착한 워커 메시지',
+            body: 'b',
+            answered: false,
+            createdAt: NOW
+          }
+        ]
+      })
+      return [{ id: 'acc1', label: '계정1', provider: 'codex' }]
+    }
+    const r = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().messages.some((m) => m.id === 'msg_concurrent')).toBe(true)
+    expect(deps.getState().tasks).toHaveLength(1) // 만들 것은 만들었다
+  })
+
+  it('task-create 는 --run 이 가리키는 Run 에 붙는다', async () => {
+    const { deps, older } = await twoRuns()
+    const r = await call(
+      deps,
+      'task-create',
+      cliArgs(['task-create', '--account', 'acc1', '--run', older, '--title', 't', '--spec', 's'])
+    )
+    expect((r.body as { runId: string }).runId).toBe(older)
+  })
+
+  // 이 결함의 본체. --run 이 무시되면 가장 최근 Run 으로 조용히 흘러가고, 코디네이터가 만든 Task 가
+  // 사람이 방금 만든 Job 에 섞인다 — 오류도 나지 않아 알아챌 방법이 없다.
+  it('--run 이 최신이 아닌 Run 을 가리켜도 그쪽에 붙는다', async () => {
+    const { deps, older, newer } = await twoRuns()
+    await call(
+      deps,
+      'task-create',
+      cliArgs(['task-create', '--account', 'acc1', '--run', older, '--title', 't', '--spec', 's'])
+    )
+    const tasks = deps.getState().tasks
+    expect(tasks).toHaveLength(1)
+    expect(tasks[0].runId).toBe(older)
+    expect(tasks[0].runId).not.toBe(newer)
+  })
+
+  it('--run 이 없으면 가장 최근 Run 에 붙는다', async () => {
+    const { deps, newer } = await twoRuns()
+    const r = await call(deps, 'task-create', cliArgs(['task-create', '--account', 'acc1', '--title', 't', '--spec', 's']))
+    expect((r.body as { runId: string }).runId).toBe(newer)
+  })
+
+  // 앱은 IPC 로 runId 를 직접 보낸다(NewTaskModal). 그 길이 계속 살아 있어야 한다
+  it('앱이 보내는 runId 도 그대로 받는다', async () => {
+    const { deps, older } = await twoRuns()
+    const r = await call(deps, 'task-create', { account: 'acc1', runId: older, title: 't', spec: 's' })
+    expect((r.body as { runId: string }).runId).toBe(older)
+  })
+
+  it('없는 Run 을 --run 으로 주면 거절한다', async () => {
+    const { deps } = await twoRuns()
+    const r = await call(
+      deps,
+      'task-create',
+      cliArgs(['task-create', '--account', 'acc1', '--run', 'run_nope', '--title', 't', '--spec', 's'])
+    )
+    expect(r.status).toBeGreaterThanOrEqual(400)
+  })
+})
+
+describe('browser-js', () => {
+  it('409 when the agent browser is off', async () => {
+    const deps = { ...makeDeps(), browserEnabled: () => false }
+    expect(await call(deps, 'browser-js', { script: 'log(1)' }, 's1')).toEqual({ status: 409, body: { error: 'agent browser is off' } })
+  })
+  it('409 when nothing is wired to run it', async () => {
+    const deps = { ...makeDeps(), browserEnabled: () => true }
+    expect(await call(deps, 'browser-js', { script: 'log(1)' }, 's1')).toEqual({ status: 409, body: { error: 'agent browser is off' } })
+  })
+  it('400 without a script', async () => {
+    const deps = { ...makeDeps(), browserEnabled: () => true, browserRun: async () => ({ ok: true as const, result: { log: [] } }) }
+    expect(await call(deps, 'browser-js', {}, 's1')).toEqual({ status: 400, body: { error: 'script is required' } })
+    expect(await call(deps, 'browser-js', { script: '   ' }, 's1')).toEqual({ status: 400, body: { error: 'script is required' } })
+  })
+  it('200 with the run result, for the calling session', async () => {
+    const seen: string[] = []
+    const deps = {
+      ...makeDeps(),
+      browserEnabled: () => true,
+      browserRun: async (sessionId: string, script: string) => { seen.push(sessionId, script); return { ok: true as const, result: { log: ['hi'] } } }
+    }
+    expect(await call(deps, 'browser-js', { script: "log('hi')" }, 'sess-9')).toEqual({ status: 200, body: { log: ['hi'] } })
+    expect(seen).toEqual(['sess-9', "log('hi')"])
+  })
+  it('passes a failed outcome through with its status', async () => {
+    const deps = { ...makeDeps(), browserEnabled: () => true, browserRun: async () => ({ ok: false as const, status: 409 as const, error: 'a script is already running' }) }
+    expect(await call(deps, 'browser-js', { script: 'log(1)' }, 's1')).toEqual({ status: 409, body: { error: 'a script is already running' } })
+  })
+})
+
+describe('handoff', () => {
+  // Typed the same way session-task's SessionTasks is above — vi.fn() with no type argument widens
+  // to a generic Mock that a union-returning method signature (handoffs.save) rejects on assignment.
+  type Handoffs = NonNullable<OrchServerDeps['handoffs']>
+  const doc = JSON.stringify({
+    nextActions: ['finish invalidation'],
+    constraints: ['no Redis'],
+    verification: [{ type: 'test', status: 'failed', summary: '2 failing' }]
+  })
+  const saved = () => ({
+    save: vi.fn<Handoffs['save']>().mockResolvedValue({ ok: true, savedAt: NOW })
+  })
+
+  it('smart resume off, or no store wired: 409 and nothing saved', async () => {
+    const a = await call({ ...makeDeps(), handoffEnabled: () => false, handoffs: saved() }, 'handoff', { memo: doc }, 'tab-1')
+    expect(a.status).toBe(409)
+    expect(JSON.stringify(a.body)).toContain('smart resume is off')
+    const b = await call({ ...makeDeps(), handoffEnabled: () => true }, 'handoff', { memo: doc }, 'tab-1')
+    expect(b.status).toBe(409)
+    const c = await call(makeDeps(), 'handoff', { memo: doc }, 'tab-1')
+    expect(c.status).toBe(409)
+  })
+
+  it('saves the document it was handed, for the calling session', async () => {
+    const store = saved()
+    const deps = { ...makeDeps(), handoffEnabled: () => true, handoffs: store }
+    const r = await call(deps, 'handoff', { memo: doc }, 'tab-1')
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ savedAt: NOW })
+    expect(store.save).toHaveBeenCalledTimes(1)
+    const [sessionId, body] = store.save.mock.calls[0]
+    expect(sessionId).toBe('tab-1')
+    expect(body.constraints).toEqual(['no Redis'])
+    expect(body.verification).toEqual([{ type: 'test', status: 'failed', summary: '2 failing' }])
+  })
+
+  it('a missing or malformed document is 400 and nothing is saved', async () => {
+    const store = saved()
+    const deps = { ...makeDeps(), handoffEnabled: () => true, handoffs: store }
+    const none = await call(deps, 'handoff', {}, 'tab-1')
+    expect(none.status).toBe(400)
+    expect(JSON.stringify(none.body)).toContain('--memo')
+    const bad = await call(deps, 'handoff', { memo: '{ nope' }, 'tab-1')
+    expect(bad.status).toBe(400)
+    expect(JSON.stringify(bad.body)).toContain('not valid JSON')
+    const empty = await call(deps, 'handoff', { memo: '{}' }, 'tab-1')
+    expect(empty.status).toBe(400)
+    expect(store.save).not.toHaveBeenCalled()
+  })
+
+  it('the store answer is passed through: unknown session and write failure', async () => {
+    const unknown = {
+      ...makeDeps(),
+      handoffEnabled: () => true,
+      handoffs: { save: vi.fn<Handoffs['save']>().mockResolvedValue({ ok: false, status: 409, error: 'unknown session: tab-9' }) }
+    }
+    const a = await call(unknown, 'handoff', { memo: doc }, 'tab-9')
+    expect(a.status).toBe(409)
+    expect(JSON.stringify(a.body)).toContain('unknown session')
+    const failing = {
+      ...makeDeps(),
+      handoffEnabled: () => true,
+      handoffs: { save: vi.fn<Handoffs['save']>().mockResolvedValue({ ok: false, status: 500, error: 'the memo could not be written' }) }
+    }
+    const b = await call(failing, 'handoff', { memo: doc }, 'tab-1')
+    expect(b.status).toBe(500)
+  })
+
+  it('a worker session may leave a memo too', async () => {
+    // Seed one worker the way the role-authorization tests in this file do: a Run, a Task, a
+    // worker-start — makeDeps().startWorker answers with sessionId 'sess1'.
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    const store = saved()
+    const r = await call({ ...deps, handoffEnabled: () => true, handoffs: store }, 'handoff', { memo: doc }, 'sess1')
+    expect(r.status).toBe(200)
+    expect(store.save.mock.calls[0][0]).toBe('sess1')
+  })
+
+  it('the CLI parser hands --memo - to stdin filling', () => {
+    const parsed = parseArgs(['handoff', '--memo', '-'])
+    expect('error' in parsed).toBe(false)
+    if ('error' in parsed) return
+    expect(parsed.cmd).toBe('handoff')
+    expect(parsed.wantsStdin).toEqual(['memo'])
+  })
+})
+
+// The pending-reports queue has to decide, with no server to ask, whether a report would be
+// accepted -- one it queues that the server would refuse holds a Dispatch open through the restart
+// cleanup and then stalls the Task, which is worse than the command simply failing. Both sides call
+// workerDoneFieldError, and this is what says so out loud: if the server ever grows a required
+// field the queue does not know about, this goes red.
+describe('the queue and the server ask for the same fields of a worker_done', () => {
+  const seed = async (): Promise<OrchServerDeps> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    return deps
+  }
+
+  it('queues exactly what the server does not refuse for a missing field', async () => {
+    const seeded = await seed()
+    const d = seeded.getState().dispatches[0]
+    const shapes: Record<string, unknown>[] = [
+      { type: 'worker_done', taskId: d.taskId, dispatchId: d.id, outcome: 'succeeded' },
+      { type: 'worker_done', taskId: d.taskId, dispatchId: d.id, outcome: 'failed' },
+      { type: 'worker_done', taskId: d.taskId, dispatchId: d.id },
+      { type: 'worker_done', taskId: d.taskId, dispatchId: d.id, outcome: true },
+      { type: 'worker_done', taskId: d.taskId, dispatchId: d.id, outcome: 'maybe' },
+      { type: 'worker_done', taskId: d.taskId, outcome: 'succeeded' },
+      { type: 'worker_done', dispatchId: d.id, outcome: 'succeeded' }
+    ]
+    for (const args of shapes) {
+      // A fresh seed per shape: the first accepted report closes the Dispatch, and every one after
+      // it would come back alreadyReported instead of being judged on its fields.
+      const deps = await seed()
+      const r = await call(deps, 'send', args, 'sess1')
+      const refusedForFields =
+        r.status === 400 &&
+        /--task-id and --dispatch-id are required|--outcome must be/.test(
+          String((r.body as { error?: string }).error)
+        )
+      expect({ args, queued: isQueueableReport({ cmd: 'send', args }) }).toEqual({
+        args,
+        queued: !refusedForFields
+      })
+    }
+  })
+})
+
+describe('handleCommand — convergence', () => {
+  const accounts = [
+    { id: 'accA', label: 'A', provider: 'claude' as const },
+    { id: 'accC', label: 'C', provider: 'codex' as const }
+  ]
+  const convDeps = (): ReturnType<typeof makeDeps> & {
+    repairs: string[]
+    onces: string[]
+    reviewFile: string | null | Error
+    onceResult: { ok: true } | { ok: false; error: string }
+  } => {
+    const base = makeDeps()
+    const box = {
+      repairs: [] as string[],
+      onces: [] as string[],
+      reviewFile: null as string | null | Error,
+      // Finding 5 의 repairOnce 반환값 — 기본은 성공. 두 번째 열린 Gate 가 여전히 막는 경우를
+      // 흉내 내려는 테스트가 { ok: false, error } 로 갈아 끼운다.
+      onceResult: { ok: true } as { ok: true } | { ok: false; error: string }
+    }
+    const deps = Object.assign(base, {
+      listAccounts: () => accounts,
+      repairTargetFor: () => ({ kind: 'same-session' as const, sessionId: 'sess1', cwd: 'D:/p', provider: 'claude' as const, accountId: 'accA' }),
+      startRepair: (a: { dispatchId: string }) => void box.repairs.push(a.dispatchId),
+      repairOnce: async (a: { taskId: string }) => {
+        box.onces.push(a.taskId)
+        return box.onceResult
+      },
+      readReviewFile: async () => {
+        if (box.reviewFile instanceof Error) throw box.reviewFile
+        return box.reviewFile
+      },
+      startValidation: () => {},
+      startReview: () => {},
+      lang: () => 'en' as const
+    })
+    // Object.assign 은 접근자를 값으로 굳혀 버린다 — get/set 을 그 안에 나란히 넣으면 대상에
+    // "지금 값"만 복사되는 평범한 데이터 속성이 되고, 그 뒤 `deps.reviewFile = x` 는 box 를 건드리지
+    // 못한 채 그 복사본만 바꾼다. 그러면 readReviewFile 은 항상 최초값(null)을 읽어 malformed 검증이
+    // 조용히 outcome 만으로 판정된 것처럼 통과해 버린다 — defineProperties 로 실제 접근자를 심는다.
+    Object.defineProperties(deps, {
+      repairs: { get: () => box.repairs, enumerable: true },
+      onces: { get: () => box.onces, enumerable: true },
+      reviewFile: {
+        get: () => box.reviewFile,
+        set: (v: string | null | Error) => {
+          box.reviewFile = v
+        },
+        enumerable: true
+      },
+      onceResult: {
+        get: () => box.onceResult,
+        set: (v: { ok: true } | { ok: false; error: string }) => {
+          box.onceResult = v
+        },
+        enumerable: true
+      }
+    })
+    return deps as unknown as ReturnType<typeof makeDeps> & {
+      repairs: string[]
+      onces: string[]
+      reviewFile: string | null | Error
+      onceResult: { ok: true } | { ok: false; error: string }
+    }
+  }
+
+  it('run-create --convergence 가 정책을 싣는다 — 값 없이는 빈 객체', async () => {
+    const deps = convDeps()
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].convergence).toEqual({})
+    const r2 = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true, maxFixAttempts: 2, maxReviewRounds: 1, blockingSeverity: 'medium' })
+    expect(r2.status).toBe(200)
+    expect(deps.getState().jobs[1].convergence).toEqual({ maxFixAttempts: 2, maxReviewRounds: 1, blockingSeverity: 'medium' })
+  })
+  it('run-create 없이 숫자만 주면, 또는 값이 틀리면 거절한다', async () => {
+    const deps = convDeps()
+    expect((await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', maxFixAttempts: 2 })).status).toBe(400)
+    expect((await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true, maxFixAttempts: 0 })).status).toBe(400)
+    expect((await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true, blockingSeverity: 'low' })).status).toBe(400)
+  })
+  it('task-create --validate 는 쉼표 목록을 validateConfigIds 로 싣는다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const r = await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1, c2' })
+    expect(r.status).toBe(200)
+    const task = deps.getState().tasks[0]
+    expect(task.validateConfigIds).toEqual(['c1', 'c2'])
+    expect(task).not.toHaveProperty('validateConfigId')
+    expect((await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1,,c2' })).status).toBe(400)
+  })
+  it('task-update --convergence off 는 convergenceOff 를 찍고 status 를 요구하지 않는다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA' })
+    const id = deps.getState().tasks[0].id
+    const r = await call(deps, 'task-update', { id, convergence: 'off' })
+    expect(r.status).toBe(200)
+    expect(deps.getState().tasks[0].convergenceOff).toBe(true)
+    expect(deps.getState().tasks[0].status).toBe('ready')
+    expect((await call(deps, 'task-update', { id, convergence: 'on' })).status).toBe(400)
+  })
+
+  /** convergence Run 에서 검토 걸린 Task 를 reviewing + 검토 Dispatch 열림까지 */
+  const reviewingRun = async (deps: ReturnType<typeof convDeps>, runExtra: Record<string, unknown> = {}) => {
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true, ...runExtra })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', review: true })
+    const taskId = deps.getState().tasks[0].id
+    const ws = await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'accA', worktree: 'current' })
+    const dispatchId = (ws.body as { dispatchId: string }).dispatchId
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' }, 'sess1')
+    expect(deps.getState().tasks[0].status).toBe('reviewing')
+    const opened = openReviewDispatch(deps.getState(), { taskId, provider: 'codex', accountId: 'accC', sessionId: 'rev1', cwd: 'D:/p', specPath: 'C:/specs/r.md' }, NOW)
+    if (!opened.ok) throw new Error(opened.error)
+    await deps.setState(opened.state)
+    return { taskId, implId: dispatchId, reviewId: opened.value.id }
+  }
+
+  it('검토 보고가 오면 review.json 을 읽어 blocking 이면 repair 를 시작한다', async () => {
+    const deps = convDeps()
+    const { taskId, reviewId } = await reviewingRun(deps)
+    deps.reviewFile = '{"issues":[{"severity":"high","title":"race"}]}'
+    const r = await call(deps, 'send', { type: 'worker_done', taskId, dispatchId: reviewId, outcome: 'failed', subject: 'race', body: 'b' }, 'rev1')
+    expect(r.status).toBe(200)
+    const task = deps.getState().tasks[0]
+    expect(task.status).toBe('dispatched')
+    expect(task.reviewIssues?.[0]).toMatchObject({ severity: 'high', blocking: true })
+    const repair = deps.getState().dispatches.find((d) => d.repair)!
+    expect(deps.repairs).toEqual([repair.id])
+  })
+  it('review.json 이 없으면 outcome 으로 해석한다', async () => {
+    const deps = convDeps()
+    const { taskId, reviewId } = await reviewingRun(deps)
+    deps.reviewFile = null
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId: reviewId, outcome: 'succeeded', subject: 'ok', body: 'b' }, 'rev1')
+    expect(deps.getState().tasks[0].status).toBe('completed')
+  })
+  it('review.json 이 깨졌거나 읽을 수 없으면 Gate 다', async () => {
+    for (const file of ['{oops', new Error('EACCES')]) {
+      const deps = convDeps()
+      const { taskId, reviewId } = await reviewingRun(deps)
+      deps.reviewFile = file
+      await call(deps, 'send', { type: 'worker_done', taskId, dispatchId: reviewId, outcome: 'succeeded', subject: 'ok', body: 'b' }, 'rev1')
+      expect(deps.getState().tasks[0].status).toBe('blocked')
+      expect(deps.repairs).toEqual([])
+    }
+  })
+  it('worker-release 는 수렴 중인 Task 의 Dispatch 를 거절한다', async () => {
+    const deps = convDeps()
+    const { implId } = await reviewingRun(deps)
+    const r = await call(deps, 'worker-release', { dispatch: implId })
+    expect(r.status).toBe(409)
+    expect(String((r.body as { error: string }).error)).toContain('still converging')
+  })
+  it('worker-release 는 꺼진 Run 에서는 지금처럼 통과한다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', review: true })
+    const taskId = deps.getState().tasks[0].id
+    const ws = await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'accA', worktree: 'current' })
+    const dispatchId = (ws.body as { dispatchId: string }).dispatchId
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' }, 'sess1')
+    expect((await call(deps, 'worker-release', { dispatch: dispatchId })).status).toBe(200)
+  })
+  it('worker-release 는 validating 인 Task 의 Dispatch 도 거절한다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId = deps.getState().tasks[0].id
+    const ws = await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'accA', worktree: 'current' })
+    const dispatchId = (ws.body as { dispatchId: string }).dispatchId
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' }, 'sess1')
+    expect(deps.getState().tasks[0].status).toBe('validating')
+    const r = await call(deps, 'worker-release', { dispatch: dispatchId })
+    expect(r.status).toBe(409)
+    expect(String((r.body as { error: string }).error)).toContain('still converging')
+  })
+  it('worker-release 는 열린 repair Dispatch 가 있는 Task 도 거절한다 — Task 상태가 이미 dispatched 로 넘어갔어도', async () => {
+    const deps = convDeps()
+    const { taskId, implId, reviewId } = await reviewingRun(deps)
+    deps.reviewFile = '{"issues":[{"severity":"high","title":"race"}]}'
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId: reviewId, outcome: 'failed', subject: 'race', body: 'b' }, 'rev1')
+    // repair Dispatch 가 열렸다 — Task 는 이미 validating/reviewing 이 아니라 dispatched 다. 그래도
+    // 수렴 중이다: repair Dispatch 가 열려 있는 동안은 원래 구현 세션(implId, 이미 닫혔다)을 놓아 줄
+    // 수 없다.
+    expect(deps.getState().tasks[0].status).toBe('dispatched')
+    const r = await call(deps, 'worker-release', { dispatch: implId })
+    expect(r.status).toBe(409)
+    expect(String((r.body as { error: string }).error)).toContain('still converging')
+  })
+  it('worker-start 는 validating·reviewing 인 Task 를 거절한다 — convergence 와 무관 (회귀)', async () => {
+    // 회귀: ALLOWED.validating/.reviewing 에 'dispatched' 가 더해진 뒤(openRepairDispatch 를
+    // 위해서다), openDispatch 의 상태 검사가 moveTask/canTransition 뿐이면 이 거절이 조용히
+    // 사라진다 — convergence 를 켜지 않은 Run 에서도. 여기서는 그 Run 으로 확인한다.
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId = deps.getState().tasks[0].id
+    const ws = await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'accA', worktree: 'current' })
+    const dispatchId = (ws.body as { dispatchId: string }).dispatchId
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' }, 'sess1')
+    expect(deps.getState().tasks[0].status).toBe('validating')
+    const r = await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'accA', worktree: 'current' })
+    expect(r.status).toBe(400)
+    expect(String((r.body as { error: string }).error)).toContain('awaiting a verdict')
+
+    const deps2 = convDeps()
+    await call(deps2, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    await call(deps2, 'task-create', { spec: 's', account: 'accA', review: true })
+    const taskId2 = deps2.getState().tasks[0].id
+    const ws2 = await call(deps2, 'worker-start', { task: taskId2, agent: 'claude', account: 'accA', worktree: 'current' })
+    const dispatchId2 = (ws2.body as { dispatchId: string }).dispatchId
+    await call(deps2, 'send', { type: 'worker_done', taskId: taskId2, dispatchId: dispatchId2, outcome: 'succeeded', subject: 's', body: 'b' }, 'sess1')
+    expect(deps2.getState().tasks[0].status).toBe('reviewing')
+    const r2 = await call(deps2, 'worker-start', { task: taskId2, agent: 'claude', account: 'accA', worktree: 'current' })
+    expect(r2.status).toBe(400)
+    expect(String((r2.body as { error: string }).error)).toContain('awaiting a verdict')
+  })
+  it('convergence 가 없는 Run 은 review.json 을 읽지 않는다 — 이 경로는 오늘과 바이트 단위로 같아야 한다', async () => {
+    const deps = convDeps()
+    const calls: string[] = []
+    deps.readReviewFile = async (path: string) => {
+      calls.push(path)
+      return null
+    }
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', review: true })
+    const taskId = deps.getState().tasks[0].id
+    const ws = await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'accA', worktree: 'current' })
+    const dispatchId = (ws.body as { dispatchId: string }).dispatchId
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' }, 'sess1')
+    expect(deps.getState().tasks[0].status).toBe('reviewing')
+    const opened = openReviewDispatch(
+      deps.getState(),
+      { taskId, provider: 'codex', accountId: 'accC', sessionId: 'rev1', cwd: 'D:/p', specPath: 'C:/specs/r.md' },
+      NOW
+    )
+    if (!opened.ok) throw new Error(opened.error)
+    await deps.setState(opened.state)
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId: opened.value.id, outcome: 'succeeded', subject: 'ok', body: 'b' }, 'rev1')
+    expect(deps.getState().tasks[0].status).toBe('completed')
+    // 이 assertion 이 없으면 guard(`reviewRun?.convergence &&`)를 지워도 248 개 테스트가 그대로
+    // 통과한다 — 옛 deps 들이 readReviewFile 을 주입하지 않아 optional chaining 이 알아서 걸러
+    // 주기 때문이다. 이 테스트만이 그 guard 가 실제로 하는 일을 pin 한다.
+    expect(calls).toEqual([])
+  })
+  it('--convergence off 와 --status 를 함께 주면 두 호출로 나누라며 거절한다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA' })
+    const id = deps.getState().tasks[0].id
+    const r = await call(deps, 'task-update', { id, convergence: 'off', status: 'ready' })
+    expect(r.status).toBe(400)
+    expect(String((r.body as { error: string }).error)).toContain('two calls')
+    expect(deps.getState().tasks[0].convergenceOff).toBeUndefined()
+  })
+  it('일반 Gate 에서는 retry-once 가 그냥 문자열 resolution 이다 — repairOnce 를 부르지 않는다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const created = await call(deps, 'task-create', { spec: 's', account: 'accA' })
+    const taskId = (created.body as { id: string }).id
+    const g = await call(deps, 'gate-create', { task: taskId, question: 'q?' })
+    const gateId = (g.body as { id: string }).id
+    const r = await call(deps, 'gate-resolve', { id: gateId, resolution: 'retry-once' })
+    expect(r.status).toBe(200)
+    expect(deps.onces).toEqual([])
+  })
+  it('소진 Gate 에 임의의 resolution 을 주면 Gate 만 풀리고 retry-once·mark-failed 어느 쪽도 타지 않는다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId = deps.getState().tasks[0].id
+    const s = deps.getState()
+    const g = createGate(
+      { ...s, tasks: s.tasks.map((t) => ({ ...t, status: 'validating' as const })) },
+      { taskId, question: 'q', kind: 'convergence-exhausted', options: ['retry-once', 'mark-failed'] },
+      NOW
+    )
+    if (!g.ok) throw new Error(g.error)
+    await deps.setState(g.state)
+    const r = await call(deps, 'gate-resolve', { id: g.value.id, resolution: 'give-up-for-now' })
+    expect(r.status).toBe(200)
+    expect(deps.onces).toEqual([])
+    expect(deps.getState().tasks[0].status).toBe('ready')
+  })
+  it('convergence Run 의 검증 실패 메시지는 --retry-of 를 말하지 않는다 (status 문구는 순수 층이 정한다)', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId = deps.getState().tasks[0].id
+    const ws = await call(deps, 'worker-start', { task: taskId, agent: 'claude', account: 'accA', worktree: 'current' })
+    const dispatchId = (ws.body as { dispatchId: string }).dispatchId
+    await call(deps, 'send', { type: 'worker_done', taskId, dispatchId, outcome: 'succeeded', subject: 's', body: 'b' }, 'sess1')
+    expect(deps.getState().tasks[0].status).toBe('validating')
+    // 검증 결과를 적용하는 것은 배선(ipc.ts 의 TaskValidator.onSettled)의 일이지 server.ts 의
+    // send 가 아니다 — 그 배선이 하는 것과 같은 단일 커밋(applyValidationResult -> setState)을
+    // 여기서 흉내내어, 실패가 실제로 메시지를 낸다는 것과 그 문구가 --retry-of 를 말하지 않는다는
+    // 것을 읽는다(순수 층 routeFailure 의 문구는 state.test.ts 가 다시 본다 — 이 테스트가 없으면
+    // "validating 에 도달했다" 만 확인하고 아무 메시지도 읽지 않은 채 통과해, 그 확인이 실제로는
+    // 아무것도 pin 하지 않았다).
+    const failing: CheckResult[] = [{ configId: 'c1', name: 'cfg', status: 'failed', exitCode: 1, outputTail: 'boom' }]
+    const repair = (await deps.repairTargetFor?.(taskId)) ?? undefined
+    const applied = applyValidationResult(deps.getState(), { taskId, results: failing, repair }, NOW)
+    if (!applied.ok) throw new Error(applied.error)
+    await deps.setState(applied.state)
+    const checked = await call(deps, 'check', {})
+    const body = checked.body as { messages: { subject: string; body: string }[] }
+    const msg = body.messages.find((m) => m.subject.startsWith('Checks failed'))
+    expect(msg).toBeDefined()
+    expect(msg!.body).not.toContain('--retry-of')
+    expect(msg!.body).toContain('The app is repairing this Task')
+  })
+  it('gate-resolve retry-once 는 repairOnce 를 부르고 mark-failed 는 failed 로 보낸다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId = deps.getState().tasks[0].id
+    // 소진 Gate 를 손으로 만든다 — 순수 층의 판정은 state.test.ts 가 본다
+    const s = deps.getState()
+    const g = createGate({ ...s, tasks: s.tasks.map((t) => ({ ...t, status: 'validating' as const, consecutiveFailures: 4 })) }, { taskId, question: 'q', kind: 'convergence-exhausted', options: ['retry-once', 'mark-failed'] }, NOW)
+    if (!g.ok) throw new Error(g.error)
+    await deps.setState(g.state)
+    const r = await call(deps, 'gate-resolve', { id: g.value.id, resolution: 'retry-once' })
+    expect(r.status).toBe(200)
+    expect(deps.onces).toEqual([taskId])
+
+    const deps2 = convDeps()
+    await call(deps2, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps2, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId2 = deps2.getState().tasks[0].id
+    const s2 = deps2.getState()
+    const g2 = createGate({ ...s2, tasks: s2.tasks.map((t) => ({ ...t, status: 'validating' as const })) }, { taskId: taskId2, question: 'q', kind: 'convergence-exhausted', options: ['retry-once', 'mark-failed'] }, NOW)
+    if (!g2.ok) throw new Error(g2.error)
+    await deps2.setState(g2.state)
+    await call(deps2, 'gate-resolve', { id: g2.value.id, resolution: 'mark-failed' })
+    expect(deps2.getState().tasks[0].status).toBe('failed')
+    expect(deps2.onces).toEqual([])
+  })
+  // 전체 브랜치 리뷰, Finding 5 — 이 Gate 를 retry-once 로 풀어도, 같은 Task 를 막는 두 번째 Gate가
+  // 여전히 열려 있으면(resolveGate 의 stillBlocked) repairOnce 의 openDispatch 는 "task is blocked
+  // by an open gate" 로 거절된다. 그 답이 조용히 사라지지 않고 200 응답에 남는다.
+  it('gate-resolve retry-once 는 두 번째 열린 Gate 가 여전히 막으면 그 사실을 응답에 남긴다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId = deps.getState().tasks[0].id
+    const s = deps.getState()
+    const exhausted = createGate(
+      { ...s, tasks: s.tasks.map((t) => ({ ...t, status: 'validating' as const })) },
+      { taskId, question: 'q1', kind: 'convergence-exhausted', options: ['retry-once', 'mark-failed'] },
+      NOW
+    )
+    if (!exhausted.ok) throw new Error(exhausted.error)
+    // 같은 Task 에 또 다른 Gate 를 하나 더 연다 — createGate 는 Task 가 이미 blocked 여도 이 자리에서
+    // 거절하지 않는다(Gate 는 taskId 로만 매인다); resolveGate 가 stillBlocked 로 두 번째 것을 본다.
+    const second = createGate(exhausted.state, { taskId, question: 'q2', kind: 'convergence-blocked' }, NOW)
+    if (!second.ok) throw new Error(second.error)
+    await deps.setState(second.state)
+    // repairOnce 자신은 real production 코드가 아니라 mock 이지만, 이 상황에서 실제 repairOnce 가
+    // 내는 답과 같은 모양(ok:false, error 포함)을 흉내 낸다 — server.ts 가 그 답을 어떻게 다루는지가
+    // 이 테스트의 관심사다.
+    deps.onceResult = { ok: false, error: 'task is blocked by an open gate: dsp_x' }
+    const r = await call(deps, 'gate-resolve', { id: exhausted.value.id, resolution: 'retry-once' })
+    expect(r.status).toBe(200)
+    expect(deps.onces).toEqual([taskId])
+    expect((r.body as { retryOnceFailed?: string }).retryOnceFailed).toContain('blocked by an open gate')
+  })
+  it('gate-resolve mark-failed 는 한 번의 커밋으로 끝난다 — resolveGate 가 남긴 ready 가 별도 커밋으로 보이지 않는다', async () => {
+    const deps = convDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', convergence: true })
+    await call(deps, 'task-create', { spec: 's', account: 'accA', validate: 'c1' })
+    const taskId = deps.getState().tasks[0].id
+    const s = deps.getState()
+    const g = createGate(
+      { ...s, tasks: s.tasks.map((t) => ({ ...t, status: 'validating' as const })) },
+      { taskId, question: 'q', kind: 'convergence-exhausted', options: ['retry-once', 'mark-failed'] },
+      NOW
+    )
+    if (!g.ok) throw new Error(g.error)
+    await deps.setState(g.state)
+    // resolveGate 는 blocked -> pending(그리고 deps 가 없으니 recomputeReady 가 ready 로) 을 이미
+    // 정한다 — mark-failed 가 그것을 별도의 setState 로 다시 덮으면, 그 사이 창에서 이 Task 가
+    // ready 로 한 번 보인다(autoDispatch Run 의 스케줄러가 집어 갈 수 있는 창). 이 테스트는 그
+    // 창이 실제로 없다는 것을 setState 호출을 가로채 확인한다.
+    const seen: string[] = []
+    const commit = deps.setState.bind(deps)
+    deps.setState = async (next) => {
+      const t = next.tasks.find((x) => x.id === taskId)
+      if (t) seen.push(t.status)
+      await commit(next)
+    }
+    await call(deps, 'gate-resolve', { id: g.value.id, resolution: 'mark-failed' })
+    expect(seen).toEqual(['failed'])
+  })
+})
+
+describe('jobs list / jobs get — 공개 표면이 내는 것', () => {
+  /** 계획 하나와 그 회차 둘 */
+  const twoRuns = async (): Promise<{ deps: OrchServerDeps & { state: OrchState }; jobId: string }> => {
+    const deps = makeDeps()
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    const jobId = (r.body as { id: string }).id
+    await call(deps, 'run-start', { run: jobId })
+    await call(deps, 'run-spawn', { run: jobId })
+    return { deps, jobId }
+  }
+
+  // **실제 CLI 로 돌려 보고서야 나온 것이다.** 옛 run-list 의 본문을 그대로 두고 이름만 바꾸면
+  // `jobs list` 가 회차를 낸다 — 공개 계약이 말하는 것과 다른 것이 나간다.
+  it('jobs list 는 계획을 낸다, 회차가 아니라', async () => {
+    const { deps, jobId } = await twoRuns()
+    const r = await call(deps, 'jobs-list')
+    expect(r.status).toBe(200)
+    expect((r.body as { id: string }[]).map((x) => x.id)).toEqual([jobId])
+  })
+
+  it('jobs get 은 계획을 내고 가장 최근 회차를 접어 싣는다', async () => {
+    const { deps, jobId } = await twoRuns()
+    const r = await call(deps, 'jobs-get', { id: jobId })
+    expect(r.status).toBe(200)
+    const body = r.body as { id: string; objective: string; run?: { ordinal: number } }
+    expect(body.id).toBe(jobId)
+    expect(body.objective).toBe('o')
+    expect(body.run?.ordinal).toBe(2)
+  })
+
+  // 코디네이터는 자기가 받은 회차의 id 를 준다 — 그때도 읽고 싶은 값(한도·수렴 정책)은 계획의 것이다
+  it('회차 id 를 줘도 그 계획을 내고, 지목한 회차를 싣는다', async () => {
+    const { deps, jobId } = await twoRuns()
+    const first = deps.getState().runs.find((x) => x.ordinal === 1)!
+    const r = await call(deps, 'jobs-get', { id: first.id })
+    expect(r.status).toBe(200)
+    const body = r.body as { id: string; run?: { id: string; ordinal: number } }
+    expect(body.id).toBe(jobId)
+    expect(body.run?.id).toBe(first.id)
+    expect(body.run?.ordinal).toBe(1)
+  })
+
+  it('없는 id 는 404 다', async () => {
+    const { deps } = await twoRuns()
+    expect((await call(deps, 'jobs-get', { id: 'nope' })).status).toBe(404)
+  })
+})
+
+describe('projects / runs / questions — 공개 읽기 표면', () => {
+  const withProject = (): OrchServerDeps & { state: OrchState } => {
+    const { state, project } = ensureProject(emptyState(), { path: 'D:/work/proj', now: NOW })
+    return { ...makeDeps(state), project } as OrchServerDeps & { state: OrchState; project: Project }
+  }
+
+  it('projects list 는 등록된 저장소를 낸다', async () => {
+    const deps = withProject()
+    const r = await call(deps, 'projects-list')
+    expect(r.status).toBe(200)
+    expect((r.body as Project[]).map((p) => p.name)).toEqual(['proj'])
+  })
+
+  it('projects get 은 id 로 하나를 낸다', async () => {
+    const deps = withProject()
+    const id = deps.getState().projects[0].id
+    expect(((await call(deps, 'projects-get', { id })).body as Project).path).toBe('D:/work/proj')
+    expect((await call(deps, 'projects-get', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'projects-get')).status).toBe(400)
+  })
+
+  // **셸에서 치는 쪽은 id 를 모르고 자기가 선 폴더를 안다.** win32 은 대소문자를 가리지 않고,
+  // 같은 저장소가 여러 철자로 들어온다 — 그래서 비교가 isSamePath 여야 한다.
+  //
+  // **철자는 이 플랫폼의 것으로 짓는다.** posix 에서 'd:\\work\\proj' 는 경로가 아니라 이름 하나이고
+  // 'D:/work/proj' 는 상대 경로라, 둘은 처음부터 다른 폴더다. 여기서 재는 것은 "같은 폴더의 다른
+  // 철자" 이지 win32 의 철자가 아니다 — posix 에서는 겹 구분자와 끝 구분자로 쓴다.
+  it('projects find 는 경로로 찾고, 철자가 달라도 같은 것으로 본다', async () => {
+    const win = process.platform === 'win32'
+    const { state } = ensureProject(emptyState(), { path: win ? 'D:/work/proj' : '/work/proj', now: NOW })
+    const deps = makeDeps(state)
+    const r = await call(deps, 'projects-find', { path: win ? 'd:\\work\\proj' : '/work//proj/' })
+    expect(r.status).toBe(200)
+    expect((r.body as Project).name).toBe('proj')
+    expect((await call(deps, 'projects-find', { path: win ? 'D:/other' : '/other' })).status).toBe(404)
+    expect((await call(deps, 'projects-find')).status).toBe(400)
+  })
+
+  const twoRuns = async (): Promise<{ deps: OrchServerDeps & { state: OrchState }; jobId: string }> => {
+    const deps = makeDeps()
+    // **run-create 는 예약이 아닐 때 회차를 돌려준다** — 옛 이름이 그랬고 코디네이터가 그 id 로
+    // 이어서 일한다. 계획의 id 는 상태에서 집는다.
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    await call(deps, 'run-spawn', { run: jobId })
+    return { deps, jobId }
+  }
+
+  // jobs list 가 계획을 내므로 회차를 볼 자리가 따로 있어야 한다 — 그 둘을 한 배열로 내던 것이
+  // 옛 run-list 다(공개 CLI 설계 §5).
+  it('runs list 는 회차를 번호순으로 낸다', async () => {
+    const { deps, jobId } = await twoRuns()
+    const r = await call(deps, 'runs-list')
+    expect(r.status).toBe(200)
+    expect((r.body as JobRun[]).map((x) => x.ordinal)).toEqual([1, 2])
+    expect((r.body as JobRun[]).every((x) => x.jobId === jobId)).toBe(true)
+  })
+
+  it('runs list --job 은 그 계획의 회차만 낸다', async () => {
+    const { deps } = await twoRuns()
+    await call(deps, 'run-create', { objective: 'other', cwd: 'D:/p' })
+    const otherId = deps.getState().jobs[1].id
+    const r = await call(deps, 'runs-list', { job: otherId })
+    expect((r.body as JobRun[]).map((x) => x.jobId)).toEqual([otherId])
+  })
+
+  it('runs get 은 id 로 회차 하나를 낸다', async () => {
+    const { deps } = await twoRuns()
+    const first = deps.getState().runs.find((x) => x.ordinal === 1)!
+    expect(((await call(deps, 'runs-get', { id: first.id })).body as JobRun).id).toBe(first.id)
+    expect((await call(deps, 'runs-get', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'runs-get')).status).toBe(400)
+  })
+
+  // **상태는 저장된 칸이 아니다** — Job 에도 JobRun 에도 없고, 그것이 거느린 Task 에 있다.
+  // 화면이 쓰는 함수를 그대로 쓴다 — 앱에서 보는 것과 셸에서 보는 것이 다르면 둘 중 하나는 거짓이다.
+  it('jobs list 와 runs list 는 상태와 진행을 싣는다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const a = await call(deps, 'task-create', { run: runId, title: 'a', spec: 's', account: 'acc1' })
+    await call(deps, 'task-create', { run: runId, title: 'b', spec: 's', account: 'acc1' })
+    await call(deps, 'task-update', { id: (a.body as { id: string }).id, status: 'completed' })
+
+    const jobs = (await call(deps, 'jobs-list')).body as Record<string, unknown>[]
+    expect(jobs[0]).toMatchObject({ outcome: 'running', progress: { done: 1, total: 2 }, questionsOpen: 0 })
+    const runs = (await call(deps, 'runs-list')).body as Record<string, unknown>[]
+    expect(runs[0]).toMatchObject({ outcome: 'running', progress: { done: 1, total: 2 } })
+  })
+
+  // 그것만이 사람을 기다리는 수이다 — 나머지 상태와 달리 사람이 답해야 움직인다
+  it('열린 질문을 그 회차의 것으로 센다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    await call(deps, 'gate-create', { task: (t.body as { id: string }).id, question: 'q' })
+    const jobs = (await call(deps, 'jobs-list')).body as Record<string, unknown>[]
+    expect(jobs[0].questionsOpen).toBe(1)
+    const runs = (await call(deps, 'runs-list')).body as Record<string, unknown>[]
+    expect(runs[0].questionsOpen).toBe(1)
+  })
+
+  // 한 응답 안에서 계획의 숫자와 접어 실은 회차가 다른 것을 말하면 안 된다
+  it('jobs get 은 접어 실은 그 회차의 숫자를 말한다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    const first = deps.getState().runs[0].id
+    await call(deps, 'task-create', { run: first, title: 'a', spec: 's', account: 'acc1' })
+    await call(deps, 'run-spawn', { run: jobId })
+
+    const r = await call(deps, 'jobs-get', { id: first })
+    const body = r.body as { progress: { total: number }; run: { id: string; progress: { total: number } } }
+    expect(body.run.id).toBe(first)
+    expect(body.progress.total).toBe(1)
+    expect(body.run.progress.total).toBe(1)
+  })
+
+  it('questions get 은 id 로 질문 하나를 낸다', async () => {
+    const deps = makeDeps()
+    const created = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    expect(created.status).toBe(200)
+    const task = await call(deps, 'task-create', {
+      run: runId,
+      title: 't',
+      spec: 's',
+      account: 'acc1'
+    })
+    const taskId = (task.body as { id: string }).id
+    const gate = await call(deps, 'gate-create', { task: taskId, question: '어느 쪽인가' })
+    const gateId = (gate.body as { id: string }).id
+    const r = await call(deps, 'questions-get', { id: gateId })
+    expect(r.status).toBe(200)
+    expect((r.body as { question: string }).question).toBe('어느 쪽인가')
+    expect((await call(deps, 'questions-get', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'questions-get')).status).toBe(400)
+  })
+})
+
+describe('jobs wait / runs wait', () => {
+  const seeded = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    jobId: string
+    runId: string
+    taskId: string
+  }> => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    return { deps, jobId, runId, taskId: (t.body as { id: string }).id }
+  }
+
+  it('일이 끝나면 completed 를 낸다', async () => {
+    const { deps, runId, taskId } = await seeded()
+    await call(deps, 'task-update', { id: taskId, status: 'completed' })
+    const r = await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ state: 'completed', runId, progress: { done: 1, total: 1 } })
+  })
+
+  // 열린 질문은 Task 가 전부 terminal 이어도 먼저다 — 스크립트가 먼저 알아야 하는 사실이다
+  it('열린 질문이 있으면 waiting 이고 그 id 를 싣는다', async () => {
+    const { deps, runId, taskId } = await seeded()
+    const g = await call(deps, 'gate-create', { task: taskId, question: 'q' })
+    const r = await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })
+    expect(r.body).toMatchObject({
+      state: 'waiting',
+      questionId: (g.body as { id: string }).id,
+      taskId
+    })
+  })
+
+  // 세워 둔 회차를 계속 기다리면 CI 가 한 시간을 조용히 매달린다.
+  // 멈춤은 예약에만 있다 — 보통 Job 은 멈출 발화가 없고, 그 워커를 멈추는 것은 worker-stop 의 일이다.
+  it('멈춰 둔 것도 끝이다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const jobId = deps.getState().jobs[0].id
+    await call(deps, 'run-spawn', { run: jobId })
+    const runId = deps.getState().runs[0].id
+    await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    expect((await call(deps, 'run-pause', { run: jobId })).status).toBe(200)
+    const r = await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })
+    expect(r.body).toMatchObject({ state: 'paused' })
+  })
+
+  // **손으로는 만들 수 없는 갈래다.** `task-update` 는 회로 카운터를 0 으로 되돌리므로
+  // (가이드 8절), 재시도가 소진된 failed 는 진짜 워커가 세 번 죽어야 나온다 — 그래서 상태를
+  // 직접 세워 덤는다. 재시도가 남은 failed 는 아직 끝이 아니다 — 그것까지 함께 재는다.
+  it('재시도가 소진된 실패만 failed 로 끝난다', async () => {
+    const { deps, runId } = await seeded()
+    const failWith = async (n: number): Promise<void> => {
+      const cur = deps.getState()
+      await deps.setState({
+        ...cur,
+        tasks: cur.tasks.map((t) =>
+          t.runId === runId ? { ...t, status: 'failed' as const, consecutiveFailures: n } : t
+        )
+      })
+    }
+    await failWith(FAILURE_LIMIT - 1)
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })).body).toMatchObject({
+      state: 'timeout'
+    })
+    await failWith(FAILURE_LIMIT)
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })).body).toMatchObject({
+      state: 'failed',
+      runId
+    })
+  })
+
+  it('마감에 닿으면 timeout 이고, 어디까지 왔는지를 싣는다', async () => {
+    const { deps, runId } = await seeded()
+    const r = await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })
+    expect(r.body).toMatchObject({ state: 'timeout', runId, progress: { done: 0, total: 1 } })
+  })
+
+  // `jobs run` 으로 돌리고 이어서 기다리는 것과 예약이 만든 회차를 잡는 것이 둘 다 되어야 한다
+  it('jobs wait 은 매 번 최신 회차를 다시 고른다', async () => {
+    const { deps, jobId, runId, taskId } = await seeded()
+    await call(deps, 'task-update', { id: taskId, status: 'completed' })
+    // 두 번째 회차를 만들면 그쪽이 최신이다 — 끝난 첫 회차를 들고 돌아오면 안 된다
+    await call(deps, 'run-spawn', { run: jobId })
+    const second = deps.getState().runs.find((r) => r.id !== runId)!
+    const r = await call(deps, 'jobs-wait', { id: jobId, timeoutMs: 120 })
+    expect(r.body).toMatchObject({ state: 'timeout', runId: second.id })
+  })
+
+  it('없는 id 는 404 이고, id 가 없으면 400 이다', async () => {
+    const { deps } = await seeded()
+    expect((await call(deps, 'runs-wait', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'jobs-wait', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'runs-wait')).status).toBe(400)
+  })
+
+  const waitingOnReset = async (resetsAt: string | undefined, resumed = false) => {
+    const { deps, runId, taskId } = await seeded()
+    const cur = deps.getState()
+    await deps.setState({
+      ...cur,
+      tasks: cur.tasks.map((t) => (t.id === taskId ? { ...t, status: 'dispatched' as const } : t)),
+      dispatches: [
+        ...cur.dispatches,
+        {
+          id: 'dsp_w', taskId, provider: 'claude' as const, accountId: 'acc1', sessionId: 's1', cwd: 'D:/p', specPath: 'D:/p/s.md',
+          startedAt: NOW, workerState: 'ready' as const, retained: false,
+          resumes: [{ stoppedAt: NOW, reason: 'waiting' as const, fromAccountId: 'acc1', ...(resetsAt ? { resetsAt } : {}), ...(resumed ? { resumedAt: NOW, toAccountId: 'acc1' } : {}) }]
+        }
+      ]
+    })
+    return { deps, runId }
+  }
+  it('ends limited, naming the reset, when every open worker waits for one (Q3)', async () => {
+    const { deps, runId } = await waitingOnReset('2026-09-25T15:00:00.000Z')
+    const r = await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })
+    expect(r.body).toMatchObject({ state: 'limited', runId, resetsAt: '2026-09-25T15:00:00.000Z' })
+  })
+  it('keeps waiting when the reset is unknown, or the stop already resumed', async () => {
+    const unknown = await waitingOnReset(undefined)
+    expect((await call(unknown.deps, 'runs-wait', { id: unknown.runId, timeoutMs: 120 })).body).toMatchObject({ state: 'timeout' })
+    const resumed = await waitingOnReset('2026-09-25T15:00:00.000Z', true)
+    expect((await call(resumed.deps, 'runs-wait', { id: resumed.runId, timeoutMs: 120 })).body).toMatchObject({ state: 'timeout' })
+  })
+  it('keeps waiting while another Task of the Run is ready to start', async () => {
+    const { deps, runId } = await waitingOnReset('2026-09-25T15:00:00.000Z')
+    await call(deps, 'task-create', { run: runId, title: 't2', spec: 's', account: 'acc1' })
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })).body).toMatchObject({ state: 'timeout' })
+  })
+  // S6 limits D2: the coordinator's own wait counts. NOW here is 2026-08-04T00:00Z.
+  const coordinatorStops = async (
+    deps: OrchServerDeps & { state: OrchState },
+    runId: string,
+    resetsAt: string | undefined
+  ): Promise<void> => {
+    const cur = deps.getState()
+    await deps.setState({
+      ...cur,
+      runs: cur.runs.map((r) =>
+        r.id === runId
+          ? { ...r, coordinatorSessionId: 'coord1', coordinatorStop: { since: NOW, ...(resetsAt ? { resetsAt } : {}) } }
+          : r
+      )
+    })
+  }
+  it('ends limited when the coordinator waits for a reset and the Run has no worker (S6 limits D2)', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    await coordinatorStops(deps, runId, '2026-08-04T03:00:00.000Z')
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })).body).toMatchObject({
+      state: 'limited',
+      runId,
+      resetsAt: '2026-08-04T03:00:00.000Z'
+    })
+    const jobId = deps.getState().jobs[0].id
+    expect((await call(deps, 'jobs-wait', { id: jobId, timeoutMs: 500 })).body).toMatchObject({ state: 'limited' })
+  })
+  it('keeps waiting on a coordinator stop with no known reset (a switch to another account)', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    await coordinatorStops(deps, runId, undefined)
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })).body).toMatchObject({ state: 'timeout' })
+  })
+  it('with a coordinator and a worker both waiting, names the earliest reset', async () => {
+    const workerFirst = await waitingOnReset('2026-08-04T02:00:00.000Z')
+    await coordinatorStops(workerFirst.deps, workerFirst.runId, '2026-08-04T03:00:00.000Z')
+    expect((await call(workerFirst.deps, 'runs-wait', { id: workerFirst.runId, timeoutMs: 500 })).body).toMatchObject({
+      state: 'limited',
+      resetsAt: '2026-08-04T02:00:00.000Z'
+    })
+    const coordinatorFirst = await waitingOnReset('2026-08-04T04:00:00.000Z')
+    await coordinatorStops(coordinatorFirst.deps, coordinatorFirst.runId, '2026-08-04T03:00:00.000Z')
+    expect((await call(coordinatorFirst.deps, 'runs-wait', { id: coordinatorFirst.runId, timeoutMs: 500 })).body).toMatchObject({
+      state: 'limited',
+      resetsAt: '2026-08-04T03:00:00.000Z'
+    })
+  })
+  it('keeps waiting while a worker works, however long the coordinator waits', async () => {
+    const working = await waitingOnReset('2026-08-04T02:00:00.000Z', true)
+    await coordinatorStops(working.deps, working.runId, '2026-08-04T03:00:00.000Z')
+    expect((await call(working.deps, 'runs-wait', { id: working.runId, timeoutMs: 120 })).body).toMatchObject({ state: 'timeout' })
+  })
+  // Only the stopped coordinator starts a ready Task of a Run the app does not drive: nothing moves.
+  it('a ready Task does not hold off limited when only the coordinator starts it, and does when the app drives the Run', async () => {
+    const { deps, runId, jobId } = await seeded()
+    expect(deps.getState().tasks[0].status).toBe('ready')
+    await coordinatorStops(deps, runId, '2026-08-04T03:00:00.000Z')
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })).body).toMatchObject({
+      state: 'limited',
+      resetsAt: '2026-08-04T03:00:00.000Z'
+    })
+    const cur = deps.getState()
+    await deps.setState({ ...cur, jobs: cur.jobs.map((j) => (j.id === jobId ? { ...j, autoDispatch: true } : j)) })
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })).body).toMatchObject({ state: 'timeout' })
+  })
+  // A clear that never came must not end every wait at once, forever.
+  it('ignores a coordinator stop whose reset is more than ten minutes past', async () => {
+    const stale = await seeded()
+    await coordinatorStops(stale.deps, stale.runId, '2026-08-03T23:49:00.000Z')
+    expect((await call(stale.deps, 'runs-wait', { id: stale.runId, timeoutMs: 120 })).body).toMatchObject({ state: 'timeout' })
+    const recent = await seeded()
+    await coordinatorStops(recent.deps, recent.runId, '2026-08-03T23:55:00.000Z')
+    expect((await call(recent.deps, 'runs-wait', { id: recent.runId, timeoutMs: 500 })).body).toMatchObject({ state: 'limited' })
+  })
+  // Final review I1: a finished Run keeps its coordinatorSessionId, so a coordinator that hits a limit
+  // after its closing summary must not turn the Run's real outcome into `limited`.
+  it('a finished Run ends with its outcome even while its coordinator waits for a reset', async () => {
+    const { deps, runId, jobId, taskId } = await seeded()
+    await call(deps, 'task-update', { id: taskId, status: 'completed' })
+    await coordinatorStops(deps, runId, '2026-08-04T03:00:00.000Z')
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })).body).toMatchObject({ state: 'completed', runId })
+    expect((await call(deps, 'jobs-wait', { id: jobId, timeoutMs: 500 })).body).toMatchObject({ state: 'completed' })
+  })
+  it('an open question still comes first', async () => {
+    const { deps, runId } = await waitingOnReset('2026-09-25T15:00:00.000Z')
+    // createGate refuses a Task with an open Dispatch (state.ts, A58), so the question is on a second Task.
+    const second = await call(deps, 'task-create', { run: runId, title: 't2', spec: 's', account: 'acc1' })
+    await call(deps, 'gate-create', { task: (second.body as { id: string }).id, question: 'q' })
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 500 })).body).toMatchObject({ state: 'waiting' })
+  })
+})
+
+describe('runs stop', () => {
+  const withWorker = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    runId: string
+    dispatchId: string
+  }> => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    const w = await call(deps, 'worker-start', {
+      task: (t.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1'
+    })
+    return { deps, runId, dispatchId: (w.body as { dispatchId: string }).dispatchId }
+  }
+
+  // Dispatch 만 닫으면 빈 자리에 다음 ready Task 가 곧바로 뜬다 — 멈췄다고 말해 놓고 계속 돈다
+  it('열린 워커를 닫고 회차를 세운다', async () => {
+    const { deps, runId, dispatchId } = await withWorker()
+    const r = await call(deps, 'runs-stop', { id: runId })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ runId, stopped: 1, paused: true })
+    const after = deps.getState()
+    expect(after.dispatches.find((d) => d.id === dispatchId)?.workerState).toBe('stopped')
+    expect(after.runs.find((x) => x.id === runId)?.paused).toBe(true)
+  })
+
+  // 되돌릴 수 있는 것이 이 명령이 stop 인 이유다 — run-resume 이 같은 칸을 푼다
+  it('멈춘 회차는 wait 에서 끝으로 나온다', async () => {
+    const { deps, runId } = await withWorker()
+    await call(deps, 'runs-stop', { id: runId })
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })).body).toMatchObject({
+      state: 'paused'
+    })
+  })
+
+  // 사람이 "이 세션을 살려 두어라" 고 말한 것이다. worker-stop 과 run-delete 가 같은 거절을 한다
+  it('붙잡아 둔 세션이 있으면 거절하고 푸는 법을 말한다', async () => {
+    const { deps, runId, dispatchId } = await withWorker()
+    await call(deps, 'worker-retain', { dispatch: dispatchId })
+    const r = await call(deps, 'runs-stop', { id: runId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain('worker-retain')
+    expect(deps.getState().runs.find((x) => x.id === runId)?.paused).toBeUndefined()
+  })
+
+  // **되돌릴 수 있다는 것이 stop 이라는 이름의 근거다.** 푸는 길이 없으면 그 이름이 거짓이 된다 —
+  // 기존 run-resume 은 예약(계획)의 것만 걷고 예약이 아닌 Job 을 거절한다.
+  it('runs resume 이 그것을 푸는 유일한 길이다', async () => {
+    const { deps, runId } = await withWorker()
+    await call(deps, 'runs-stop', { id: runId })
+    // 예약이 아니므로 계획 쪽 명령은 이것을 풀지 못한다
+    const jobId = deps.getState().runs.find((r) => r.id === runId)!.jobId
+    expect((await call(deps, 'run-resume', { run: jobId })).status).toBe(400)
+    expect(deps.getState().runs.find((r) => r.id === runId)?.paused).toBe(true)
+
+    expect((await call(deps, 'runs-resume', { id: runId })).status).toBe(200)
+    expect(deps.getState().runs.find((r) => r.id === runId)?.paused).toBeUndefined()
+    expect((await call(deps, 'runs-wait', { id: runId, timeoutMs: 120 })).body).toMatchObject({
+      state: 'timeout'
+    })
+  })
+
+  it('세우지 않은 것을 풀어도 말이 없다', async () => {
+    const { deps, runId } = await withWorker()
+    expect((await call(deps, 'runs-resume', { id: runId })).status).toBe(200)
+    // 순수 층의 `unknown …` 은 commit 이 404 로 가른다 — 없는 id 와 잘못된 인자는 다른 일이다
+    expect((await call(deps, 'runs-resume', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'runs-resume')).status).toBe(400)
+  })
+
+  it('열린 워커가 없어도 세운다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const r = await call(deps, 'runs-stop', { id: runId })
+    expect(r.body).toMatchObject({ runId, stopped: 0, paused: true })
+  })
+
+  it('없는 회차는 404, id 가 없으면 400 이다', async () => {
+    const deps = makeDeps()
+    expect((await call(deps, 'runs-stop', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'runs-stop')).status).toBe(400)
+  })
+})
+
+describe('jobs run / questions answer', () => {
+  // 새 이름이지 새 동작이 아니다 — 사이드바의 '실행' 과 다시 돌리기를 한 명령으로 묶는다
+  it('무장하지 않은 계획은 첫 회차를 만들며 시작한다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true })
+    const jobId = deps.getState().jobs[0].id
+    expect(deps.getState().jobs[0].pendingStart).toBe(true)
+    expect(deps.getState().runs.length).toBe(0)
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs[0].pendingStart).toBeUndefined()
+    expect(deps.getState().runs.length).toBe(1)
+    // **돌려주는 것은 언제나 회차다.** 실제로 계획 id 를 받아 `task-create --run` 에 넘겼더니
+    // Task 가 회차가 아니라 계획에 붙어 이번 회차에서는 아무 일도 하지 않았다.
+    expect((r.body as { id: string }).id).toBe(deps.getState().runs[0].id)
+    expect((r.body as { ordinal: number }).ordinal).toBe(1)
+  })
+
+  it('끝난 계획을 다시 돌리면 회차가 하나 늘어난다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    await call(deps, 'task-update', { id: (t.body as { id: string }).id, status: 'completed' })
+    const again = await call(deps, 'jobs-run', { id: jobId })
+    expect(again.status).toBe(200)
+    expect(deps.getState().runs.filter((r) => r.jobId === jobId).length).toBe(2)
+    expect((again.body as { ordinal: number }).ordinal).toBe(2)
+  })
+
+  // Task 15 (carry 4, R18, N7). **계정은 하나, 'accA' 뿐** — 두 테스트가 함께 쓴다.
+  const coordJobDeps = (): OrchServerDeps & {
+    state: OrchState
+    startCoordinator: ReturnType<typeof vi.fn>
+  } => {
+    const startCoordinator = vi.fn(async (a: { runId: string; brief: string }) => ({
+      sessionId: `coord-${a.runId}`
+    }))
+    return Object.assign(makeDeps(), {
+      listAccounts: () => [{ id: 'accA', label: 'A', provider: 'claude' as const }],
+      makeRunWorktree: async (a: { repoPath: string; name: string }) => `D:/wt/${a.name}`,
+      startCoordinator
+    }) as never
+  }
+  // Task 가 없는 회차는 outcomeOf 가 'running' 으로 읽는다(view.ts) — 하나 만들어 곧바로
+  // 끝내야 다음 `jobs run` 이 "이미 도는 중" 을 답하지 않는다.
+  const finishRun = async (deps: OrchServerDeps, runId: string): Promise<void> => {
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'accA' })
+    await call(deps, 'task-update', { id: (t.body as { id: string }).id, status: 'completed' })
+  }
+
+  it('코디네이터 계정이 있는 계획의 두 번째 jobs run 도 새 회차에 코디네이터를 띄운다 (carry 4)', async () => {
+    const deps = coordJobDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, coordinatorAccount: 'accA' })
+    const jobId = deps.getState().jobs[0].id
+    const first = await call(deps, 'jobs-run', { id: jobId })
+    expect(first.status).toBe(200)
+    const firstRunId = (first.body as { id: string }).id
+    await finishRun(deps, firstRunId)
+    const second = await call(deps, 'jobs-run', { id: jobId })
+    expect(second.status).toBe(200)
+    const secondRunId = (second.body as { id: string }).id
+    expect(secondRunId).not.toBe(firstRunId)
+    expect(deps.startCoordinator).toHaveBeenCalledTimes(2)
+    expect(deps.startCoordinator.mock.calls[1][0]).toMatchObject({ runId: secondRunId })
+    expect(deps.getState().runs.find((r) => r.id === secondRunId)?.coordinatorSessionId).toBe(
+      `coord-${secondRunId}`
+    )
+  })
+
+  // N7.
+  it('뒤 회차의 코디네이터가 못 뜨면 그 회차는 그대로 남고, 오류가 재시도 명령을 말한다', async () => {
+    const deps = coordJobDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, coordinatorAccount: 'accA' })
+    const jobId = deps.getState().jobs[0].id
+    const first = await call(deps, 'jobs-run', { id: jobId })
+    const firstRunId = (first.body as { id: string }).id
+    await finishRun(deps, firstRunId)
+
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(400)
+    const runs = deps.getState().runs.filter((x) => x.jobId === jobId)
+    expect(runs).toHaveLength(2)
+    expect(runs[1].coordinatorSessionId).toBeUndefined()
+    // The Run's own id (U1): `run-start` takes it as that Run's ▶, and a scheduled Job's id would only
+    // release its gate.
+    expect((r.body as { error: string }).error).toContain(`astera run-start --run ${runs[1].id}`)
+    // M6 (final review): one instruction. The reason given is the true one (final review I3): a run
+    // whose coordinator failed does not count as running, so `jobs run` again is not refused, and it
+    // would start another run beside this one.
+    expect((r.body as { error: string }).error).toContain('`jobs run` again would start another run beside this one')
+    expect((r.body as { error: string }).error).not.toMatch(/refused while/)
+    expect(r.body).toMatchObject({ jobId, runId: runs[1].id })
+    const beside = await call(deps, 'jobs-run', { id: jobId })
+    expect(beside.status).toBe(200)
+    expect(deps.getState().runs.filter((x) => x.jobId === jobId)).toHaveLength(3)
+
+    // 그 오류가 말하는 재시도가 실제로 이 회차를 다시 겨눈다
+    const again = await call(deps, 'run-start', { run: runs[1].id })
+    expect(again.status).toBe(200)
+    expect(deps.getState().runs.find((x) => x.id === runs[1].id)?.coordinatorSessionId).toBeDefined()
+  })
+
+  // "지금 돌려라" 는 한 회차를 지금 만들라는 말이지 "이 예약을 켜라" 가 아니다
+  it('예약은 무장을 건드리지 않고 한 회차만 만든다', async () => {
+    const deps = makeDeps()
+    // `--auto` 가 무장 게이트를 세운다(pendingStart) — 그것이 그대로 남는지를 보는 테스트다
+    await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const jobId = deps.getState().jobs[0].id
+    expect(deps.getState().jobs[0].pendingStart).toBe(true)
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(200)
+    expect((r.body as { ordinal: number }).ordinal).toBe(1)
+    expect(deps.getState().jobs[0].pendingStart).toBe(true)
+  })
+
+  // 한 계획에 두 회차가 동시에 도는 것을 손이 미끄러져 만들지 않게 한다. **무언가가 그 회차를 움직이고
+  // 있어야 도는 것이다**(fix round 1, C1): 여기서는 워커 하나가 그 Task 에서 일하는 중이다.
+  it('돌고 있는 것은 거절하고 무엇이 도는지 말한다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    await call(deps, 'worker-start', { task: (t.body as { id: string }).id, agent: 'codex', account: 'acc1', worktree: 'current' })
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain(runId)
+  })
+
+  // Task 1 review Minor 3: `limited` ends `runs wait`, but the Run still runs. It resumes by itself at
+  // the reset, so a cron `jobs run` in between must not start a second Run beside it.
+  it('a Run limited by its coordinator or its workers still counts as running', async () => {
+    const byCoordinator = makeDeps()
+    await call(byCoordinator, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = byCoordinator.getState().jobs[0].id
+    const runId = byCoordinator.getState().runs[0].id
+    const cur = byCoordinator.getState()
+    await byCoordinator.setState({
+      ...cur,
+      runs: cur.runs.map((r) => ({ ...r, coordinatorSessionId: 'coord1', coordinatorStop: { since: NOW, resetsAt: '2026-08-04T03:00:00.000Z' } }))
+    })
+    expect((await call(byCoordinator, 'runs-wait', { id: runId, timeoutMs: 500 })).body).toMatchObject({ state: 'limited' })
+    const r = await call(byCoordinator, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain(runId)
+    expect(byCoordinator.getState().runs).toHaveLength(1)
+    // A fire asks the same question (run-spawn --unless-running, the user's ruling of 2026-09-25).
+    const skipped = await call(byCoordinator, 'run-spawn', { run: jobId, unlessRunning: true })
+    expect(skipped.status).toBe(409)
+    expect(skipped.body).toMatchObject({ jobId, running: runId })
+    expect(byCoordinator.getState().runs).toHaveLength(1)
+
+    const byWorkers = makeDeps()
+    await call(byWorkers, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const wJob = byWorkers.getState().jobs[0].id
+    const wRun = byWorkers.getState().runs[0].id
+    const t = await call(byWorkers, 'task-create', { run: wRun, title: 't', spec: 's', account: 'acc1' })
+    const taskId = (t.body as { id: string }).id
+    const w = byWorkers.getState()
+    await byWorkers.setState({
+      ...w,
+      tasks: w.tasks.map((x) => (x.id === taskId ? { ...x, status: 'dispatched' as const } : x)),
+      dispatches: [
+        ...w.dispatches,
+        {
+          id: 'dsp_w', taskId, provider: 'claude' as const, accountId: 'acc1', sessionId: 's1', cwd: 'D:/p', specPath: 'D:/p/s.md',
+          startedAt: NOW, workerState: 'ready' as const, retained: false,
+          resumes: [{ stoppedAt: NOW, reason: 'waiting' as const, fromAccountId: 'acc1', resetsAt: '2026-08-04T03:00:00.000Z' }]
+        }
+      ]
+    })
+    expect((await call(byWorkers, 'runs-wait', { id: wRun, timeoutMs: 500 })).body).toMatchObject({ state: 'limited' })
+    expect((await call(byWorkers, 'jobs-run', { id: wJob })).status).toBe(409)
+    expect((await call(byWorkers, 'run-spawn', { run: wJob, unlessRunning: true })).status).toBe(409)
+    expect(byWorkers.getState().runs).toHaveLength(1)
+    // Without the flag run-spawn makes the run as before (jobs run's own later-run path checks first).
+    expect((await call(byWorkers, 'run-spawn', { run: wJob })).status).toBe(200)
+  })
+
+  // Final review I1: once every Task is terminal the Run is over, whatever its coordinator waits for.
+  it('a finished Run whose coordinator waits for a reset does not block the next run', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    await call(deps, 'task-update', { id: (t.body as { id: string }).id, status: 'completed' })
+    const cur = deps.getState()
+    await deps.setState({
+      ...cur,
+      runs: cur.runs.map((r) => ({ ...r, coordinatorSessionId: 'coord1', coordinatorStop: { since: NOW, resetsAt: '2026-08-04T03:00:00.000Z' } }))
+    })
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(200)
+    expect(deps.getState().runs).toHaveLength(2)
+  })
+
+  it('없는 계획은 404, id 가 없으면 400 이다', async () => {
+    const deps = makeDeps()
+    expect((await call(deps, 'jobs-run', { id: 'nope' })).status).toBe(404)
+    expect((await call(deps, 'jobs-run')).status).toBe(400)
+  })
+
+  it('questions answer 는 gate-resolve 와 같은 일을 한다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    const g = await call(deps, 'gate-create', {
+      task: (t.body as { id: string }).id,
+      question: 'q'
+    })
+    const gateId = (g.body as { id: string }).id
+    const r = await call(deps, 'questions-answer', { id: gateId, answer: 'A 로' })
+    expect(r.status).toBe(200)
+    expect((r.body as { status: string; resolution: string }).status).toBe('resolved')
+    expect((r.body as { resolution: string }).resolution).toBe('A 로')
+  })
+
+  it('답이 없으면 거절한다', async () => {
+    expect((await call(makeDeps(), 'questions-answer', { id: 'gat_x' })).status).toBe(400)
+  })
+})
+
+/**
+ * 공개 쓰기 표면 phase C — `jobs create`, `tasks add`, `accounts list`.
+ *
+ * 셸이 부르는 모양이다: 세션 id 가 비어 있고 워커가 아니다(run.ts 의 ASTERA_SESSION ?? '').
+ */
+describe('jobs create / tasks add / accounts list', () => {
+  const shell = (
+    deps: OrchServerDeps,
+    cmd: string,
+    args: Record<string, unknown> = {}
+  ): Promise<{ status: number; body: unknown }> => call(deps, cmd, args, '')
+
+  const jobOf = async (deps: ReturnType<typeof makeDeps>): Promise<string> => {
+    const r = await shell(deps, 'jobs-create', { objective: 'o', cwd: 'D:/p' })
+    return (r.body as { id: string }).id
+  }
+
+  // **언제나 계획부터다.** auto 없는 run-create 는 Task 가 하나도 없는 회차를 곧바로 돌린다 —
+  // 셸에서 치는 사람이 원하는 일이 아니다. 사이드바의 '새 작업' 이 보내는 것과 같은 모양이다.
+  it('jobs create 는 회차 없이 계획을 만들고 그 계획을 돌려준다', async () => {
+    const deps = makeDeps()
+    const r = await shell(deps, 'jobs-create', { objective: '무언가', cwd: 'D:/p', concurrency: 2 })
+    expect(r.status).toBe(200)
+    expect(deps.getState().jobs).toHaveLength(1)
+    expect(deps.getState().runs).toHaveLength(0)
+    const job = deps.getState().jobs[0]
+    expect(job).toMatchObject({ pendingStart: true, autoDispatch: true, concurrency: 2 })
+    // 계획이다, 회차가 아니라 — 그리고 jobs get 처럼 파생값을 싣는다
+    expect(r.body).toMatchObject({ id: job.id, objective: '무언가', pendingStart: true })
+    expect(r.body).toHaveProperty('outcome')
+    expect(r.body).toHaveProperty('progress')
+    expect(r.body).toHaveProperty('questionsOpen', 0)
+    expect(r.body).not.toHaveProperty('ordinal')
+  })
+
+  it('jobs create 는 run-create 의 검증을 그대로 쓴다', async () => {
+    const deps = makeDeps()
+    expect((await shell(deps, 'jobs-create', { cwd: 'D:/p' })).status).toBe(400)
+    expect(
+      (await shell(deps, 'jobs-create', { objective: 'o', cwd: 'D:/p', coordinatorAccount: 'nope' })).status
+    ).toBe(404)
+    expect(
+      (await shell(deps, 'jobs-create', { objective: 'o', cwd: 'D:/p', maxFixAttempts: '2' })).status
+    ).toBe(400)
+    const ok = await shell(deps, 'jobs-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      coordinatorAccount: 'acc1',
+      convergence: true,
+      maxFixAttempts: '2'
+    })
+    expect(ok.status).toBe(200)
+    expect(ok.body).toMatchObject({ coordinatorAccountId: 'acc1', convergence: { maxFixAttempts: 2 } })
+    expect(deps.getState().runs).toHaveLength(0)
+  })
+
+  it('tasks add --job 은 정의 Task 를 만든다', async () => {
+    const deps = makeDeps()
+    const jobId = await jobOf(deps)
+    const r = await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'acc1' })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ jobId, title: 's' })
+    expect(r.body).not.toHaveProperty('runId')
+  })
+
+  it('tasks add --run 은 그 회차에 붙인다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const r = await shell(deps, 'tasks-add', { run: runId, spec: 's', account: 'acc1', review: true })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ runId, reviewRequested: true })
+    expect(r.body).not.toHaveProperty('jobId')
+  })
+
+  // **최신 회차로 기본값을 두지 않는다** — task-create 의 기본값은 남의 회차에 떨어질 수 있다.
+  it('--job 과 --run 은 정확히 하나다', async () => {
+    const deps = makeDeps()
+    const jobId = await jobOf(deps)
+    await call(deps, 'run-create', { objective: 'o2', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const neither = await shell(deps, 'tasks-add', { spec: 's', account: 'acc1' })
+    expect(neither.status).toBe(400)
+    const both = await shell(deps, 'tasks-add', { job: jobId, run: runId, spec: 's', account: 'acc1' })
+    expect(both.status).toBe(400)
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  // **친 플래그로 센다, 값으로가 아니라.** `--job --run r1` 은 `job: true` 로 오는데 값으로 세면
+  // `--run` 하나만 준 것이 되어 부른 사람이 적은 `--job` 이 조용히 사라진다.
+  it('값 없이 친 --job·--run 도 친 것이다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const both = await shell(deps, 'tasks-add', { job: true, run: runId, spec: 's', account: 'acc1' })
+    expect(both.status).toBe(400)
+    const empty = await shell(deps, 'tasks-add', { job: '', spec: 's', account: 'acc1' })
+    expect(empty.status).toBe(400)
+    expect(JSON.stringify(empty.body)).toContain('--job needs a value')
+    const bare = await shell(deps, 'tasks-add', { run: true, spec: 's', account: 'acc1' })
+    expect(bare.status).toBe(400)
+    expect(JSON.stringify(bare.body)).toContain('--run needs a value')
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  // **다른 종류의 id 는 그 플래그의 종류로 없는 것이다** — 조용히 다른 일을 하지 않는다.
+  it('--job 에 회차 id, --run 에 계획 id 는 404 다', async () => {
+    const deps = makeDeps()
+    const jobId = await jobOf(deps)
+    await call(deps, 'run-create', { objective: 'o2', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const wrongJob = await shell(deps, 'tasks-add', { job: runId, spec: 's', account: 'acc1' })
+    expect(wrongJob.status).toBe(404)
+    expect(JSON.stringify(wrongJob.body)).toContain(`unknown job: ${runId}`)
+    const wrongRun = await shell(deps, 'tasks-add', { run: jobId, spec: 's', account: 'acc1' })
+    expect(wrongRun.status).toBe(404)
+    expect(JSON.stringify(wrongRun.body)).toContain(`unknown run: ${jobId}`)
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  // `--run-id` 는 task-create 가 받는 옛 철자다. 그것이 `--job` 을 이기면 정확히 하나의 규칙이 샌다.
+  it('--run-id 가 --job 을 넘어 회차로 새지 않는다', async () => {
+    const deps = makeDeps()
+    const jobId = await jobOf(deps)
+    await call(deps, 'run-create', { objective: 'o2', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const r = await shell(deps, 'tasks-add', { job: jobId, runId, spec: 's', account: 'acc1' })
+    expect(r.status).toBe(400)
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  it('없는 계정·deps·parent 는 404, 없는 spec·account 는 400 이다', async () => {
+    const deps = makeDeps()
+    const jobId = await jobOf(deps)
+    expect((await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'nope' })).status).toBe(404)
+    expect(
+      (await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'acc1', deps: ['tsk_x'] })).status
+    ).toBe(404)
+    expect(
+      (await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'acc1', parent: 'tsk_x' })).status
+    ).toBe(404)
+    expect((await shell(deps, 'tasks-add', { job: jobId, account: 'acc1' })).status).toBe(400)
+    expect((await shell(deps, 'tasks-add', { job: jobId, spec: 's' })).status).toBe(400)
+  })
+
+  // phase D: 검사 구성 id 는 `run-configs list --job` 이 준다. 그 목록은 계획의 폴더의 것이다 —
+  // 코디네이터용 `run-configs` 처럼 "가장 최근 회차" 의 것이 아니다.
+  const withConfigs = (): { deps: ReturnType<typeof makeDeps>; asked: string[] } => {
+    const asked: string[] = []
+    const deps = makeDeps()
+    deps.listRunConfigs = async (p) => {
+      asked.push(p)
+      return p === 'D:/p'
+        ? [
+            { id: 'cfg1', name: 'test', type: 'npm' },
+            { id: 'cfg2', name: 'lint', type: 'npm' }
+          ]
+        : [{ id: 'other', name: 'other', type: 'npm' }]
+    }
+    return { deps, asked }
+  }
+
+  it('run-configs list --job 은 그 계획의 폴더의 구성이다, 가장 최근 회차의 것이 아니라', async () => {
+    const { deps, asked } = withConfigs()
+    const jobId = await jobOf(deps)
+    await call(deps, 'run-create', { objective: 'later', cwd: 'D:/q' }) // 더 최근 회차, 다른 폴더
+    const r = await shell(deps, 'run-configs-list', { job: jobId })
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual([
+      { id: 'cfg1', name: 'test', type: 'npm' },
+      { id: 'cfg2', name: 'lint', type: 'npm' }
+    ])
+    expect(asked).toEqual(['D:/p'])
+  })
+
+  it('run-configs list 는 없는 계획에 404, --job 이 없으면 400 이다', async () => {
+    const { deps, asked } = withConfigs()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const missing = await shell(deps, 'run-configs-list', { job: 'job_nope' })
+    expect(missing.status).toBe(404)
+    expect(JSON.stringify(missing.body)).toContain('unknown job: job_nope')
+    // 회차 id 는 계획 id 가 아니다 — tasks add 의 --job 과 같은 규칙이다
+    expect((await shell(deps, 'run-configs-list', { job: runId })).status).toBe(404)
+    expect((await shell(deps, 'run-configs-list', {})).status).toBe(400)
+    expect((await shell(deps, 'run-configs-list', { job: true })).status).toBe(400)
+    expect(asked).toEqual([])
+  })
+
+  it('tasks add --validate 는 그 계획의 구성 id 를 받아 Task 에 싣는다 — --job 과 --run 둘 다', async () => {
+    const { deps, asked } = withConfigs()
+    const jobId = await jobOf(deps)
+    const byJob = await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'acc1', validate: 'cfg1,cfg2' })
+    expect(byJob.status).toBe(200)
+    expect(byJob.body).toMatchObject({ jobId, validateConfigIds: ['cfg1', 'cfg2'] })
+    const ran = await shell(deps, 'jobs-run', { id: jobId })
+    const runId = (ran.body as { id: string }).id
+    const byRun = await shell(deps, 'tasks-add', { run: runId, spec: 's2', account: 'acc1', validate: 'cfg2' })
+    expect(byRun.status).toBe(200)
+    expect(byRun.body).toMatchObject({ runId, validateConfigIds: ['cfg2'] })
+    expect(asked).toEqual(['D:/p', 'D:/p'])
+  })
+
+  it('tasks add --validate 에 없는 구성 id 는 404 이고 계획 id 를 싣는다 — Task 는 생기지 않는다', async () => {
+    const { deps } = withConfigs()
+    const jobId = await jobOf(deps)
+    const r = await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'acc1', validate: 'cfg1,other' })
+    expect(r.status).toBe(404)
+    expect(JSON.stringify(r.body)).toContain('unknown run configuration: other')
+    // nextSteps 의 `run-configs list --job <jobId>` 를 채우는 값이다(cliOutput)
+    expect(r.body).toMatchObject({ jobId })
+    expect(deps.getState().tasks).toHaveLength(0)
+    // 빈 칸은 task-create 와 같은 400 이다 — 목록을 묻기 전에
+    const empty = await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'acc1', validate: 'cfg1,,cfg2' })
+    expect(empty.status).toBe(400)
+    expect((await shell(deps, 'tasks-add', { job: jobId, spec: 's', account: 'acc1', validate: true })).status).toBe(400)
+    expect(deps.getState().tasks).toHaveLength(0)
+  })
+
+  // 정의 Task 는 jobs run 이 회차로 베낀다 — deps 도 새 id 로 다시 이어진다(startJobRun).
+  it('tasks add --job 두 개 뒤의 jobs run 은 둘을 회차로 베낀다', async () => {
+    const deps = makeDeps()
+    const jobId = await jobOf(deps)
+    const a = await shell(deps, 'tasks-add', { job: jobId, spec: 'first', account: 'acc1' })
+    const aId = (a.body as { id: string }).id
+    const b = await shell(deps, 'tasks-add', { job: jobId, spec: 'second', account: 'acc1', deps: [aId] })
+    expect(b.status).toBe(200)
+    expect(deps.getState().runs).toHaveLength(0)
+    const ran = await shell(deps, 'jobs-run', { id: jobId })
+    expect(ran.status).toBe(200)
+    const runId = (ran.body as { id: string }).id
+    const copies = deps.getState().tasks.filter((t) => t.runId === runId)
+    expect(copies.map((t) => t.spec).sort()).toEqual(['first', 'second'])
+    const first = copies.find((t) => t.spec === 'first')!
+    const second = copies.find((t) => t.spec === 'second')!
+    expect(second.deps).toEqual([first.id])
+  })
+
+  it('accounts list 는 accounts 와 같은 목록이고 --agent 로 거른다', async () => {
+    const seen: (string | undefined)[] = []
+    const deps = {
+      ...makeDeps(),
+      listAccounts: (p?: string) => {
+        seen.push(p)
+        return [{ id: 'acc1', label: '계정1', provider: 'codex' as const }]
+      }
+    }
+    const r = await shell(deps, 'accounts-list', {})
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual([{ id: 'acc1', label: '계정1', provider: 'codex' }])
+    await shell(deps, 'accounts-list', { agent: 'claude' })
+    expect(seen).toEqual([undefined, 'claude'])
+  })
+
+  // 워커는 계획도 Task 도 만들 수 없다 — 안에서 부르는 run-create·task-create 의 경계가 그대로 선다.
+  it('워커 세션은 jobs create 와 tasks add 를 부를 수 없다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, spec: 's', account: 'acc1' })
+    await call(deps, 'worker-start', {
+      task: (t.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    const job = await call(deps, 'jobs-create', { objective: 'x', cwd: 'D:/p' }, 'sess1')
+    expect(job.status).toBe(403)
+    const add = await call(deps, 'tasks-add', { run: runId, spec: 's', account: 'acc1' }, 'sess1')
+    expect(add.status).toBe(403)
+  })
+})
+
+/**
+ * `sessions list / read / send` (CLI phase C). 답은 Host 의 레지스트리가 준다 — 여기서는 그 셋을
+ * 가짜로 주입한다. id 는 앱의 세션 id(`ASTERA_SESSION`)이고, 어느 pty 인지, 화면을 어떻게 그리는지,
+ * Enter 를 언제 치는지는 Host 쪽 일이다(host/sessions.ts 와 그 테스트).
+ */
+describe('sessions list / read / send', () => {
+  const withSessions = (
+    listed: HostSession[],
+    screen: SessionScreen = { cols: 80, rows: 24, screen: ['D:\\p>echo hi', 'hi'], scrollback: ['older'] }
+  ): {
+    deps: OrchServerDeps
+    reads: Array<[string, number]>
+    sent: Array<[string, string, boolean]>
+    chatReads: Array<[string, number]>
+    chatSent: Array<[string, string]>
+  } => {
+    const reads: Array<[string, number]> = []
+    const sent: Array<[string, string, boolean]> = []
+    const chatReads: Array<[string, number]> = []
+    const chatSent: Array<[string, string]> = []
+    return {
+      reads,
+      sent,
+      chatReads,
+      chatSent,
+      deps: {
+        ...makeDeps(),
+        listSessions: async () => listed,
+        readSession: async (id, lines) => {
+          reads.push([id, lines])
+          return screen
+        },
+        sendSession: async (id, text, enter) => {
+          sent.push([id, text, enter])
+        },
+        readChat: async (id, turns) => {
+          chatReads.push([id, turns])
+          return [{ role: 'user', text: '안녕', tools: [] }]
+        },
+        chatSend: async (id, text) => {
+          chatSent.push([id, text])
+          return { sent: true }
+        }
+      }
+    }
+  }
+  const term: HostSession = { id: 'ses-1', kind: 'terminal', title: 'repo', accountId: 'acc1', cwd: 'D:/p', alive: true, state: 'waiting' }
+  const chat: HostSession = { id: 'chat-1', kind: 'chat', title: '대화', accountId: 'acc1', cwd: 'D:/p', alive: true, state: 'unknown' }
+
+  it('sessions list 는 Host 가 준 목록 그대로다', async () => {
+    const { deps } = withSessions([term, chat])
+    const r = await call(deps, 'sessions-list', {}, '')
+    expect(r).toEqual({ status: 200, body: [term, chat] })
+  })
+
+  // 앱 안의 명령 층은 레지스트리를 쥐고 있지 않다 — 거기서 닿으면 없는 것이 아니라 "여기서는 못 한다".
+  it('레지스트리가 주입되지 않은 층에서는 409 다', async () => {
+    for (const cmd of ['sessions-list', 'sessions-read', 'sessions-send'])
+      expect((await call(makeDeps(), cmd, { id: 'ses-1', text: 'x' }, '')).status, cmd).toBe(409)
+  })
+
+  it('sessions read 는 Host 가 그린 화면과 그 위의 줄들을 싣는다', async () => {
+    const { deps, reads } = withSessions([term])
+    const r = await call(deps, 'sessions-read', { id: 'ses-1', lines: '5' }, '')
+    expect(r).toEqual({
+      status: 200,
+      body: { id: 'ses-1', kind: 'terminal', alive: true, cols: 80, rows: 24, screen: ['D:\\p>echo hi', 'hi'], scrollback: ['older'] }
+    })
+    expect(reads).toEqual([['ses-1', 5]])
+  })
+
+  it('--lines 의 기본은 200 이고, 숫자로 와도 같다', async () => {
+    const { deps, reads } = withSessions([term])
+    await call(deps, 'sessions-read', { id: 'ses-1' }, '')
+    await call(deps, 'sessions-read', { id: 'ses-1', lines: 7 }, '')
+    expect(reads).toEqual([
+      ['ses-1', 200],
+      ['ses-1', 7]
+    ])
+  })
+
+  it('--lines 가 1 이상의 정수가 아니면 400 이다', async () => {
+    const { deps, reads } = withSessions([term])
+    for (const lines of ['0', '-1', 'x', '1.5', true])
+      expect((await call(deps, 'sessions-read', { id: 'ses-1', lines }, '')).status, String(lines)).toBe(400)
+    expect(reads).toEqual([])
+  })
+
+  // 에뮬레이터는 --lines 만큼 줄을 잡아 둔다. 상한이 없으면 한 번의 read 가 모든 세션을 쥔 Host 를
+  // 수백 MB 부풀린다(검토에서 1,000,000 으로 약 512 MB 를 쟀다). Host 가 세션마다 쥐는 출력이
+  // 256,000 자라 10,000 줄이면 남는다.
+  it('--lines 는 10000 까지다 — 넘으면 400 이고 Host 에 닿지 않는다', async () => {
+    const { deps, reads } = withSessions([term])
+    expect((await call(deps, 'sessions-read', { id: 'ses-1', lines: '10001' }, '')).status).toBe(400)
+    expect(reads).toEqual([])
+    expect((await call(deps, 'sessions-read', { id: 'ses-1', lines: '10000' }, '')).status).toBe(200)
+  })
+
+  it('없는 id 는 404, 없는 --id 는 400 이다', async () => {
+    const { deps, reads, sent } = withSessions([term])
+    const missing = await call(deps, 'sessions-read', { id: 'nope' }, '')
+    expect(missing.status).toBe(404)
+    expect(JSON.stringify(missing.body)).toContain('unknown session: nope')
+    expect((await call(deps, 'sessions-send', { id: 'nope', text: 'x' }, '')).status).toBe(404)
+    expect((await call(deps, 'sessions-read', {}, '')).status).toBe(400)
+    expect((await call(deps, 'sessions-send', { text: 'x' }, '')).status).toBe(400)
+    expect([reads, sent]).toEqual([[], []])
+  })
+
+  // 대화 세션은 화면이 아니라 턴이다(CLI phase D4). 읽는 것은 Host 가 대화 화면의 그 파일에서 한다.
+  it('대화 세션의 read 는 턴을 싣는다 — --turns 의 기본은 20 이다', async () => {
+    const { deps, chatReads, reads } = withSessions([chat])
+    expect(await call(deps, 'sessions-read', { id: 'chat-1' }, '')).toEqual({
+      status: 200,
+      body: { id: 'chat-1', kind: 'chat', alive: true, turns: [{ role: 'user', text: '안녕', tools: [] }] }
+    })
+    await call(deps, 'sessions-read', { id: 'chat-1', turns: '5' }, '')
+    await call(deps, 'sessions-read', { id: 'chat-1', turns: 200 }, '')
+    expect(chatReads).toEqual([
+      ['chat-1', 20],
+      ['chat-1', 5],
+      ['chat-1', 200]
+    ])
+    expect(reads).toEqual([])
+  })
+
+  it('--turns 는 1 이상 200 이하의 정수다 — 아니면 400 이고 Host 에 닿지 않는다', async () => {
+    const { deps, chatReads } = withSessions([chat])
+    for (const turns of ['0', '-1', 'x', '1.5', true, '201'])
+      expect((await call(deps, 'sessions-read', { id: 'chat-1', turns }, '')).status, String(turns)).toBe(400)
+    expect(chatReads).toEqual([])
+  })
+
+  // 한 명령에 두 모양이 있고, 각 플래그는 한쪽에만 뜻이 있다. 조용히 무시하면 사람이 준 것이 안
+  // 먹은 줄 모른다.
+  it('맞지 않는 쪽의 플래그는 400 이다 — 대화에 --lines, 터미널에 --turns, 대화에 --no-enter', async () => {
+    const { deps, reads, chatReads, sent, chatSent } = withSessions([term, chat])
+    const lines = await call(deps, 'sessions-read', { id: 'chat-1', lines: '5' }, '')
+    expect(lines.status).toBe(400)
+    expect(JSON.stringify(lines.body)).toMatch(/--lines .*terminal/)
+    const turns = await call(deps, 'sessions-read', { id: 'ses-1', turns: '5' }, '')
+    expect(turns.status).toBe(400)
+    expect(JSON.stringify(turns.body)).toMatch(/--turns .*chat/)
+    const noEnter = await call(deps, 'sessions-send', { id: 'chat-1', text: 'x', noEnter: true }, '')
+    expect(noEnter.status).toBe(400)
+    expect(JSON.stringify(noEnter.body)).toMatch(/--no-enter .*terminal/)
+    expect([reads, chatReads, sent, chatSent]).toEqual([[], [], [], []])
+  })
+
+  // 카드는 앱만 본다. 앱이 답했을 때만 칸이 있다 — 없음(null)과 볼 수 없음(칸 없음)은 다른 말이다.
+  it('pending 은 앱이 답했을 때만 있다', async () => {
+    const { deps } = withSessions([chat])
+    const read = async (chatPending: OrchServerDeps['chatPending']) =>
+      (await call({ ...deps, chatPending }, 'sessions-read', { id: 'chat-1' }, '')).body as Record<string, unknown>
+    expect(await read(async () => ({ kind: 'approval', summary: 'Bash: npm test' }))).toMatchObject({
+      pending: { kind: 'approval', summary: 'Bash: npm test' }
+    })
+    expect(await read(async () => null)).toMatchObject({ pending: null })
+    // Host 가 앱에 묻지 못했다(orchDeps 의 DEGRADES) — 칸을 싣지 않는다.
+    expect('pending' in (await read(async () => undefined))).toBe(false)
+    expect('pending' in (await read(undefined))).toBe(false)
+  })
+
+  it('대화 세션의 send 는 chatSend 로 넘긴다 — Enter 는 없다', async () => {
+    const { deps, chatSent, sent } = withSessions([chat])
+    expect(await call(deps, 'sessions-send', { id: 'chat-1', text: '다음' }, '')).toEqual({
+      status: 200,
+      body: { id: 'chat-1', sent: true }
+    })
+    expect(chatSent).toEqual([['chat-1', '다음']])
+    expect(sent).toEqual([])
+  })
+
+  // 카드에 답하는 것은 앱에서 사람이 할 일이다. send 로 답하지 않고 무엇이 열렸는지 말한다(R4.3).
+  it('앱이 카드가 열렸다고 하면 409 이고, 그 카드를 이름으로 말한다', async () => {
+    const { deps } = withSessions([chat])
+    const r = await call(
+      { ...deps, chatSend: async () => ({ sent: false, pending: { kind: 'approval', summary: 'Bash: rm -rf out' } }) },
+      'sessions-send',
+      { id: 'chat-1', text: 'x' },
+      ''
+    )
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toMatch(/waiting on an approval: Bash: rm -rf out.*Astera/)
+    const q = await call(
+      { ...deps, chatSend: async () => ({ sent: false, pending: { kind: 'question', summary: '어느 쪽?' } }) },
+      'sessions-send',
+      { id: 'chat-1', text: 'x' },
+      ''
+    )
+    expect(JSON.stringify(q.body)).toMatch(/waiting on a question: 어느 쪽\?/)
+  })
+
+  // 앱이 붙어 있지만 그 세션을 아직 되찾지 않았다(재접속 중) — 지금 상태 때문이니 6 이다(M2).
+  it('앱이 세션을 아직 쥐지 않았다고 하면 409 이고 잠시 뒤 다시 하라고 말한다', async () => {
+    const { deps } = withSessions([chat])
+    const r = await call({ ...deps, chatSend: async () => ({ sent: false, reason: 'not-held' }) }, 'sessions-send', { id: 'chat-1', text: 'x' }, '')
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toMatch(/Astera .*chat-1.*try again in a moment/)
+  })
+
+  it('끝난 대화 세션에는 치지 않는다 — 409 다', async () => {
+    const { deps, chatSent } = withSessions([{ ...chat, alive: false }])
+    const r = await call(deps, 'sessions-send', { id: 'chat-1', text: 'x' }, '')
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toMatch(/has ended/)
+    expect(chatSent).toEqual([])
+  })
+
+  // 붙여 넣고 Enter 를 치는 약속과 그 150ms 는 Host 가 지킨다(host/sessions.ts 의 sendSession).
+  it('sessions send 는 Enter 와 함께, --no-enter 는 Enter 없이 넘긴다', async () => {
+    const { deps, sent } = withSessions([term])
+    expect(await call(deps, 'sessions-send', { id: 'ses-1', text: 'echo hi' }, '')).toEqual({
+      status: 200,
+      body: { id: 'ses-1', sent: true, enter: true }
+    })
+    expect(await call(deps, 'sessions-send', { id: 'ses-1', text: 'draft', noEnter: true }, '')).toEqual({
+      status: 200,
+      body: { id: 'ses-1', sent: true, enter: false }
+    })
+    expect(sent).toEqual([
+      ['ses-1', 'echo hi', true],
+      ['ses-1', 'draft', false]
+    ])
+  })
+
+  it('끝난 세션에는 치지 않는다 — 409 다', async () => {
+    const { deps, sent } = withSessions([{ ...term, alive: false }])
+    const r = await call(deps, 'sessions-send', { id: 'ses-1', text: 'x' }, '')
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toMatch(/has ended/)
+    expect(sent).toEqual([])
+  })
+
+  it('--text 가 없거나 비었으면 400 이다', async () => {
+    const { deps, sent } = withSessions([term])
+    for (const text of [undefined, '', true])
+      expect((await call(deps, 'sessions-send', { id: 'ses-1', text }, '')).status, String(text)).toBe(400)
+    expect(sent).toEqual([])
+  })
+
+  // **사용자 결정: 누구든 부를 수 있다** — 워커 세션도. COORDINATOR_ONLY 에 넣지 않았다.
+  it('워커 세션도 세 명령을 다 부를 수 있다', async () => {
+    const { deps, sent } = withSessions([term])
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, spec: 's', account: 'acc1' })
+    await call(deps, 'worker-start', {
+      task: (t.body as { id: string }).id,
+      agent: 'codex',
+      account: 'acc1',
+      worktree: 'current'
+    })
+    expect((await call(deps, 'sessions-list', {}, 'sess1')).status).toBe(200)
+    expect((await call(deps, 'sessions-read', { id: 'ses-1' }, 'sess1')).status).toBe(200)
+    expect((await call(deps, 'sessions-send', { id: 'ses-1', text: 'x', noEnter: true }, 'sess1')).status).toBe(200)
+    expect(sent).toEqual([['ses-1', 'x', false]])
+  })
+})
+
+/**
+ * **적은 id 가 없으면 어느 명령에서든 404(4) 다.** 없는 id 가 호출자에게 가는 길이 셋이었다 — 직접
+ * `notFound`, `commit()` 의 옮김, 그리고 순수 층의 거절을 `bad()` 로 내보내는 자리들. 마지막 길에서만
+ * 같은 사실이 400(2) 으로 끝나, 4 를 보는 스크립트가 그것을 영영 못 봤다. 반대쪽도 여기서 고정한다:
+ * **있는 것을 적었는데 그 뒤가 어긋난 것은 400 그대로다.**
+ */
+describe('없는 id 는 404 — 순수 층의 거절을 내보내던 자리들', () => {
+  const seedDispatch = async (): Promise<{
+    deps: ReturnType<typeof makeDeps>
+    taskId: string
+    dispatchId: string
+  }> => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, spec: 's', account: 'acc1' })
+    const taskId = (t.body as { id: string }).id
+    const ws = await call(deps, 'worker-start', { task: taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    const dispatchId = (ws.body as { dispatchId: string }).dispatchId
+    return { deps, taskId, dispatchId }
+  }
+  const dropTask = async (deps: ReturnType<typeof makeDeps>, taskId: string): Promise<void> => {
+    const s = deps.getState()
+    await deps.setState({ ...s, tasks: s.tasks.filter((t) => t.id !== taskId) })
+  }
+  const done = (taskId: string, dispatchId: string): Record<string, unknown> => ({
+    type: 'worker_done',
+    taskId,
+    dispatchId,
+    outcome: 'succeeded',
+    subject: 's',
+    body: 'b'
+  })
+
+  // 공개 증상 그 자체다: `astera questions answer --id <없는 id>` 가 2 로 끝났다
+  it('없는 질문에 답하면 404 다 — questions answer 와 gate-resolve 둘 다', async () => {
+    const deps = makeDeps()
+    const a = await call(deps, 'questions-answer', { id: 'gat_nope', answer: 'x' })
+    expect(a).toEqual({ status: 404, body: { error: 'unknown gate: gat_nope' } })
+    const r = await call(deps, 'gate-resolve', { id: 'gat_nope', resolution: 'x' })
+    expect(r).toEqual({ status: 404, body: { error: 'unknown gate: gat_nope' } })
+  })
+
+  // Gate 는 있고 그것이 가리키는 Task 가 없다 — 적은 id 가 없는 것이 아니다
+  it('있는 Gate 의 Task 가 사라진 것은 400 그대로다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const t = await call(deps, 'task-create', { run: deps.getState().runs[0].id, spec: 's', account: 'acc1' })
+    const taskId = (t.body as { id: string }).id
+    const g = await call(deps, 'gate-create', { task: taskId, question: 'q' })
+    expect(g.status).toBe(200)
+    await dropTask(deps, taskId)
+    const gateId = (g.body as { id: string }).id
+    const r = await call(deps, 'gate-resolve', { id: gateId, resolution: 'x' })
+    expect(r).toEqual({ status: 400, body: { error: `unknown task for gate: ${gateId}` } })
+  })
+
+  it('없는 배치를 ack 하면 404 이고 아무것도 쓰지 않는다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const before = deps.getState()
+    const r = await call(deps, 'check', { ack: 'dlv_nope' })
+    // The Run it was checked against rides along, for the CLI's `check --run <runId>` next step
+    expect(r).toEqual({ status: 404, body: { error: 'unknown delivery: dlv_nope', runId: before.runs[0].id } })
+    expect(deps.getState()).toBe(before)
+  })
+
+  it('없는 Dispatch 의 worker_done 은 404 다', async () => {
+    const { deps, taskId } = await seedDispatch()
+    const r = await call(deps, 'send', done(taskId, 'dsp_nope'))
+    expect(r).toEqual({ status: 404, body: { error: 'unknown dispatch: dsp_nope' } })
+  })
+
+  // 적은 --task-id 가 그 Dispatch 의 Task 와 같은데 그 Task 가 없다 — 적은 id 가 없는 것이다
+  it('Dispatch 는 있고 적은 Task 가 없으면 404 다', async () => {
+    const { deps, taskId, dispatchId } = await seedDispatch()
+    await dropTask(deps, taskId)
+    const r = await call(deps, 'send', done(taskId, dispatchId))
+    expect(r).toEqual({ status: 404, body: { error: `unknown task: ${taskId}` } })
+  })
+
+  // 둘 다 있다 — 짝이 틀린 것은 인자가 틀린 것이다. 적은 Task 가 마침 없어도 거절 문구는 짝을
+  // 말하므로, 그 문구를 404 로 내면 문구와 코드가 서로 다른 것을 말한다.
+  it('Task 와 Dispatch 의 짝이 틀린 것은 400 그대로다', async () => {
+    const { deps, dispatchId } = await seedDispatch()
+    const runId = deps.getState().runs[0].id
+    const other = await call(deps, 'task-create', { run: runId, spec: 's2', account: 'acc1' })
+    for (const taskId of [(other.body as { id: string }).id, 'tsk_nope']) {
+      const r = await call(deps, 'send', done(taskId, dispatchId))
+      expect(r, taskId).toEqual({ status: 400, body: { error: 'taskId does not match dispatch' } })
+    }
+  })
+
+  // 검토 Dispatch 의 보고는 applyReviewResult 로 간다 — 같은 규칙이 그 갈래에도 선다
+  it('검토 보고도 적은 Task 가 없으면 404, 짝이 틀리면 400 이다', async () => {
+    const { deps, taskId, dispatchId } = await seedDispatch()
+    const s = deps.getState()
+    await deps.setState({
+      ...s,
+      dispatches: s.dispatches.map((d) => (d.id === dispatchId ? { ...d, review: true } : d))
+    })
+    expect((await call(deps, 'send', done('tsk_other', dispatchId))).status).toBe(400)
+    await dropTask(deps, taskId)
+    const r = await call(deps, 'send', done(taskId, dispatchId))
+    expect(r).toEqual({ status: 404, body: { error: `unknown task: ${taskId}` } })
+  })
+
+  it('없는 --retry-of 는 404, 다른 Task 의 Dispatch 는 400 이다', async () => {
+    const { deps, taskId, dispatchId } = await seedDispatch()
+    await call(deps, 'send', { ...done(taskId, dispatchId), outcome: 'failed' }, 'sess1')
+    const runId = deps.getState().runs[0].id
+    const other = await call(deps, 'task-create', { run: runId, spec: 's2', account: 'acc1' })
+    const otherId = (other.body as { id: string }).id
+    const start = { task: otherId, agent: 'codex', account: 'acc1', worktree: 'current' }
+    const missing = await call(deps, 'worker-start', { ...start, retryOf: 'dsp_nope' })
+    expect(missing).toEqual({ status: 404, body: { error: 'unknown retryOf dispatch: dsp_nope' } })
+    const wrong = await call(deps, 'worker-start', { ...start, retryOf: dispatchId })
+    expect(wrong).toEqual({
+      status: 400,
+      body: { error: `retryOf dispatch belongs to a different task: ${dispatchId}` }
+    })
+    // 거절은 아무것도 열지 않았다
+    expect(deps.getState().dispatches.filter((d) => d.taskId === otherId)).toEqual([])
+  })
+
+  // **조용한 성공이 가장 나쁘다.** 오타 난 회차 id 로 check --wait 를 부르면 200 빈 배치를 받거나
+  // 기한까지 기다렸다 — 코디네이터가 되풀이해 부르는 명령에서 한 시간을 잃는다. 기다리기 전에 404 다.
+  it('check --run 이 없는 회차면 기다리기 전에 404 다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const before = deps.getState()
+    const started = Date.now()
+    const r = await call(deps, 'check', { run: 'run_nope', wait: true, timeoutMs: 5000 })
+    expect(r).toEqual({ status: 404, body: { error: 'unknown run: run_nope' } })
+    expect(Date.now() - started).toBeLessThan(1000)
+    // --ack 가 함께 와도 아무것도 ack 하지 않는다
+    expect((await call(deps, 'check', { run: 'run_nope', ack: 'dlv_x' })).status).toBe(404)
+    expect(deps.getState()).toBe(before)
+    // 있는 회차는 예전 그대로 빈 배치다
+    const runId = deps.getState().runs[0].id
+    expect(await call(deps, 'check', { run: runId })).toEqual({ status: 200, body: { count: 0, messages: [] } })
+  })
+
+  // 감사 #101. 이름 댄 id 가 없으면 404 라는 규칙이 여기만 빠져 있었다 — 빈 목록은 "그 Job 에 회차가
+  // 없다" 로 읽힌다. 회차 id 를 --job 에 준 것도 없는 Job 이다.
+  it('runs list --job 이 없는 Job 이면 404 다 — 빈 목록이 아니라', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const jobId = deps.getState().runs[0].jobId
+    expect(await call(deps, 'runs-list', { job: 'job_nope' })).toEqual({
+      status: 404,
+      body: { error: 'unknown job: job_nope' }
+    })
+    expect((await call(deps, 'runs-list', { job: runId })).status).toBe(404)
+    const listed = await call(deps, 'runs-list', { job: jobId })
+    expect(listed.status).toBe(200)
+    expect((listed.body as { id: string }[]).map((r) => r.id)).toEqual([runId])
+  })
+
+  // 리뷰 M1. 빈 값(`--job ""`, 또는 값 없는 `--job`)은 걸러지지 않은 전체 목록이 아니다 — 비어 있는 id 를
+  // 받은 스크립트가 모든 회차를 그 Job 의 것으로 읽는다. tasks add 의 --job 과 같은 400 이다.
+  it('runs list --job 에 값이 없으면 400 이다 — 전부를 돌려주지 않는다', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    for (const job of ['', true]) {
+      const r = await call(deps, 'runs-list', { job })
+      expect(r, String(job)).toEqual({ status: 400, body: { error: '--job needs a value: the Job id' } })
+    }
+    expect((await call(deps, 'runs-list', {})).status).toBe(200)
+  })
+
+  it('tasks list --run 이 없는 회차면 404 다 — 빈 목록이 아니라', async () => {
+    const deps = makeDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const r = await call(deps, 'tasks-list', { run: 'run_nope' })
+    expect(r).toEqual({ status: 404, body: { error: 'unknown run: run_nope' } })
+    const runId = deps.getState().runs[0].id
+    expect(await call(deps, 'tasks-list', { run: runId })).toEqual({ status: 200, body: [] })
+  })
+
+  // ask 는 워커의 명령이라 워커가 남의 Dispatch 를 적으면 403 이 먼저다. 404 는 Dispatch 를 가진
+  // 적이 없는 세션이 적은 id 가 없을 때, 그리고 그 Dispatch 의 Task 가 사라졌을 때다.
+  it('ask 가 적은 Dispatch 나 Task 가 없으면 404 다', async () => {
+    const { deps, taskId, dispatchId } = await seedDispatch()
+    const q = { taskId, question: 'q?', timeoutMs: 50 }
+    const missing = await call(deps, 'ask', { ...q, dispatchId: 'dsp_nope' })
+    expect(missing).toEqual({ status: 404, body: { error: 'unknown dispatch: dsp_nope' } })
+    await dropTask(deps, taskId)
+    const gone = await call(deps, 'ask', { ...q, dispatchId })
+    expect(gone).toEqual({ status: 404, body: { error: `unknown task: ${taskId}` } })
+  })
+})
+
+describe('version / status — 공개 표면의 두 읽기', () => {
+  it('version 은 앱 버전과 프로토콜을 낸다', async () => {
+    const deps = { ...makeDeps(), appVersion: () => '1.2.3' }
+    const r = await call(deps, 'version')
+    expect(r.status).toBe(200)
+    expect(r.body).toEqual({ version: '1.2.3', protocol: 1 })
+  })
+
+  // 앱 쪽 값이 없다고 명령이 실패할 이유는 없다 — CLI 는 자기 버전을 빌드에서 받는다
+  it('앱 버전을 주입하지 않으면 그 칸만 비운다', async () => {
+    expect((await call(makeDeps(), 'version')).body).toEqual({ version: null, protocol: 1 })
+  })
+
+  it('status 는 지금 무엇이 있는지 센다', async () => {
+    const deps = { ...makeDeps(), runningSessions: () => 2, appVersion: () => '1.2.3' }
+    const r = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    expect(r.status).toBe(200)
+    const s = await call(deps, 'status')
+    expect(s.status).toBe(200)
+    expect(s.body).toMatchObject({
+      running: true,
+      version: '1.2.3',
+      protocol: 1,
+      jobs: 1,
+      // 태스크 없는 회차는 일이 돌지 않는다 — 아래 테스트가 규칙을 본다
+      runsRunning: 0,
+      runsWaitingForInput: 0,
+      questionsOpen: 0,
+      sessionsRunning: 2
+    })
+  })
+
+  // **질문만 따로 센다.** 그것만이 사람을 기다리는 수이고, CI 가 분기하는 값이다(명세 §19).
+  it('열린 질문이 있으면 그 회차를 기다리는 것으로 센다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'gate-create', { task: taskId, question: '어느 DB 를 쓸까요' })
+    const s = await call(deps, 'status')
+    expect(s.body).toMatchObject({ runsWaitingForInput: 1, questionsOpen: 1 })
+  })
+
+  // 감사 #100. `runsRunning` 은 `host stop` 의 거절과 Host 의 유휴 종료가 세는 것과 같은 규칙이다
+  // (running.ts 의 runningRunCount) — 일이 도는 회차. 아직 시작하지 않은 계획은 세지 않는다.
+  it('runsRunning 은 host stop 이 세는 규칙과 같다 — 일이 도는 회차만', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const empty = await call(deps, 'status')
+    expect(empty.body).toMatchObject({ runsRunning: 0 })
+    expect((empty.body as { runsRunning: number }).runsRunning).toBe(runningRunCount(deps.getState()))
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    const s = deps.getState()
+    await deps.setState({
+      ...s,
+      tasks: s.tasks.map((t) => (t.id === taskId ? { ...t, status: 'validating' as const } : t))
+    })
+    const busy = await call(deps, 'status')
+    expect(busy.body).toMatchObject({ runsRunning: 1 })
+    expect((busy.body as { runsRunning: number }).runsRunning).toBe(runningRunCount(deps.getState()))
+  })
+
+  it('세션 수를 주입하지 않으면 그 칸만 비운다', async () => {
+    expect((await call(makeDeps(), 'status')).body).toMatchObject({ sessionsRunning: null })
+  })
+})
+
+// Host S2 fix round, I1: a Dispatch whose worker-start has not answered yet still carries the
+// `pending:` placeholder. There is no session to kill, and the spawn may still complete and write the
+// real id onto the Dispatch. Recording it stopped would leave a live agent on a closed Dispatch, so the
+// four commands that stop workers refuse, and write nothing.
+describe('stopping a worker that is still starting', () => {
+  /** `startedAt` minus this many ms: 0 is a start still in its window, STALE one long past it. */
+  const STALE = PENDING_START_WINDOW_MS + 60_000
+  const ago = (ms: number): string => new Date(Date.parse(NOW) - ms).toISOString()
+  const pendingPatch = (s: OrchState, dispatchId: string, age = 0): OrchState => ({
+    ...s,
+    dispatches: s.dispatches.map((d) => (d.id === dispatchId ? { ...d, sessionId: 'pending:abc', startedAt: ago(age) } : d))
+  })
+  const tracked = (deps: OrchServerDeps & { state: OrchState }): string[] => {
+    const released: string[] = []
+    deps.releaseWorker = async ({ dispatchId }) => {
+      released.push(dispatchId)
+    }
+    return released
+  }
+  const withPendingWorker = async (age = 0) => {
+    const deps = makeDeps()
+    const released = tracked(deps)
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'acc1' })
+    const w = await call(deps, 'worker-start', { task: (t.body as { id: string }).id, agent: 'codex', account: 'acc1' })
+    const dispatchId = (w.body as { dispatchId: string }).dispatchId
+    await deps.setState(pendingPatch(deps.getState(), dispatchId, age))
+    return { deps, released, runId, dispatchId }
+  }
+  const withPendingScheduledWorker = async (age = 0) => {
+    const deps = makeDeps()
+    const released = tracked(deps)
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, schedule: { kind: 'daily', time: '09:00' } })
+    const templateId = (c.body as { id: string }).id
+    await call(deps, 'run-start', { run: templateId })
+    await deps.setState({
+      ...deps.getState(),
+      runs: [...deps.getState().runs, { id: 'run_kid', jobId: templateId, ordinal: 1, createdAt: NOW }],
+      tasks: [{ id: 'tsk_kid', runId: 'run_kid', title: 't', spec: 's', deps: [], status: 'dispatched', consecutiveFailures: 0, createdAt: NOW, updatedAt: NOW }],
+      dispatches: [{ id: 'dsp_kid', taskId: 'tsk_kid', provider: 'claude', accountId: 'acc1', sessionId: 'pending:abc', cwd: 'D:/p', specPath: '', startedAt: ago(age), workerState: 'ready', retained: false }]
+    })
+    return { deps, released, templateId }
+  }
+  const refusedAsStarting = (r: { status: number; body: unknown }): void => {
+    expect(r.status).toBe(409)
+    expect((r.body as { error: string }).error).toContain('the worker is still starting; try again in a moment')
+  }
+
+  it('worker-stop refuses and writes nothing', async () => {
+    const { deps, released, dispatchId } = await withPendingWorker()
+    const before = deps.getState()
+    refusedAsStarting(await call(deps, 'worker-stop', { dispatch: dispatchId }))
+    expect(released).toEqual([])
+    expect(deps.getState()).toBe(before)
+  })
+  it('runs-stop refuses and writes nothing', async () => {
+    const { deps, released, runId } = await withPendingWorker()
+    const before = deps.getState()
+    refusedAsStarting(await call(deps, 'runs-stop', { id: runId }))
+    expect(released).toEqual([])
+    expect(deps.getState()).toBe(before)
+  })
+  it('run-delete of a scheduled Job refuses and writes nothing', async () => {
+    const { deps, released, templateId } = await withPendingScheduledWorker()
+    const before = deps.getState()
+    refusedAsStarting(await call(deps, 'run-delete', { id: templateId }))
+    expect(released).toEqual([])
+    expect(deps.getState()).toBe(before)
+  })
+  it('run-pause refuses and writes nothing', async () => {
+    const { deps, released, templateId } = await withPendingScheduledWorker()
+    const before = deps.getState()
+    refusedAsStarting(await call(deps, 'run-pause', { run: templateId }))
+    expect(released).toEqual([])
+    expect(deps.getState()).toBe(before)
+  })
+
+  // Fix round 2, N1: past the start window a placeholder is a start that died (an app that quit inside
+  // worker-start leaves one, and nothing rolls it back). There is no pty to kill, so the stop goes
+  // ahead without a release and closes it as a Stop did before the refusal existed.
+  it('the start window is longer than a spawn deadline plus the idle wait, with room to spare', () => {
+    expect(PENDING_START_WINDOW_MS).toBeGreaterThan(SPAWN_DEADLINE_MS + DEFAULT_IDLE_WAIT_TIMEOUT_MS + 30_000)
+  })
+  it('worker-stop closes a stale placeholder as stopped, and kills nothing', async () => {
+    const { deps, released, dispatchId } = await withPendingWorker(STALE)
+    expect((await call(deps, 'worker-stop', { dispatch: dispatchId })).status).toBe(200)
+    expect(released).toEqual([])
+    expect(deps.getState().dispatches.find((d) => d.id === dispatchId)).toMatchObject({ workerState: 'stopped', closedBy: 'stop', endedAt: NOW })
+  })
+  it('runs-stop closes a stale placeholder and pauses the run, and kills nothing', async () => {
+    const { deps, released, runId, dispatchId } = await withPendingWorker(STALE)
+    expect((await call(deps, 'runs-stop', { id: runId })).status).toBe(200)
+    expect(released).toEqual([])
+    expect(deps.getState().dispatches.find((d) => d.id === dispatchId)?.workerState).toBe('stopped')
+    expect(deps.getState().runs.find((r) => r.id === runId)?.paused).toBe(true)
+  })
+  it('run-delete of a scheduled Job goes ahead over a stale placeholder, and kills nothing', async () => {
+    const { deps, released, templateId } = await withPendingScheduledWorker(STALE)
+    expect((await call(deps, 'run-delete', { id: templateId })).status).toBe(200)
+    expect(released).toEqual([])
+    expect(deps.getState().jobs).toHaveLength(0)
+  })
+  it('run-pause goes ahead over a stale placeholder and closes it, and kills nothing', async () => {
+    const { deps, released, templateId } = await withPendingScheduledWorker(STALE)
+    expect((await call(deps, 'run-pause', { run: templateId })).status).toBe(200)
+    expect(released).toEqual([])
+    expect(deps.getState().dispatches[0].endedAt).toBeDefined()
+  })
+})
+
+// F65 and U1: a schedule firing behaves exactly like `jobs run` of that Job, and the ▶ on a Run row
+// (App.tsx's restartCoordinator) sends that Run's id to `run-start`.
+describe('a fired Run and the ▶ on a Run row (U1)', () => {
+  const coordDeps = (): OrchServerDeps & { state: OrchState; startCoordinator: ReturnType<typeof vi.fn> } => {
+    const startCoordinator = vi.fn(async (a: { runId: string }) => ({ sessionId: `coord-${a.runId}` }))
+    return Object.assign(makeDeps(), {
+      listAccounts: () => [{ id: 'accA', label: 'A', provider: 'claude' as const }],
+      startCoordinator
+    }) as never
+  }
+  /** A scheduled Job as the sidebar makes it (a coordinator account, `auto`), started once. */
+  const scheduled = async (deps: OrchServerDeps, coordinatorAccount?: string): Promise<string> => {
+    const r = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      schedule: { kind: 'daily', time: '09:00' },
+      ...(coordinatorAccount ? { coordinatorAccount } : {})
+    })
+    const jobId = (r.body as { id: string }).id
+    await call(deps, 'run-start', { run: jobId })
+    return jobId
+  }
+  const coordinatorOf = (deps: OrchServerDeps, runId: string): string | undefined =>
+    deps.getState().runs.find((r) => r.id === runId)?.coordinatorSessionId
+
+  it('run-spawn of a scheduled Job with a coordinator account starts that Run’s coordinator', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduled(deps, 'accA')
+    expect(deps.startCoordinator).not.toHaveBeenCalled() // '실행' only releases the gate
+    const r = await call(deps, 'run-spawn', { run: jobId })
+    expect(r.status).toBe(200)
+    const runId = (r.body as { id: string }).id
+    expect(deps.startCoordinator).toHaveBeenCalledTimes(1)
+    expect(coordinatorOf(deps, runId)).toBe(`coord-${runId}`)
+  })
+
+  it('jobs run of a scheduled Job with a coordinator account does the same', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduled(deps, 'accA')
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(200)
+    const runId = (r.body as { id: string }).id
+    expect(coordinatorOf(deps, runId)).toBe(`coord-${runId}`)
+    expect(deps.startCoordinator).toHaveBeenCalledTimes(1)
+  })
+
+  it('a fired Run whose coordinator cannot start stays, and the answer names it', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduled(deps, 'accA')
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    const r = await call(deps, 'run-spawn', { run: jobId })
+    expect(r.status).toBe(400)
+    const runs = deps.getState().runs.filter((x) => x.jobId === jobId)
+    expect(runs).toHaveLength(1)
+    expect(runs[0].coordinatorSessionId).toBeUndefined()
+    expect(r.body).toMatchObject({ jobId, runId: runs[0].id })
+    expect((r.body as { error: string }).error).toMatch(/spawn refused/)
+  })
+
+  it('▶ on a fired Run’s row starts that Run’s coordinator (run-start takes a Run id)', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduled(deps, 'accA')
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    await call(deps, 'run-spawn', { run: jobId })
+    const runId = deps.getState().runs.find((x) => x.jobId === jobId)!.id
+    const r = await call(deps, 'run-start', { run: runId })
+    expect(r.status).toBe(200)
+    expect(coordinatorOf(deps, runId)).toBe(`coord-${runId}`)
+    // Pressed twice, it starts no second coordinator.
+    expect((await call(deps, 'run-start', { run: runId })).status).toBe(200)
+    expect(deps.startCoordinator).toHaveBeenCalledTimes(2)
+  })
+
+  it('▶ on an older Run’s row of a Job with several Runs starts that Run’s coordinator, not the latest’s', async () => {
+    const deps = coordDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, coordinatorAccount: 'accA' })
+    const jobId = deps.getState().jobs[0].id
+    await call(deps, 'run-start', { run: jobId })
+    await call(deps, 'run-spawn', { run: jobId })
+    const [older, latest] = deps.getState().runs.filter((x) => x.jobId === jobId)
+    // Both coordinators gone (their tabs closed).
+    const s = deps.getState()
+    await deps.setState({ ...s, runs: s.runs.map(({ coordinatorSessionId: _gone, ...r }) => r) })
+    deps.startCoordinator.mockClear()
+    const r = await call(deps, 'run-start', { run: older.id })
+    expect(r.status).toBe(200)
+    expect(deps.startCoordinator).toHaveBeenCalledTimes(1)
+    expect(deps.startCoordinator.mock.calls[0][0]).toMatchObject({ runId: older.id })
+    expect(coordinatorOf(deps, older.id)).toBe(`coord-${older.id}`)
+    expect(coordinatorOf(deps, latest.id)).toBeUndefined()
+  })
+
+  it('run-start with a Run id of a Job that has no coordinator account starts nothing and answers 200', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduled(deps)
+    const r = await call(deps, 'run-spawn', { run: jobId })
+    const runId = (r.body as { id: string }).id
+    expect((await call(deps, 'run-start', { run: runId })).status).toBe(200)
+    expect(deps.startCoordinator).not.toHaveBeenCalled()
+  })
+})
+
+// A fire hands its Run to a coordinator while the rest of the state keeps moving: the loop places other
+// Runs, workers report. The coordinator's start is a long await, so the hand-over must land on the
+// state as it is by then, not on the one it read before.
+describe('the hand-over of a fired Run lands on the current state', () => {
+  it('a commit made while the coordinator starts is kept', async () => {
+    const deps = makeDeps()
+    const startCoordinator = vi.fn(async (a: { runId: string }) => {
+      // Something else commits in the meantime.
+      const s = deps.getState()
+      await deps.setState({ ...s, jobs: s.jobs.map((j) => ({ ...j, objective: 'changed meanwhile' })) })
+      return { sessionId: `coord-${a.runId}` }
+    })
+    Object.assign(deps, {
+      listAccounts: () => [{ id: 'accA', label: 'A', provider: 'claude' as const }],
+      startCoordinator
+    })
+    const c = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      coordinatorAccount: 'accA',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const jobId = (c.body as { id: string }).id
+    await call(deps, 'run-start', { run: jobId })
+    const r = await call(deps, 'run-spawn', { run: jobId })
+    expect(r.status).toBe(200)
+    const runId = (r.body as { id: string }).id
+    expect(deps.getState().runs.find((x) => x.id === runId)?.coordinatorSessionId).toBe(`coord-${runId}`)
+    expect(deps.getState().jobs.find((j) => j.id === jobId)?.objective).toBe('changed meanwhile')
+  })
+})
+
+// Task 1 fix round 1. C1: a Run counts as running only while something can still move it (one rule
+// for `jobs run` and for a fire's --unless-running). I1: a coordinator start in flight is marked on the
+// Run, so a ▶ does not start a second one. I2: a hand-over that finds another slot stops its own
+// session. I3: ▶ on a finished Run does nothing.
+describe('fix round 1: what counts as running, and one coordinator per Run', () => {
+  const coordDeps = () => {
+    const stopped: string[] = []
+    const logs: string[] = []
+    const deps = makeDeps()
+    const startCoordinator = vi.fn(async (a: { runId: string }) => ({ sessionId: `coord-${a.runId}` }))
+    // Final round 2, I-A: the check waits this process serves, as the Host's command server holds them.
+    const waits = createCheckWaits()
+    Object.assign(deps, {
+      listAccounts: () => [{ id: 'accA', label: 'A', provider: 'claude' as const }],
+      startCoordinator,
+      enterCheckWait: (runId: string, sessionId: string) => waits.enter(runId, sessionId),
+      coordinatorIdle: (runId: string, sessionId: string) => waits.parked(runId, sessionId),
+      stopCoordinator: async (sessionId: string) => {
+        stopped.push(sessionId)
+      },
+      log: (m: string) => {
+        logs.push(m)
+      }
+    })
+    return Object.assign(deps, { startCoordinator, stopped, logs })
+  }
+  const scheduledJob = async (deps: OrchServerDeps): Promise<string> => {
+    const r = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      coordinatorAccount: 'accA',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const jobId = (r.body as { id: string }).id
+    await call(deps, 'run-start', { run: jobId })
+    return jobId
+  }
+  const fire = (deps: OrchServerDeps, jobId: string) => call(deps, 'run-spawn', { run: jobId, unlessRunning: true })
+  const patchRun = async (deps: OrchServerDeps, runId: string, f: (r: JobRun) => JobRun): Promise<void> => {
+    const s = deps.getState()
+    await deps.setState({ ...s, runs: s.runs.map((r) => (r.id === runId ? f(r) : r)) })
+  }
+  const detach = ({ coordinatorSessionId: _gone, ...r }: JobRun): JobRun => r
+  /** The coordinator session ends: the exit release empties its slot (L1: that is the stop confirmed). */
+  const exited = async (deps: OrchServerDeps, sessionId: string): Promise<void> => {
+    const released = coordinatorReleaseOf(deps.getState(), sessionId, 0)
+    if (released) await deps.setState(released.state)
+  }
+  /** The Run's coordinator parks in `check --wait` (I-A). Resolves once the wait is in flight; the
+   *  returned promise is the wait itself, which ends on its short deadline. */
+  const park = async (deps: OrchServerDeps, runId: string): Promise<{ done: Promise<unknown> }> => {
+    const waiting = call(deps, 'check', { run: runId, wait: true, timeoutMs: 300 }, `coord-${runId}`)
+    await new Promise((r) => setTimeout(r, 20))
+    // Wrapped: an async function returning a promise would adopt it, and so wait out the check.
+    return { done: waiting }
+  }
+
+  it('C1(a): a fire after the coordinator failed to start still makes the next Run', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    expect((await fire(deps, jobId)).status).toBe(400)
+    const r = await fire(deps, jobId)
+    expect(r.status).toBe(200)
+    expect(deps.getState().runs.filter((x) => x.jobId === jobId)).toHaveLength(2)
+  })
+
+  it('C1(b): a fire after the coordinator was released with no Tasks makes one', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    await patchRun(deps, first.id, detach)
+    expect((await fire(deps, jobId)).status).toBe(200)
+  })
+
+  it('C1(c): a fire after the coordinator died leaving ready Tasks nothing places makes one', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    await patchRun(deps, first.id, detach)
+    expect(deps.getState().tasks.find((t) => t.runId === first.id)?.status).toBe('ready')
+    expect((await fire(deps, jobId)).status).toBe(200)
+  })
+
+  it('C1: jobs run is allowed in the same cases, and blocked while the coordinator is alive', async () => {
+    const deps = coordDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, coordinatorAccount: 'accA' })
+    const jobId = deps.getState().jobs[0].id
+    const first = (await call(deps, 'jobs-run', { id: jobId })).body as { id: string }
+    await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    expect((await call(deps, 'jobs-run', { id: jobId })).status).toBe(409)
+    await patchRun(deps, first.id, detach)
+    // Gone, with a ready Task nothing places: nothing moves it.
+    expect((await call(deps, 'jobs-run', { id: jobId })).status).toBe(200)
+  })
+
+  // Inverted by U4 (the user, 2026-09-25): a live coordinator on a Run with no Task it can start is the
+  // only thing left, so the fire replaces that Run instead of being skipped for good.
+  it('U4: a Run with no Tasks and only a live coordinator is replaced at the fire', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    expect(deps.getState().runs.find((r) => r.id === first.id)?.coordinatorSessionId).toBe(`coord-${first.id}`)
+    // I-A: replaced only because its coordinator is parked in `check --wait`.
+    const waiting = await park(deps, first.id)
+    const r = await fire(deps, jobId)
+    await waiting.done
+    expect(r.status).toBe(200)
+    const second = (r.body as { id: string }).id
+    expect(second).not.toBe(first.id)
+    expect(deps.stopped).toEqual([`coord-${first.id}`])
+    const old = deps.getState().runs.find((x) => x.id === first.id)!
+    // L1: the slot is kept, marked pending, until the session is gone.
+    expect(old.coordinatorSessionId).toBe(`coord-${first.id}`)
+    expect(old.coordinatorStopPending).toBe(NOW)
+    // Ended the way `runs stop` ends a Run: paused, so `runs resume` can take it back.
+    expect(old.paused).toBe(true)
+    await exited(deps, `coord-${first.id}`)
+    expect(deps.getState().runs.find((x) => x.id === first.id)).not.toHaveProperty('coordinatorSessionId')
+    expect(deps.getState().runs.find((x) => x.id === second)?.coordinatorSessionId).toBe(`coord-${second}`)
+    expect(deps.logs.join('\n')).toContain(`coord-${first.id}`)
+  })
+
+  it('U4: a Run whose live coordinator can still start a Task is skipped, and its coordinator is left alone', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    const r = await fire(deps, jobId)
+    expect(r.status).toBe(409)
+    expect(r.body).toMatchObject({ running: first.id })
+    expect(deps.stopped).toEqual([])
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorSessionId).toBe(`coord-${first.id}`)
+  })
+
+  it('U4: a finished Run whose coordinator is still attached has it stopped at the fire, and is not paused', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const t = await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    await call(deps, 'task-update', { id: (t.body as { id: string }).id, status: 'completed' })
+    expect((await fire(deps, jobId)).status).toBe(200)
+    expect(deps.stopped).toEqual([`coord-${first.id}`])
+    const old = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(old.coordinatorStopPending).toBe(NOW)
+    expect(old.paused).toBeUndefined()
+    await exited(deps, `coord-${first.id}`)
+    expect(deps.getState().runs.find((x) => x.id === first.id)).not.toHaveProperty('coordinatorSessionId')
+  })
+
+  it('U4: jobs run agrees: an idle-only Run does not count as running, and a manual Run keeps its coordinator', async () => {
+    const deps = coordDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, coordinatorAccount: 'accA' })
+    const jobId = deps.getState().jobs[0].id
+    const first = (await call(deps, 'jobs-run', { id: jobId })).body as { id: string }
+    expect(deps.getState().runs.find((r) => r.id === first.id)?.coordinatorSessionId).toBe(`coord-${first.id}`)
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(200)
+    expect(deps.stopped).toEqual([])
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorSessionId).toBe(`coord-${first.id}`)
+  })
+
+  it('U4: a stop that throws is logged, and the Run is still replaced, its slot kept pending (L1)', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    Object.assign(deps, {
+      stopCoordinator: async () => {
+        throw new Error('pty gone')
+      }
+    })
+    const waiting = await park(deps, first.id)
+    const r = await fire(deps, jobId)
+    expect(r.status).toBe(200)
+    await waiting.done
+    expect((r.body as { id: string }).id).not.toBe(first.id)
+    const old = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(old.coordinatorSessionId).toBe(`coord-${first.id}`)
+    expect(old.coordinatorStopPending).toBe(NOW)
+    expect(deps.logs.join('\n')).toContain('pty gone')
+  })
+
+  it('U4: run-coordinator-stop stops a finished Run’s coordinator, and refuses while the Run still moves', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const t = await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    const refused = await call(deps, 'run-coordinator-stop', { run: first.id })
+    expect(refused.status).toBe(409)
+    expect(deps.stopped).toEqual([])
+    await call(deps, 'task-update', { id: (t.body as { id: string }).id, status: 'completed' })
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id })
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ runId: first.id, stopped: `coord-${first.id}` })
+    expect(deps.stopped).toEqual([`coord-${first.id}`])
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorStopPending).toBe(NOW)
+    await exited(deps, `coord-${first.id}`)
+    expect(deps.getState().runs.find((x) => x.id === first.id)).not.toHaveProperty('coordinatorSessionId')
+    // Nothing left to stop: 200, and nothing is stopped twice.
+    expect((await call(deps, 'run-coordinator-stop', { run: first.id })).body).toMatchObject({ stopped: null })
+    expect(deps.stopped).toHaveLength(1)
+    expect((await call(deps, 'run-coordinator-stop', { run: 'run_nope' })).status).toBe(404)
+  })
+
+  it('I-A: a coordinator with no check wait in flight is not replaced, and the fire is skipped', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const r = await fire(deps, jobId)
+    expect(r.status).toBe(409)
+    expect(r.body).toMatchObject({ jobId, running: first.id })
+    expect(deps.stopped).toEqual([])
+    expect(deps.getState().runs.filter((x) => x.jobId === jobId)).toHaveLength(1)
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorSessionId).toBe(`coord-${first.id}`)
+    expect(deps.logs.join('\n')).toContain('coordinator busy or unknown, skipped')
+  })
+
+  it('I-A: with no coordinatorIdle dep the answer is unknown, and the fire is skipped', async () => {
+    const deps = coordDeps()
+    Object.assign(deps, { coordinatorIdle: undefined })
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const waiting = await park(deps, first.id)
+    const r = await fire(deps, jobId)
+    await waiting.done
+    expect(r.status).toBe(409)
+    expect(deps.stopped).toEqual([])
+  })
+
+  it('I-A: run-coordinator-stop on a Run with no Tasks needs its coordinator parked in check --wait', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    expect((await call(deps, 'run-coordinator-stop', { run: first.id })).status).toBe(409)
+    expect(deps.stopped).toEqual([])
+    const waiting = await park(deps, first.id)
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id })
+    await waiting.done
+    expect(r.status).toBe(200)
+    expect(deps.stopped).toEqual([`coord-${first.id}`])
+  })
+
+  // Mutation M1a: the replacement is for a scheduled Job's fire only.
+  it('U4: run-spawn --unless-running on a Job with no schedule replaces nothing, even with its coordinator parked', async () => {
+    const deps = coordDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, coordinatorAccount: 'accA' })
+    const jobId = deps.getState().jobs[0].id
+    const first = (await call(deps, 'jobs-run', { id: jobId })).body as { id: string }
+    const waiting = await park(deps, first.id)
+    const r = await fire(deps, jobId)
+    await waiting.done
+    expect(r.status).toBe(200)
+    expect(deps.stopped).toEqual([])
+    const old = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(old.coordinatorSessionId).toBe(`coord-${first.id}`)
+    expect(old.paused).toBeUndefined()
+  })
+
+  // Minor 3: the exit release may empty the slot during the stop; the replaced Run is still paused.
+  it('U4: a replaced Run is paused even when the exit release emptied its slot during the stop', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    Object.assign(deps, {
+      stopCoordinator: async () => {
+        await patchRun(deps, first.id, detach)
+      }
+    })
+    const waiting = await park(deps, first.id)
+    expect((await fire(deps, jobId)).status).toBe(200)
+    await waiting.done
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.paused).toBe(true)
+  })
+
+  // Minor 4: the Run gained work while its coordinator was being stopped; nothing is detached.
+  it('run-coordinator-stop re-checks the Run after the stop, and leaves the slot when the Run now moves', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    Object.assign(deps, {
+      stopCoordinator: async () => {
+        await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+      }
+    })
+    const waiting = await park(deps, first.id)
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id })
+    await waiting.done
+    expect(r.status).toBe(409)
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorSessionId).toBe(`coord-${first.id}`)
+  })
+
+  // Limits pass L1: the slot is kept, marked pending, until the exit release confirms the session gone.
+  it('L1: run-coordinator-stop keeps the slot marked pending, even when the stop throws', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const t = await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    await call(deps, 'task-update', { id: (t.body as { id: string }).id, status: 'completed' })
+    Object.assign(deps, {
+      stopCoordinator: async () => {
+        throw new Error('pty gone')
+      }
+    })
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id })
+    expect(r.status).toBe(200)
+    const run = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(run.coordinatorSessionId).toBe(`coord-${first.id}`)
+    expect(run.coordinatorStopPending).toBe(NOW)
+    expect(deps.logs.join('\n')).toContain('pty gone')
+  })
+
+  it('L1: a pending stop of a replaced (paused) Run is sent again without the idle check', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const waiting = await park(deps, first.id)
+    expect((await fire(deps, jobId)).status).toBe(200)
+    await waiting.done
+    const old = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(old.paused).toBe(true)
+    expect(old.coordinatorStopPending).toBeDefined()
+    // Not parked any more: the decision was made already, so the retry does not ask again.
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id })
+    expect(r.status).toBe(200)
+    expect(deps.stopped).toEqual([`coord-${first.id}`, `coord-${first.id}`])
+  })
+
+  it('L1: a pending stop on a Run that moves again is refused, and its mark dropped', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    await patchRun(deps, first.id, (r) => ({ ...r, coordinatorStopPending: NOW }))
+    await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id })
+    expect(r.status).toBe(409)
+    expect(deps.stopped).toEqual([])
+    const run = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(run.coordinatorSessionId).toBe(`coord-${first.id}`)
+    expect(run).not.toHaveProperty('coordinatorStopPending')
+  })
+
+  // Final review I2. A replaced Run with no Tasks does not move after `runs resume` (nothing to start),
+  // so "moves again" never dropped the mark and the retry stopped the coordinator the person took back.
+  it('L1: runs resume on a replaced Run drops its pending stop, so the retry no longer stops that coordinator', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const waiting = await park(deps, first.id)
+    expect((await fire(deps, jobId)).status).toBe(200)
+    await waiting.done
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorStopPending).toBeDefined()
+    expect((await call(deps, 'runs-resume', { id: first.id })).status).toBe(200)
+    const resumed = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(resumed).not.toHaveProperty('paused')
+    expect(resumed).not.toHaveProperty('coordinatorStopPending')
+    // The coordinator is at work again (not parked): a stop now is a fresh one and asks the idle check.
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id })
+    expect(r.status).toBe(409)
+    expect(deps.stopped).toEqual([`coord-${first.id}`])
+  })
+
+  it('L1: a pending stop on a Run neither paused nor finished asks the idle check again', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    await patchRun(deps, first.id, (r) => ({ ...r, coordinatorStopPending: NOW }))
+    // Busy (not parked in check --wait): refused, and the mark dropped so the loop stops asking.
+    const busy = await call(deps, 'run-coordinator-stop', { run: first.id })
+    expect(busy.status).toBe(409)
+    expect(deps.stopped).toEqual([])
+    expect(deps.getState().runs.find((x) => x.id === first.id)).not.toHaveProperty('coordinatorStopPending')
+    // Parked: the idle check answers yes, and the stop goes out.
+    await patchRun(deps, first.id, (r) => ({ ...r, coordinatorStopPending: NOW }))
+    const waiting = await park(deps, first.id)
+    const idle = await call(deps, 'run-coordinator-stop', { run: first.id })
+    await waiting.done
+    expect(idle.status).toBe(200)
+    expect(deps.stopped).toEqual([`coord-${first.id}`])
+  })
+
+  // Final review M3. `--gone` and the start-mark sweep are the driving loop's own calls. A coordinator
+  // could otherwise empty its own slot while alive (`--gone <own id>`) and orphan itself.
+  it('M3: --gone and run-start-marks-clear are refused from inside an agent session, and taken from the app, the Host and a shell', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    const own = `coord-${first.id}`
+    const gone = await call(deps, 'run-coordinator-stop', { run: first.id, gone: own }, own)
+    expect(gone.status).toBe(403)
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorSessionId).toBe(own)
+    expect((await call(deps, 'run-start-marks-clear', {}, own)).status).toBe(403)
+    expect((await call(deps, 'run-start-marks-clear', {}, 'some-tab')).status).toBe(403)
+    for (const caller of [APP_CALLER, HOST_CALLER, '']) {
+      expect((await call(deps, 'run-start-marks-clear', {}, caller)).status).toBe(200)
+      expect((await call(deps, 'run-coordinator-stop', { run: first.id, gone: 'coord-someone-else' }, caller)).status).toBe(200)
+    }
+  })
+
+  it('L1: run-coordinator-stop --gone empties the slot the way the exit release does, and only for that session', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    await patchRun(deps, first.id, (r) => ({ ...r, coordinatorStopPending: NOW, paused: true }))
+    const other = await call(deps, 'run-coordinator-stop', { run: first.id, gone: 'coord-someone-else' }, HOST_CALLER)
+    expect(other.status).toBe(200)
+    expect(other.body).toMatchObject({ released: null })
+    expect(deps.getState().runs.find((x) => x.id === first.id)?.coordinatorSessionId).toBe(`coord-${first.id}`)
+    const r = await call(deps, 'run-coordinator-stop', { run: first.id, gone: `coord-${first.id}` }, HOST_CALLER)
+    expect(r.status).toBe(200)
+    expect(r.body).toMatchObject({ runId: first.id, released: `coord-${first.id}` })
+    expect(deps.stopped).toEqual([])
+    const run = deps.getState().runs.find((x) => x.id === first.id)!
+    expect(run).not.toHaveProperty('coordinatorSessionId')
+    expect(run).not.toHaveProperty('coordinatorStopPending')
+    expect(run.paused).toBe(true)
+  })
+
+  it('I1: the Run is committed marked as starting its coordinator, and the attach clears the mark', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    let seen: string | undefined
+    deps.startCoordinator.mockImplementationOnce(async (a: { runId: string }) => {
+      seen = deps.getState().runs.find((r) => r.id === a.runId)?.coordinatorStartingAt
+      return { sessionId: `coord-${a.runId}` }
+    })
+    const run = (await fire(deps, jobId)).body as JobRun
+    expect(seen).toBe(NOW)
+    expect(run).not.toHaveProperty('coordinatorStartingAt')
+    expect(deps.getState().runs.find((r) => r.id === run.id)).not.toHaveProperty('coordinatorStartingAt')
+  })
+
+  it('I1: a failed start clears the mark, so the ▶ can start it', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    await fire(deps, jobId)
+    const run = deps.getState().runs.find((r) => r.jobId === jobId)!
+    expect(run).not.toHaveProperty('coordinatorStartingAt')
+    expect((await call(deps, 'run-start', { run: run.id })).status).toBe(200)
+    expect(deps.getState().runs.find((r) => r.id === run.id)?.coordinatorSessionId).toBe(`coord-${run.id}`)
+  })
+
+  it('I1: ▶ while a start is in flight answers 200 and starts nothing; a mark past the window is ignored', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    await fire(deps, jobId)
+    const run = deps.getState().runs.find((r) => r.jobId === jobId)!
+    deps.startCoordinator.mockClear()
+    await patchRun(deps, run.id, (r) => ({ ...r, coordinatorStartingAt: NOW }))
+    expect((await call(deps, 'run-start', { run: run.id })).status).toBe(200)
+    expect(deps.startCoordinator).not.toHaveBeenCalled()
+    // A crash left the mark: past the window it no longer holds anything.
+    await patchRun(deps, run.id, (r) => ({ ...r, coordinatorStartingAt: '2026-08-03T00:00:00.000Z' }))
+    expect((await call(deps, 'run-start', { run: run.id })).status).toBe(200)
+    expect(deps.startCoordinator).toHaveBeenCalledTimes(1)
+  })
+
+  it('I1: a fire while the latest Run is still starting its coordinator is skipped', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    await fire(deps, jobId)
+    const run = deps.getState().runs.find((r) => r.jobId === jobId)!
+    await patchRun(deps, run.id, (r) => ({ ...r, coordinatorStartingAt: NOW }))
+    expect((await fire(deps, jobId)).status).toBe(409)
+  })
+
+  it('I2: a hand-over that finds another coordinator in the slot stops its own session and keeps the slot', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    deps.startCoordinator.mockImplementationOnce(async (a: { runId: string }) => {
+      await patchRun(deps, a.runId, (r) => ({ ...r, coordinatorSessionId: 'coord-other' }))
+      return { sessionId: 'coord-mine' }
+    })
+    const r = await fire(deps, jobId)
+    expect(r.status).toBe(200)
+    const run = deps.getState().runs.find((x) => x.jobId === jobId)!
+    expect(run.coordinatorSessionId).toBe('coord-other')
+    expect(run).not.toHaveProperty('coordinatorStartingAt')
+    expect(deps.stopped).toEqual(['coord-mine'])
+    expect(deps.logs.join('\n')).toMatch(/coord-mine/)
+  })
+
+  it('I3: ▶ on a finished Run answers 200 and starts nothing', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    deps.startCoordinator.mockRejectedValueOnce(new Error('spawn refused'))
+    await fire(deps, jobId)
+    const run = deps.getState().runs.find((r) => r.jobId === jobId)!
+    const t = await call(deps, 'task-create', { run: run.id, title: 't', spec: 's', account: 'accA' })
+    await call(deps, 'task-update', { id: (t.body as { id: string }).id, status: 'completed' })
+    deps.startCoordinator.mockClear()
+    expect((await call(deps, 'run-start', { run: run.id })).status).toBe(200)
+    expect(deps.startCoordinator).not.toHaveBeenCalled()
+  })
+
+  // A paused Run is taken back with `runs resume`, not ▶. The view shows no ▶ on it (view.ts), and the
+  // CLI path matches: a fire's replaced Run is paused and must not get a coordinator nobody wants.
+  it('▶ on a paused Run answers 200 and starts nothing', async () => {
+    const deps = coordDeps()
+    const jobId = await scheduledJob(deps)
+    const first = (await fire(deps, jobId)).body as { id: string }
+    // The next fire replaces it: coordinator stopped, Run paused (U4).
+    const waiting = await park(deps, first.id)
+    expect((await fire(deps, jobId)).status).toBe(200)
+    await waiting.done
+    expect(deps.getState().runs.find((r) => r.id === first.id)?.paused).toBe(true)
+    await exited(deps, `coord-${first.id}`)
+    deps.startCoordinator.mockClear()
+    const r = await call(deps, 'run-start', { run: first.id })
+    expect(r.status).toBe(200)
+    expect(deps.startCoordinator).not.toHaveBeenCalled()
+    expect(deps.getState().runs.find((x) => x.id === first.id)).not.toHaveProperty('coordinatorSessionId')
+  })
+})
+
+// Task 1 small round 2: the clauses of runMoves each pinned, and a start drops only its own mark.
+describe('fix round 2: each clause of what counts as running', () => {
+  const noCoordDeps = () =>
+    Object.assign(makeDeps(), { listAccounts: () => [{ id: 'accA', label: 'A', provider: 'claude' as const }] })
+
+  it('an app-placed Run with a ready Task and no worker open counts as running: the fire skips', async () => {
+    const deps = noCoordDeps()
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, schedule: { kind: 'daily', time: '09:00' } })
+    const jobId = (c.body as { id: string }).id
+    await call(deps, 'task-create', { run: jobId, title: 't', spec: 's', account: 'accA' })
+    await call(deps, 'run-start', { run: jobId })
+    const first = await call(deps, 'run-spawn', { run: jobId, unlessRunning: true })
+    expect(first.status).toBe(200)
+    const runId = (first.body as { id: string; autoDispatch?: boolean }).id
+    expect((first.body as { autoDispatch?: boolean }).autoDispatch).toBe(true)
+    expect(deps.getState().tasks.find((t) => t.runId === runId)?.status).toBe('ready')
+    expect(deps.getState().dispatches).toHaveLength(0)
+    const r = await call(deps, 'run-spawn', { run: jobId, unlessRunning: true })
+    expect(r.status).toBe(409)
+    expect(r.body).toMatchObject({ running: runId })
+  })
+
+  it('a Run waiting on a Gate counts as running', async () => {
+    const deps = noCoordDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'accA' })
+    expect((await call(deps, 'gate-create', { task: (t.body as { id: string }).id, question: 'which one?' })).status).toBe(200)
+    const r = await call(deps, 'jobs-run', { id: jobId })
+    expect(r.status).toBe(409)
+    expect(JSON.stringify(r.body)).toContain(runId)
+  })
+
+  it.each(['validating', 'reviewing'] as const)('a Run with a Task %s counts as running: a check is under way', async (status) => {
+    const deps = noCoordDeps()
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const jobId = deps.getState().jobs[0].id
+    const runId = deps.getState().runs[0].id
+    const t = await call(deps, 'task-create', { run: runId, title: 't', spec: 's', account: 'accA' })
+    const s = deps.getState()
+    await deps.setState({ ...s, tasks: s.tasks.map((x) => (x.id === (t.body as { id: string }).id ? { ...x, status } : x)) })
+    expect((await call(deps, 'jobs-run', { id: jobId })).status).toBe(409)
+  })
+
+  it('a failed start drops only the mark it wrote, not a later one', async () => {
+    const deps = noCoordDeps()
+    const later = '2026-08-04T00:05:00.000Z'
+    const startCoordinator = vi.fn(async (a: { runId: string }) => {
+      // The start outlived its window, and a ▶ has marked the Run since.
+      const s = deps.getState()
+      await deps.setState({ ...s, runs: s.runs.map((r) => (r.id === a.runId ? { ...r, coordinatorStartingAt: later } : r)) })
+      throw new Error('spawn refused')
+    })
+    Object.assign(deps, { startCoordinator })
+    const c = await call(deps, 'run-create', {
+      objective: 'o',
+      cwd: 'D:/p',
+      auto: true,
+      coordinatorAccount: 'accA',
+      schedule: { kind: 'daily', time: '09:00' }
+    })
+    const jobId = (c.body as { id: string }).id
+    await call(deps, 'run-start', { run: jobId })
+    expect((await call(deps, 'run-spawn', { run: jobId })).status).toBe(400)
+    expect(deps.getState().runs.find((r) => r.jobId === jobId)?.coordinatorStartingAt).toBe(later)
+  })
+})
+
+// Final review I1 (2026-09-25): an app-placed Run counts as running only while the loop can still place
+// or start something. Nothing retries a failed Task in a Run the app places (slotsToFill takes `ready`
+// only, and recovery acts on open Dispatches), and recomputeReady never frees a Task behind a
+// dependency that failed for good. A coordinator retries a failed Task (`worker-start --retry-of`).
+describe('final review I1: an app-placed Run that nothing can move does not block the fire', () => {
+  const noCoordDeps = () =>
+    Object.assign(makeDeps(), { listAccounts: () => [{ id: 'accA', label: 'A', provider: 'claude' as const }] })
+  const firedRun = async (deps: OrchServerDeps, titles: string[]): Promise<{ jobId: string; runId: string }> => {
+    const c = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, schedule: { kind: 'daily', time: '09:00' } })
+    const jobId = (c.body as { id: string }).id
+    for (const title of titles) await call(deps, 'task-create', { run: jobId, title, spec: 's', account: 'accA' })
+    await call(deps, 'run-start', { run: jobId })
+    const first = await call(deps, 'run-spawn', { run: jobId, unlessRunning: true })
+    expect(first.status).toBe(200)
+    return { jobId, runId: (first.body as { id: string }).id }
+  }
+  const setTasks = async (deps: OrchServerDeps, runId: string, f: (t: OrchState['tasks'][number], i: number) => OrchState['tasks'][number]): Promise<void> => {
+    const s = deps.getState()
+    let i = 0
+    await deps.setState({ ...s, tasks: s.tasks.map((t) => (t.runId === runId ? f(t, i++) : t)) })
+  }
+
+  it('a Task that failed once and that nothing retries no longer blocks the fire', async () => {
+    const deps = noCoordDeps()
+    const { jobId, runId } = await firedRun(deps, ['t'])
+    await setTasks(deps, runId, (t) => ({ ...t, status: 'failed', consecutiveFailures: 1 }))
+    const r = await call(deps, 'run-spawn', { run: jobId, unlessRunning: true })
+    expect(r.status).toBe(200)
+    expect(deps.getState().runs.filter((x) => x.jobId === jobId)).toHaveLength(2)
+  })
+
+  it('a pending Task behind a dependency that failed for good no longer blocks the fire', async () => {
+    const deps = noCoordDeps()
+    const { jobId, runId } = await firedRun(deps, ['a', 'b'])
+    const [a] = deps.getState().tasks.filter((t) => t.runId === runId)
+    await setTasks(deps, runId, (t, i) =>
+      i === 0 ? { ...t, status: 'failed', consecutiveFailures: FAILURE_LIMIT } : { ...t, status: 'pending', deps: [a.id] }
+    )
+    const r = await call(deps, 'run-spawn', { run: jobId, unlessRunning: true })
+    expect(r.status).toBe(200)
+  })
+
+  it('a pending Task behind a ready one still blocks the fire: the loop places the ready one', async () => {
+    const deps = noCoordDeps()
+    const { jobId, runId } = await firedRun(deps, ['a', 'b'])
+    const [a] = deps.getState().tasks.filter((t) => t.runId === runId)
+    await setTasks(deps, runId, (t, i) => (i === 0 ? t : { ...t, status: 'pending', deps: [a.id] }))
+    expect((await call(deps, 'run-spawn', { run: jobId, unlessRunning: true })).status).toBe(409)
+  })
+
+  it('a coordinator Run with a Task that failed once still counts as running: the coordinator retries it', async () => {
+    const deps = noCoordDeps()
+    Object.assign(deps, { startCoordinator: vi.fn(async (a: { runId: string }) => ({ sessionId: `coord-${a.runId}` })) })
+    await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p', auto: true, coordinatorAccount: 'accA' })
+    const jobId = deps.getState().jobs[0].id
+    const first = (await call(deps, 'jobs-run', { id: jobId })).body as { id: string }
+    await call(deps, 'task-create', { run: first.id, title: 't', spec: 's', account: 'accA' })
+    await setTasks(deps, first.id, (t) => ({ ...t, status: 'failed', consecutiveFailures: 1 }))
+    expect((await call(deps, 'jobs-run', { id: jobId })).status).toBe(409)
+  })
+})
+
+// R4 (2026-09-25): a pure-layer refusal is a 404 only when state.ts marks it `missing`. commit() used
+// to answer 404 to any refusal whose words began `unknown `.
+describe('handleCommand — 404 는 missing 표시로만 난다 (R4)', () => {
+  const seedWorker = async (): Promise<OrchServerDeps & { state: OrchState }> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    return deps
+  }
+
+  it('reply: 없는 메시지는 404, 있는데 질문이 아닌 메시지는 400 이다 (applyReply 의 두 갈래)', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    const sent = await call(deps, 'send', { type: 'status', taskId: d.taskId, dispatchId: d.id, subject: 's', body: 'b' }, 'sess1')
+    expect(sent.status).toBe(200)
+    const status = deps.getState().messages.find((m) => m.type === 'status')!
+    expect(await call(deps, 'reply', { id: 'msg_nope', body: 'x' })).toEqual({
+      status: 404,
+      body: { error: 'unknown question: msg_nope' }
+    })
+    const before = deps.getState()
+    expect(await call(deps, 'reply', { id: status.id, body: 'x' })).toEqual({
+      status: 400,
+      body: { error: `not a question: ${status.id}` }
+    })
+    expect(deps.getState()).toBe(before)
+  })
+
+  // The words do not decide: applyWorkerDone's `unknown run for task` (a Task whose Run is gone) is not
+  // marked missing, so it is a 400 even though it starts `unknown `.
+  it('"unknown " 으로 시작해도 missing 이 아닌 거절은 400 이다', async () => {
+    const deps = await seedWorker()
+    const d = deps.getState().dispatches[0]
+    await deps.setState({
+      ...deps.getState(),
+      tasks: deps.getState().tasks.map((t) => (t.id === d.taskId ? { ...t, runId: 'run_gone' } : t))
+    })
+    const before = deps.getState()
+    const r = await call(
+      deps,
+      'send',
+      { type: 'worker_done', taskId: d.taskId, dispatchId: d.id, outcome: 'succeeded', subject: 'a', body: 'b' },
+      'sess1'
+    )
+    expect(r).toEqual({ status: 400, body: { error: `unknown run for task: ${d.taskId}` } })
+    expect(deps.getState()).toBe(before)
+  })
+
+  it('commit 을 지나는 없는 id 는 여전히 404 다', async () => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    expect((await call(deps, 'task-create', { account: 'acc1', runId: 'run_nope', title: 't', spec: 's' })).status).toBe(404)
+    expect((await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's', deps: ['tsk_nope'] })).status).toBe(404)
+    expect((await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's', parent: 'tsk_nope' })).status).toBe(404)
+    expect((await call(deps, 'gate-create', { task: 'tsk_nope', question: 'q?' })).status).toBe(404)
+    expect((await call(deps, 'runs-resume', { id: 'run_nope' })).status).toBe(404)
+    expect((await call(deps, 'run-worktree-set', { run: 'run_nope', worktree: 'D:/w' })).status).toBe(404)
+  })
+})
+
+// A worker names only its own dispatches. A dispatch that is not there and one that belongs to another
+// session get the same 403, before anything else is looked at: the answer must not tell a worker which
+// dispatch ids exist, and nothing may be written either way.
+describe('handleCommand — 워커가 남의 dispatch 나 없는 dispatch 를 지목하면 403 이고 아무것도 쓰지 않는다', () => {
+  const seedWorkerWithForeign = async (): Promise<{
+    deps: OrchServerDeps & { state: OrchState }
+    taskId: string
+    foreignTaskId: string
+  }> => {
+    const deps = makeDeps()
+    const run = await call(deps, 'run-create', { objective: 'o', cwd: 'D:/p' })
+    const runId = (run.body as { id: string }).id
+    const task = await call(deps, 'task-create', { account: 'acc1', runId, title: 't', spec: 's' })
+    const taskId = (task.body as { id: string }).id
+    const other = await call(deps, 'task-create', { account: 'acc1', runId, title: 't2', spec: 's2' })
+    const foreignTaskId = (other.body as { id: string }).id
+    await call(deps, 'worker-start', { taskId, agent: 'codex', account: 'acc1', worktree: 'current' })
+    expect(deps.getState().dispatches.map((d) => d.sessionId)).toEqual(['sess1']) // sess1 is a worker
+    await deps.setState({
+      ...deps.getState(),
+      dispatches: [
+        ...deps.getState().dispatches,
+        {
+          id: 'dsp_foreign',
+          taskId: foreignTaskId,
+          provider: 'codex' as const,
+          accountId: 'acc1',
+          sessionId: 'sess2',
+          cwd: 'D:/p2',
+          specPath: 'D:/p2/orch/specs/a.md',
+          startedAt: NOW,
+          workerState: 'ready' as const,
+          retained: false
+        }
+      ]
+    })
+    return { deps, taskId, foreignTaskId }
+  }
+
+  for (const target of ['dsp_nope', 'dsp_foreign'] as const) {
+    it(`send worker_done 이 ${target} 를 지목하면 403`, async () => {
+      const { deps, taskId, foreignTaskId } = await seedWorkerWithForeign()
+      const before = deps.getState()
+      const r = await call(
+        deps,
+        'send',
+        {
+          type: 'worker_done',
+          taskId: target === 'dsp_foreign' ? foreignTaskId : taskId,
+          dispatchId: target,
+          outcome: 'succeeded',
+          subject: 'a',
+          body: 'b'
+        },
+        'sess1'
+      )
+      expect(r).toEqual({ status: 403, body: { error: 'cannot report for another dispatch' } })
+      expect(deps.getState()).toBe(before)
+    })
+
+    it(`send status 가 ${target} 를 지목하면 403`, async () => {
+      const { deps, taskId, foreignTaskId } = await seedWorkerWithForeign()
+      const before = deps.getState()
+      const r = await call(
+        deps,
+        'send',
+        { type: 'status', taskId: target === 'dsp_foreign' ? foreignTaskId : taskId, dispatchId: target, subject: 's', body: 'b' },
+        'sess1'
+      )
+      expect(r).toEqual({ status: 403, body: { error: 'cannot send for another dispatch' } })
+      expect(deps.getState()).toBe(before)
+    })
+
+    it(`ask 가 ${target} 를 지목하면 403`, async () => {
+      const { deps, taskId, foreignTaskId } = await seedWorkerWithForeign()
+      const before = deps.getState()
+      const r = await call(
+        deps,
+        'ask',
+        { taskId: target === 'dsp_foreign' ? foreignTaskId : taskId, dispatchId: target, question: 'q?', timeoutMs: 50 },
+        'sess1'
+      )
+      expect(r).toEqual({ status: 403, body: { error: 'cannot ask for another dispatch' } })
+      expect(deps.getState()).toBe(before)
+    })
+  }
+})
+
+describe('handleCommand — chats pending and chats answer (chat takeover §3.5)', () => {
+  const p = (sessionId: string, id: string, kind: 'approval' | 'question' = 'approval'): ChatPrompt => ({ sessionId, id, kind, tool: kind === 'approval' ? 'Bash' : null, summary: 's' })
+  const withChats = (prompts: ChatPrompt[], answer: ChatAnswerResult = { answered: true }, complete = true, initial?: OrchState) => {
+    const answered: Array<[string, string, string]> = []
+    return {
+      answered,
+      deps: { ...makeDeps(initial), chatPrompts: async (sid?: string) => ({ prompts: prompts.filter((x) => !sid || x.sessionId === sid), complete }), chatAnswer: async (s: string, id: string, d: 'allow' | 'deny') => { answered.push([s, id, d]); return answer } } as OrchServerDeps
+    }
+  }
+  it('lists the open prompts, filtered by --session', async () => {
+    const { deps } = withChats([p('c1', 'r1'), p('c2', 'r2')])
+    expect(await call(deps, 'chats-pending', {}, '')).toEqual({ status: 200, body: { prompts: [p('c1', 'r1'), p('c2', 'r2')], complete: true } })
+    expect(((await call(deps, 'chats-pending', { session: 'c2' }, '')).body as ChatPromptList).prompts).toEqual([p('c2', 'r2')])
+  })
+  it('answers one prompt by its session’s writer', async () => {
+    const { deps, answered } = withChats([p('c1', 'r1')])
+    expect(await call(deps, 'chats-answer', { id: 'r1', deny: true }, '')).toEqual({ status: 200, body: { sessionId: 'c1', id: 'r1', decision: 'deny', answered: true } })
+    expect(answered).toEqual([['c1', 'r1', 'deny']])
+  })
+  it('is 409 for a prompt that is no longer open, before and after asking', async () => {
+    expect((await call(withChats([]).deps, 'chats-answer', { id: 'r1', allow: true }, '')).status).toBe(409)
+    expect((await call(withChats([p('c1', 'r1')], { answered: false, reason: 'not-open' }).deps, 'chats-answer', { id: 'r1', allow: true }, '')).status).toBe(409)
+  })
+  it('is 409 for a question (P6)', async () => {
+    const { deps, answered } = withChats([p('c1', 'q1', 'question')])
+    expect((await call(deps, 'chats-answer', { id: 'q1', deny: true }, '')).status).toBe(409)
+    expect(answered).toEqual([])
+  })
+  it('is 400 for an id open in two sessions without --session, and answers with it (P7)', async () => {
+    const { deps, answered } = withChats([p('c1', '0'), p('c2', '0')])
+    const r = await call(deps, 'chats-answer', { id: '0', allow: true }, '')
+    expect(r.status).toBe(400)
+    expect(JSON.stringify(r.body)).toMatch(/c1.*c2|--session/)
+    expect((await call(deps, 'chats-answer', { id: '0', allow: true, session: 'c2' }, '')).status).toBe(200)
+    expect(answered).toEqual([['c2', '0', 'allow']])
+  })
+  it('is 400 for neither or both of --allow and --deny, and for no --id', async () => {
+    const { deps } = withChats([p('c1', 'r1')])
+    expect((await call(deps, 'chats-answer', { id: 'r1' }, '')).status).toBe(400)
+    expect((await call(deps, 'chats-answer', { id: 'r1', allow: true, deny: true }, '')).status).toBe(400)
+    expect((await call(deps, 'chats-answer', { allow: true }, '')).status).toBe(400)
+  })
+  it('is 409 where no Host answers', async () => {
+    expect((await call(makeDeps(), 'chats-pending', {}, '')).status).toBe(409)
+  })
+  // Task 8 fix round 1, the controller's ruling: an answer is for a person. Every caller inside an agent
+  // session is refused (a worker, a coordinator, a plain tab); the shell calls with an empty session id.
+  it('refuses chats answer from inside any agent session with 403, and answers the shell', async () => {
+    const state = { ...emptyState(), dispatches: [{ id: 'd1', sessionId: 'w1', taskId: 't1', runId: 'r1', startedAt: NOW }] } as unknown as OrchState
+    const { deps, answered } = withChats([p('c1', 'r1')], { answered: true }, true, state)
+    for (const caller of ['w1', 'coordinator', 'plain-tab']) {
+      const r = await call(deps, 'chats-answer', { id: 'r1', allow: true }, caller)
+      expect(r.status, caller).toBe(403)
+      expect(JSON.stringify(r.body)).toMatch(/for a person/)
+      expect((await call(deps, 'chats-pending', {}, caller)).status, caller).toBe(200)
+    }
+    expect(answered).toEqual([])
+    expect((await call(deps, 'chats-answer', { id: 'r1', allow: true }, '')).status).toBe(200)
+    expect(answered).toEqual([['c1', 'r1', 'allow']])
+  })
+  it('answers 409 with the Host detail when the answer carries one', async () => {
+    const detail = 'c1 is written by an Astera too old to be asked; answer it in Astera'
+    const r = await call(withChats([p('c1', 'r1')], { answered: false, reason: 'not-held', detail }).deps, 'chats-answer', { id: 'r1', allow: true }, '')
+    expect(r).toEqual({ status: 409, body: { error: detail } })
+  })
+})

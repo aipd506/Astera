@@ -2,7 +2,7 @@
 // here decides a strategy — it just runs the one it is handed, the same split the orchestration
 // guide draws between "what to do" and "doing it".
 import { randomBytes } from 'node:crypto'
-import { openDispatch, beginValidation, createGate, type OrchState } from '../../core/orchestration/state'
+import { openDispatch, beginValidation, createGate, jobOf, type OrchState } from '../../core/orchestration/state'
 import { buildCheckpoint, type GitSummary } from '../../core/orchestration/checkpoint'
 import { formatResumeSection } from '../../core/orchestration/resumeSection'
 import { policyOf, repairCountOf } from '../../core/orchestration/convergence'
@@ -12,14 +12,14 @@ import { t, type Lang } from '../../core/i18n'
 import type { LostAttempt, RecoveryDecision } from '../../core/recovery/types'
 import type { Provider } from '../../core/providers/meta'
 import type { KnowledgeFiles } from '../../core/knowledge/detect'
-import { buildSpecFile } from '../orchestration/coordinator'
+import { buildSpecFile } from '../../core/orchestration/exec/coordinator'
 
 export type ExecuteResult = { ok: true; newDispatchId?: string } | { ok: false; error: string }
 
 export interface ExecuteDeps {
   getState(): OrchState
   setState(next: OrchState): Promise<void>
-  /** Same shape as OrchCoordinator.startWorker (main/orchestration/coordinator.ts) — a subset of its
+  /** Same shape as OrchCoordinator.startWorker (core/orchestration/exec/coordinator.ts) — a subset of its
    *  fields, the ones a recovered attempt needs. Never touches OrchState; throws on failure. */
   startWorker(a: {
     dispatchId: string
@@ -107,7 +107,7 @@ async function startAttempt(a: ExecuteInput, deps: ExecuteDeps): Promise<Execute
       provider: attempt.provider,
       accountId: attempt.accountId,
       sessionId: `pending:${randomBytes(4).toString('hex')}`,
-      cwd: run.cwd,
+      cwd: jobOf(state, run)?.cwd ?? '',
       specPath: '',
       retryOf: attempt.dispatchId,
       // 유실된 attempt 가 repair 였다면 새 attempt 도 repair 다 — 그 Task 는 아직 수렴 중이고, 세션을
@@ -146,7 +146,7 @@ async function startAttempt(a: ExecuteInput, deps: ExecuteDeps): Promise<Execute
       spec: task.spec,
       taskId: task.id,
       dispatchId,
-      committing: !isSamePath(attempt.cwd, run.cwd),
+      committing: !isSamePath(attempt.cwd, jobOf(state, run)?.cwd ?? ''),
       knowledge,
       repair: {
         reason: attempt.repair,
@@ -177,7 +177,7 @@ async function startAttempt(a: ExecuteInput, deps: ExecuteDeps): Promise<Execute
       ...(specFileContent ? { specFileContent } : {}),
       provider: attempt.provider,
       accountId: attempt.accountId,
-      runCwd: run.cwd,
+      runCwd: jobOf(state, run)?.cwd ?? '',
       worktree: attempt.cwd,
       ...(resume ? { resume } : {})
     })
@@ -211,13 +211,15 @@ async function startAttempt(a: ExecuteInput, deps: ExecuteDeps): Promise<Execute
   return { ok: true, newDispatchId: dispatchId }
 }
 
-/** Moves the Task to `validating` (skipped if it is already there) and starts the check. Starts no
- *  agent — the whole point of a recheck is that the previous attempt may have already finished the
- *  work, so nothing new needs to run. */
+/** Moves the Task to `validating` and starts the check. Starts no agent — the whole point of a recheck
+ *  is that the previous attempt may have already finished the work, so nothing new needs to run. */
 async function recheck(a: ExecuteInput, deps: ExecuteDeps): Promise<ExecuteResult> {
   const { attempt, now } = a
   const state = deps.getState()
   const task = state.tasks.find((t) => t.id === attempt.taskId)
+  // candidates() only yields `dispatched` Tasks, so the other side of this guard is not reached today.
+  // It stays for a state changed during the reconciler's await on git: without it an already-validating
+  // Task would get a redundant commit, and any other status a logged refusal from beginValidation.
   if (task && task.status === 'dispatched') {
     const res = beginValidation(state, { taskId: attempt.taskId }, now)
     if (res.ok) await deps.setState(res.state)

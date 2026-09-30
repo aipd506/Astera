@@ -14,7 +14,7 @@ import { matchesLimitPhrase } from './detect'
 const EXCERPT_MAX = 200 // the cap on the excerpt used for logs — the full original is never leaked into the log
 
 /** The limit-hit signal read from a transcript. It does not carry the reset time or scope — the
- *  statusLine path (recordRecovery in rolling.ts) already does that, and it is sturdier than parsing a
+ *  statusLine path (recordRecovery in claudeCoordinator.ts) already does that, and it is sturdier than parsing a
  *  time out of the phrase. */
 export interface ClaudeLimitHit {
   at: number // the entry's timestamp (ms)
@@ -92,7 +92,7 @@ function subagentLimitText(o: Record<string, unknown>): string | null {
 }
 
 /** Pulls the limit signal out of one transcript line. null when it is not a limit or has a different shape.
- *  A public API — the orchestration limit probe (main/orchestration/limitProbe.ts) reuses it.
+ *  A public API — the orchestration limit probe (core/orchestration/exec/limitProbe.ts) reuses it.
  *  The body of this function (including the false-positive defences) is unchanged — widening or narrowing
  *  it away from what the 9 measured cases justify is a regression. */
 export function parseClaudeLimitLine(raw: string): ClaudeLimitHit | null {
@@ -142,11 +142,29 @@ export class ClaudeTranscriptTail {
   // at least once.
   private failed = false
 
+  /** `opts.offset` continues a tail another process was reading (a restored rolling snapshot, S6 R4):
+   *  reading starts at that byte rather than at the file's end as of now. */
   constructor(
     filePath: string,
-    private since: number
+    private since: number,
+    opts: { offset?: number } = {}
   ) {
-    this.tail = new JsonlTail(filePath, { startAtEnd: true })
+    this.tail = new JsonlTail(filePath, opts.offset !== undefined ? { offset: opts.offset } : { startAtEnd: true })
+  }
+
+  /** The next byte to read, or null while the startAtEnd stat is pending (S6 R4). */
+  get offset(): number | null {
+    return this.tail.position
+  }
+
+  /** Settles once `offset` is known (JsonlTail.positioned). Never rejects. */
+  get positioned(): Promise<void> {
+    return this.tail.positioned
+  }
+
+  /** The time before which a limit entry is ignored (S6 R4). */
+  get sinceMs(): number {
+    return this.since
   }
 
   /** The latest of the limit entries that have appeared since the last call. null when there is none.

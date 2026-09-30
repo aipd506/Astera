@@ -2,20 +2,42 @@
 // `status()`: nothing else in slice 1 depends on the Host being there, and every failure ends here,
 // as a sentence somebody can read, rather than reaching a caller.
 import net from 'node:net'
-import { HOST_PROTOCOL, type ClientMessage, type HostMessage } from '../../core/host/protocol'
-import { hostIsOutdated } from './outdated'
+import { HOST_PROTOCOL, HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, HOST_YIELD_SLACK, type ClientMessage, type HostMessage } from '../../core/host/protocol'
+import { HOST_UNRESPONSIVE_MS, PING_MS } from '../../core/host/unresponsive'
+import { hostIsOutdated, hostSpeaksPing } from './outdated'
 import { encodeLine, createLineReader } from '../../host/framing'
 // HostStatus is declared in core/types.ts, not here, so the renderer can name it without importing
 // from src/main.
 import type { HostStatus } from '../../core/types'
+import { unsafeSocketDir } from '../../core/host/socketDir'
+import { newHostNonce, proofMatches } from '../../core/host/hostKey'
+
+/** What `spawnHost` is handed: whether the spawn it is about to make is still wanted. */
+export interface SpawnContext {
+  wanted(): boolean
+}
 
 export interface HostClientDeps {
   address: string
   appVersion: string
   /** Start a Host. Called at most once per connect cycle; the client then waits for the address to
-   *  answer rather than for the process. */
-  spawnHost(): void
+   *  answer rather than for the process.
+   *
+   *  **May be asynchronous, and is awaited** (stage 3 task 2): the app's spawnHost first waits for the
+   *  Host runtime to be installed, which after an update can take many seconds. The attempts to reach
+   *  the address start counting only once it has resolved — they are for a Host binding after its
+   *  process starts, not for the install before it. A rejection is the same as a throw.
+   *
+   *  **`ctx.wanted()` is asked after that wait, before anything is spawned.** It turns false once the
+   *  client was stopped (the updater's stop, or the app quitting) or a restart began another cycle
+   *  while the install ran; spawning then would leave a detached Host behind an update, or two
+   *  Hosts racing for one address. Time spent in here does not count against `ready(ms)` either. */
+  spawnHost(ctx: SpawnContext): void | Promise<void>
   log(m: string): void
+  /** The profile's Host key (core/host/hostKey.ts `readHostKey`), read before each connection. The
+   *  Host's hello has to carry the proof of it, or this client treats what answered as somebody
+   *  else's and sends it nothing more: on Windows another account can create the pipe first. */
+  hostKey(): Promise<string | null>
   /** The protocol this app speaks. Injected only so a test can be the odd one out. */
   protocol?: number
   /** How many times to try the address before giving up on this cycle. */
@@ -24,6 +46,19 @@ export interface HostClientDeps {
   retryMs?: number
   /** How long to wait for the Host's `hello` after the socket connects. Defaults to HANDSHAKE_MS. */
   helloMs?: number
+  /** The heartbeat's interval, and how many of its pings may be in flight unanswered before the Host
+   *  is called unresponsive. Injected only so a test does not have to wait out the real ones. */
+  pingMs?: number
+  pingMisses?: number
+  /** Whether the runtime the Host was started from is missing files (design F6). Read at every hello,
+   *  not once: the answer belongs to the Host that just answered, and the next one may be started
+   *  from a runtime this app has since repaired. */
+  runtimeIncomplete?: () => boolean
+  /** Whether this app holds its own Slack socket now (Slack in the Host Task 8). Read at every hello: while
+   *  it is true the hello leaves the `slack` yield out, because a Slack-owning Host opens its socket the
+   *  moment a yielding hello reaches it, and two sockets on one token split the replies. Absent: yields.
+   *  A throw is read as true (no second socket) and logged. */
+  keepsSlack?: () => boolean
 }
 
 const DEFAULT_ATTEMPTS = 25
@@ -52,9 +87,16 @@ export const READY_TIMEOUT_MS = CONNECT_PHASE_MS + HANDSHAKE_MS
 /** After a connection that worked drops, wait before trying again: 1s, 2s, 4s, capped at 30s. */
 const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000]
 
+/** How many pings may be in flight unanswered before that Host is called unresponsive. Derived from
+ *  `HOST_UNRESPONSIVE_MS` divided by `PING_MS` (both in core/host/unresponsive.ts), rather than a second
+ *  literal that could drift from it — `cli/host.ts`'s `host stop` has to agree with the same 15s
+ *  judgment. If a slow first spawn or a wake from sleep ever produces a false verdict, `HOST_UNRESPONSIVE_MS`
+ *  is what moves (docs/2026-09-22-host-unresponsive-recovery-design.md §9), not this line. */
+export const PING_MISSES = HOST_UNRESPONSIVE_MS / PING_MS
+
 /** How long `retire()` waits for the Host to be gone. Covers the Host's own EXIT_HAMMER_MS
  *  (host/index.ts), which is the point by which it has stopped being polite about leaving. */
-const RETIRE_SETTLE_MS = 2_000
+export const RETIRE_SETTLE_MS = 2_000
 
 /** Which Host answered, as the `hello` reports it. Two `hello`s with the same pair came from the same
  *  process, and one whose registry therefore still holds the ptys this app spawned before the drop. */
@@ -72,8 +114,16 @@ const sleep = (ms: number): Promise<void> =>
     timer.unref?.()
   })
 
-const connectOnce = (address: string): Promise<net.Socket> =>
-  new Promise((resolve, reject) => {
+const connectOnce = async (address: string, log: (m: string) => void): Promise<net.Socket> => {
+  // Before anything is sent there: a socket in a directory another user could have made is not this
+  // user's Host, whatever answers (core/host/socketDir.ts). Refused the way an absent Host is, and the
+  // Host this then starts refuses the same directory itself, so nothing of this profile ever runs there.
+  const unsafe = await unsafeSocketDir(address)
+  if (unsafe !== null) {
+    log(`${unsafe} — not connecting there`)
+    throw new Error(unsafe)
+  }
+  return new Promise((resolve, reject) => {
     const socket = net.connect(address)
     socket.setEncoding('utf8')
     socket.once('connect', () => resolve(socket))
@@ -82,10 +132,20 @@ const connectOnce = (address: string): Promise<net.Socket> =>
       reject(err)
     })
   })
+}
 
 export class HostClient {
   private socket: net.Socket | null = null
   private stopped = false
+  /** Which `cycle()` is the current one. A cycle still waiting on an asynchronous spawnHost when a
+   *  restart begins another is superseded, and its spawn is no longer wanted. */
+  private cycleGen = 0
+  /** How many asynchronous spawnHost calls are in flight — the runtime being installed. `ready(ms)`
+   *  does not count that time. */
+  private spawning = 0
+  /** `ready()` waits whose time ran out while spawnHost was installing; each restarts its full wait
+   *  once that is over. */
+  private readonly afterSpawn = new Set<() => void>()
   private drops = 0
   private readonly subscribers = new Set<(m: HostMessage) => void>()
   /** The connection to the Host went away. Notified from the socket's own 'close' handler, before a
@@ -95,11 +155,22 @@ export class HostClient {
   private readonly connectSubscribers = new Set<(h: HostIdentity) => void>()
   /** Callers waiting on `ready()` for the current connection attempt to have an outcome. */
   private readonly readyWaiters = new Set<() => void>()
+  /** Every change of `status()`. What decides where a new pty goes — the Host or the app's own
+   *  node-pty — listens here, because that decision has to follow the Host becoming unresponsive and
+   *  not only it connecting (design F1). */
+  private readonly statusSubscribers = new Set<(s: HostStatus) => void>()
   /** Runs from `attach` until the Host answers. See where it is armed for what it is for. */
   private handshake: ReturnType<typeof setTimeout> | null = null
+  /** The heartbeat, and how many of its pings are in flight with no answer (design F2). */
+  private heartbeat: ReturnType<typeof setInterval> | null = null
+  private pingSeq = 0
+  private pingsOutstanding = 0
   /** Whether anything ever accepted a connection at the address. Set once, in `attach`, and never
    *  cleared: see `sawPeer`. */
   private peerSeen = false
+  /** The socket whose Host proved itself (protocol 4), and what its proof is checked against. */
+  private proven: net.Socket | null = null
+  private expecting: { key: string | null; nonce: string } | null = null
   private state: HostStatus = {
     connected: false,
     protocol: null,
@@ -108,6 +179,8 @@ export class HostClient {
     pid: null,
     problem: null,
     outdated: false,
+    unresponsive: false,
+    runtimeIncomplete: false,
     features: []
   }
 
@@ -115,6 +188,95 @@ export class HostClient {
 
   status(): HostStatus {
     return { ...this.state }
+  }
+
+  /** Notified after every change of `status()`, with the new value. Returns an unsubscribe. */
+  onStatusChange(cb: (s: HostStatus) => void): () => void {
+    this.statusSubscribers.add(cb)
+    return () => this.statusSubscribers.delete(cb)
+  }
+
+  /** The one place `state` is written after construction, so no transition can reach the outside
+   *  world without its subscribers hearing about it. */
+  private setState(next: HostStatus): void {
+    this.state = next
+    for (const cb of [...this.statusSubscribers]) {
+      try {
+        cb({ ...next })
+      } catch (err) {
+        // Same rule as every other fan-out here: one subscriber's failure is its own.
+        this.deps.log(`a status subscriber threw: ${String(err)}`)
+      }
+    }
+  }
+
+  /**
+   * The Host is there and is not answering.
+   *
+   * Called from the heartbeat, from the handshake deadline, and by the wiring for a Host too old for
+   * the heartbeat whose request ran its deadline out (design F1, F4). Idempotent, because all three
+   * can fire about the same silence.
+   *
+   * **The socket is left alone** when there is one. Nothing about it is broken — the Host simply is
+   * not reading it — and a late answer arriving on it is the one thing that takes this state back
+   * without ending anybody's sessions.
+   */
+  markUnresponsive(problem: string): void {
+    // **A later reason replaces an earlier one**, rather than the first one winning. The heartbeat
+    // reaches this first with the general fact, and what comes after it is more specific — a restart
+    // that could not end the Host, which is the only place a person learns why the button they just
+    // pressed did nothing. (The heartbeat does not keep calling: see where it is armed.)
+    if (this.state.unresponsive && this.state.problem === problem) return
+    this.deps.log(problem)
+    this.setState({ ...this.state, connected: false, unresponsive: true, problem })
+    // A `ready()` caller waiting on this connection has its answer: there is a Host, and it is not
+    // going to talk to us.
+    this.settleReady()
+  }
+
+  /** Every message from the Host lands here first. Whatever it says, it proves the event loop on the
+   *  other side is turning, which is the only question `unresponsive` asks. */
+  private alive(): void {
+    this.pingsOutstanding = 0
+    if (!this.state.unresponsive) return
+    this.deps.log('the Host is answering again')
+    this.setState({ ...this.state, connected: true, unresponsive: false, problem: null })
+  }
+
+  /** Arms the heartbeat against a Host that announced it answers pings. A Host that did not is judged
+   *  by the deadline on a request instead — see `hostSpeaksPing`. */
+  private startHeartbeat(): void {
+    this.stopHeartbeat()
+    if (!hostSpeaksPing(this.state)) return
+    const misses = this.deps.pingMisses ?? PING_MISSES
+    this.heartbeat = setInterval(() => {
+      this.pingSeq += 1
+      this.pingsOutstanding += 1
+      this.send({ t: 'ping', seq: this.pingSeq })
+      // Judged after sending, so the count is pings in flight: with the defaults this fires fifteen
+      // seconds after the first one went unanswered. **Pinging continues past it on purpose** — a late
+      // pong reaching `alive()` is what takes the state back, and a heartbeat that stopped at the
+      // verdict would make that recovery impossible.
+      //
+      //
+      // **It says this once, and then stops saying it.** The verdict is reached every interval from
+      // here on, but the state it produces is already there, and something else may have added a more
+      // useful sentence to it since — a restart explaining that the Host could not be ended, which is
+      // the one thing that tells a person why the button did nothing. Repeating the generic reason
+      // overwrote that, four seconds later, every time (measured in the dev app, 2026-09-22).
+      if (this.pingsOutstanding >= misses && !this.state.unresponsive) {
+        this.markUnresponsive('the Host stopped answering')
+      }
+    }, this.deps.pingMs ?? PING_MS)
+    // Nothing here should keep the app alive, the same reason the retry sleep and the handshake
+    // deadline unref themselves.
+    this.heartbeat.unref?.()
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat)
+    this.heartbeat = null
+    this.pingsOutstanding = 0
   }
 
   /** Whether a Host was ever there — did anything accept a connection at the address, at any point in
@@ -138,6 +300,7 @@ export class HostClient {
   async stop(): Promise<void> {
     this.stopped = true
     this.clearHandshake()
+    this.stopHeartbeat()
     this.socket?.destroy()
     this.socket = null
   }
@@ -198,10 +361,27 @@ export class HostClient {
     return new Promise((resolve) => {
       const done = (): void => {
         clearTimeout(timer)
+        this.afterSpawn.delete(arm)
         this.readyWaiters.delete(done)
         resolve()
       }
-      const timer = setTimeout(done, ms)
+      // **The wait does not run out while spawnHost is still installing the runtime** (review of
+      // stage 3 task 2). A first install after an update can take far longer than `ms`, and a caller
+      // that gave up then would read "no Host" for a Host that was never started yet. The install
+      // has its own deadline (INSTALL_TIMEOUT_MS in runtimeInstall.ts), so this cannot wait forever.
+      const arm = (): void => {
+        this.afterSpawn.delete(arm)
+        timer = setTimeout(expire, ms)
+        timer.unref?.()
+      }
+      const expire = (): void => {
+        if (this.spawning > 0 && !this.stopped) {
+          this.afterSpawn.add(arm)
+          return
+        }
+        done()
+      }
+      let timer = setTimeout(expire, ms)
       timer.unref?.()
       this.readyWaiters.add(done)
     })
@@ -273,19 +453,31 @@ export class HostClient {
     if (!this.stopped) return
     this.stopped = false
     this.drops = 0
-    // What is known about the *previous* Host is not a description of the one being started.
-    this.state = { ...this.state, connected: false, protocol: null, hostVersion: null, startedAt: null, pid: null, problem: null, outdated: false, features: [] }
+    // What is known about the *previous* Host is not a description of the one being started — and
+    // that includes it having stopped answering, which is the reason a replacement is usually being
+    // started at all (design F5).
+    this.setState({ ...this.state, connected: false, protocol: null, hostVersion: null, startedAt: null, pid: null, problem: null, outdated: false, unresponsive: false, runtimeIncomplete: false, features: [] })
     void this.cycle()
   }
 
   private async cycle(): Promise<void> {
     if (this.stopped) return
+    const gen = ++this.cycleGen
+    const wanted = (): boolean => !this.stopped && gen === this.cycleGen
     const attempts = this.deps.attempts ?? DEFAULT_ATTEMPTS
     const retryMs = this.deps.retryMs ?? DEFAULT_RETRY_MS
     let asked = false
     for (let i = 0; i < attempts && !this.stopped; i++) {
       try {
-        const socket = await connectOnce(this.deps.address)
+        const socket = await connectOnce(this.deps.address, this.deps.log)
+        // Read after the connect and before the hello: nothing arrives before this client speaks, and
+        // the proof has to be checked the moment the Host's hello lands (see `handleHostMessage`).
+        let key: string | null = null
+        try {
+          key = await this.deps.hostKey()
+        } catch (err) {
+          this.deps.log(`the Host key could not be read: ${String(err)}`)
+        }
         // `stop()` may have landed while this connect was in flight. Attaching now would report a
         // connection the caller has already given up on, and the socket's own 'close' handler returns
         // early once stopped — so the status would never be corrected again.
@@ -293,7 +485,7 @@ export class HostClient {
           socket.destroy()
           return
         }
-        this.attach(socket)
+        this.attach(socket, key)
         return
       } catch {
         // Nothing is listening. Ask for a Host once, then keep trying the address — the Host binds
@@ -301,12 +493,19 @@ export class HostClient {
         if (!asked && !this.stopped) {
           asked = true
           this.deps.log('no Host at the address — starting one')
+          this.spawning += 1
           try {
-            this.deps.spawnHost()
+            await this.deps.spawnHost({ wanted })
           } catch (err) {
-            this.fail(`the Host could not be started: ${String(err)}`)
+            if (wanted()) this.fail(`the Host could not be started: ${String(err)}`)
             return
+          } finally {
+            this.spawning -= 1
+            if (this.spawning === 0) for (const a of [...this.afterSpawn]) a()
           }
+          // Stopped, or superseded by a restart, while the runtime was being installed: this cycle is
+          // over, and whatever was wanted of it is now the newer cycle's business.
+          if (!wanted()) return
         }
         await sleep(retryMs)
       }
@@ -314,8 +513,12 @@ export class HostClient {
     if (!this.stopped) this.fail('no Host answered at the address')
   }
 
-  private attach(socket: net.Socket): void {
+  private attach(socket: net.Socket, key: string | null): void {
     this.socket = socket
+    // A new nonce per connection, so an answer seen on one proves nothing on the next.
+    const nonce = newHostNonce()
+    this.proven = null
+    this.expecting = { key, nonce }
     // The connection was accepted, so something is listening at the address. Recorded before the
     // handshake, not after it: a peer that never says hello is exactly the case `sawPeer` exists to
     // tell apart from an address nothing answers.
@@ -329,14 +532,24 @@ export class HostClient {
     socket.on('data', read)
     // A peer that accepts the connection and then says nothing is not a dropped connection: nothing
     // closes, so the 'close' handler below never runs and the status would sit at "not connected, no
-    // reason" for the app's whole life, with no retry. Ending the socket ourselves puts that case
-    // back on the path that already handles a connection going away.
+    // reason" for the app's whole life, with no retry.
+    //
+    // **And it is not a peer to reconnect to, either.** This used to `end()` the socket to put the
+    // case back on the reconnect path, which assumed the other side would close in return. A Host
+    // whose event loop is stuck does not: measured 2026-09-22, the close never came, nothing retried,
+    // and the status sat unchanged for the rest of the app's life — with a Host holding a person's
+    // sessions the whole time. Reconnecting would not have helped either, because the next connect
+    // gets accepted and ignored exactly like this one. So: destroy the socket, and say what is true.
+    // `unresponsive` is a state the app acts on (design F1, F3), not a sentence nobody reads.
     this.handshake = setTimeout(() => {
       this.handshake = null
       // Only a socket that never answered can reach here: the hello and the mismatch both clear this.
       if (this.socket !== socket) return
-      this.fail('the Host accepted the connection but did not answer')
-      socket.end()
+      // Cleared before destroying, so the 'close' handler below returns early rather than scheduling a
+      // reconnect to a peer this has just given up on.
+      this.socket = null
+      socket.destroy()
+      this.markUnresponsive('the Host accepted the connection but did not answer')
     }, this.deps.helloMs ?? HANDSHAKE_MS)
     // Same reason as `sleep`'s timer: a client waiting on a handshake is not work the app has to
     // finish before quitting.
@@ -344,15 +557,19 @@ export class HostClient {
     socket.on('close', () => {
       if (this.socket !== socket) return
       this.clearHandshake()
+      this.stopHeartbeat()
       this.socket = null
       if (this.stopped) return
-      this.state = {
+      this.setState({
         ...this.state,
         connected: false,
+        // A dropped connection is not an unresponsive Host: this one has a way forward of its own, the
+        // backoff below, and the Host on the other side may be perfectly well.
+        unresponsive: false,
         // A reason already set (a protocol mismatch, say) is more use than this one, and the next
         // successful handshake clears it either way.
         problem: this.state.problem ?? 'the connection to the Host dropped'
-      }
+      })
       const wait = BACKOFF_MS[Math.min(this.drops, BACKOFF_MS.length - 1)]
       this.drops += 1
       this.deps.log(`connection to the Host dropped — retrying in ${wait}ms`)
@@ -368,17 +585,76 @@ export class HostClient {
       void sleep(wait).then(() => this.cycle())
     })
     socket.on('error', (err) => this.deps.log(`connection error: ${String(err)}`))
-    this.send({ t: 'hello', protocol: this.deps.protocol ?? HOST_PROTOCOL, app: this.deps.appVersion })
+    // `role` is what makes this client the one the Host sends `orch-act` to; `app` cannot say it,
+    // because the CLI's hello carries a version string in the same field (core/host/connect.ts).
+    // `yields` hands the Host the Job worktrees (host S3 ruling R4): this app writes worktrees.json
+    // through a Host that announces `worktrees` and understands `git-op`. `dispatch` (S4+S5 §4.2)
+    // hands it the Jobs: a Host that announces `dispatch` drives them, and this app's scheduler stands
+    // down in front of it (ipc.ts's `hostDrives`). `rolling` (S6): a Host that announces it rolls the
+    // sessions it owns, and this app shows them. `chat-takeover`: this app writes its chat chains into
+    // the proc notes and leaves a Host-started or Host-marked chat proc to a Host that announces it.
+    // An older Host ignores the names, and this app goes on driving in front of it (D5).
+    // `journal` (Host journal J2): a Host that announces it writes the Job Journal, and this app only
+    // reads it (appJournal.ts). Sent only by a build that stops writing in front of such a Host: a
+    // yield before that would make the Host a second writer.
+    // `workspace` (agent workspace design): this app shows the Host's workspaces in a mirror tab, so the Host may push them.
+    // `slack` (Slack in the Host P4): this app opens no socket and posts nothing in front of a Host that
+    // announces `slack-owner`, and forwards what only it sees. Left out while this app holds its own socket
+    // (keepsSlack), so that Host stays inactive rather than opening a second one beside it.
+    let keepsSlack = false
+    try {
+      keepsSlack = this.deps.keepsSlack?.() === true
+    } catch (err) {
+      keepsSlack = true
+      this.deps.log(`keepsSlack threw, so this hello keeps Slack: ${String(err)}`)
+    }
+    this.send({
+      t: 'hello',
+      protocol: this.deps.protocol ?? HOST_PROTOCOL,
+      app: this.deps.appVersion,
+      role: 'app',
+      // Leftovers Task 1 (S6-3): the Host asks whether this pid lives when app.pid could not be written.
+      pid: process.pid,
+      // `orch-state-latest` (stage 3 T4): the `orch-state` handler in ipc.ts swaps the mirror for whatever
+      // arrives, and its commit hook diffs against the last one it took, so a push a newer one replaced
+      // is never missed. The one reader that needs every commit — the app's own journal recorder — is
+      // idle while the Host announces `journal`, and every Host that reads this name does.
+      yields: [HOST_YIELD_WORKTREES, HOST_YIELD_DISPATCH, HOST_YIELD_ROLLING, HOST_YIELD_CHAT_TAKEOVER, HOST_YIELD_JOURNAL, HOST_YIELD_WORKSPACE, HOST_YIELD_ORCH_STATE_LATEST, ...(keepsSlack ? [] : [HOST_YIELD_SLACK])],
+      nonce
+    })
   }
 
   private handleHostMessage(m: HostMessage): void {
+    // Before anything is read off it: whatever this message says, it says the Host's event loop is
+    // turning. That is the only question `unresponsive` asks, so a Host written off a moment ago
+    // takes itself back here rather than waiting for somebody to notice (design F1).
+    // **Nothing from a peer that has not proven itself reaches anyone** (protocol 4, core/host/hostKey.ts).
+    // A Host sends nothing before its hello, so this drops only what a squatter would try to slip in.
+    if (this.proven !== this.socket && m?.t !== 'hello' && m?.t !== 'protocol-mismatch') return
+    this.alive()
     if (m?.t === 'hello') {
+      const expecting = this.expecting
+      if (!expecting || expecting.key === null || !proofMatches(expecting.key, expecting.nonce, m.proof)) {
+        this.clearHandshake()
+        // Somebody else's process at this profile's address, most likely another account's on a shared
+        // Windows machine. Cleared before destroying, so the 'close' handler does not reconnect to it;
+        // the Info tab shows the sentence, and Restart tries again.
+        const socket = this.socket
+        this.socket = null
+        socket?.destroy()
+        this.fail(
+          `something at the Host's address answered but could not prove it is this profile's Host${expecting?.key === null ? ' (this profile has no Host key)' : ''} — another account on this machine may be holding the address; nothing was sent to it`
+        )
+        return
+      }
+      this.proven = this.socket
       this.clearHandshake()
       this.drops = 0
       // Judged here, from the two versions this handshake already carries, so the status the Info tab
       // reads and the replacement rule in ipc.ts act on cannot disagree about it.
       const outdated = hostIsOutdated(m.host, this.deps.appVersion)
-      this.state = {
+      const runtimeIncomplete = this.deps.runtimeIncomplete?.() ?? false
+      this.setState({
         connected: true,
         protocol: m.protocol,
         hostVersion: m.host,
@@ -386,11 +662,15 @@ export class HostClient {
         pid: m.pid,
         problem: null,
         outdated,
+        unresponsive: false,
+        runtimeIncomplete,
         features: Array.isArray(m.features) ? m.features.filter((f): f is string => typeof f === 'string') : []
-      }
+      })
       this.deps.log(
-        `connected to Host ${m.host} (pid ${m.pid}, protocol ${m.protocol})${outdated ? ` — older than this app (${this.deps.appVersion}); replaced once it holds nothing` : ''}`
+        `connected to Host ${m.host} (pid ${m.pid}, protocol ${m.protocol})${outdated ? ` — older than this app (${this.deps.appVersion}); replaced once it holds nothing` : ''}${runtimeIncomplete ? ' — its runtime is missing files; replaced once it holds nothing' : ''}`
       )
+      // Armed from the status this hello just set, which is what `hostSpeaksPing` reads.
+      this.startHeartbeat()
       this.settleReady()
       // After settleReady, so a first-connection subscriber and a `ready()` caller see the same
       // already-connected status rather than racing over it.
@@ -415,11 +695,15 @@ export class HostClient {
       // other than ours is turned away, whatever it actually is.
       this.deps.log(`the Host speaks protocol ${m.protocol} — retiring it and starting one we can talk to`)
       this.send({ t: 'retire' })
-      this.state = { ...this.state, connected: false, problem: `the Host speaks protocol ${m.protocol}` }
+      this.setState({ ...this.state, connected: false, problem: `the Host speaks protocol ${m.protocol}` })
       this.socket?.end()
       this.settleReady()
       return
     }
+    // The heartbeat's answer carries nothing but the fact that it arrived, and `alive()` above has
+    // already taken that. Returning here keeps it out of the subscribers, who would have to know to
+    // ignore it.
+    if (m?.t === 'pong') return
     for (const cb of [...this.subscribers]) {
       try {
         cb(m)
@@ -432,7 +716,7 @@ export class HostClient {
   }
 
   private fail(problem: string): void {
-    this.state = { connected: false, protocol: null, hostVersion: null, startedAt: null, pid: null, problem, outdated: false, features: [] }
+    this.setState({ connected: false, protocol: null, hostVersion: null, startedAt: null, pid: null, problem, outdated: false, unresponsive: false, runtimeIncomplete: false, features: [] })
     this.deps.log(problem)
     this.settleReady()
   }

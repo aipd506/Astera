@@ -15,16 +15,6 @@ export const es: Catalog = {
   // visible before picking it
   'settings.general.language.system': 'Configuración del sistema ({lang})',
   'settings.general.language.saveFailed': 'No se pudo guardar la configuración de idioma: {detail}',
-  // Agent orchestration
-  'settings.orchestration.label': 'Orquestación de agentes (experimental)',
-  'settings.orchestration.hint':
-    'Cuando está activada, las sesiones de agente que abre la aplicación pueden abrir sesiones de trabajador con otro proveedor. ' +
-    'Un agente podrá crear sesiones con cualquiera de las cuentas de la aplicación, así que actívela solo cuando la necesite. ' +
-    'Solo funciona en un proyecto que sea un repositorio de git. ' +
-    'No se aplica a las sesiones que ya están abiertas: funciona a partir de las sesiones nuevas. ' +
-    'Pida a la sesión que vaya a usar como orquestador que ejecute astera help para obtener la guía de uso completa.',
-  'settings.orchestration.saveFailed':
-    'No se pudo guardar la configuración de orquestación: {detail}',
   // Modo de permisos del agente
   'settings.agentPermission.label': 'Ejecutar agentes sin comprobar permisos',
   'settings.agentPermission.hint':
@@ -51,6 +41,13 @@ export const es: Catalog = {
     'Instala la habilidad astera-browser en todas las cuentas. Solo se puede abrir localhost. ' +
     'No afecta a las sesiones ya abiertas; sí a las nuevas.',
   'settings.agentBrowser.saveFailed': 'No se pudo guardar el ajuste del navegador del agente: {detail}',
+  // Espacio de trabajo de apps del agente
+  'settings.agentApp.label': 'Espacio de trabajo de apps del agente (experimental)',
+  'settings.agentApp.hint':
+    'Activado, un agente puede abrir la app de este proyecto donde usted no la ve (un escritorio oculto en Windows, una pantalla virtual en Linux, en segundo plano en macOS), manejarla y fotografiarla. ' +
+    'Nunca toma su pantalla ni su puntero. En Windows y macOS comparte su portapapeles. Instala la habilidad astera-app en todas las cuentas. ' +
+    'No afecta a las sesiones ya abiertas; sí a las nuevas.',
+  'settings.agentApp.saveFailed': 'No se pudo guardar el ajuste del espacio de trabajo de apps del agente: {detail}',
   // Generación de explicaciones (How It Works)
   'settings.gen.label': 'Cuenta para explicaciones',
   'settings.gen.hint': 'Cuando termina un trabajo, esta cuenta escribe la explicación de la función. No se genera nada hasta que elijas una.',
@@ -88,6 +85,8 @@ export const es: Catalog = {
   'files.error.alreadyExistsInDest': '«{name}» ya existe en la carpeta de destino',
   'files.error.renameStranded':
     'No se pudo cambiar el nombre ni revertir el cambio. El archivo está en «{tmp}»',
+  'files.error.unreachable':
+    'La carpeta no respondió (¿una unidad de red desconectada?), así que no se cambió nada. Vuelve a intentarlo cuando sea accesible.',
   // worktrees/include.ts, worktrees/create.ts — worktree creation warnings
   'worktree.include.tooManyEntries':
     '.worktreeinclude supera las {max} entradas; se ignoraron las líneas restantes',
@@ -99,7 +98,13 @@ export const es: Catalog = {
   'worktree.include.missing': 'Omitido, no existe: {entry}',
   'worktree.include.notIgnored': 'Omitido, no está en gitignore: {entry}',
   'worktree.include.sizeFailed': 'No se pudo calcular el tamaño: {entry} ({detail})',
+  'worktree.include.unreachable': 'La carpeta del proyecto no respondió, así que no se copió ninguna entrada de .worktreeinclude: {path}',
   'worktree.include.overLimit': 'Omitido, supera el límite de copia (200 MB): {entry}',
+  'worktree.include.linkFailed': 'Omitido, no se pudo recrear un enlace: {entry} ({detail})',
+  'worktree.include.unsafeDest': 'No se copió bajo {path}: es un enlace y escribir a través de él saldría del worktree ({entry})',
+  'worktree.include.linkTargetMissing': 'No se recreó un enlace de carpeta porque su destino dentro del repositorio no está en el worktree: {path} ({entry})',
+  'worktree.include.outsideLinkSkipped': 'No se recreó un enlace de carpeta que apunta fuera del repositorio porque no se pudo crear un enlace simbólico ({detail}). Créalo a mano si lo necesitas: {path} ({entry})',
+  'worktree.include.overFileCount': 'Omitido, más de {max} elementos: {entry}',
   'worktree.include.copyFailed': 'Error al copiar: {entry} ({detail})',
   'worktree.create.fetchFailed':
     'No se pudo actualizar desde el remoto; se creó a partir de {baseRef} local',
@@ -124,7 +129,16 @@ export const es: Catalog = {
   'worktree.error.orphanUnverifiable':
     'git no rastrea esta carpeta, así que no se puede saber si hay cambios sin confirmar.',
   'worktree.error.gitAddFailed': 'No se pudo crear el worktree de git.',
+  'worktree.error.cancelled': 'Se canceló la creación del worktree. Se deshizo todo lo creado.',
+  'worktree.error.rollbackIncomplete': 'No se pudo deshacer la creación del worktree. Elimina a mano la carpeta {path} y la rama {branch}.',
   'worktree.error.gitRemoveFailed': 'No se pudo eliminar el worktree de git.',
+  'worktree.error.unreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se eliminó nada. Vuelve a intentarlo cuando sea accesible.',
+  'worktree.error.linksUnverified': 'No se pudieron comprobar y quitar todos los enlaces de la carpeta del worktree, así que no se eliminó nada. Eliminarla de todos modos podría borrar archivos de fuera a través de una unión (junction). Vuelve a intentarlo o quita los enlaces a mano.',
+  'worktree.error.locked': 'El worktree está bloqueado (git worktree lock), así que no se eliminó nada. Desbloquéalo primero o elimínalo forzando.',
+  'worktree.error.hasSubmodules': 'El worktree tiene submódulos, que git solo elimina forzando, así que no se eliminó nada. Elimínalo forzando.',
+  'worktree.error.rootUnreachable': 'No se pudo acceder a la carpeta del worktree ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
+  'worktree.error.repoUnreachable': 'No se pudo acceder a la carpeta del proyecto ni comprobarla (¿una unidad de red desconectada?), así que no se creó ningún worktree. Vuelve a intentarlo cuando sea accesible.',
+  'worktree.error.noGit': 'No se pudo ejecutar git (¿está instalado y en el PATH?), así que no se creó ningún worktree.',
   'worktree.error.raw': '{detail}',
   'worktree.inUse.session':
     'La sesión «{title}» está en ejecución y usa este worktree. Cierre primero esa sesión.',
@@ -133,6 +147,7 @@ export const es: Catalog = {
   'worktree.inUse.unknown': 'Este worktree está en uso.',
   // ROLL_MIXED_PROVIDER in sessions/manager.ts — a session-rolling constraint unrelated to worktrees
   'session.roll.mixedProvider': 'La rotación no puede mezclar cuentas de Claude y de Codex',
+  'session.resume.hostChatNotAdopted': 'Esta conversación sigue ejecutándose en el Host de Astera y esta ventana aún no la ha recuperado. Vuelve a intentarlo en un momento.',
   // App.tsx — shared window controls, resizer, separator
   'common.minimize': 'Minimizar',
   'common.maximize': 'Maximizar',
@@ -152,6 +167,8 @@ export const es: Catalog = {
   'session.rail.toggleSidebar': 'Contraer o expandir la barra lateral',
   'session.rail.openSessions': 'Cuentas e historial',
   'session.spawn.failed': 'No se pudo iniciar la sesión: {message}',
+  'session.spawn.cwdMissing': 'No se encuentra la carpeta: {path}. Vuelva a elegir la carpeta.',
+  'session.spawn.cwdUnreachable': 'La carpeta no respondió a tiempo: {path}. Si está en una unidad de red, compruebe la conexión.',
   'session.spawn.failedWorktreeKept':
     'No se pudo iniciar la sesión: {message} (el worktree "{name}" se conservó; elimínelo desde el panel Worktrees)',
   // Rolling-resume guard hit — tells the user the tab was just focused and their chosen options were dropped
@@ -212,6 +229,14 @@ export const es: Catalog = {
   'settings.info.hostConnected': 'Conectado · protocolo {protocol} · desde hace {uptime}',
   'settings.info.hostNotConnected': 'Sin conexión',
   'settings.info.hostNotConnectedWhy': 'Sin conexión · {detail}',
+  'status.hostPreparing': 'Preparando el Astera Host…',
+  'status.hostPreparingSlow': 'Preparando el Astera Host… sigue en curso ({seconds} s)',
+  'status.hostPrepareFailed': 'No se pudo preparar el Astera Host',
+  'status.hostPrepareFailedTitle':
+    '{reason} ({detail}) Esta vez el Host se inicia desde el ejecutable de la app, y se vuelve a preparar en el próximo inicio.',
+  'status.hostPrepareReason.copy': 'No se pudieron copiar los archivos del Host.',
+  'status.hostPrepareReason.timeout': 'La preparación no terminó en dos minutos.',
+  'status.hostPrepareReason.unknown': 'Un error inesperado detuvo la preparación.',
   'settings.slack.save': 'Guardar',
   'settings.slack.saved': 'Guardado',
   'settings.slack.saveFailed': 'No se pudo guardar la configuración de Slack: {detail}',
@@ -295,10 +320,12 @@ export const es: Catalog = {
   'settings.font.loadingList': 'leyendo las fuentes instaladas…',
   // App.tsx — update status (the title-bar UpdateIndicator / the settings Info tab)
   'update.tb.restartInstallVersion': 'Reiniciar e instalar v{version}',
+  'update.tb.manualInstallVersion': 'Instalar v{version} a mano',
   'update.tb.checking': 'Comprobando actualizaciones…',
   'update.tb.available': 'Nueva versión {version} encontrada',
   'update.tb.downloading': 'Descargando {percent}%',
   'update.tb.error': 'Error de actualización',
+  'update.checkTimedOut': 'La comprobación de actualizaciones no respondió en {seconds} s. Revisa la red e inténtalo de nuevo.',
   // index.ts — diagnostic message for when the electron-updater module does not export properly (title-bar tooltip)
   'update.tb.autoUpdaterMissing': 'No se encontró el export autoUpdater',
   'update.info.downloading': 'Descargando {percent}%…',
@@ -310,6 +337,14 @@ export const es: Catalog = {
   'update.info.available': 'Nueva versión {version} disponible',
   'update.info.downloadVersion': 'Descargar {version}',
   'update.info.checkFailed': 'Error al comprobar',
+  'update.info.manualInstallVersion': 'Instalar v{version} a mano',
+  'update.info.manualWhy': 'Esta versión no puede instalarse sola: hay que moverla a mano',
+  'update.manual.title': 'Instalar a mano',
+  'update.manual.done':
+    'La nueva versión está abierta en el Finder. Arrastra Astera a la carpeta Aplicaciones y vuelve a abrirla.\n\n{path}',
+  'update.manual.failed': 'No se pudo preparar el instalador: {message}',
+  'update.manual.noFile': 'No hay ningún instalador descargado',
+  'update.manual.quit': 'Salir y moverla',
   // App.tsx — the toast for a downloaded new version, and the session-kill confirmation when installing now
   'update.toast.available': 'Ya está disponible la versión v{version}',
   'update.toast.download': 'Descargar',
@@ -382,7 +417,7 @@ export const es: Catalog = {
   'shortcut.explorer.cut': 'Cortar',
   'shortcut.explorer.copy': 'Copiar',
   'shortcut.gesture.itemDrag': 'Arrastrar el elemento',
-  'shortcut.explorer.move': 'Mover · con Ctrl, copiar',
+  'shortcut.explorer.move': 'Mover · con {mod}, copiar',
   'shortcut.explorer.undo': 'Deshacer',
   'shortcut.run.run': 'Ejecutar',
   'shortcut.run.stop': 'Detener ejecución',
@@ -402,7 +437,7 @@ export const es: Catalog = {
   'files.commit.failed': 'Error en {action}: {detail}',
   // useFileOps.ts — delete confirmation modal
   'files.delete.undoHint':
-    'Puede recuperarlo con Ctrl+Z o desde Local History (se guarda hasta 30 días · se excluyen los elementos de más de 50MB).',
+    'Puede recuperarlo con {mod}+Z o desde Local History (se guarda hasta 30 días · se excluye lo que supere 50MB o 5.000 elementos).',
   'files.delete.confirmOne': '¿Eliminar «{name}»?\n{undoHint}',
   'files.delete.confirmDirWithCount':
     '¿Eliminar la carpeta «{name}» y los {count} elementos que contiene?\n{undoHint}',
@@ -410,7 +445,14 @@ export const es: Catalog = {
   'files.delete.confirmMany': '{shown}{more} — ¿eliminar {total} elementos?{dirNote}\n{undoHint}',
   'files.delete.dirNote': ' Se eliminará también el contenido de {count} carpetas.',
   'files.delete.moreNames': ', y {count} más',
-  'files.delete.skippedTooLarge': 'El elemento era demasiado grande para guardarlo en Local History',
+  'files.delete.skippedTooLarge': 'El elemento era demasiado grande para guardarlo en Local History (más de 50MB o 5.000 elementos)',
+  // explorer busy status (delete / copy progress)
+  'files.op.deleting': 'Eliminando… {count} elementos',
+  'files.op.snapshotting': 'Guardando una copia en Local History… {count} elementos',
+  'files.op.copying': 'Copiando… {count} elementos',
+  'files.op.deletingNoCount': 'Eliminando…',
+  'files.op.copyingNoCount': 'Copiando…',
+  'files.op.busy': 'Trabajando…',
   'files.delete.skippedFailed':
     'No se pudo crear la instantánea en Local History — la eliminación sí se completó',
   // useFileOps.ts — cut/copy and paste
@@ -431,7 +473,7 @@ export const es: Catalog = {
   'files.undo.partialFail': 'Al deshacer fallaron {failed} de {attempted} elementos: {shown}{more}',
   'files.undo.partialMissing': 'Al deshacer fallaron {missing} de {total} elementos: {shown}{more}',
   'files.undo.permanentTooLarge':
-    'Se eliminó de forma permanente al deshacer — era demasiado grande para guardarlo en Local History, así que no se puede recuperar',
+    'Se eliminó de forma permanente al deshacer — era demasiado grande para guardarlo en Local History (más de 50MB o 5.000 elementos), así que no se puede recuperar',
   'files.undo.permanentSnapshotFailed':
     'Se eliminó al deshacer — la instantánea en Local History falló, así que no se puede recuperar',
   'files.undo.done': 'Se deshizo {desc}',
@@ -458,6 +500,7 @@ export const es: Catalog = {
   'explorer.noActiveSession': 'No hay ninguna sesión activa',
   // Folder state shown inside the tree (the .fx-note row)
   'explorer.dir.loading': 'Cargando…',
+  'explorer.dir.reading': 'Leyendo la carpeta…',
   'explorer.dir.readFailed': 'Error al leer: {detail}',
   'explorer.dir.empty': 'Vacío',
   'explorer.refresh': 'Actualizar',
@@ -465,21 +508,23 @@ export const es: Catalog = {
   'explorer.menu.newFile': 'Archivo nuevo',
   'explorer.menu.newFolder': 'Carpeta nueva',
   'explorer.menu.rename': 'Cambiar nombre (F2)',
-  'explorer.menu.delete': 'Eliminar (Del)',
-  'explorer.menu.deleteCount': 'Eliminar ({count}, Del)',
+  'explorer.menu.delete': 'Eliminar ({del})',
+  'explorer.menu.deleteCount': 'Eliminar ({count}, {del})',
   'explorer.menu.duplicateCount': 'Duplicar ({count})',
-  'explorer.menu.cut': 'Cortar (Ctrl+X)',
-  'explorer.menu.copy': 'Copiar (Ctrl+C)',
-  'explorer.menu.paste': 'Pegar (Ctrl+V)',
+  'explorer.menu.cut': 'Cortar ({mod}+X)',
+  'explorer.menu.copy': 'Copiar ({mod}+C)',
+  'explorer.menu.paste': 'Pegar ({mod}+V)',
   'explorer.menu.copyPath': 'Copiar la ruta',
   'explorer.menu.copyRelativePath': 'Copiar la ruta relativa',
   'explorer.menu.reveal': 'Abrir en el explorador',
+  'explorer.menu.revealMac': 'Mostrar en el Finder',
   // FileExplorer.tsx — git status on a tree row (tooltip, aria-label)
   'explorer.git.new': 'Archivo nuevo',
   'explorer.git.modified': 'Modificado',
   'explorer.git.deleted': 'Eliminado',
   'explorer.git.conflict': 'Conflicto',
   'explorer.git.folderCount': '{count} cambios',
+  'explorer.git.unavailable': 'Estado de git no disponible: se muestra el último resultado',
   'explorer.rail.toggle': 'Explorador de archivos',
   // WorkbenchTabs.tsx — the dirty marker on a file tab
   'explorer.tab.unsaved': 'Sin guardar',
@@ -590,6 +635,13 @@ export const es: Catalog = {
   'session.new.useWorktree': 'Iniciar en un worktree aparte',
   'session.new.worktreeNoBase':
     'Este repositorio no tiene ninguna rama que sirva de base, así que no se puede crear el worktree. Cree un commit y vuelva a intentarlo.',
+  'session.new.worktreeBranchesUnavailable': 'No se pudo comprobar la lista de ramas (git no respondió). La rama base se detectará automáticamente.',
+  'session.new.worktreeRepoUnknown': 'No se pudo comprobar si esta carpeta es un repositorio git (git no respondió a tiempo; una ruta de red o de WSL puede ser lenta). Puedes iniciar una sesión aquí, pero no en un worktree aparte.',
+  'session.new.worktreeRepoNoGit': 'No se pudo ejecutar git, así que no se comprobó si esta carpeta es un repositorio (¿está git instalado y en el PATH?). Puedes iniciar una sesión aquí, pero no en un worktree aparte.',
+  'session.new.worktreeRepoNoFolder': 'No se encuentra esta carpeta. Vuelve a elegirla.',
+  'session.new.worktreeRepoError': 'No se pudo comprobar si esta carpeta es un repositorio git. Puedes iniciar una sesión aquí, pero no en un worktree aparte.',
+  'session.new.checkingCli': 'Comprobando la CLI en esta carpeta…',
+  'pr.create.branchesUnavailable': 'No se pudo comprobar la lista de ramas (git no respondió).',
   'session.new.worktreeBaseRef': 'Rama base',
   'session.new.worktreeBaseCurrent': '(rama actual)',
   'session.new.worktreeBaseRemote': 'Remotas',
@@ -613,9 +665,15 @@ export const es: Catalog = {
   'session.new.blocked.noAccount': 'Elige una cuenta',
   'session.new.blocked.cliMissing': 'No se encontró la CLI de esta cuenta',
   'session.new.blocked.noSchedule': 'Fija una hora programada',
-  'session.new.blocked.checkingFolder': 'Comprobando la carpeta del proyecto',
+  'session.new.blocked.checkingFolder': 'Comprobando el repositorio…',
+  'startup.readingShellEnv': 'Leyendo el entorno de la shell…',
   'session.new.starting': 'Iniciando la sesión…',
   'session.new.startingWorktree': 'Creando el worktree…',
+  'session.new.stage.fetch': 'Obteniendo la rama base…',
+  'session.new.stage.checkout': 'Extrayendo los archivos…',
+  'session.new.stage.copyIncludes': 'Copiando los archivos incluidos…',
+  'session.new.stage.copyCount': '{copied} / {total} · {files} / {filesTotal} archivos',
+  'session.new.cancelling': 'Cancelando…',
   // NewSessionDialog.tsx scheduler UI
   'session.new.schedLabel': 'Programador — ejecutar un comando periódicamente',
   'session.new.schedMode.interval': 'Cada N minutos',
@@ -644,6 +702,8 @@ export const es: Catalog = {
   // ConversationPane.tsx — exited banner (session-failure-visibility design D2/F2). Este catálogo
   // parcial aún no tiene el resto de las claves conversation.* (se sustituyen por en/ko); estas tres
   // se añaden antes que las demás.
+  'conversation.indexingFiles': 'Indexando archivos…',
+  'conversation.filesUnavailable': 'La lista de archivos no está disponible para esta carpeta.',
   'conversation.exited.withCode': 'Esta sesión ha terminado (código {code})',
   'conversation.exited.detail': 'Detalles',
   'conversation.exited.restart': 'Reiniciar',
@@ -705,6 +765,7 @@ export const es: Catalog = {
   'history.panel.title': 'Historial',
   'history.panel.empty': 'Sin registros',
   'history.loading': 'Cargando…',
+  'history.scan.codex': 'Analizando el historial de Codex… {done}/{total}',
   'history.filter.deletedSuffix': ' (eliminada)',
   // HistoryBrowser.tsx — account filter labels
   'session.resume.originAccount': 'Cuenta original',
@@ -723,6 +784,8 @@ export const es: Catalog = {
   'history.resume.pickFolder': 'Elegir carpeta',
   // WorktreePanel.tsx — status labels
   'worktree.status.orphanDir': 'Registro de git perdido',
+  'worktree.status.unreachable': 'Carpeta no accesible',
+  'worktree.status.gitUnchecked': 'No se pudo comprobar git',
   // WorktreePanel.tsx — delete confirmation modal, result toasts
   'worktree.remove.title': 'Eliminar worktree',
   'worktree.remove.body':
@@ -955,18 +1018,33 @@ export const es: Catalog = {
   'preview.agent.stop': 'Detener el script del agente',
   'preview.agent.stopped': 'Script del agente detenido',
   'preview.agent.inUse': 'El agente está usando tu computadora  ·  Esc para cancelar',
+  // Pestaña espejo del espacio de trabajo de apps del agente
+  'workspace.tab.tag': 'App',
+  'workspace.tab.running': 'El agente está manejando su app en un escritorio oculto',
+  'workspace.pane.title': 'App de {session}',
+  'workspace.pane.running': 'En curso: {helper}',
+  'workspace.pane.launching': 'Iniciando la app… {seconds} s',
+  'workspace.pane.idle': 'En espera (la app sigue abierta)',
+  'workspace.pane.closed': 'Cerrado',
+  'workspace.pane.waiting': 'Esperando la primera imagen',
+  'workspace.pane.stop': 'Detener',
+  'workspace.pane.close': 'Cerrar',
+  'workspace.pane.alt': 'La app del agente',
+  'workspace.pane.failed': 'No se pudo llegar al espacio de trabajo: {detail}',
+  'workspace.pane.nothingToStop': 'No hay ningún script que detener',
+  'workspace.pane.nothingToClose': 'No hay ningún espacio de trabajo que cerrar',
   // BottomPanel, the rail terminal button
   'terminal.rail.open': 'Terminal',
   'terminal.tab.label': 'Terminal {n}',
   'terminal.tab.new': 'Terminal nuevo',
   'terminal.tab.close': 'Cerrar el terminal',
   'terminal.open.failed': 'Error al abrir el terminal: {detail}',
-  // rolling.ts and codexRolling.ts — the default resume prompt. Must stay identical to
+  // claudeCoordinator.ts and codexCoordinator.ts — the default resume prompt. Must stay identical to
   // session.new.rollPromptPlaceholder, which shows this value as its placeholder.
   'rolling.continuePrompt': 'Continúa con el trabajo',
-  // slack.ts — the notification text that goes out to Slack
+  // notifier.ts — the notification text that goes out to Slack
   'slack.turnDone': '✅ Respuesta completada',
-  // {at} is HH:MM for the 5-hour scope but M/D HH:MM for the weekly one (fmtAt in main/slack.ts),
+  // {at} is HH:MM for the 5-hour scope but M/D HH:MM for the weekly one (fmtAt in core/slack/notifier.ts),
   // so no preposition can precede it
   'slack.limitWaiting': '⏸ Límite alcanzado — reanudación: {at} (límite {scope})',
   'slack.limitScope.weekly': 'semanal',
@@ -990,7 +1068,7 @@ export const es: Catalog = {
   'slack.choice.singleOnlyAt': 'Pregunta {index}: solo se puede elegir una opción',
   'slack.choice.outOfRange': 'No existe la opción {n} (1-{max})',
   'slack.choice.outOfRangeAt': 'Pregunta {index}: no existe la opción {n} (1-{max})',
-  // slackInbox.ts — the notice left in the thread when a reply could not be injected
+  // core/slack/inbox.ts — the notice left in the thread when a reply could not be injected
   'slack.inbox.tooLong':
     '⚠️ La respuesta era demasiado larga y no se entregó (máximo {max} caracteres)',
   'slack.inbox.sessionEnded': '⚠️ Esta sesión finalizó, así que no se pudo entregar la entrada',
@@ -1043,6 +1121,7 @@ export const es: Catalog = {
   'jobs.run.mergeConfirmBody': 'Integra en la carpeta del proyecto lo que los trabajadores confirmaron en sus árboles de trabajo ({count} árbol(es) de trabajo).\n\nLas confirmaciones se añaden a la rama actual de la carpeta del proyecto.',
   'jobs.run.mergeNothing': 'No queda nada que fusionar: las carpetas de los árboles de trabajo ya no existen',
   'jobs.run.mergeUncommitted': '{count} cambio(s) sin confirmar no se fusionaron: siguen en el árbol de trabajo y se pierden si se elimina la carpeta',
+  'jobs.run.mergeUncommittedUnknown': 'No se pudieron comprobar los cambios sin confirmar en {count} árbol(es) de trabajo: revíselos antes de eliminar las carpetas',
   'jobs.run.mergeFailed': 'No se pudo fusionar: {reason}',
   'jobs.run.notStarted': 'Sin iniciar',
   'jobs.run.notStartedHint': 'Aún no se ha iniciado — pulsa Ejecutar en la ventana de detalle para empezar',
@@ -1057,6 +1136,7 @@ export const es: Catalog = {
   'jobs.run.deleteRetained': 'Hay una sesión retenida por worker-retain, así que no se puede eliminar — libérala primero',
   'jobs.run.deleteBusy': 'Hay un worker corriendo en este trabajo, así que no se puede eliminar — deténlo primero',
   'jobs.run.deleteFailed': 'No se pudo eliminar el trabajo',
+  'jobs.run.deleteKeptWorktrees': 'Se conservaron {count} carpeta(s) de worktree: tienen cambios sin confirmar o no se pudo comprobar su estado. Revísalas y elimínalas desde el panel de worktrees.',
   'jobs.run.sharedFolder': 'carpeta compartida',
   'jobs.run.sharedFolderHint': 'Corre en la misma carpeta que el worker de otro trabajo — sus ediciones pueden mezclarse, y la app ni lo impide ni lo detecta',
   'jobs.run.scheduled': 'Programado',
@@ -1169,6 +1249,9 @@ export const es: Catalog = {
   'jobs.detail.cycle': 'Sus dependencias se apuntan entre sí, así que no hay orden que dibujar — estas Tasks nunca empezarán',
   'jobs.detail.hidden': '{count} eventos de otras Tasks — pulsa el nodo otra vez para quitar el filtro',
   'jobs.detail.clearFilter': 'Quitar filtro',
+  'jobs.detail.journalOlder': 'Mostrar entradas anteriores del diario',
+  'jobs.detail.journalCapped': 'Las entradas más antiguas del diario no se muestran aquí. Esta ventana muestra solo las más recientes.',
+  'jobs.detail.journalBusy': 'El diario está ocupado ahora, así que estas son las últimas entradas leídas. Se actualizarán con la próxima actualización.',
   'jobs.detail.edgeWaiting': 'dependencia pendiente',
   'jobs.detail.edgeResolved': 'dependencia ya resuelta',
   'jobs.detail.layer': 'capa {n}',
@@ -1197,6 +1280,7 @@ export const es: Catalog = {
   'jobs.new.failed': 'No se pudo crear el trabajo',
   'jobs.gate.noAccountAssigned': 'Esta tarea no tiene cuenta, así que no hay forma de saber qué agente debe ejecutarla — asigna una',
   'jobs.gate.noAccount': 'Ninguna cuenta de {provider} tiene la sesión iniciada, así que esta Task no puede empezar',
+  'jobs.gate.workerLostNoApp': 'El worker de esta Task se perdió (dispatch {dispatch}) mientras ningún Astera estaba abierto para recuperarlo. Resuelve esta Gate para volver a iniciarlo.',
   'jobs.gate.assignedAccountUnusable':
     'No se puede usar la primera cuenta asignada a esta Task, y las siguientes solo están ahí para pasar a ellas más tarde — vuelve a iniciar sesión en esa cuenta o cambia la lista de cuentas de esta Task',
   // NewTaskModal.tsx — el formulario en el que se convierte el panel inferior de RunDetail
@@ -1241,6 +1325,7 @@ export const es: Catalog = {
   'jobs.node.answerLabel': 'Decisión',
   'jobs.node.gateQuestion': 'Por qué queda en espera',
   'jobs.node.failed': 'No se pudo completar esta acción',
+  'jobs.node.stopFailed': 'No se pudo detener el worker: {detail}',
   // How It Works — comprensión del proyecto
   'hiw.rail.open': 'How It Works',
   'hiw.title': 'How It Works',
@@ -1258,6 +1343,8 @@ export const es: Catalog = {
     'Una comprobación que ejecutó el agente no pasó — vale la pena revisar el resultado.',
   'hiw.record.reason.checkFailedJob':
     'Una comprobación que ejecutó la aplicación no pasó — vale la pena revisar el resultado.',
+  'hiw.record.reason.evidenceUnreachable':
+    'La carpeta del proyecto no respondió, así que no se pudieron comprobar los archivos que cita este resumen. Vuelve a generarlo cuando la carpeta sea accesible.',
   'hiw.pane.overview': 'Qué hace',
   'hiw.pane.userVisible': 'Qué notarás',
   'hiw.pane.flow': 'Cómo funciona',

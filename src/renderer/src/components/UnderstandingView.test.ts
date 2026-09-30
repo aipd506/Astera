@@ -143,6 +143,14 @@ describe('UnderstandingView', () => {
     expect(html).not.toContain('CHECK_FAILED_JOB')
   })
 
+  // Stage 4 T1: the cited files could not be checked (the project folder did not answer) — not a
+  // ghost path, and the person is told to try again rather than shown a code.
+  it('근거를 확인하지 못한 기록도 코드가 아니라 안내 문구로 바뀐다', () => {
+    const html = render({ records: [rec({ status: 'failed', reason: 'EVIDENCE_UNREACHABLE' })] })
+    expect(html).toContain('hiw.record.reason.evidenceUnreachable')
+    expect(html).not.toContain('EVIDENCE_UNREACHABLE')
+  })
+
   // Every other reason is a free-form sentence the agent or the validator wrote, so it is shown
   // as it stands. Text we do not control gets no invented translation.
   it('알려지지 않은 사유는 고치지 않고 그대로 보인다', () => {

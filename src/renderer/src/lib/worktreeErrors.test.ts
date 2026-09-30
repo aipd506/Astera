@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { worktreeErrorMessage, dirtyCount, isOrphanUnverifiable } from './worktreeErrors'
+import { worktreeErrorMessage, dirtyCount, isOrphanUnverifiable, isCancelled } from './worktreeErrors'
 
 describe('worktreeErrorMessage', () => {
   it('IPC 프리픽스가 붙어도 코드를 찾는다', () => {
@@ -101,5 +101,69 @@ describe('isOrphanUnverifiable', () => {
   // 기존 테스트에 있던 케이스 — isOrphanUnverifiable은 이 태스크에서 변경하지 않으므로 유지한다.
   it('DIRTY는 false', () => {
     expect(isOrphanUnverifiable('DIRTY: 3')).toBe(false)
+  })
+})
+
+// 닿지 않는 폴더(끊긴 네트워크 드라이브)는 원문 대신 번역된 문장으로 보인다
+describe('worktreeErrorMessage, unreachable folders', () => {
+  it('WORKTREE_UNREACHABLE 는 삭제용 키로 간다', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: WORKTREE_UNREACHABLE: folder not reachable, nothing was removed (Z:\wt\a)")
+    ).toEqual({ key: 'worktree.error.unreachable' })
+  })
+  it('WORKTREE_ROOT_UNREACHABLE 는 생성용 키로 간다', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.create': Error: WORKTREE_ROOT_UNREACHABLE: folder not reachable: Z:\wt")
+    ).toEqual({ key: 'worktree.error.rootUnreachable' })
+  })
+  it('REPO_UNREACHABLE 는 프로젝트 폴더 키로 간다 — NOT_GIT_REPO 로 읽히지 않는다', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.create': Error: REPO_UNREACHABLE: folder not reachable: Z:/proj")
+    ).toEqual({ key: 'worktree.error.repoUnreachable' })
+  })
+  it('NO_GIT 는 git 을 찾지 못했다는 키로 간다', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.create': Error: NO_GIT: git could not be run (is it installed and on PATH?): D:/proj")
+    ).toEqual({ key: 'worktree.error.noGit' })
+  })
+})
+
+// 취소와, 취소(또는 실패) 뒤 되돌리기가 끝나지 못한 경우
+describe('worktreeErrorMessage, cancel and rollback', () => {
+  it('WORKTREE_CANCELLED 는 취소 키로 가고, isCancelled 가 알아본다', () => {
+    const raw = "Error invoking remote method 'worktrees.create': Error: WORKTREE_CANCELLED: worktree creation was cancelled"
+    expect(worktreeErrorMessage(raw)).toEqual({ key: 'worktree.error.cancelled' })
+    expect(isCancelled(raw)).toBe(true)
+    expect(isCancelled('GIT_ADD_FAILED: x')).toBe(false)
+  })
+  it('ROLLBACK_INCOMPLETE 는 남은 경로와 브랜치를 싣는다 — 취소 문구가 섞여 있어도', () => {
+    const note = JSON.stringify({ path: 'C:\wt\repo\a b', branch: 'me/a', remains: ['folder'] })
+    const raw = `Error invoking remote method 'worktrees.create': Error: ROLLBACK_INCOMPLETE: ${note} — remove it by hand; the rollback after "WORKTREE_CANCELLED: worktree creation was cancelled" did not finish`
+    expect(worktreeErrorMessage(raw)).toEqual({
+      key: 'worktree.error.rollbackIncomplete',
+      params: { path: 'C:\wt\repo\a b', branch: 'me/a' }
+    })
+    expect(isCancelled(raw)).toBe(false)
+  })
+})
+
+// Stage 2 final review, C1: the links in the folder could not all be taken out before the removal
+describe('worktreeErrorMessage, links not verified', () => {
+  it('LINKS_UNVERIFIED goes to its own key', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: LINKS_UNVERIFIED: the links in the folder could not all be checked and taken out, nothing was removed (C:\wt\a): timeout")
+    ).toEqual({ key: 'worktree.error.linksUnverified' })
+  })
+})
+
+// Re-review minor: a locked worktree, or one with submodules, is refused before the link walk
+describe('worktreeErrorMessage, refused before the link walk', () => {
+  it('WORKTREE_LOCKED and HAS_SUBMODULES go to their own keys', () => {
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: WORKTREE_LOCKED: the worktree is locked (git worktree lock), nothing was removed (C:\wt\a)")
+    ).toEqual({ key: 'worktree.error.locked' })
+    expect(
+      worktreeErrorMessage("Error invoking remote method 'worktrees.remove': Error: HAS_SUBMODULES: the worktree has submodules, remove it with force (C:\wt\a)")
+    ).toEqual({ key: 'worktree.error.hasSubmodules' })
   })
 })

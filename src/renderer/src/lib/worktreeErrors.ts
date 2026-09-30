@@ -16,8 +16,24 @@ const MESSAGES: Array<[string, MessageKey]> = [
   ['ORPHAN_UNPROVEN', 'worktree.error.orphanUnproven'],
   // ORPHAN_UNVERIFIABLE is routed to the force-removal reconfirmation, so it is detected by isOrphanUnverifiable() alongside dirtyCount
   ['ORPHAN_UNVERIFIABLE', 'worktree.error.orphanUnverifiable'],
+  // A folder or root that did not answer in time (an offline network drive). Nothing was created or removed.
+  ['WORKTREE_ROOT_UNREACHABLE', 'worktree.error.rootUnreachable'],
+  ['WORKTREE_UNREACHABLE', 'worktree.error.unreachable'],
+  // The project folder did not answer before git was spawned in it (create.ts resolveRepo): could not
+  // check, not "not a repository". Nothing was created.
+  ['REPO_UNREACHABLE', 'worktree.error.repoUnreachable'],
+  // The folder is there and git could not be started (create.ts resolveRepo): not installed, not on PATH
+  ['NO_GIT', 'worktree.error.noGit'],
+  // The links inside the folder could not all be taken out before git removes it (a junction would carry
+  // the removal outside the folder). Nothing was removed.
+  ['LINKS_UNVERIFIED', 'worktree.error.linksUnverified'],
+  // Refused without force before the link walk: git would refuse a locked worktree, or one with submodules
+  ['WORKTREE_LOCKED', 'worktree.error.locked'],
+  ['HAS_SUBMODULES', 'worktree.error.hasSubmodules'],
   ['GIT_ADD_FAILED', 'worktree.error.gitAddFailed'],
   ['GIT_REMOVE_FAILED', 'worktree.error.gitRemoveFailed'],
+  // The person pressed Cancel and everything the creation made was taken back
+  ['WORKTREE_CANCELLED', 'worktree.error.cancelled'],
   // Not a worktree code but a session rolling constraint (sessions/manager.ts) — App.tsx's spawn catch
   // handles it through this function, so it is mapped here. It gets its own slot at the end of the array
   // so it is not confused with the worktree codes
@@ -30,7 +46,24 @@ const MESSAGES: Array<[string, MessageKey]> = [
 // before the value), so \s* absorbs that space — it matches without it too (a direct 'IN_USE:SESSION:x').
 const IN_USE = /IN_USE:\s*(SESSION|RUN):([\s\S]+)$/
 
+// create.ts writes ROLLBACK_INCOMPLETE: {"path":…,"branch":…,"remains":[…]} — JSON, because a path can hold
+// spaces and colons. It is checked before the codes above: its text quotes the error that started the
+// rollback (WORKTREE_CANCELLED among them), and what matters to the person is what was left behind.
+const ROLLBACK_INCOMPLETE = /ROLLBACK_INCOMPLETE:\s*(\{.*?\})(?= — )/
+
 export function worktreeErrorMessage(raw: string): Message {
+  const rb = ROLLBACK_INCOMPLETE.exec(raw)
+  if (rb) {
+    try {
+      const note = JSON.parse(rb[1]) as { path?: unknown; branch?: unknown }
+      return {
+        key: 'worktree.error.rollbackIncomplete',
+        params: { path: String(note.path ?? ''), branch: String(note.branch ?? '') }
+      }
+    } catch {
+      return { key: 'worktree.error.raw', params: { detail: raw } }
+    }
+  }
   const inUse = IN_USE.exec(raw)
   if (inUse) {
     const value = inUse[2].trim()
@@ -55,4 +88,10 @@ export function dirtyCount(raw: string): number | null {
  *  no force escape hatch), so the suffix boundary is checked. */
 export function isOrphanUnverifiable(raw: string): boolean {
   return raw.includes('ORPHAN_UNVERIFIABLE')
+}
+
+/** The creation was cancelled and fully rolled back — an outcome the person asked for, not a failure.
+ *  A cancel whose rollback did not finish is not this: it has something left to tell. */
+export function isCancelled(raw: string): boolean {
+  return raw.includes('WORKTREE_CANCELLED') && !raw.includes('ROLLBACK_INCOMPLETE')
 }

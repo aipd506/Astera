@@ -4,13 +4,16 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { Account, Provider, SessionInfo, ScheduleConfig } from '../types'
 import { defaultSessionTitle, normalizeSessionTitle } from './title'
-import { findGitBash } from './gitBash'
+import { createGitBashResolver, findGitBash, type GitBashResolver } from './gitBash'
+import { checkCwd, defaultCwdProbe, defaultProbe, probeLog, type Probe } from './pathProbe'
 import {
   descriptorOf,
   makeDescriptors,
   type ProviderDescriptor
 } from '../providers/descriptor'
 import type { PtyFactory, PtyLike } from './pty'
+import type { RollSpawnExtra } from '../rolling/snapshot'
+import { sessionInfoFromNote } from './noteInfo'
 import { cliEnvFor } from './cliEnv'
 
 /** statusLine info injected when a session spawns (provided by main's StatusLineManager,
@@ -62,6 +65,48 @@ export function prependToPath(env: Record<string, string | undefined>, dir: stri
   env[key] = current ? `${dir}${path.delimiter}${current}` : dir
 }
 
+/** What the spawn path looks at on disk, injected so it can be tested without a disk. */
+export interface SpawnChecks {
+  /** The session's folder (`timeout` means "not reachable", never "missing"). */
+  cwd: Probe
+  /** Git Bash for an env, cached per PATH string (see gitBash.ts). */
+  gitBash: GitBashResolver
+  /** Whether Git Bash is looked for at all — only on win32. */
+  platform: NodeJS.Platform
+  now: () => number
+  /** The sync look at the disk, used only by a spawn nobody prepared. Injected so a test can prove
+   *  it did not run. */
+  syncExists: (p: string) => boolean
+  /** Where a spawn that had to fall back to the sync checks says so. */
+  log: (m: string) => void
+}
+
+/** One resolver per process, so its cache is shared by every SessionManager in it. */
+let processGitBash: GitBashResolver | null = null
+/** `log` is the owning process's log (the Host's host.log, the app's sessions log); without one, the
+ *  probe log each entry point sets (pathProbe.ts setProbeLog). */
+export function defaultSpawnChecks(log: (m: string) => void = probeLog): SpawnChecks {
+  processGitBash ??= createGitBashResolver(defaultProbe)
+  return {
+    cwd: defaultCwdProbe,
+    gitBash: processGitBash,
+    platform: process.platform,
+    now: Date.now,
+    syncExists: existsSync,
+    log
+  }
+}
+
+/** How long a folder `prepare` confirmed is trusted by `spawn` without being looked at again. A
+ *  roll prepares before its kill and spawns right after it, so a minute is plenty. */
+const CWD_CONFIRMED_MS = 60_000
+
+/** The PATH value of an env, whatever the key's casing (Windows gives `Path`). */
+function pathValueOf(env: Record<string, string | undefined>): string {
+  const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH')
+  return (key ? env[key] : undefined) ?? ''
+}
+
 interface LiveSession {
   info: SessionInfo
   pty: PtyLike
@@ -88,8 +133,55 @@ export class SessionManager {
     private homeDir: string = os.homedir(),
     private statusLineProvider?: StatusLineProvider,
     /** Directories every Claude session may read without a prompt — the app's screenshot folder. */
-    private sessionReadDirs: string[] = []
+    private sessionReadDirs: string[] = [],
+    /** The environment every child env is built from. The app keeps process.env; the Host passes
+     *  its own minus what its start added (hostWorkerBaseEnv, design D4). */
+    private baseEnv: NodeJS.ProcessEnv = process.env,
+    private checks: SpawnChecks = defaultSpawnChecks()
   ) {}
+
+  /** Folders `prepare` confirmed, and when. */
+  private confirmedCwds = new Map<string, number>()
+  /** The Git Bash `prepare` found, per PATH string, and when — held here, not read back from the
+   *  resolver's cache, so an entry that expires between a prepare and its spawn cannot send the spawn
+   *  to the sync search. Trusted as long as a confirmed folder is. */
+  private preparedGitBash = new Map<string, { bash: string | null; timedOut: boolean; at: number }>()
+
+  /**
+   * Everything `spawn` would look for on disk, looked for without blocking: the folder, and on win32
+   * the Git Bash for this account's env (probed once per PATH string, see gitBash.ts). **Every caller
+   * awaits this before `spawn`** — a roll does it before its kill, since the spawn after it has no
+   * await. Rejects with CWD_MISSING, or CWD_UNREACHABLE when the folder did not answer in time.
+   */
+  async prepare(opts: { account: Account; cwd: string; missing?: string }): Promise<void> {
+    // A folder confirmed a moment ago (a Host session create checks it, then spawns) is not probed again.
+    if (!this.cwdConfirmed(opts.cwd)) {
+      await checkCwd(opts.cwd, this.checks.cwd, opts.missing)
+      const now = this.checks.now()
+      for (const [cwd, at] of this.confirmedCwds) if (now - at >= CWD_CONFIRMED_MS) this.confirmedCwds.delete(cwd)
+      this.confirmedCwds.set(opts.cwd, now)
+    }
+    if (this.checks.platform === 'win32') {
+      const env = this.envFor(opts.account)
+      const { bash, timedOut } = await this.checks.gitBash.search(env)
+      const now = this.checks.now()
+      for (const [k, v] of this.preparedGitBash) if (now - v.at >= CWD_CONFIRMED_MS) this.preparedGitBash.delete(k)
+      this.preparedGitBash.set(pathValueOf(env), { bash, timedOut, at: now })
+    }
+  }
+
+  private cwdConfirmed(cwd: string): boolean {
+    const at = this.confirmedCwds.get(cwd)
+    return at !== undefined && this.checks.now() - at < CWD_CONFIRMED_MS
+  }
+
+  /** The env a CLI child gets: the base env (process.env in the app) minus the app-managed and
+   *  inherited-agent keys, plus the provider's config-dir variable set to the account's dir (or deleted
+   *  for the ambient dir). See cliEnv.ts for the full rationale. */
+  private envFor(account: Account): Record<string, string | undefined> {
+    const descriptor = descriptorOf(this.descriptors, account)
+    return cliEnvFor({ base: this.baseEnv, account, descriptor, homeDir: this.homeDir })
+  }
 
   spawn(opts: {
     account: Account
@@ -110,15 +202,27 @@ export class SessionManager {
      *  Dispatch is a worker"; the environment variable would become a second source of truth, frozen
      *  at spawn time and stale as soon as the session is reused.
      *  skillsPath is the directory the CLI's help reads orchestration-guide.md from (resolveGuidePath
-     *  in src/cli/run.ts) — without it, help dies. */
-    orchEnv?: { cliPath: string; infoPath: string; skillsPath: string }
+     *  in src/cli/run.ts) — without it, help dies.
+     *  profileDir is this app's own userData folder; see where it is planted below for why the CLI
+     *  cannot work it out for itself. */
+    orchEnv?: { cliPath: string; skillsPath: string; profileDir: string }
     /** Initial prompt for an interactive session. Carried as the command's last positional argument. */
     initialPrompt?: string
     /** Sets the tab title explicitly — orchestration worker tabs use task.title.
      *  Omitted, the existing behavior (cwd basename) applies. */
     title?: string
+    /** Extra keys for the pty's note, merged into `meta.restore` **before** the manager's own keys so
+     *  those always win (S6 R6). A rolling respawn carries `rolledFrom` and its chain's snapshot here, so
+     *  a process that takes the session over before the rekey commits still knows what it is. */
+    restoreExtra?: RollSpawnExtra
   }): SessionInfo {
-    if (!existsSync(opts.cwd)) throw new Error(`CWD_MISSING: ${opts.cwd}`)
+    // The folder `prepare` just confirmed is not looked at again. The sync check is left only for a
+    // caller that did not prepare (tests, and anything added later without it): it is the one that can
+    // freeze this thread on an offline drive.
+    if (!this.cwdConfirmed(opts.cwd)) {
+      this.checks.log(`session spawn without prepare: checking the folder synchronously, which can freeze this thread on an offline drive: ${opts.cwd}`)
+      if (!this.checks.syncExists(opts.cwd)) throw new Error(`CWD_MISSING: ${opts.cwd}`)
+    }
     const d = descriptorOf(this.descriptors, opts.account)
     // Mixed-provider rolling is impossible — the transcript formats differ, so the relay cannot work.
     // codex-only and claude-only chains are handled by their own coordinators.
@@ -154,16 +258,28 @@ export class SessionManager {
       resumePrompt: opts.resumePrompt,
       initialPrompt: opts.initialPrompt
     })
-    // The env a CLI child gets: process.env minus the app-managed and inherited-agent keys, plus the
-    // provider's config-dir variable set to the account's dir (or deleted for the ambient dir). See
-    // cliEnv.ts for the full rationale — this used to be inline here.
-    const env = cliEnvFor({ base: process.env, account: opts.account, descriptor: d, homeDir: this.homeDir })
+    const env = this.envFor(opts.account)
     // Windows only: CLAUDE_CODE_GIT_BASH_PATH exists for Git for Windows, and on other platforms the
     // agent's bash is the system one. The agent's hooks and statusLine need a real Git Bash when
     // available; without one the statusLine capture never runs and the app never learns this session's
     // provider id or its usage (see findGitBash). The value the user set is never overwritten.
-    if (process.platform === 'win32') {
-      const gitBash = findGitBash(env, existsSync)
+    // What `prepare` found is used as is; only an unprepared spawn falls back to the sync search.
+    if (this.checks.platform === 'win32' && !env.CLAUDE_CODE_GIT_BASH_PATH) {
+      const prepared = this.preparedGitBash.get(pathValueOf(env))
+      let gitBash: string | null
+      if (prepared && this.checks.now() - prepared.at < CWD_CONFIRMED_MS) {
+        gitBash = prepared.bash
+        // Nothing tells the person otherwise: without Git Bash this session's statusLine capture never
+        // runs, for its whole life. When a timeout is why (a dead PATH drive, a full probe pool), the
+        // owner's log (sessions.log, host.log) says so, once for this spawn.
+        if (gitBash === null && prepared.timedOut)
+          this.checks.log(
+            `session ${id} spawned without Git Bash: the lookup timed out (an offline PATH drive?), so its statusLine capture and usage will not run`
+          )
+      } else {
+        this.checks.log('session spawn without prepare: searching for Git Bash synchronously, which can freeze this thread on an offline PATH drive')
+        gitBash = findGitBash(env, this.checks.syncExists)
+      }
       if (gitBash) env.CLAUDE_CODE_GIT_BASH_PATH = gitBash
     }
     if (sl) {
@@ -180,11 +296,23 @@ export class SessionManager {
       // turned on has no CLI even after the toggle flips; a new tab is the fix (see
       // resources/skills/task-stub.md, and resources/skills/browser-stub.md's step 1).
       env.ASTERA_CLI = opts.orchEnv.cliPath
-      env.ASTERA_INFO = opts.orchEnv.infoPath
+      // **The profile, not the address.** The CLI now talks to the Host rather than to this process,
+      // and left to itself it recomputes the profile folder from the platform (`userDataDir`) — which
+      // answers `%APPDATA%\astera` for a dev build too, because the `-dev` suffix comes from
+      // `app.isPackaged` (src/main/index.ts) and no environment variable carries it. A worker spawned
+      // by the dev app then reached the *installed* Host, and wrote its undelivered reports into the
+      // installed profile's queue, where the installed app drained them. Measured 2026-09-22 (F43).
+      //
+      // An address alone could not fix that: `astera` needs the profile folder itself for the pending
+      // report queue and for the state file it falls back to, and an address does not say which
+      // profile the Host behind it uses. So the folder travels, and the CLI derives the address from
+      // it exactly as this app does (`hostAddress`). `ASTERA_HOST` stays what it was — an override for
+      // pointing at one specific Host.
+      env.ASTERA_PROFILE_DIR = opts.orchEnv.profileDir
       env.ASTERA_SKILLS = opts.orchEnv.skillsPath
       env.ASTERA_SESSION = id
       // Uses cliPath's directory rather than adding a new field — the shuttle file is already named
-      // `astera` (main/orchestration/shuttle.ts: astera.cmd on win32, astera on posix).
+      // `astera` (core/orchestration/exec/shuttle.ts: astera.cmd on win32, astera on posix).
       prependToPath(env, path.dirname(opts.orchEnv.cliPath))
     }
     const pty = this.ptyFactory(file, args, {
@@ -202,6 +330,7 @@ export class SessionManager {
         // restore) — restore carries slackNotify and rollAccountIds only because they also decide
         // whether toolHooks get installed.
         restore: {
+          ...(opts.restoreExtra ?? {}),
           accountId: opts.account.id,
           cwd: opts.cwd,
           title: opts.title ?? defaultSessionTitle(opts.cwd),
@@ -271,7 +400,7 @@ export class SessionManager {
    *
    *  Deliberately does none of spawn's other work: the process exists, so there is no env to build, no
    *  statusLine to configure and no hooks to install. The cwd is not checked either — spawn's
-   *  existsSync guard is about a directory it is about to start a process in, and refusing a session
+   *  cwd guard (and prepare's) is about a directory it is about to start a process in, and refusing a session
    *  whose folder was renamed since would orphan a process that is still running.
    *
    *  **Keeps the session's own id** — `PtyMeta.id`, which the Host hands back beside the note. The id is
@@ -303,33 +432,9 @@ export class SessionManager {
    *  for a completion nobody will send. The Host's entry carries an `alive` flag; filtering on it is the
    *  caller's job. */
   adopt(a: { kind: string; id: string; pty: PtyLike; restore: Record<string, unknown> }): SessionInfo | null {
-    // Checked before any field, because the kinds' readable shapes overlap: a note of another kind can
-    // satisfy the fields below and would come back rebuilt as the wrong thing.
-    if (a.kind !== 'session') return null
-    const r = a.restore
-    const str = (k: string): string | undefined => (typeof r[k] === 'string' ? (r[k] as string) : undefined)
-    const accountId = str('accountId')
-    const cwd = str('cwd')
-    const title = str('title')
-    if (!accountId || !cwd || !title) return null
-    const info: SessionInfo = {
-      id: a.id,
-      accountId,
-      cwd,
-      status: 'running',
-      title,
-      // Spread rather than assigned, because the note omits what was absent at spawn rather than
-      // carrying an undefined — so an absent key must stay absent here too.
-      ...(str('resumeSessionId') ? { resumeSessionId: str('resumeSessionId') } : {}),
-      // Elements checked, not just the array: the roll coordinators index accounts by these, and one
-      // non-string in a list that crossed a process boundary would surface far from here.
-      ...(Array.isArray(r.rollAccountIds) && r.rollAccountIds.every((x) => typeof x === 'string')
-        ? { rollAccountIds: r.rollAccountIds as string[] }
-        : {}),
-      ...(str('rollPrompt') ? { rollPrompt: str('rollPrompt') } : {}),
-      ...(typeof r.slackNotify === 'boolean' ? { slackNotify: r.slackNotify } : {}),
-      ...(typeof r.bypassPermissions === 'boolean' ? { bypassPermissions: r.bypassPermissions } : {})
-    }
+    // The note is read by the rule the Host's takeover shares (noteInfo.ts).
+    const info = sessionInfoFromNote(a)
+    if (!info) return null
     // An adopted pty is resumed rather than assumed to be flowing. pause() travels to the Host and
     // nothing there releases it when the app goes away, so an app that died inside a backpressure pause
     // left the child blocked on a full pipe — and the record built here says paused:false, which is what
@@ -459,6 +564,15 @@ export class SessionManager {
 
   list(): SessionInfo[] {
     return [...this.sessions.values()].map((s) => ({ ...s.info }))
+  }
+
+  /** Drops the record of a session that has exited; a running one is kept and false is answered. For a
+   *  process that never lists exited sessions (the Host); the app keeps them for resume and tab lookup. */
+  forget(id: string): boolean {
+    const live = this.sessions.get(id)
+    if (!live || live.info.status !== 'exited') return false
+    this.sessions.delete(id)
+    return true
   }
 
   /** The running sessions this app has to end when it quits: the ones whose pty is this process's own

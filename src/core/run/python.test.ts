@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest'
-import { venvInterpreterPaths, pythonBinNames, parsePythonVersion, hasPythonProject } from './python'
+import {
+  venvInterpreterPaths,
+  pythonBinNames,
+  parsePythonVersion,
+  hasPythonProject,
+  pathPythonCandidates,
+  isStoreAppAlias
+} from './python'
 
 describe('venvInterpreterPaths', () => {
   // venv 배치는 규약이지 표준이 아니고, 플랫폼마다 다르다
@@ -60,5 +67,31 @@ describe('hasPythonProject', () => {
   it('마커가 없으면 false', () => {
     expect(hasPythonProject(['package.json', 'README.md'])).toBe(false)
     expect(hasPythonProject([])).toBe(false)
+  })
+})
+
+// `where python` 이 Microsoft Store 의 앱 실행 별칭(WindowsApps\python.exe)을 돌려주면, 그것을 돌리는
+// 것만으로 5초 기한까지 멈출 수 있다. 진짜 인터프리터가 아니니 후보에서 뺀다.
+describe('pathPythonCandidates', () => {
+  it('drops the Microsoft Store app-execution aliases under WindowsApps', () => {
+    const out = [
+      'C:\\Python311\\python.exe',
+      'C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe',
+      'c:\\users\\me\\appdata\\local\\microsoft\\windowsapps\\python3.exe',
+      ''
+    ].join('\r\n')
+    expect(pathPythonCandidates(out)).toEqual(['C:\\Python311\\python.exe'])
+  })
+
+  it('keeps an ordinary posix path and trims blank lines', () => {
+    expect(pathPythonCandidates('/usr/bin/python3\n\n/usr/local/bin/python3\n')).toEqual([
+      '/usr/bin/python3',
+      '/usr/local/bin/python3'
+    ])
+  })
+
+  it('isStoreAppAlias matches the folder, not a lookalike name', () => {
+    expect(isStoreAppAlias('C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe')).toBe(true)
+    expect(isStoreAppAlias('C:\\tools\\MyWindowsAppsPython\\python.exe')).toBe(false)
   })
 })

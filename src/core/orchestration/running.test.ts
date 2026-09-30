@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { runningCount, isStoppedWorker } from './running'
+import { runningCount, isStoppedWorker, runningRunCount } from './running'
 import { snapshotFor } from './view'
 import { emptyState } from './state'
 import type { OrchState } from './state'
-import type { Dispatch, Run, Task } from './types'
+import type { Dispatch, Task } from './types'
+import { stateFromLegacy } from './legacyState'
+import type { LegacyRun } from './legacy'
 import { absPath } from '../testPaths'
 
 // 이 테스트는 JobTask 를 손으로 짓지 않고 **실제 투영(snapshotFor)을 거쳐** 만든다. 세는 규칙이
@@ -11,7 +13,7 @@ import { absPath } from '../testPaths'
 // 자리(OrchState)에서 출발해야 재현이 된다. JobTask 를 직접 지으면 그 어긋남 자체를 테스트가
 // 가정해 버려서, 투영이 바뀌는 날 조용히 통과한다.
 const PROJ = absPath('proj')
-const run = (id: string): Run => ({
+const run = (id: string): LegacyRun => ({
   id,
   objective: `objective ${id}`,
   cwd: PROJ,
@@ -51,13 +53,13 @@ const stopped = (d: Dispatch): Dispatch => ({
 
 /** 상태를 투영까지 돌려 그 Run 의 JobTask 들을 얻는다 */
 const countOf = (tasks: Task[], dispatches: Dispatch[]): number => {
-  const s: OrchState = { ...emptyState(), runs: [run('r1')], tasks, dispatches }
+  const s: OrchState = stateFromLegacy({ runs: [run('r1')], tasks, dispatches })
   return runningCount(snapshotFor(s, PROJ, () => true, [], () => null, () => true).runs[0].tasks)
 }
 
 /** 상태를 투영까지 돌려 그 Run 의 JobTask 하나를 얻는다 */
 const taskOf = (tasks: Task[], dispatches: Dispatch[], id: string) => {
-  const s: OrchState = { ...emptyState(), runs: [run('r1')], tasks, dispatches }
+  const s: OrchState = stateFromLegacy({ runs: [run('r1')], tasks, dispatches })
   const t = snapshotFor(s, PROJ, () => true, [], () => null, () => true).runs[0].tasks.find((x) => x.id === id)
   if (!t) throw new Error(`no such task in snapshot: ${id}`)
   return t
@@ -135,5 +137,47 @@ describe('isStoppedWorker', () => {
     const ts = [task('t1', 'completed')]
     const d = { ...open('d1', 't1'), outcome: 'succeeded' as const, endedAt: '2026-08-20T02:00:00.000Z' }
     expect(isStoppedWorker(taskOf(ts, [d], 't1'))).toBe(false)
+  })
+})
+
+
+// === ruling F57 — `astera host stop` 이 거절할 때 세는 값 ===
+//
+// 같은 규칙을 상태 원본에서 답한다. 화면이 "도는 중" 이라고 적은 회차를 Host 가 멈춰도 되는 것으로
+// 읽으면 안 되므로, 아래 셋은 위 runningCount 의 갈래를 그대로 따라간다.
+describe('runningRunCount', () => {
+  const stateOf = (tasks: Task[], dispatches: Dispatch[]): OrchState =>
+    stateFromLegacy({ runs: [run('r1')], tasks, dispatches })
+
+  it('워커가 붙어 있는 회차를 센다', () => {
+    const d = open('d1', 't1')
+    expect(runningRunCount(stateOf([task('t1', 'dispatched')], [d]))).toBe(1)
+  })
+
+  // worker-stop 은 세션을 죽이고 Task 는 그대로 둔다 — 상태만 보면 영원히 "도는 중" 이고, 그러면
+  // 다 꺼 놓은 회차 하나가 host stop 을 영영 거절한다.
+  it('워커를 멈춘 회차는 세지 않는다', () => {
+    const d = stopped(open('d1', 't1'))
+    expect(runningRunCount(stateOf([task('t1', 'dispatched')], [d]))).toBe(0)
+  })
+
+  // 검증·검토는 앱이 세션 없이 도는 일이다 — Dispatch 로만 세면 이 둘이 사라진다.
+  it('검증·검토는 세션이 없어도 센다', () => {
+    expect(runningRunCount(stateOf([task('t1', 'validating')], []))).toBe(1)
+    expect(runningRunCount(stateOf([task('t1', 'reviewing')], []))).toBe(1)
+  })
+
+  it('아직 시작하지 않은 계획은 세지 않는다', () => {
+    expect(runningRunCount(stateOf([task('t1', 'pending'), task('t2', 'ready')], []))).toBe(0)
+  })
+
+  it('끝난 회차는 세지 않는다', () => {
+    expect(runningRunCount(stateOf([task('t1', 'completed'), task('t2', 'failed')], []))).toBe(0)
+  })
+
+  // 한 회차에 도는 Task 가 둘이어도 회차는 하나다 — 문장이 세는 것은 Job 이다.
+  it('한 회차는 한 번만 센다', () => {
+    const ds = [open('d1', 't1'), open('d2', 't2')]
+    expect(runningRunCount(stateOf([task('t1', 'dispatched'), task('t2', 'dispatched')], ds))).toBe(1)
   })
 })

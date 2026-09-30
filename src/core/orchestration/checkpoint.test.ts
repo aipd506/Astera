@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import {
   emptyState,
-  createRun,
+  createJob,
+  startJobRun,
   createTask,
   openDispatch,
   applyWorkerDone,
@@ -11,7 +12,7 @@ import {
   resolveGate,
   type OrchState
 } from './state'
-import { buildCheckpoint, type GitSummary } from './checkpoint'
+import { buildCheckpoint, sanitize, type GitSummary } from './checkpoint'
 import { formatResumeSection } from './resumeSection'
 
 const NOW = '2026-08-26T00:00:00.000Z'
@@ -29,8 +30,12 @@ const CREDENTIAL_BODY =
  *  이 파일 전용 시나리오를 조립한다: 선행 Task 하나 -> 본 Task -> 첫 Dispatch 가 실패로 보고 ->
  *  재시도 Dispatch 가 usage limit 으로 멈춘다(closeDispatch) -> stopSnapshot 기록. */
 function seed() {
+  // 계획을 만들고 그 1회차를 시작한다 — 예전의 createRun 한 번이 이제 두 걸음이다.
+  const planned = unwrap<{ id: string }>(
+    createJob(emptyState(), { objective: 'Implement OAuth login', cwd: 'D:/p' }, NOW) as never
+  )
   let { state: s, value: run } = unwrap<{ id: string }>(
-    createRun(emptyState(), { objective: 'Implement OAuth login', cwd: 'D:/p' }, NOW) as never
+    startJobRun(planned.state, planned.value.id, NOW) as never
   )
   const dep = unwrap<{ id: string }>(
     createTask(
@@ -126,9 +131,10 @@ function seed() {
 /** 보고 body 하나만 다른, 위 seed() 와 같은 조립. redaction 이 그 body 를 어떻게 다루는지만
  *  보려는 테스트가 쓴다 — seed() 는 이미 CREDENTIAL_BODY 를 심어 두므로 재사용할 수 없다. */
 function seedWithReport(body: string): { s: OrchState; dispatchId: string } {
-  const run = unwrap<{ id: string }>(
-    createRun(emptyState(), { objective: 'o', cwd: 'D:/p' }, NOW) as never
+  const planned = unwrap<{ id: string }>(
+    createJob(emptyState(), { objective: 'o', cwd: 'D:/p' }, NOW) as never
   )
+  const run = unwrap<{ id: string }>(startJobRun(planned.state, planned.value.id, NOW) as never)
   const t = unwrap<{ id: string }>(
     createTask(run.state, { runId: run.value.id, title: 't', spec: 'do it', deps: [] }, NOW) as never
   )
@@ -294,8 +300,11 @@ describe('buildCheckpoint', () => {
   })
 
   it('carries a resolved human decision from Gate.question/Gate.resolution', () => {
+    const planned = unwrap<{ id: string }>(
+      createJob(emptyState(), { objective: 'o', cwd: 'D:/p' }, NOW) as never
+    )
     let { state: s, value: run } = unwrap<{ id: string }>(
-      createRun(emptyState(), { objective: 'o', cwd: 'D:/p' }, NOW) as never
+      startJobRun(planned.state, planned.value.id, NOW) as never
     )
     const t = unwrap<{ id: string }>(
       createTask(s, { runId: run.id, title: 't', spec: 'do it', deps: [] }, NOW) as never
@@ -321,5 +330,54 @@ describe('buildCheckpoint', () => {
     expect(c.decisions).toEqual([
       { question: 'Which token store?', status: 'resolved', resolution: 'Use the existing KeyStore.' }
     ])
+  })
+})
+
+// Review follow-up: two credential shapes the key=value gate never saw. The URL userinfo password and
+// a query parameter whose name is a credential name are redacted whatever the value looks like; the
+// name is matched whole, so a name that merely contains one (monkey, keyword) is left alone.
+describe('sanitize — URL userinfo and credential-named query parameters', () => {
+  it('redacts the password in scheme://user:password@host and keeps the user and host', () => {
+    expect(sanitize('clone https://admin:hunter2@git.corp/repo failed')).toBe(
+      'clone https://admin:[REDACTED]@git.corp/repo failed'
+    )
+    expect(sanitize('postgres://svc:p%40ss@db:5432/app')).toBe('postgres://svc:[REDACTED]@db:5432/app')
+  })
+
+  it('redacts a query value whose name is a credential name, in any case', () => {
+    expect(sanitize('GET https://maps.example.com/api?key=abc123&page=2')).toBe(
+      'GET https://maps.example.com/api?key=[REDACTED]&page=2'
+    )
+    expect(sanitize('https://h/p?x=1&APIKEY=short&api-key=v&Sig=s1#frag')).toBe(
+      'https://h/p?x=1&APIKEY=[REDACTED]&api-key=[REDACTED]&Sig=[REDACTED]#frag'
+    )
+    expect(sanitize('https://h/cb?access_token=t0k&auth=x&signature=zz&client_secret=cs')).toBe(
+      'https://h/cb?access_token=[REDACTED]&auth=[REDACTED]&signature=[REDACTED]&client_secret=[REDACTED]'
+    )
+  })
+
+  it('redacts token, password, passwd, secret and refresh_token query values however short', () => {
+    expect(sanitize('https://h/p?token=short&Password=pw&passwd=x&SECRET=s&refresh_token=r')).toBe(
+      'https://h/p?token=[REDACTED]&Password=[REDACTED]&passwd=[REDACTED]&SECRET=[REDACTED]&refresh_token=[REDACTED]'
+    )
+  })
+
+  it('leaves tokens=, secretary= and password_hint= alone', () => {
+    const text = 'https://h/p?tokens=3&secretary=kim&password_hint=pet'
+    expect(sanitize(text)).toBe(text)
+  })
+
+  it('leaves names that only contain a credential name, users without a password and plain ids', () => {
+    for (const text of [
+      'https://h/p?monkey=1',
+      'https://h/p?keyword=x',
+      'https://h/p?id=abc',
+      'ssh://git@github.com/org/repo.git',
+      'https://user@host/path',
+      'http://localhost:5173/app',
+      'monkey=1 and keyword=x in prose'
+    ]) {
+      expect(sanitize(text)).toBe(text)
+    }
   })
 })

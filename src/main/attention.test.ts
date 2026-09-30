@@ -184,6 +184,124 @@ describe('createAttentionState — set', () => {
   })
 })
 
+/** What Claude Code 2.1.280 sends when an API error ends the turn, field for field (its builder
+ *  `sAe`): the session fields every hook carries, `error` (rate_limit, overloaded,
+ *  authentication_failed, server_error, …), `error_details` when there are any, and the error
+ *  message's own text as `last_assistant_message`. It fires *instead of* Stop. */
+const stopFailure = (error = 'rate_limit'): unknown => ({
+  session_id: 'cc-1',
+  transcript_path: 'D:/t.jsonl',
+  cwd: 'D:/work',
+  hook_event_name: 'StopFailure',
+  error,
+  last_assistant_message: 'API Error: Repeated 529 Overloaded errors'
+})
+
+// StopFailure is the other way a turn ends, so it ends a turn here exactly as Stop does. Before, a
+// turn that errored left whatever the value was standing: `waiting` stayed up with nobody waiting,
+// and the next real prompt was no transition, so the desktop notifier never fired for it.
+describe('createAttentionState — StopFailure', () => {
+  it('StopFailure ends the turn the way Stop does: idle, every outstanding call cleared', () => {
+    const state = createAttentionState()
+    const seen: Array<[string, Attention]> = []
+    state.subscribe((id, value) => seen.push([id, value]))
+    state.onHookEvent('w', pre('call-1'))
+    state.onHookEvent('w', pre('call-2'))
+    state.onHookEvent('q', pre('call-3'))
+    state.onHookEvent('q', notify('permission_prompt'))
+    seen.length = 0
+    state.onHookEvent('w', stopFailure('overloaded'))
+    state.onHookEvent('q', stopFailure('authentication_failed'))
+    expect(state.get('w')).toBe('idle')
+    expect(state.get('q')).toBe('idle')
+    expect(seen).toEqual([
+      ['w', 'idle'],
+      ['q', 'idle']
+    ])
+    // cleared, not only flipped: a stray PostToolUse of one of them does not bring working back
+    state.onHookEvent('w', post('call-1'))
+    expect(state.get('w')).toBe('idle')
+  })
+
+  it('a StopFailure for a session never seen creates nothing, as Stop does not', () => {
+    const state = createAttentionState()
+    const seen: Array<[string, Attention]> = []
+    state.subscribe((id, value) => seen.push([id, value]))
+    state.onHookEvent('fresh', stopFailure())
+    expect(state.get('fresh')).toBe('idle')
+    expect(seen).toEqual([])
+  })
+
+  // StopFailure and UserPromptSubmit are captured async, so a prompt submitted right after a failed
+  // turn can have its UserPromptSubmit land first, and the old StopFailure after the new turn's first
+  // tool call. The capture stamps when it started (`astera_at`); a turn end that happened before the
+  // latest prompt belongs to the turn before it.
+  it.each(['StopFailure', 'Stop'])('a %s older than the latest prompt does not end the new turn', (name) => {
+    const state = createAttentionState()
+    state.onHookEvent('w', { hook_event_name: 'UserPromptSubmit', prompt: 'again', astera_at: 1_020 })
+    state.onHookEvent('w', { hook_event_name: 'PreToolUse', tool_use_id: 'call-1', astera_at: 1_500 })
+    state.onHookEvent('w', { ...(stopFailure() as object), hook_event_name: name, astera_at: 1_000 })
+    expect(state.get('w')).toBe('working')
+    // and the call it left outstanding is still the one that ends the value
+    state.onHookEvent('w', { hook_event_name: 'PostToolUse', tool_use_id: 'call-1', astera_at: 1_600 })
+    expect(state.get('w')).toBe('idle')
+  })
+
+  // An instant API error whose StopFailure lands before its own prompt: the prompt is older, so the
+  // turn end stands.
+  it('a StopFailure that landed before its own older prompt still ends the turn', () => {
+    const state = createAttentionState()
+    state.onHookEvent('w', { hook_event_name: 'PreToolUse', tool_use_id: 'call-1', astera_at: 900 })
+    state.onHookEvent('w', { ...(stopFailure() as object), astera_at: 1_005 })
+    state.onHookEvent('w', { hook_event_name: 'UserPromptSubmit', prompt: 'go', astera_at: 1_000 })
+    expect(state.get('w')).toBe('idle')
+    state.onHookEvent('w', { hook_event_name: 'PreToolUse', tool_use_id: 'call-2', astera_at: 2_000 })
+    state.onHookEvent('w', { ...(stopFailure() as object), astera_at: 2_500 })
+    expect(state.get('w')).toBe('idle')
+  })
+
+  // A wall clock set back 30 s during a turn stamps its Stop well before the prompt. That is far past
+  // any reordering, so the stamps are not trusted and the Stop ends the turn as it lands.
+  it('a Stop stamped 20 s before its prompt, after a clock step back, still ends the turn', () => {
+    const state = createAttentionState()
+    state.onHookEvent('w', { hook_event_name: 'UserPromptSubmit', prompt: 'go', astera_at: 1_000_000 })
+    state.onHookEvent('w', { hook_event_name: 'PreToolUse', tool_use_id: 'call-1', astera_at: 1_000_000 - 25_000 })
+    state.onHookEvent('w', { hook_event_name: 'Stop', astera_at: 1_000_000 - 20_000 })
+    expect(state.get('w')).toBe('idle')
+  })
+
+  // Lines from a capture that predates the stamp keep the append-order rule, and so does a tie.
+  it.each([
+    ['no stamp', {}, {}],
+    ['the same millisecond', { astera_at: 1_000 }, { astera_at: 1_000 }]
+  ])('with %s the turn end ends the turn, as it always did', (_label, promptAt, endAt) => {
+    const state = createAttentionState()
+    state.onHookEvent('w', { hook_event_name: 'UserPromptSubmit', prompt: 'go', ...promptAt })
+    state.onHookEvent('w', pre('call-1'))
+    state.onHookEvent('w', { ...(stopFailure() as object), ...endAt })
+    expect(state.get('w')).toBe('idle')
+  })
+})
+
+// The capture also records UserPromptSubmit, for `astera sessions list` (core/hooks/sessionState.ts).
+// It is not this state's business: a turn starting is no reason to raise a banner.
+describe('createAttentionState — the events it does not read', () => {
+  it('UserPromptSubmit changes no value and notifies nobody', () => {
+    const state = createAttentionState()
+    const seen: Array<[string, Attention]> = []
+    state.subscribe((id, value) => seen.push([id, value]))
+    state.onHookEvent('w', pre('call-1'))
+    state.onHookEvent('q', pre('call-2'))
+    state.onHookEvent('q', notify('permission_prompt'))
+    seen.length = 0
+    for (const id of ['w', 'q', 'fresh']) state.onHookEvent(id, { hook_event_name: 'UserPromptSubmit', prompt: 'go' })
+    expect(state.get('w')).toBe('working')
+    expect(state.get('q')).toBe('waiting')
+    expect(state.get('fresh')).toBe('idle')
+    expect(seen).toEqual([])
+  })
+})
+
 describe('createAttentionState — malformed input', () => {
   it('a non-object payload and an unrecognised hook_event_name are ignored rather than throwing', () => {
     const state = createAttentionState()

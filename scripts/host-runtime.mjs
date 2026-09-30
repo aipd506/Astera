@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto'
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { bundlePackages, dependencyClosure } from './host-runtime-scan.mjs'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const OUT = join(ROOT, 'resources', 'host-runtime')
@@ -28,7 +29,10 @@ const OUT = join(ROOT, 'resources', 'host-runtime')
  * consulted, so no `files` entry can bring it back, and a flat layout shipped node-pty-less. One
  * level of nesting puts it at `<dir>/node_modules`, which that same filter keeps.
  */
-const nodeDirName = (version) => `node-${version}`
+const nodeDirName = (version) => `node-${version}-astera-host`
+/** Node's own node.exe, byte for byte, under a name that says whose it is in Task Manager. Both names
+ *  must match `nodeDirName` and `HOST_EXE` in src/core/host/runtime.ts, which reads this tree. */
+const HOST_EXE = 'astera-host.exe'
 const CACHE = join(ROOT, 'build', '.cache')
 
 /**
@@ -121,12 +125,8 @@ async function main() {
   const tree = join(OUT, nodeDirName(NODE.version))
   mkdirSync(tree, { recursive: true })
 
-  writeFileSync(join(tree, 'node.exe'), exe)
+  writeFileSync(join(tree, HOST_EXE), exe)
   writeFileSync(join(tree, 'LICENSE.node.txt'), license)
-  // Which directory to copy, read by the app from the directory rather than from a constant in its
-  // own code — so the two can never disagree about which Node was shipped. It sits outside the
-  // versioned tree because it is the thing that names the version.
-  writeFileSync(join(OUT, 'runtime.json'), JSON.stringify({ node: NODE.version, app: appVersion }, null, 2) + '\n')
 
   // package.json is required: node-pty's own entry point is read from it. lib/ is the JavaScript,
   // prebuilds/win32-x64 the native half. The .pdb files are debug symbols for someone else's build —
@@ -140,6 +140,25 @@ async function main() {
     filter: (src) => !src.endsWith('.pdb')
   })
 
+  // **Every other package the Host bundle loads** (`bundlePackages`, scripts/host-runtime-scan.mjs),
+  // with its whole resolved dependency closure (`dependencyClosure`): what those packages load in turn,
+  // resolved the way Node resolves it. Each package lands at the same path under node_modules it has
+  // here, so a nested node_modules stays exactly where npm put it and node.exe resolves the same copy the
+  // app does. Type-only packages (@types/*, undici-types) are left out (P14). A native module is refused,
+  // loudly here rather than on a user's machine: node-pty above is the one native half this runtime
+  // ships, as a prebuild, and it is handled apart.
+  const packages = bundlePackages(join(built, 'host.js')).filter((name) => name !== 'node-pty')
+  for (const rel of dependencyClosure(ROOT, packages)) {
+    const from = join(ROOT, ...rel.split('/'))
+    // A package's own nested node_modules is not copied with it: each nested package is an entry of the
+    // closure in its own right, at its own path, so a type-only one there stays out too (P14).
+    cpSync(from, join(tree, ...rel.split('/')), {
+      recursive: true,
+      filter: (src) => src === from || !src.slice(from.length + 1).split(/[\\/]/).includes('node_modules')
+    })
+    console.log(`host-runtime: the Host bundle requires ${rel.slice('node_modules/'.length)} — shipped`)
+  }
+
   // The whole chunks directory rather than the one file host.js names. It is ~11 KB, the names carry
   // build hashes, and which chunk belongs to which entry is a bundler detail this script has no
   // business parsing.
@@ -149,6 +168,42 @@ async function main() {
   if (existsSync(join(built, 'chunks'))) {
     cpSync(join(built, 'chunks'), join(buildOut, 'chunks'), { recursive: true })
   }
+
+  /** Every file under `dir`, relative to it, with the separator the app compares against. */
+  const filesUnder = (dir, prefix = '') => {
+    const out = []
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix ? `${prefix}\\${e.name}` : e.name
+      if (e.isDirectory()) out.push(...filesUnder(join(dir, e.name), rel))
+      else out.push(rel)
+    }
+    return out.sort()
+  }
+
+  // Which directory to copy, and what a whole copy of it contains. Both read by the app from the
+  // directory rather than from a constant in its own code — so the two can never disagree about what
+  // was shipped. It sits outside the versioned tree because it is the thing that names the version.
+  //
+  // **The file list is walked from what was actually written, never typed out here.** A hand-kept
+  // list is one that goes stale the first time this script copies something new, and a list that is
+  // missing an entry is a runtime the app will call whole while the Host cannot spawn from it — which
+  // is the exact failure this exists to catch (2026-09-22). The two halves are listed apart because
+  // they go missing for different reasons: see `RuntimeFiles` in src/main/host/runtime.ts.
+  writeFileSync(
+    join(OUT, 'runtime.json'),
+    JSON.stringify(
+      {
+        node: NODE.version,
+        app: appVersion,
+        files: {
+          node: filesUnder(tree).filter((f) => !f.startsWith('builds\\')),
+          build: filesUnder(buildOut)
+        }
+      },
+      null,
+      2
+    ) + '\n'
+  )
 
   const total = (dir) => {
     let n = 0
@@ -161,7 +216,7 @@ async function main() {
     return n
   }
   console.log(
-    `host-runtime: node ${NODE.version} + node-pty + build ${appVersion} -> resources/host-runtime/${nodeDirName(NODE.version)} (${mb(total(OUT))})`
+    `host-runtime: node ${NODE.version} + node-pty + ${packages.length} packages + build ${appVersion} -> resources/host-runtime/${nodeDirName(NODE.version)} (${mb(total(OUT))})`
   )
 }
 

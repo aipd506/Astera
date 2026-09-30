@@ -1,5 +1,6 @@
 // 다 끝난 예약 회차의 워크트리를 걷어도 되는가에 대한 **순수 판정**. 실제 삭제는 배선이 한다
-// (src/main/ipc.ts 의 reapWorktree) — integrate.ts 가 병합 판정과 실제 병합을 나눈 것과 같은 경계다.
+// (src/core/orchestration/exec/integrateGit.ts 의 reapWorktree, src/main/ipc.ts 가 부른다) —
+// integrate.ts 가 병합 판정과 실제 병합을 나눈 것과 같은 경계다.
 //
 // **왜 이 파일이 따로 있는가.** 이 판정은 outcomeOf(view.ts)와 runWorktrees(integrate.ts)를 함께
 // 봐야 하는데, view.ts 가 integrate.ts 를 임포트한다. integrate.ts 에 두면 순환이 되고, view.ts 에
@@ -9,6 +10,7 @@
 import { runWorktrees } from './integrate'
 import type { OrchState } from './state'
 import { outcomeOf } from './view'
+import { jobOf } from './state'
 
 /** 워크트리를 걷어도 되는 예약 회차들과 그 폴더들.
  *
@@ -42,7 +44,9 @@ export function reapableChildRuns(
 ): Array<{ runId: string; worktrees: string[] }> {
   const out: Array<{ runId: string; worktrees: string[] }> = []
   for (const run of s.runs) {
-    if (run.templateId === undefined) continue
+    // 예약이 만든 회차만 걷는다. 손으로 다시 돌린 회차의 워크트리는 보통 Job 의 것과 같이 남긴다 —
+    // 쌓이는 것은 5분마다 도는 예약이지 사람이 한 번 더 누른 것이 아니다.
+    if (!jobOf(s, run)?.schedule) continue
     if (outcomeOf(s, run.id) !== 'completed') continue
     const taskIds = new Set(s.tasks.filter((t) => t.runId === run.id).map((t) => t.id))
     const open = s.dispatches.some((d) => taskIds.has(d.taskId) && !d.outcome && !d.endedAt)

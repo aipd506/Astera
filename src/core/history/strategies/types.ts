@@ -3,26 +3,45 @@ import type { Account, HistoryEntry, ProjectSummary, TranscriptPreview } from '.
 // There are two HistoryEntry types — session history (core/types.ts) and local file history
 // (core/files/localHistory.ts, the delete-recovery snapshot). They are unrelated. This is the former.
 
+/** One session file as a listing found it — the key the rollout index (sessionCwdCache.ts) matches on. */
+export type MemoFile = { path: string; mtimeMs: number; size: number }
+
+/** What the rollout index keeps for one codex file besides its cwd: the row an expansion shows. */
+export interface IndexedRow {
+  cwd: string
+  sessionId: string
+  title: string
+  awaitingReply: boolean
+}
+
 /** HistoryIndex exposing its own helpers narrowly.
  *  The owner of the caches (dirCache, entryById) and of the file traversal is still the single
  *  HistoryIndex — duplicating a cache per strategy would just be a new surface for bugs. */
 export interface HistoryIo {
   /** Owns the mtime signature cache (dirCache), entryById registration, and parsing in parallel at concurrency 24 */
   parseDir(account: Account, dir: string): Promise<HistoryEntry[]>
-  jsonlByMtimeDesc(dir: string): Promise<{ name: string; mtimeMs: number; size: number }[]>
+  /** `status`, when given, is marked incomplete if the directory or a file in it could not be read
+   *  for any reason other than not existing (projects.ts ListStatus). */
+  jsonlByMtimeDesc(dir: string, status?: { complete: boolean }): Promise<{ name: string; mtimeMs: number; size: number }[]>
   /** Resolves the cwd of many session files at once, reusing a persisted memo where (mtimeMs, size)
    *  still match; `parse` is called only on a miss. For a provider whose folder name does not carry
    *  the project (codex: the folder is a date), the project list can only be built by opening every
    *  session file, and this is what keeps that off the startup path from the second run on.
-   *  Called once per pass with the pass's whole live file set. Input order is preserved. */
-  cwdMemo(
-    files: { path: string; mtimeMs: number; size: number }[],
-    parse: (filePath: string) => Promise<string | null>
-  ): Promise<(string | null)[]>
+   *  Called once per pass with the pass's whole live file set. Input order is preserved.
+   *
+   *  `scope`, when given, says `files` is every file under that root, so the memo drops the entries
+   *  of files that are gone from it. The misses are what the "Scanning Codex history" progress counts. */
+  cwdMemo(files: MemoFile[], parse: (filePath: string) => Promise<string | null>, scope?: string): Promise<(string | null)[]>
+  /** The expansion row of each file through the same persisted index: `build` runs only for a file
+   *  whose (mtimeMs, size) has no row yet. Input order is preserved; a null build stays null. */
+  rowMemo(files: MemoFile[], build: (f: MemoFile) => Promise<IndexedRow | null>): Promise<(IndexedRow | null)[]>
+  /** Asks for the index to be saved — once per pass, after cwdMemo and rowMemo. Not awaited: the store
+   *  debounces, serializes and writes atomically on its own. */
+  flushIndex(): void
   /** Absolute paths of the subdirectories. The codex strategy assembles the three-level date walk
    *  (y/m/d) out of this itself — the knowledge that "the date is three levels" belongs to the side
    *  that knows the layout */
-  subdirs(dir: string): Promise<string[]>
+  subdirs(dir: string, status?: { complete: boolean }): Promise<string[]>
   /** Resolves a directory's real cwd (the cwd of the newest non-helper session). Both strategies use it */
   resolveProjectCwd(dir: string, filesNewestFirst: string[]): Promise<string | null>
   /** Normalization for path comparison — the same rule as `norm` in index.ts */
@@ -57,6 +76,10 @@ export interface HistoryStrategy {
    *  cwd can sit in a different folder — a row cannot be recomputed from one directory alone. The
    *  caller falls back to invalidating that account when it is absent. */
   projectSummaryForDir?(account: Account, dir: string, io: HistoryIo): Promise<ProjectSummary | null>
+  /** The entries of one project, for a provider whose directories cannot be filtered by project
+   *  (codex). When present, HistoryIndex calls it instead of parsing every directory and filtering
+   *  afterwards: the rollout index says which files belong to the project, so only those are built. */
+  entriesForProject?(account: Account, projectPath: string, io: HistoryIo): Promise<HistoryEntry[]>
   buildEntry(
     account: Account,
     filePath: string,

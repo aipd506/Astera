@@ -4,7 +4,7 @@ import {
   queueableReportProblem,
   PENDING_REPORTS_DIR,
   isQueueableReport,
-  pendingReportsDirFrom,
+  pendingReportsDirIn,
   pendingReportFileName,
   pendingReportTempName,
   isAbandonedWorkingFile,
@@ -99,10 +99,9 @@ describe('isQueueableReport — which commands a file can stand in for', () => {
   })
 })
 
-describe('pendingReportsDirFrom', () => {
-  it('is a folder beside the info file the CLI already reads', () => {
-    const info = path.join('C:', 'u', 'orch', 'orch-info.json')
-    expect(pendingReportsDirFrom(info)).toBe(path.join('C:', 'u', 'orch', PENDING_REPORTS_DIR))
+describe('pendingReportsDirIn', () => {
+  it('is a folder under the profile every reader can name', () => {
+    expect(pendingReportsDirIn(path.join('C:', 'u'))).toBe(path.join('C:', 'u', 'orch', PENDING_REPORTS_DIR))
   })
 })
 
@@ -281,7 +280,7 @@ describe('reportedDispatchIdsOf — which Dispatches a queued report speaks for'
 })
 
 describe('undeliveredReportNotice — what the agent is told', () => {
-  const notice = JSON.parse(undeliveredReportNotice({ path: 'C:\\u\\orch\\pending-reports\\a.json' }))
+  const notice = undeliveredReportNotice({ path: 'C:\\u\\orch\\pending-reports\\a.json' })
   it('says it was recorded', () => {
     expect(notice.queued).toBe(true)
     expect(notice.path).toBe('C:\\u\\orch\\pending-reports\\a.json')
@@ -289,10 +288,10 @@ describe('undeliveredReportNotice — what the agent is told', () => {
   it('says it was not applied — the other half an agent has to read', () => {
     expect(notice.applied).toBe(false)
   })
-  it('is not an ok: nothing in it claims the report went through', () => {
-    expect(notice.ok).toBeUndefined()
-    expect(notice.sent).toBeUndefined()
-    expect(notice.error).toBeUndefined()
+  // 봉투의 `ok` 는 "명령이 돌았다" 이지 "보고가 닿았다" 가 아니다(공개 CLI 설계 §7).
+  // 닿았는지를 말하는 것은 `applied` 하나고, 그래서 이 객체는 성공처럼 읽힐 칸을 지어내지 않는다.
+  it('성공을 뜻하는 칸을 지어내지 않는다', () => {
+    expect(Object.keys(notice).sort()).toEqual(['applied', 'note', 'path', 'queued'])
   })
   it('tells the agent not to send it again', () => {
     expect(String(notice.note)).toMatch(/again/)
@@ -308,7 +307,7 @@ describe('undeliveredReportNotice — what the agent is told', () => {
     expect(String(notice.note)).not.toMatch(/would not reach/)
     expect(String(notice.note)).toMatch(/already has/)
   })
-  // Whether the app applies it depends on the orchestration toggle, which the worker cannot see.
+  // Whether the app applies it depends on the state it finds, which the worker cannot see.
   it('does not promise the next start will apply it', () => {
     expect(String(notice.note)).not.toMatch(/next time it starts/)
   })

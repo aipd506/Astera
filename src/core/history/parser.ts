@@ -2,6 +2,17 @@ import { createReadStream } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import type { LastCommand, TranscriptMessage } from '../types'
+import {
+  TRANSCRIPT_HEAD_BYTES,
+  TRANSCRIPT_HEAD_BYTES_MAX,
+  TRANSCRIPT_TAIL_BYTES,
+  TRANSCRIPT_TAIL_BYTES_MAX,
+  openTranscriptSource,
+  parseTranscriptLine,
+  readHeadLines,
+  readTailLines,
+  type TranscriptWindowOptions
+} from './transcriptWindow'
 
 export interface TranscriptMeta {
   sessionId: string | null
@@ -175,8 +186,8 @@ export async function parseTranscriptMeta(filePath: string, maxLines = 50): Prom
 }
 
 /** Reads only the last tailBytes of the file to pull out the last user message title and whether a
- *  reply is unread. It is called on every list refresh, so unlike the full parse
- *  (parseTranscriptPreview) it looks only near the end of the file. */
+ *  reply is unread. It is called on every list refresh, so it reads one fixed window and never widens
+ *  it, unlike the preview (parseTranscriptPreview), which widens until it has enough turns. */
 export async function parseTranscriptTail(
   filePath: string,
   tailBytes = 256 * 1024
@@ -250,7 +261,7 @@ export async function parseTranscriptTail(
   }
 }
 
-/** 탭 세션용 재개 브리핑의 재료. `buildTabResumeText`(main/orchestration/resumePacket.ts)가 대화
+/** 탭 세션용 재개 브리핑의 재료. `buildTabResumeText`(core/orchestration/exec/resumePacket.ts)가 대화
  *  파일 하나에서 이 넷을 **한 번의 읽기로** 뽑는다 — 따로따로 읽으면 같은(어쩌면 수십 MB짜리)
  *  파일을 네 번 훑는다. 무엇을 메모에 얼마나 실을지(개수·길이 상한)는 포매터
  *  (core/orchestration/tabResume.ts)가 정한다 — 이 함수는 재료만 모은다. */
@@ -289,7 +300,7 @@ export interface TranscriptResumeMaterial {
  *  쓴다 — 그래서 export한다(claude와 codex 두 재료 읽기가 서로 다른 상한으로 갈리지 않게). */
 export const READ_BUFFER_MAX = 20
 
-/** `launchPrompt`(main/orchestration/coordinator.ts)가 spec 경로에 적용하는 것과 같은 정규화 —
+/** `launchPrompt`(core/orchestration/exec/coordinator.ts)가 spec 경로에 적용하는 것과 같은 정규화 —
  *  `file-history-snapshot`의 경로는 OS 그대로(윈도에서는 `\`)라서, 그 문자가 셸의 이스케이프
  *  문자로 읽히는 것을 앞서 그 파일이 겪은 것과 같은 이유로 미리 없앤다. */
 function toPortablePath(p: string): string {
@@ -313,7 +324,83 @@ function extractToolResultText(content: unknown): string | null {
   return null
 }
 
-export async function parseTranscriptForResume(filePath: string): Promise<TranscriptResumeMaterial> {
+/** 재개 재료에 쓰이는 한 줄의 요약. 창(window)을 뒤에서부터 넓혀 가며 읽으므로 줄을 읽는 순서가
+ *  파일 순서가 아니다 — 그래서 줄마다 필요한 것만 이 모양으로 뽑아 두고(파싱은 줄마다 한 번), 창이
+ *  넓어질 때마다 파일 순서로 이어 붙인 목록을 foldResume 이 처음부터 다시 접는다. 접기는 문자열을
+ *  옮길 뿐이라 싸다. 이 분리 덕에 판정 규칙은 foldResume 한 곳에만 있고, 그것은 창 이전의
+ *  전체 읽기(fixtures/parserReference.ts)의 루프 본문과 한 줄씩 대응한다. */
+type ResumeLine =
+  | { kind: 'title'; value: string }
+  | { kind: 'snapshot'; files: string[] }
+  | {
+      kind: 'message'
+      role: 'user' | 'assistant'
+      bashUses: Array<{ id: string; command: string }>
+      /** 이 줄의 tool_use id 전부(Bash 가 아닌 것도) — 창이 어떤 결과의 호출까지 담았는지 알려고 든다 */
+      toolUseIds: string[]
+      toolResults: Array<{ id: string; failed: boolean; excerpt: string }>
+      text: string | null
+      isMeta: boolean
+      timestamp: string | undefined
+    }
+
+function resumeLineOf(obj: Record<string, unknown>): ResumeLine | null {
+  // 제목 레코드는 **이름이 버전마다 다르다** — 현행 Claude Code 는 `ai-title`(필드 `aiTitle`),
+  // 구버전은 `summary`(필드 `summary`)로 남긴다. 이 앱은 구버전 CLI 를 쓰는 사용자에게도 나가므로
+  // 둘 다 받는다. 한쪽만 받으면 그 사용자는 제목 줄을 영구히 못 받고, 그 사실이 조용히 지나간다.
+  if (obj.type === 'ai-title' && typeof obj.aiTitle === 'string') return { kind: 'title', value: obj.aiTitle }
+  if (obj.type === 'summary' && typeof obj.summary === 'string') return { kind: 'title', value: obj.summary }
+
+  if (obj.type === 'file-history-snapshot') {
+    const snapshot = obj.snapshot as { trackedFileBackups?: unknown } | undefined
+    const tracked = snapshot?.trackedFileBackups
+    if (tracked && typeof tracked === 'object' && !Array.isArray(tracked)) {
+      return { kind: 'snapshot', files: Object.keys(tracked).map(toPortablePath) }
+    }
+    return null
+  }
+
+  // 아래의 어느 판정도 user/assistant 가 아닌 줄에는 효과가 없다(Bash 짝은 assistant 의 tool_use 와
+  // user 의 tool_result 뿐이고, 텍스트는 두 역할만 싣는다).
+  if (obj.type !== 'user' && obj.type !== 'assistant') return null
+  const line: ResumeLine = {
+    kind: 'message',
+    role: obj.type,
+    bashUses: [],
+    toolUseIds: [],
+    toolResults: [],
+    text: extractText(obj.message),
+    isMeta: isMetaUserRecord(obj),
+    timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined
+  }
+  // Bash 호출과 그 결과 — extractText 가 text 블록만 찾는 것과 달리 여기서는 같은
+  // message.content 배열에서 tool_use/tool_result 블록을 본다. 같은 줄이 text 와 tool_use 를 함께
+  // 실을 수 있으므로 둘 다 담는다.
+  const blocks = (obj.message as { content?: unknown } | undefined)?.content
+  if (Array.isArray(blocks)) {
+    for (const b of blocks) {
+      if (b === null || typeof b !== 'object') continue
+      const item = b as Record<string, unknown>
+      if (obj.type === 'assistant' && item.type === 'tool_use' && typeof item.id === 'string') line.toolUseIds.push(item.id)
+      if (obj.type === 'assistant' && item.type === 'tool_use' && item.name === 'Bash') {
+        const input = item.input as { command?: unknown } | undefined
+        if (typeof item.id === 'string' && typeof input?.command === 'string') {
+          line.bashUses.push({ id: item.id, command: input.command })
+        }
+      } else if (obj.type === 'user' && item.type === 'tool_result' && typeof item.tool_use_id === 'string') {
+        line.toolResults.push({
+          id: item.tool_use_id,
+          failed: item.is_error === true,
+          excerpt: extractToolResultText(item.content) ?? ''
+        })
+      }
+    }
+  }
+  return line
+}
+
+/** 파일 순서의 줄 요약들을 재개 재료로 접는다. */
+function foldResume(lines: readonly ResumeLine[]): TranscriptResumeMaterial {
   const result: TranscriptResumeMaterial = {
     title: null,
     requests: [],
@@ -328,99 +415,160 @@ export async function parseTranscriptForResume(filePath: string): Promise<Transc
   // **한 슬롯이 아니라 맵인 이유(리뷰가 잡았다).** 한 턴이 Bash tool_use 를 여러 개 내보낼 수 있고
   // (독립적인 호출은 한 번에 묶어 보내는 것이 권장된다), 슬롯 하나면 나중 id 가 앞 id 를 덮어써서
   // **먼저 시작된 호출의 결과가 도착해도 짝을 못 찾고 조용히 버려졌다.** 맵이면 어느 순서로
-  // 도착해도 짝이 맞는다. 미완으로 남는 항목은 파일을 다 읽고 그냥 버려진다 — 결과가 없는 호출은
+  // 도착해도 짝이 맞는다. 미완으로 남는 항목은 다 접고 그냥 버려진다 — 결과가 없는 호출은
   // 성공/실패를 말할 수 없으므로 이 절에 실을 것이 없다.
   const pendingBash = new Map<string, string>()
-  const stream = createReadStream(filePath, { encoding: 'utf8' })
-  const rl = createInterface({ input: stream })
-  try {
-    for await (const raw of rl) {
-      let obj: Record<string, unknown>
-      try {
-        obj = JSON.parse(raw)
-      } catch {
-        continue // defensive parsing — ignore a broken line
-      }
-      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) continue
-
-      // 제목 레코드는 **이름이 버전마다 다르다** — 현행 Claude Code 는 `ai-title`(필드 `aiTitle`),
-      // 구버전은 `summary`(필드 `summary`)로 남긴다. 이 앱은 구버전 CLI 를 쓰는 사용자에게도 나가므로
-      // 둘 다 받는다. 한쪽만 받으면 그 사용자는 제목 줄을 영구히 못 받고, 그 사실이 조용히 지나간다.
-      if (result.title === null && obj.type === 'ai-title' && typeof obj.aiTitle === 'string') {
-        result.title = toTitle(obj.aiTitle)
-        continue
-      }
-      if (result.title === null && obj.type === 'summary' && typeof obj.summary === 'string') {
-        result.title = toTitle(obj.summary)
-        continue
-      }
-
-      if (obj.type === 'file-history-snapshot') {
-        const snapshot = obj.snapshot as { trackedFileBackups?: unknown } | undefined
-        const tracked = snapshot?.trackedFileBackups
-        if (tracked && typeof tracked === 'object' && !Array.isArray(tracked)) {
-          result.editedFiles = Object.keys(tracked).map(toPortablePath)
-        }
-        continue
-      }
-
-      // Bash 호출과 그 결과 — extractText 가 text 블록만 찾는 것과 달리 여기서는 같은
-      // message.content 배열에서 tool_use/tool_result 블록을 본다. 이 검사는 아래 text 추출과
-      // 배타적이지 않다(같은 줄이 text 와 tool_use 를 함께 실을 수 있다) — 그래서 continue 하지
-      // 않고 통과시킨다.
-      const blocks = (obj.message as { content?: unknown } | undefined)?.content
-      if (Array.isArray(blocks)) {
-        for (const b of blocks) {
-          if (b === null || typeof b !== 'object') continue
-          const item = b as Record<string, unknown>
-          if (obj.type === 'assistant' && item.type === 'tool_use' && item.name === 'Bash') {
-            const input = item.input as { command?: unknown } | undefined
-            if (typeof item.id === 'string' && typeof input?.command === 'string') {
-              pendingBash.set(item.id, input.command)
-            }
-          } else if (
-            obj.type === 'user' &&
-            item.type === 'tool_result' &&
-            typeof item.tool_use_id === 'string' &&
-            pendingBash.has(item.tool_use_id)
-          ) {
-            result.lastCommand = {
-              command: pendingBash.get(item.tool_use_id) as string,
-              failed: item.is_error === true,
-              excerpt: extractToolResultText(item.content) ?? ''
-            }
-            pendingBash.delete(item.tool_use_id) // 같은 id 의 결과가 두 번 오면 첫 번째만 센다
-          }
-        }
-      }
-
-      if (obj.type !== 'user' && obj.type !== 'assistant') continue
-      const text = extractText(obj.message)
-      if (text === null) continue
-
-      if (obj.type === 'user') {
-        // 기계가 남긴 user 줄 — 요청도 꼬리도 아니다. 표지를 단 부류(접두어)와 표지 없이 오는
-        // 부류(isMeta, 스킬 본문 등) 둘 다 여기서 떨어진다.
-        if (!isRealUserText(text) || isMetaUserRecord(obj)) continue
-        result.requests.push(text)
-        if (result.requests.length > READ_BUFFER_MAX) result.requests.shift()
-      }
-
-      result.tail.push({
-        role: obj.type,
-        text,
-        timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined
-      })
-      if (result.tail.length > READ_BUFFER_MAX) result.tail.shift()
+  for (const line of lines) {
+    if (line.kind === 'title') {
+      if (result.title === null) result.title = toTitle(line.value)
+      continue
     }
-  } finally {
-    rl.close()
-    stream.destroy()
+    if (line.kind === 'snapshot') {
+      result.editedFiles = line.files
+      continue
+    }
+    for (const use of line.bashUses) pendingBash.set(use.id, use.command)
+    for (const r of line.toolResults) {
+      if (!pendingBash.has(r.id)) continue
+      result.lastCommand = { command: pendingBash.get(r.id) as string, failed: r.failed, excerpt: r.excerpt }
+      pendingBash.delete(r.id) // 같은 id 의 결과가 두 번 오면 첫 번째만 센다
+    }
+
+    const text = line.text
+    if (text === null) continue
+    if (line.role === 'user') {
+      // 기계가 남긴 user 줄 — 요청도 꼬리도 아니다. 표지를 단 부류(접두어)와 표지 없이 오는
+      // 부류(isMeta, 스킬 본문 등) 둘 다 여기서 떨어진다.
+      if (!isRealUserText(text) || line.isMeta) continue
+      result.requests.push(text)
+      if (result.requests.length > READ_BUFFER_MAX) result.requests.shift()
+    }
+    result.tail.push({ role: line.role, text, timestamp: line.timestamp })
+    if (result.tail.length > READ_BUFFER_MAX) result.tail.shift()
   }
   return result
 }
 
-/** Full (capped) parse for the preview — called only when an item is opened (lazy) */
+/** 창이 이만큼을 담았으면 더 넓혀도 재료가 바뀌지 않는다:
+ *  - 요청과 꼬리가 둘 다 상한(READ_BUFFER_MAX)까지 찼다 — 그 앞의 것은 어차피 밀려난다.
+ *  - 손댄 파일 목록의 출처인 가장 최근 snapshot 이 창 안에 있다.
+ *  - 완료된 Bash 호출(짝)이 창 안에 있고, **그 뒤의 어떤 tool_result 도 호출이 창 밖에 있지 않다.**
+ *    창 밖에서 시작한 Bash 가 그 뒤에 끝났다면 전체 읽기의 lastCommand 는 그것이다 — 결과가 어느
+ *    도구의 것인지는 호출을 봐야 알 수 있으므로, 호출이 창 밖인 결과가 하나라도 남아 있으면 넓힌다.
+ *    호출은 보통 결과 바로 앞에 있어 한 번 넓히면 풀린다.
+ *  셋 중 무엇이든 끝내 안 차는 파일(Bash 를 한 번도 안 쓴 세션 등)은 상한까지 읽는다 — 그 비용은
+ *  상한이 묶고, 비동기다. */
+function resumeWindowIsEnough(lines: readonly ResumeLine[]): boolean {
+  let requests = 0
+  let tail = 0
+  let snapshot = false
+  const uses = new Set<string>()
+  const pendingBash = new Set<string>()
+  let paired = false
+  let orphanAfterPair = false
+  for (const line of lines) {
+    if (line.kind === 'snapshot') snapshot = true
+    if (line.kind !== 'message') continue
+    for (const id of line.toolUseIds) uses.add(id)
+    for (const use of line.bashUses) pendingBash.add(use.id)
+    for (const r of line.toolResults) {
+      if (pendingBash.delete(r.id)) {
+        paired = true
+        orphanAfterPair = false
+      } else if (!uses.has(r.id)) {
+        orphanAfterPair = true
+      }
+    }
+    if (line.text === null) continue
+    if (line.role === 'user' && (!isRealUserText(line.text) || line.isMeta)) continue
+    tail++
+    if (line.role === 'user') requests++
+  }
+  return snapshot && paired && !orphanAfterPair && requests >= READ_BUFFER_MAX && tail >= READ_BUFFER_MAX
+}
+
+function resumeLinesOf(raw: readonly string[]): ResumeLine[] {
+  const out: ResumeLine[] = []
+  for (const r of raw) {
+    const obj = parseTranscriptLine(r)
+    if (obj === null) continue
+    const line = resumeLineOf(obj)
+    if (line !== null) out.push(line)
+  }
+  return out
+}
+
+/** 대화 파일에서 재개 브리핑의 재료를 뽑는다.
+ *
+ *  **파일 전체가 아니라 창을 읽는다.** 이 함수는 Smart Resume 이 세션을 띄우기 전에 메인 스레드에서
+ *  불린다(main/ipc.ts). 이 컴퓨터의 대화 파일은 100~143MB 에 이르고, 한 줄이 1MB 를 넘는다(base64
+ *  이미지). 전부 JSON.parse 하던 동안 앱이 멈췄다. 이제는 꼬리 창(TRANSCRIPT_TAIL_BYTES)부터 읽고
+ *  재료가 다 찰 때까지(resumeWindowIsEnough) 두 배씩 넓히되 TRANSCRIPT_TAIL_BYTES_MAX 에서 멈춘다.
+ *  무거운 줄은 parseTranscriptLine 이 base64 를 비우고 파싱한다.
+ *
+ *  제목만은 파일의 **첫** 제목 레코드여야 하고 그것은 앞머리에 있다(TRANSCRIPT_HEAD_BYTES 의 실측).
+ *  꼬리 창이 파일 처음까지 닿지 않았으면 작은 머리 창(TRANSCRIPT_HEAD_BYTES → _MAX)을 따로 읽어
+ *  찾는다. 머리 창에서 못 찾으면 꼬리 창에서 처음 만난 제목을 쓴다 — 머리 창이 꼬리 창에 닿았다면
+ *  그것이 곧 첫 제목이다.
+ *
+ *  **결과는 전체 읽기와 같다. 다를 수 있는 경우는 정확히 이것뿐이다:**
+ *  1. 꼬리 창이 상한(TRANSCRIPT_TAIL_BYTES_MAX)에 닿고도 재료가 안 찼을 때 — 요청·꼬리가 덜 찬
+ *     채로, 손댄 파일이 창 안의 마지막 snapshot 에서(없으면 빈 채로), lastCommand 가 창 안에서
+ *     짝지은 마지막 호출(없으면 null)로 돌아온다.
+ *  2. 머리 창이 상한(TRANSCRIPT_HEAD_BYTES_MAX)에 닿고도 제목을 못 찾았고 꼬리 창에도 닿지 않았을 때 —
+ *     제목이 꼬리 창의 첫 제목(없으면 null)이 된다.
+ *  3. 줄 하나가 HEAVY_LINE_CHARS 를 넘을 때 — 값 전체가 4096 자 이상의 base64 인 JSON 문자열은
+ *     빈 문자열로 읽힌다(transcriptWindow.ts 의 parseTranscriptLine). 사람이 그런 토큰 하나만을
+ *     메시지로 보냈다면 그 요청은 빠진다. 글 사이에 낀 토큰은 그대로다.
+ *  4. 그러고도 줄 하나가 PARSE_LINE_CHARS_MAX 를 넘을 때 — 그 줄은 파싱하지 않고 건너뛴다.
+ *  1·2 는 창 크기의 문제라 상한을 넘는 파일에서만, 3·4 는 창과 무관하게 그런 줄이 있을 때만
+ *  생긴다. 이 넷은 parserWindow.test.ts 가 하나씩 보여 준다. */
+export async function parseTranscriptForResume(
+  filePath: string,
+  opts?: TranscriptWindowOptions
+): Promise<TranscriptResumeMaterial> {
+  const src = await (opts?.open ?? openTranscriptSource)(filePath)
+  try {
+    let lines: ResumeLine[] = []
+    const { from } = await readTailLines(
+      src,
+      { initial: opts?.tailBytes ?? TRANSCRIPT_TAIL_BYTES, max: opts?.maxTailBytes ?? TRANSCRIPT_TAIL_BYTES_MAX },
+      (raw) => {
+        lines = resumeLinesOf(raw).concat(lines)
+        return resumeWindowIsEnough(lines)
+      }
+    )
+    const result = foldResume(lines)
+    if (from > 0) {
+      let headTitle: string | null = null
+      await readHeadLines(
+        src,
+        from,
+        { initial: opts?.headBytes ?? TRANSCRIPT_HEAD_BYTES, max: opts?.maxHeadBytes ?? TRANSCRIPT_HEAD_BYTES_MAX },
+        (raw) => {
+          for (const r of raw) {
+            // 제목 레코드의 type 값은 JSON 에 그대로 적힌다 — 이 글자가 없는 줄은 파싱할 필요가 없다.
+            if (!r.includes('"ai-title"') && !r.includes('"summary"')) continue
+            const obj = parseTranscriptLine(r)
+            const line = obj === null ? null : resumeLineOf(obj)
+            // 공백뿐인 제목은 없는 것으로 친다 — foldResume 이 다음 제목 레코드로 넘어가는 것과 같다.
+            const title = line?.kind === 'title' ? toTitle(line.value) : null
+            if (title !== null) {
+              headTitle = title
+              return true
+            }
+          }
+          return false
+        }
+      )
+      if (headTitle !== null) result.title = headTitle
+    }
+    return result
+  } finally {
+    await src.close().catch(() => undefined)
+  }
+}
+
 /** 미리보기가 보여 주는 최근 턴 수. 한 턴은 user 메시지에서 시작해 다음 user 메시지 전까지다. */
 export const PREVIEW_TURNS = 10
 
@@ -440,41 +588,66 @@ export function lastTurns(
   return { messages: messages.slice(starts[starts.length - maxTurns]), truncated: true }
 }
 
+function previewMessagesOf(raw: readonly string[]): TranscriptMessage[] {
+  const out: TranscriptMessage[] = []
+  for (const r of raw) {
+    const obj = parseTranscriptLine(r)
+    if (obj === null) continue
+    if (obj.type !== 'user' && obj.type !== 'assistant') continue
+    const text = extractText(obj.message)
+    if (!text) continue
+    out.push({
+      role: obj.type as 'user' | 'assistant',
+      text,
+      timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined
+    })
+  }
+  return out
+}
+
+function userCount(messages: readonly TranscriptMessage[]): number {
+  let n = 0
+  for (const m of messages) if (m.role === 'user') n++
+  return n
+}
+
+/** 미리보기 — 사용자가 목록의 항목을 열 때만 불린다.
+ *
+ *  **파일 전체가 아니라 꼬리 창을 읽는다.** 예전에는 끝까지 스트림으로 읽었다(28MB 를 162ms 에
+ *  읽는다는 실측이 근거였다). 이 컴퓨터의 대화 파일이 100~143MB 로 자라고 1MB 가 넘는 이미지 줄을
+ *  싣게 되면서 그 근거가 무너졌다. 이제 창을 두 배씩 넓혀 **user 메시지가 maxTurns + 1 개** 모일
+ *  때까지만 읽는다 — 그만큼 모이면 마지막 maxTurns 턴이 창 안에 온전히 있고, 잘린 것이 있다는
+ *  것(truncated)도 확실하다. 그러면 결과가 전체 읽기와 같다. 파일 처음에 닿아도 같다.
+ *
+ *  상한(TRANSCRIPT_TAIL_BYTES_MAX)에서 멈춘 경우만 추정이다: 창 앞에 무엇이 더 있으므로 truncated 는
+ *  참이다. 창 안에 user 메시지가 maxTurns 개 있으면 첫 user 메시지 앞의 assistant 응답은 창 밖의
+ *  (보여 주지 않을) 턴에 속하므로 떨어뜨리고, 그보다 적으면 그 응답이 속한 턴도 보여 줄 턴이므로
+ *  보이는 만큼 남긴다. 줄 하나가 너무 길 때의 차이(parseTranscriptForResume 문서의 3·4)는 여기서도
+ *  같다. */
 export async function parseTranscriptPreview(
   filePath: string,
-  maxTurns = PREVIEW_TURNS
+  maxTurns = PREVIEW_TURNS,
+  opts?: TranscriptWindowOptions
 ): Promise<{ messages: TranscriptMessage[]; truncated: boolean }> {
-  const messages: TranscriptMessage[] = []
-  const stream = createReadStream(filePath, { encoding: 'utf8' })
-  const rl = createInterface({ input: stream })
+  const src = await (opts?.open ?? openTranscriptSource)(filePath)
+  let messages: TranscriptMessage[] = []
+  let from: number
   try {
-    for await (const raw of rl) {
-      let obj: Record<string, unknown>
-      try {
-        obj = JSON.parse(raw)
-      } catch {
-        continue
+    ;({ from } = await readTailLines(
+      src,
+      { initial: opts?.tailBytes ?? TRANSCRIPT_TAIL_BYTES, max: opts?.maxTailBytes ?? TRANSCRIPT_TAIL_BYTES_MAX },
+      (raw) => {
+        messages = previewMessagesOf(raw).concat(messages)
+        return userCount(messages) > maxTurns
       }
-      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) continue
-      if (obj.type !== 'user' && obj.type !== 'assistant') continue
-      const text = extractText(obj.message)
-      if (!text) continue
-      messages.push({
-        role: obj.type as 'user' | 'assistant',
-        text,
-        timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : undefined
-      })
-    }
+    ))
   } finally {
-    rl.close()
-    stream.destroy()
+    await src.close().catch(() => undefined)
   }
-  // **파일을 끝까지 읽는다.** 마지막 턴들을 남기려면 끝을 봐야 하고, parseTranscriptTail 처럼
-  // 바이트 꼬리만 읽으면 10 턴이 그 안에 들어오는지 알 수 없어 조용히 더 적게 보여 준다.
-  // 값은 실측했다: 28MB·15,873 줄(user/assistant 5,270 개)을 162ms 에 읽는다. 이 함수는 사용자가
-  // 미리보기를 열 때만 불린다 — 목록 갱신마다 불리는 parseTranscriptTail 과 다른 자리다.
-  //
-  // 대가는 잠깐 파일만큼의 문자열을 드는 것이다. 병목이 되면 여기서 롤링 버퍼로 바꾼다(턴 시작
-  // 인덱스를 들고 앞에서 잘라 내면 메모리가 maxTurns 로 묶인다).
-  return lastTurns(messages, maxTurns)
+  if (from === 0 || userCount(messages) > maxTurns) return lastTurns(messages, maxTurns)
+  if (userCount(messages) === maxTurns) {
+    const first = messages.findIndex((m) => m.role === 'user')
+    return { messages: first === -1 ? [] : messages.slice(first), truncated: true }
+  }
+  return { messages, truncated: true }
 }

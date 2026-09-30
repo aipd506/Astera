@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest'
 import { chainOf, layersOf } from './graph'
 import { emptyState } from './state'
 import type { OrchState } from './state'
-import type { Run, Task } from './types'
+import type { Task } from './types'
+import { stateFromLegacy } from './legacyState'
+import type { LegacyRun } from './legacy'
 import { absPath } from '../testPaths'
 
 const T = (n: number): string => `2026-08-18T00:0${n}:00.000Z`
-const run = (id: string): Run => ({
+const run = (id: string): LegacyRun => ({
   id, objective: `objective ${id}`, cwd: absPath('p'), createdAt: T(0)
 })
 // timeline.test.ts 의 task() 와 같은 모양이되, deps 를 받는 인자가 하나 더 있다 — 고정된
@@ -15,7 +17,7 @@ const task = (id: string, runId: string, deps: string[] = [], createdAt = T(1)):
   id, runId, title: `task ${id}`, spec: '', deps, status: 'pending',
   consecutiveFailures: 0, createdAt, updatedAt: createdAt
 })
-const state = (p: Partial<OrchState>): OrchState => ({ ...emptyState(), ...p })
+const state = (p: Parameters<typeof stateFromLegacy>[0]): OrchState => stateFromLegacy(p)
 
 describe('layersOf', () => {
   it('deps 가 없는 Task 는 0층이다', () => {
@@ -148,6 +150,40 @@ describe('layersOf', () => {
   it('Task 가 없는 Run 은 빈 층과 빈 cyclic 이다', () => {
     const s = state({ runs: [run('r1')] })
     expect(layersOf(s, 'r1')).toEqual({ layers: [], deps: {}, cyclic: [] })
+  })
+
+  // 아직 한 번도 돌지 않은 계획의 상세 창도 그래프를 그린다 — 그 계획의 정의 Task 로. 없으면
+  // "새 작업" 으로 짠 계획이 실행 전까지 빈 창으로 보인다(정의 Task 에는 runId 가 없다).
+  it('Job id 를 주면 그 계획의 정의 Task 를 층으로 묶는다', () => {
+    const def = (id: string, deps: string[], createdAt: string): Task => {
+      const { runId: _r, ...rest } = task(id, '', deps, createdAt)
+      return { ...rest, jobId: 'job1' }
+    }
+    const s: OrchState = {
+      ...emptyState(),
+      tasks: [def('a', [], T(1)), def('b', ['a'], T(2))]
+    }
+    expect(layersOf(s, 'job1')).toEqual({
+      layers: [['a'], ['b']],
+      deps: { a: [], b: ['a'] },
+      cyclic: []
+    })
+  })
+
+  // 회차로 베껴진 Task 는 jobId 도 들고 있을 수 있다 — 그것이 계획의 그림에 섞이면 안 된다
+  it('계획의 그림에는 회차의 Task 가 섞이지 않는다', () => {
+    const s: OrchState = {
+      ...emptyState(),
+      tasks: [
+        { ...task('inst', 'r1'), jobId: 'job1' },
+        (() => {
+          const { runId: _r, ...rest } = task('def', '')
+          return { ...rest, jobId: 'job1' }
+        })()
+      ]
+    }
+    expect(layersOf(s, 'job1').layers).toEqual([['def']])
+    expect(layersOf(s, 'r1').layers).toEqual([['inst']])
   })
 })
 

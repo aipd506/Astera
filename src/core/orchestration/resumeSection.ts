@@ -170,7 +170,9 @@ export function formatResumeNote(c: Checkpoint): string | null {
     parts.push(`While you waited the worktree moved to ${c.git.head ?? 'a new commit'}.`)
   else if (c.worktreeMoved === false) parts.push('While you waited the worktree did not move.')
   const changed = c.git.changed
-  if (changed.length === 0) parts.push('There are no uncommitted changes right now.')
+  // changedUnknown: status did not answer — an empty list is then "unknown", never "clean"
+  if (c.git.changedUnknown) parts.push('Could not check for uncommitted changes right now (git status did not answer).')
+  else if (changed.length === 0) parts.push('There are no uncommitted changes right now.')
   else {
     const shown = changed.slice(0, NOTE_FILES_MAX)
     const more = changed.length - shown.length
