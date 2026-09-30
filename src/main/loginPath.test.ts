@@ -6,7 +6,7 @@
 // 확인할 수 없다 — 터미널에서 앱을 실행하면 부모 셸의 PATH 를 그대로 물려받아 프로브가 없어도
 // 통과하기 때문이다. 그래서 플랫폼 분기의 증거는 이 검사뿐이다.
 import { describe, it, expect } from 'vitest'
-import { readLoginPath } from './loginPath'
+import { mergeWindowsPath, readLoginPath } from './loginPath'
 
 /** 프로브 출력의 모양 — 마커 사이에 PATH 를 끼운 것 */
 const probeOutput = (p: string): string => `__ASTERA_PATH__${p}__END__`
@@ -55,10 +55,34 @@ describe('readLoginPath — 로그인 셸 PATH 프로브', () => {
     expect(noShell.calls[0].file).toBe('/bin/zsh')
   })
 
-  it('win32: 셸을 띄우지 않는다 — PATH 는 환경 변수라 GUI 앱도 그대로 물려받는다', async () => {
-    const rec = recorder(probeOutput('/never'))
-    expect(await readLoginPath({ platform: 'win32', shell: undefined, run: rec.run })).toBeNull()
-    expect(rec.calls).toHaveLength(0)
+  // 2026-09-30, the 1.4.0 update: the installer relaunched the app with the old app's environment,
+  // copied before Codex put its folder on the user Path, and the app said codex was not installed.
+  // So on win32 the Path Windows keeps (Machine, then User) is read the way a fresh process gets it.
+  it('win32: 셸이 아니라 Windows 가 저장해 둔 Path 를 Windows PowerShell 로 읽는다', async () => {
+    const rec = recorder(probeOutput('C:\\Windows\\system32;C:\\Users\\u\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin'))
+    const got = await readLoginPath({ platform: 'win32', shell: undefined, run: rec.run })
+    expect(got).toBe('C:\\Windows\\system32;C:\\Users\\u\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin')
+    expect(rec.calls).toHaveLength(1)
+    // By its absolute path, never by name: a bare name is looked up in the working directory first
+    expect(rec.calls[0].file).toMatch(/[\\/]System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i)
+    expect(rec.calls[0].args.join(' ')).toContain("GetEnvironmentVariable('Path','Machine')")
+    expect(rec.calls[0].args.join(' ')).toContain("GetEnvironmentVariable('Path','User')")
+  })
+})
+
+describe('mergeWindowsPath — 물려받은 Path 는 그대로, 빠진 것만 뒤에', () => {
+  it('keeps the inherited order and appends what the saved Path has that it lacks', () => {
+    expect(mergeWindowsPath('C:\\a;C:\\b', 'C:\\b;C:\\c;C:\\a')).toBe('C:\\a;C:\\b;C:\\c')
+  })
+
+  it('does not add a folder again in another case or with a trailing separator', () => {
+    expect(mergeWindowsPath('C:\\Tools\\', 'c:\\tools;C:\\new')).toBe('C:\\Tools\\;C:\\new')
+  })
+
+  it('keeps the inherited Path as it was when the saved one adds nothing, or cannot be read', () => {
+    expect(mergeWindowsPath('C:\\a;;C:\\b;', 'C:\\a;C:\\b')).toBe('C:\\a;;C:\\b;')
+    expect(mergeWindowsPath('C:\\a', null)).toBe('C:\\a')
+    expect(mergeWindowsPath(undefined, 'C:\\a')).toBe('C:\\a')
   })
 
   it('프로브가 실패하면 null — 앱 시작을 막지 않는다', async () => {

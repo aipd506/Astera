@@ -8,8 +8,9 @@ import { DEFAULT_THEME_ID, isThemeId, themeById, type Theme } from '../core/them
 // statusLine hook files and detects accounts), and with it every session spawn, since nothing can
 // spawn before core exists. The wait is bounded (LOGIN_PATH_GATE_MS) even if the shell will not die.
 //
-// Windows is untouched: there is no probe there (readLoginPath returns at once), and the order stays
-// probe, core, window.
+// Windows keeps its order, probe, core, window. Its probe is not a shell but a read of the Path Windows
+// keeps (loginPath.ts windowsPathProbe, under 200 ms measured): a process can inherit an older copy,
+// as the 1.4.0 update's relaunch did, and then a CLI installed since looks missing.
 
 /** How long start-up waits for the login-shell probe at most. The probe's own execFile timeout is
  *  5 s, but that kills the shell and then waits for its pipes, which a child of the rc file can hold
