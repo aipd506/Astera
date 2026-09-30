@@ -1,6 +1,68 @@
 # Contributing
 
-Issues and pull requests are welcome. A couple of things worth knowing before you start:
+Issues and pull requests are welcome, from a one-line typo fix to a new feature. This page starts
+with what you need on your first day and ends with the rules that matter once you are changing code.
+
+## Getting started
+
+You need **Node.js 22.12+** and a C++ toolchain for `node-pty` (see
+[Build from source](../README.md#build-from-source) for what that is on each platform).
+
+```bash
+git clone https://github.com/<you>/Astera.git
+cd Astera
+git checkout develop
+npm ci
+npm run dev
+```
+
+`npm run dev` starts a development build with its own profile (`astera-dev`, next to the installed
+app's `astera`), so it never touches the accounts, sessions or settings of an Astera you have
+installed, and the two can run side by side. Before opening a pull request, run what CI runs:
+
+```bash
+npm run typecheck
+npm test
+npm run build
+```
+
+## Where things live
+
+| Folder | What it is |
+|---|---|
+| `src/core` | Logic with no Electron in it: sessions, rolling, orchestration, git, the Host protocol. Most of the tests are here. |
+| `src/main` | The Electron main process: windows, IPC handlers, and the wiring that puts `src/core` together. |
+| `src/renderer` | The React UI. It can import only the parts of `src/core` that need no `node:` module. |
+| `src/preload` | The bridge between the two, `window.api`. |
+| `src/host` | The Astera Host, the background process that runs sessions and Jobs while the app is closed. It runs on plain Node, so nothing it imports may reach `electron`, `src/main` or `src/renderer`; `src/host/importFence.test.ts` fails the build if it does. |
+| `src/cli` | The `astera` command. |
+
+Longer design notes and decisions live in `knowledge/`, and the published guides in `docs/`
+(`docs/cli.md` for the command, `docs/jobs.md` for Jobs).
+
+## Finding something to work on
+
+Issues labelled [good first issue](https://github.com/parsingk/Astera/labels/good%20first%20issue)
+are small and self-contained; [help wanted](https://github.com/parsingk/Astera/labels/help%20wanted)
+ones are larger. Reviewing the Japanese or Spanish translations is always welcome, since neither had a
+native speaker's review (see the i18n rule below). If you want to work on something bigger, open an
+issue or a [discussion](https://github.com/parsingk/Astera/discussions) first, so we can agree on the
+approach before you spend time on it. Questions are welcome in Discussions too.
+
+## Reporting a bug
+
+Use the bug report form in [Issues](https://github.com/parsingk/Astera/issues/new/choose). It asks for
+the app version (Settings, Info), your OS, and the lines of the relevant log. The logs are in the
+profile folder: `%APPDATA%\astera` on Windows, `~/Library/Application Support/astera` on macOS and
+`~/.config/astera` on Linux. `host/host.log` there is the background Host, and `rolling.log` is
+account rolling.
+
+**A security problem is not a bug report.** Please report it privately instead, as
+[SECURITY.md](SECURITY.md) describes.
+
+## Rules worth knowing
+
+A couple of things worth knowing before you change code:
 
 - Run `npm run typecheck`, `npm test` and `npm run build` before opening a PR — that is what CI checks,
   in that order, after `npm ci`.
@@ -76,9 +138,6 @@ Issues and pull requests are welcome. A couple of things worth knowing before yo
   encodes `assets/rolling.gif`, `assets/schedule.gif` and `assets/jobs.gif`, which needs `ffmpeg` on
   `PATH`. Change the page rather than the GIFs, then commit both. The script carries comments on the
   parts of Electron's offscreen rendering that do not behave as they read.
-- Bug reports are much easier to act on with the app version, your OS version, and the relevant
-  lines from `rolling.log` when the problem involves account rolling — `%APPDATA%\astera\rolling.log`
-  on Windows, `~/Library/Application Support/astera/rolling.log` on macOS.
 - Commit subjects carry a type prefix, written as an instruction, with the body saying why rather
   than restating the diff. In use, most used first: `fix:`, `feat:`, `docs:`, `test:`, `chore:`,
   `refactor:`, `ci:`, and a handful of `style:`, `perf:` and `build:`. Most subjects also carry a

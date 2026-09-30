@@ -409,9 +409,10 @@ Issues and pull requests are welcome. A couple of things worth knowing before yo
 - A change to behaviour is expected to come with a test. One rule worth knowing before you touch the
   rolling tests: the usage-limit phrases are split with `+` on purpose, because Astera watches session
   output for them — see [CONTRIBUTING](.github/CONTRIBUTING.md).
-- Bug reports are much easier to act on with the app version, your OS version, and the relevant
-  lines from `rolling.log` when the problem involves account rolling — `%APPDATA%\astera\rolling.log`
-  on Windows, `~/Library/Application Support/astera/rolling.log` on macOS.
+- New here? [CONTRIBUTING](.github/CONTRIBUTING.md) starts with setting up, where things live and
+  what to pick up first. Report bugs with the form in
+  [Issues](https://github.com/parsingk/Astera/issues/new/choose), and security problems privately as
+  [SECURITY.md](.github/SECURITY.md) says.
 
 ## Acknowledgements
 

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea to talk through
+    url: https://github.com/parsingk/Astera/discussions
+    about: Ask how something works, or discuss an idea before opening an issue.
+  - name: Security problem
+    url: https://github.com/parsingk/Astera/security/advisories/new
+    about: Report a vulnerability privately. Please do not open a public issue for it.
+  - name: Guide
+    url: https://astera.run
+    about: How to install and use Astera.

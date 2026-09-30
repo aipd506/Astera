@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in Astera does not work the way it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A security problem should not be reported here: please follow
+        [SECURITY.md](https://github.com/parsingk/Astera/blob/main/.github/SECURITY.md) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. See …
+  - type: input
+    id: version
+    attributes:
+      label: Astera version
+      description: Settings, Info, Version.
+      placeholder: 1.4.1
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: cli
+    attributes:
+      label: Agent CLI versions, if the problem involves a session
+      placeholder: "Claude Code 2.1.x, codex-cli 0.155.x"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: |
+        From the profile folder: `%APPDATA%\astera` on Windows, `~/Library/Application Support/astera`
+        on macOS, `~/.config/astera` on Linux. `host/host.log` is the background Host and
+        `rolling.log` is account rolling. Please remove anything private before pasting.
+      render: text
