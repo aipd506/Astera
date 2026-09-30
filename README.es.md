@@ -4,12 +4,14 @@
 
 **Mantén Claude Code y Codex trabajando mientras no estás.**
 
+**Guía: [astera.run](https://astera.run)**
+
 [![CI](https://github.com/parsingk/Astera/actions/workflows/ci.yml/badge.svg)](https://github.com/parsingk/Astera/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/parsingk/Astera?logo=github)](https://github.com/parsingk/Astera/releases/latest)
 [![License](https://img.shields.io/github/license/parsingk/Astera?color=blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555)
 
-[Descargar](#instalación) · [Qué hace](#qué-hace) · [Jobs](#jobs) · [Documentación](#documentación) · [Reportar un error](https://github.com/parsingk/Astera/issues/new)
+[Guía](https://astera.run) · [Descargar](#instalación) · [Qué hace](#qué-hace) · [Jobs](#jobs) · [Documentación](#documentación) · [Reportar un error](https://github.com/parsingk/Astera/issues/new)
 
 [English](README.md) · [한국어](README.ko.md) · [日本語](README.ja.md) · **Español**
 

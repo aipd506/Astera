@@ -4,12 +4,14 @@
 
 **席を離れている間も、Claude Code と Codex を動かし続ける。**
 
+**ガイド: [astera.run](https://astera.run)**
+
 [![CI](https://github.com/parsingk/Astera/actions/workflows/ci.yml/badge.svg)](https://github.com/parsingk/Astera/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/parsingk/Astera?logo=github)](https://github.com/parsingk/Astera/releases/latest)
 [![License](https://img.shields.io/github/license/parsingk/Astera?color=blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555)
 
-[ダウンロード](#インストール) · [できること](#できること) · [Jobs](#jobs) · [ドキュメント](#ドキュメント) · [バグ報告](https://github.com/parsingk/Astera/issues/new)
+[ガイド](https://astera.run) · [ダウンロード](#インストール) · [できること](#できること) · [Jobs](#jobs) · [ドキュメント](#ドキュメント) · [バグ報告](https://github.com/parsingk/Astera/issues/new)
 
 [English](README.md) · [한국어](README.ko.md) · **日本語** · [Español](README.es.md)
 
